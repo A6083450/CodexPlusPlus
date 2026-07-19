@@ -1,5 +1,5 @@
 /// User-facing version. Cargo represents the fourth numeric component as build metadata.
-pub const VERSION: &str = "1.2.38.2";
+pub const VERSION: &str = "1.2.39.2";
 
 #[cfg(test)]
 mod tests {
@@ -7,6 +7,6 @@ mod tests {
 
     #[test]
     fn exposes_release_display_version() {
-        assert_eq!(VERSION, "1.2.38.2");
+        assert_eq!(VERSION, "1.2.39.2");
     }
 }
