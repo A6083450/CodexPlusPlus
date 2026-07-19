@@ -25,9 +25,7 @@
       "supports_parallel_tool_calls": true,
       "input_modalities": ["text", "image"],
       "supports_search_tool": true,
-      "tool_mode": "code_mode_only",
-      "multi_agent_version": "v2",
-      "use_responses_lite": true
+      "multi_agent_version": "v2"
     },
     {
       "slug": "gpt-5.6-terra",
@@ -54,9 +52,7 @@
       "supports_parallel_tool_calls": true,
       "input_modalities": ["text", "image"],
       "supports_search_tool": true,
-      "tool_mode": "code_mode_only",
-      "multi_agent_version": "v2",
-      "use_responses_lite": true
+      "multi_agent_version": "v2"
     },
     {
       "slug": "gpt-5.6-luna",
@@ -82,9 +78,7 @@
       "supports_parallel_tool_calls": true,
       "input_modalities": ["text", "image"],
       "supports_search_tool": true,
-      "tool_mode": "code_mode_only",
-      "multi_agent_version": "v1",
-      "use_responses_lite": true
+      "multi_agent_version": "v1"
     }
   ]
 }

@@ -141,6 +141,13 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
         assert!(!efforts.contains(&"minimal"));
         assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
         assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(model["supports_search_tool"], serde_json::json!(true));
+        assert_eq!(
+            model["web_search_tool_type"],
+            serde_json::json!("text_and_image")
+        );
+        assert!(model.get("tool_mode").is_none());
+        assert!(model.get("use_responses_lite").is_none());
     }
 }
 

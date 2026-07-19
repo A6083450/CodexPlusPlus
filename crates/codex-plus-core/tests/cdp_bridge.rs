@@ -729,6 +729,25 @@ fn injection_script_loads_backend_settings_before_initial_scan() {
 }
 
 #[test]
+fn injection_script_loads_service_tier_after_startup_settings() {
+    // Given: service-tier controls are enabled before the renderer starts.
+    let script = assets::injection_script(57321);
+    let startup = script
+        .find("function loadBackendSettingsForStartup")
+        .expect("script should define the startup settings loader");
+    let startup_body = &script[startup
+        ..script[startup..]
+            .find("async function setBackendSetting")
+            .map(|offset| startup + offset)
+            .expect("startup settings loader should end before the settings writer")];
+
+    // When: backend settings finish loading successfully.
+    // Then: the service-tier state is loaded without requiring the menu to open.
+    assert!(startup_body.contains("codexPlusSettings().serviceTierControls"));
+    assert!(startup_body.contains("void loadCodexServiceTierState();"));
+}
+
+#[test]
 fn injection_script_exposes_conversation_view_width_control() {
     let script = assets::injection_script(57321);
 
@@ -822,6 +841,10 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("installAppServerModelRequestPatch"));
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
+    assert!(script.contains("codexAppServerClientAssetUrls"));
+    assert!(script.contains("Missing AppServer request message handler"));
+    assert!(script.contains("sendRequest=async"));
+    assert!(script.contains("runtime-scan:"));
     assert!(script.contains("send-cli-request-for-host"));
     assert!(script.contains("Response.prototype.json"));
     assert!(script.contains("scheduleCodexModelWhitelistRefresh"));
@@ -936,6 +959,153 @@ fn injection_script_discovers_vscode_api_asset_without_hardcoded_hash() {
 }
 
 #[test]
+fn injection_script_discovers_dispatcher_by_runtime_shape_when_named_assets_are_absent() {
+    // Given: a Codex App build whose dispatcher is no longer in a named asset.
+    let script = assets::injection_script(57321);
+
+    // When: Codex++ builds its renderer injection script.
+    // Then: the script includes a shape-based fallback over loaded asset modules.
+    assert!(script.contains("codexServiceTierDispatcherAssetUrls"));
+    assert!(script.contains("source.includes(\"dispatchHostMessage\")"));
+    assert!(script.contains("source.includes(\"dispatchMessage\")"));
+    assert!(script.contains("source.includes(\"subscribe\")"));
+    assert!(script.contains("runtime-scan:"));
+}
+
+#[test]
+fn injection_script_supports_css_module_composer_footer() {
+    // Given: a Codex App build whose composer footer uses a CSS-module class.
+    let script = assets::injection_script(57321);
+
+    // When: Codex++ builds its service-tier badge locator.
+    // Then: it can find a visible footer through the live contenteditable composer.
+    assert!(script.contains("[class*='_footer_']"));
+    assert!(script.contains("[contenteditable='true']"));
+}
+
+#[test]
+fn injection_script_uses_native_fast_indicator_beside_model_name() {
+    let script = assets::injection_script(57321);
+    let scan = script
+        .find("function scanDeferred")
+        .expect("script should define the deferred scan");
+    let scan_body = &script[scan..script[scan..]
+        .find("function runScanStep")
+        .map(|offset| scan + offset)
+        .expect("deferred scan should end before its wrapper")];
+
+    assert!(scan_body.contains("removeCodexServiceTierBadges();"));
+    assert!(!scan_body.contains("installCodexServiceTierBadge();"));
+    assert!(scan_body.contains("syncCodexNativeServiceTierPicker();"));
+    assert!(script.contains("function syncCodexNativeServiceTierPicker"));
+    assert!(script.contains("updateQueue?.memoCache?.data"));
+    assert!(script.contains("isServiceTierAllowed"));
+    assert!(script.contains("selectedServiceTier"));
+    assert!(script.contains("serviceTierForRequest"));
+    assert!(script.contains("codexServiceTierForceNativePickerRefresh"));
+    assert!(script.contains("installCodexNativeServiceTierSelectionSync"));
+    assert!(script.contains("codexNativeServiceTierModeFromMenuItem"));
+    assert!(script.contains("label === candidate || label.startsWith(candidate)"));
+    assert!(!script.contains("data-codex-service-tier-icon=\"true\""));
+}
+
+#[test]
+fn injection_script_places_service_tier_control_in_native_model_menu() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("installCodexServiceTierMenu"));
+    assert!(script.contains("data-codex-service-tier-menu-trigger"));
+    assert!(script.contains("data-codex-service-tier-menu-content"));
+    assert!(script.contains("data-model-picker-model-row"));
+    assert!(script.contains("速度"));
+    assert!(script.contains("默认速度"));
+    assert!(script.contains("1.5 倍速度，用量更多"));
+    assert!(
+        script
+            .contains("setCodexServiceTierModeFromMenu(mode, selectionContext, selectionRevision)")
+    );
+    assert!(script.contains("menuitemradio"));
+    assert!(script.contains("aria-checked"));
+    assert!(script.contains("aria-activedescendant"));
+    assert!(script.contains("__codexServiceTierMenuKeyboardVersion"));
+    assert!(script.contains("event.stopImmediatePropagation()"));
+    assert!(script.contains("codexServiceTierMenuFocusOption"));
+    assert!(script.contains("ArrowDown"));
+    assert!(script.contains("ArrowUp"));
+    assert!(script.contains("event.key === \"Home\""));
+    assert!(script.contains("event.key === \"End\""));
+    assert!(script.contains("cursor-not-allowed opacity-50"));
+    assert!(script.contains("ensureCodexServiceTierMenuBackendReady"));
+    assert!(script.contains("codexServiceTierMenuContext"));
+    assert!(script.contains("selectionRevision !== codexServiceTierMenuSelectionRevision"));
+    assert!(script.contains("++codexServiceTierMenuSelectionRevision"));
+    assert!(script.contains("任务已切换，请在当前任务重新选择服务模式"));
+    assert!(script.contains("content.contains(activeOption) ? activeOption : fallbackOption"));
+    assert!(script.contains("watchCodexServiceTierMenuLifecycle"));
+    assert!(script.contains("parentMenu.isConnected"));
+
+    let relevance = script
+        .find("function scanRelevantSelector")
+        .expect("script should define scan relevance");
+    let relevance_body = &script[relevance
+        ..script[relevance..]
+            .find("function nodeSelfOrAncestorMatchesScanRelevance")
+            .map(|offset| relevance + offset)
+            .expect("scan relevance should end before the node matcher")];
+    assert!(relevance_body.contains("[data-model-picker-model-row]"));
+
+    let backend_check = script
+        .find("async function ensureCodexServiceTierMenuBackendReady")
+        .expect("script should define the live backend check");
+    let backend_check_body = &script[backend_check
+        ..script[backend_check..]
+            .find("function codexServiceTierMenuContext")
+            .map(|offset| backend_check + offset)
+            .expect("backend check should end before the menu context helper")];
+    assert!(backend_check_body.contains("postJson(\"/backend/status\", {})"));
+    assert!(!backend_check_body.contains("status === \"ok\") return true"));
+
+    let scan = script
+        .find("function scanDeferred")
+        .expect("script should define the deferred scan");
+    let scan_body = &script[scan..script[scan..]
+        .find("function runScanStep")
+        .map(|offset| scan + offset)
+        .expect("deferred scan should end before its wrapper")];
+    assert!(scan_body.contains("installCodexServiceTierMenu();"));
+    assert!(scan_body.contains("removeCodexServiceTierBadges();"));
+    assert!(scan_body.contains("syncCodexNativeServiceTierPicker();"));
+}
+
+#[test]
+fn injection_script_falls_back_when_legacy_service_tier_state_api_is_absent() {
+    // Given: a Codex App build without the legacy setting-storage and vscode-api assets.
+    let script = assets::injection_script(57321);
+
+    // When: Codex++ reads the inherited service tier.
+    // Then: missing legacy assets resolve to the declared default instead of a failed control.
+    assert!(script.contains("message.includes(`未找到 Codex App asset:`)"));
+    assert!(script.contains("return codexDefaultServiceTierSetting.default;"));
+}
+
+#[test]
+fn injection_script_bounds_service_tier_state_read_time() {
+    let script = assets::injection_script(57321);
+    let loader = script
+        .find("async function loadCodexServiceTierState")
+        .expect("script should define the service-tier state loader");
+    let loader_body = &script[loader
+        ..script[loader..]
+            .find("function setCodexThreadServiceTierMode")
+            .map(|offset| loader + offset)
+            .expect("state loader should end before the thread-mode setter")];
+
+    assert!(script.contains("codexServiceTierReadTimeoutMs"));
+    assert!(loader_body.contains("Promise.race"));
+    assert!(loader_body.contains("codexDefaultServiceTierSetting.default"));
+}
+
+#[test]
 fn injection_script_clears_project_state_when_moving_to_projectless() {
     let script = assets::injection_script(57321);
 
@@ -980,6 +1150,22 @@ fn injection_script_applies_fast_service_tier_contract() {
 
     assert_eq!(cases["startConversation"]["serviceTier"], "priority");
     assert_eq!(cases["solFastAvailability"]["supported"], true);
+    assert_eq!(
+        cases["solFastDescriptor"]["additionalSpeedTiers"],
+        json!(["fast"])
+    );
+    assert_eq!(
+        cases["solFastDescriptor"]["serviceTiers"][0]["id"],
+        "priority"
+    );
+    assert_eq!(
+        cases["existingSolDescriptor"]["serviceTiers"][0]["id"],
+        "priority"
+    );
+    assert_eq!(
+        cases["modelListResult"]["data"][0]["serviceTiers"][0]["id"],
+        "priority"
+    );
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
     assert_eq!(
         cases["solDescriptor"]["supportedReasoningEfforts"][4]["reasoningEffort"],
@@ -991,6 +1177,16 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     assert_eq!(cases["dispatcherFromSingleton"], true);
     assert_eq!(cases["dispatcherFromClass"], true);
+    assert_eq!(cases["nativeAuthRefresh"]["selectedAuthDispatch"], true);
+    assert_eq!(cases["nativeAuthRefresh"]["unrelatedDispatchCalls"], 0);
+    assert_eq!(cases["nativeAuthRefresh"]["authMethod"], "apikey");
+    assert_eq!(cases["nativeAuthRefresh"]["sameReference"], false);
+    assert_eq!(cases["nativeSelectionStandard"]["mode"], "global-standard");
+    assert_eq!(cases["nativeSelectionStandard"]["defaultMode"], "standard");
+    assert_eq!(cases["nativeSelectionFast"]["mode"], "global-fast");
+    assert_eq!(cases["nativeSelectionFast"]["defaultMode"], "fast");
+    assert_eq!(cases["nestedNativeMenuStandard"], "standard");
+    assert_eq!(cases["nestedNativeMenuFast"], "fast");
 }
 
 fn run_service_tier_contract_harness() -> serde_json::Value {
@@ -1105,6 +1301,12 @@ api.setModelCatalog({{
   }},
 }});
 const solFastAvailability = api.fastAvailability("gpt-5.6-sol");
+const solFastDescriptor = api.modelDescriptor("gpt-5.6-sol");
+const existingSolDescriptor = {{ model: "gpt-5.6-sol", serviceTiers: [] }};
+api.applyModelMetadata(existingSolDescriptor, "gpt-5.6-sol");
+const modelListResult = api.patchAppServerResult("model/list", {{
+  data: [{{ model: "gpt-5.6-sol", serviceTiers: [] }}],
+}});
 api.setModelCatalog({{
   status: "ok",
   model: "gpt-5.6-sol",
@@ -1128,6 +1330,59 @@ class DispatcherClass {{
   dispatchMessage() {{}}
 }}
 const dispatcherFromClass = api.dispatcherFromModule({{ current: DispatcherClass }}) === DispatcherClass.instance;
+let unrelatedDispatchCalls = 0;
+const authState = {{ openAIAuth: "apikey", authMethod: "apikey", requiresAuth: false }};
+let refreshedAuthState = authState;
+const unrelatedDispatch = () => {{ unrelatedDispatchCalls += 1; }};
+const authDispatch = (action) => {{
+  refreshedAuthState = typeof action === "function" ? action(authState) : action;
+}};
+const nativeAuthRefreshDispatch = api.nativeAuthRefreshDispatch({{
+  memoizedState: {{
+    memoizedState: null,
+    baseState: null,
+    queue: {{ dispatch: unrelatedDispatch }},
+    next: {{
+      memoizedState: authState,
+      baseState: authState,
+      queue: {{ dispatch: authDispatch }},
+      next: null,
+    }},
+  }},
+  alternate: null,
+}});
+nativeAuthRefreshDispatch?.(api.nativeAuthRefreshAction);
+const nativeAuthRefresh = {{
+  selectedAuthDispatch: nativeAuthRefreshDispatch === authDispatch,
+  unrelatedDispatchCalls,
+  authMethod: refreshedAuthState.authMethod,
+  sameReference: refreshedAuthState === authState,
+}};
+api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
+api.syncNativeSelection("standard");
+const nativeSelectionStandard = api.threadState();
+api.syncNativeSelection("fast");
+const nativeSelectionFast = api.threadState();
+const speedHeader = {{
+  textContent: "速度",
+  closest: () => null,
+}};
+const speedWrapper = {{
+  textContent: "速度标准默认速度快速1.5 倍速度，用量更多",
+  closest: () => null,
+}};
+const speedMenu = {{
+  children: [speedWrapper],
+  querySelectorAll: () => [speedWrapper, speedHeader],
+}};
+const nativeMenuItem = (label) => ({{
+  textContent: label,
+  getAttribute: (name) => name === "aria-label" ? label : "",
+  querySelectorAll: () => [],
+  closest: (selector) => selector === '[role="menu"]' ? speedMenu : null,
+}});
+const nestedNativeMenuStandard = api.nativeModeFromMenuItem(nativeMenuItem("标准默认速度"));
+const nestedNativeMenuFast = api.nativeModeFromMenuItem(nativeMenuItem("快速1.5 倍速度，用量更多"));
 
 process.stdout.write(JSON.stringify({{
   supportedFast,
@@ -1137,9 +1392,17 @@ process.stdout.write(JSON.stringify({{
   customInheritUnsupported,
   startConversation,
   solFastAvailability,
+  solFastDescriptor,
+  existingSolDescriptor,
+  modelListResult,
   solDescriptor,
   dispatcherFromSingleton,
   dispatcherFromClass,
+  nativeAuthRefresh,
+  nativeSelectionStandard,
+  nativeSelectionFast,
+  nestedNativeMenuStandard,
+  nestedNativeMenuFast,
 }}));
 "#,
         script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())

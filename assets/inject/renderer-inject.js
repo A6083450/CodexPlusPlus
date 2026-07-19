@@ -468,7 +468,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "3";
-  const codexAppServerModelRequestPatchVersion = "2";
+  const codexAppServerModelRequestPatchVersion = "3";
   const codexPluginMarketplaceUnlockVersion = "12";
   const codexPluginAutoExpandVersion = "1";
   const codexPluginAutoExpandMaxClicks = 80;
@@ -1546,18 +1546,23 @@
   };
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
+  const codexServiceTierReadTimeoutMs = 1500;
   const codexServiceTierModulePromises = new Map();
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
   ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
-  function codexAppAssetUrl(namePart) {
-    const urls = [
+  function codexServiceTierDispatcherAssetUrls() {
+    return [...new Set([
       ...Array.from(document.scripts || []).map((script) => script.src),
       ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
       ...performance.getEntriesByType("resource").map((entry) => entry.name),
-    ].filter(Boolean);
+    ].filter((url) => url && url.includes("/assets/") && url.split("?")[0].endsWith(".js")))];
+  }
+
+  function codexAppAssetUrl(namePart) {
+    const urls = codexServiceTierDispatcherAssetUrls();
     return urls.find((url) => url.includes("/assets/") && url.includes(namePart) && url.split("?")[0].endsWith(".js")) || "";
   }
 
@@ -1615,11 +1620,14 @@
       const settingStorage = await codexSettingStorageModule();
       return await settingStorage.n(codexDefaultServiceTierSetting);
     } catch (error) {
-      if (typeof codexStateCall === "function") {
+      try {
         const result = await codexStateCall("get-setting", { params: { key: codexDefaultServiceTierSetting.key } });
         return result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : codexDefaultServiceTierSetting.default;
+      } catch (stateError) {
+        const message = String(stateError?.message || stateError);
+        if (message.includes(`未找到 Codex App asset:`)) return codexDefaultServiceTierSetting.default;
+        throw stateError;
       }
-      throw error;
     }
   }
 
@@ -2032,6 +2040,8 @@
       button.title = fastTitle;
     });
     refreshCodexServiceTierBadges();
+    syncCodexNativeServiceTierPicker();
+    refreshCodexServiceTierMenu();
   }
 
   async function loadCodexServiceTierState() {
@@ -2042,8 +2052,17 @@
     }
     codexServiceTierState = { ...codexServiceTierState, status: "loading", message: "正在读取…" };
     refreshCodexServiceTierControls();
+    let readTimeout;
     try {
-      const serviceTier = await getCodexServiceTierSetting();
+      const serviceTier = await Promise.race([
+        getCodexServiceTierSetting(),
+        new Promise((resolve) => {
+          readTimeout = setTimeout(() => {
+            sendCodexPlusDiagnostic("service_tier_read_timeout", { timeoutMs: codexServiceTierReadTimeoutMs });
+            resolve(codexDefaultServiceTierSetting.default);
+          }, codexServiceTierReadTimeoutMs);
+        }),
+      ]);
       codexServiceTierState = {
         ...codexServiceTierState,
         status: "ok",
@@ -2061,6 +2080,7 @@
         errorMessage: error?.message || String(error),
       });
     } finally {
+      clearTimeout(readTimeout);
       refreshCodexServiceTierControls();
     }
   }
@@ -2244,6 +2264,19 @@
     return dispatcherClass?.getInstance?.() || null;
   }
 
+  async function codexServiceTierDispatcherFromRuntimeAssets() {
+    for (const url of codexServiceTierDispatcherAssetUrls()) {
+      const source = await fetch(url).then((response) => response.ok ? response.text() : "");
+      if (!source.includes("dispatchHostMessage")
+        || !source.includes("dispatchMessage")
+        || !source.includes("subscribe")) continue;
+      const module = await import(url);
+      const dispatcher = codexServiceTierDispatcherFromModule(module);
+      if (dispatcher) return { dispatcher, assetPrefix: `runtime-scan:${url.split("/").pop() || "asset"}` };
+    }
+    throw new Error("dispatcher export unavailable in loaded assets");
+  }
+
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
     const loadDispatcher = async () => {
@@ -2257,6 +2290,11 @@
         } catch (error) {
           errors.push(`${assetPrefix}: ${error?.message || String(error)}`);
         }
+      }
+      try {
+        return await codexServiceTierDispatcherFromRuntimeAssets();
+      } catch (error) {
+        errors.push(`runtime-scan: ${error?.message || String(error)}`);
       }
       throw new Error(`Codex dispatcher unavailable (${errors.join("; ")})`);
     };
@@ -2306,6 +2344,9 @@
   function loadBackendSettingsForStartup(attempt = 0) {
     loadBackendSettings().then((loaded) => {
       if (loaded) {
+        if (codexPlusSettings().serviceTierControls) {
+          void loadCodexServiceTierState();
+        }
         scan();
         return;
       }
@@ -5159,6 +5200,10 @@
       currentModelName: () => codexServiceTierCurrentModelName(),
       fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
+      applyModelMetadata: (descriptor, modelName) => applyCodexPlusModelMetadata(descriptor, modelName),
+      patchAppServerResult: (method, result) => patchAppServerModelResult(method, result),
+      nativeAuthRefreshDispatch: (fiber) => codexServiceTierNativeAuthRefreshDispatch(fiber),
+      nativeAuthRefreshAction: codexServiceTierNativeAuthRefreshAction,
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
           status: "ok",
@@ -5186,6 +5231,9 @@
           ...state,
         }));
       },
+      threadState: () => readThreadServiceTierState(),
+      syncNativeSelection: (mode) => syncCodexServiceTierFromNativeSelection(mode),
+      nativeModeFromMenuItem: (item) => codexNativeServiceTierModeFromMenuItem(item),
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
     };
     return;
@@ -5282,6 +5330,14 @@
         changed = true;
       }
     }
+    for (const key of ["additionalSpeedTiers", "serviceTiers"]) {
+      if (!Array.isArray(metadata[key])) continue;
+      const nextValues = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
+      if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValues)) {
+        descriptor[key] = nextValues;
+        changed = true;
+      }
+    }
     return changed;
   }
 
@@ -5298,6 +5354,10 @@
       isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
+      additionalSpeedTiers: Array.isArray(metadata?.additionalSpeedTiers) ? [...metadata.additionalSpeedTiers] : [],
+      serviceTiers: Array.isArray(metadata?.serviceTiers)
+        ? metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry)
+        : [],
     };
   }
 
@@ -5612,7 +5672,7 @@
   }
 
   function patchAppServerModelResult(method, result) {
-    if (method !== "list-models-for-host") return result;
+    if (method !== "list-models-for-host" && method !== "model/list") return result;
     try {
       if (Array.isArray(result)) patchModelArray(result, true);
       if (Array.isArray(result?.data)) patchModelArray(result.data, true);
@@ -5718,6 +5778,18 @@
   let appServerModelRequestPatchMissCount = 0;
   let appServerModelRequestPatchDisabled = false;
 
+  async function codexAppServerClientAssetUrls() {
+    const matches = [];
+    for (const url of codexServiceTierDispatcherAssetUrls()) {
+      const source = await fetch(url).then((response) => response.ok ? response.text() : "");
+      if (source.includes("Missing AppServer request message handler")
+        && source.includes("sendRequest=async")) {
+        matches.push(url);
+      }
+    }
+    return matches;
+  }
+
   function noteAppServerModelRequestPatchMiss(event, detail) {
     appServerModelRequestPatchMissCount += 1;
     // installAppServerModelRequestPatch() runs on every model-whitelist
@@ -5751,9 +5823,14 @@
           const module = await loadOptionalCodexAppModule(assetPrefix);
           if (module) modules.push({ assetPrefix, module });
         }
+        for (const url of await codexAppServerClientAssetUrls()) {
+          modules.push({
+            assetPrefix: `runtime-scan:${url.split("/").pop() || "asset"}`,
+            module: await import(url),
+          });
+        }
         if (modules.length === 0) {
-          window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
-          sendCodexPlusDiagnostic("model_app_server_request_patch_skipped", {
+          noteAppServerModelRequestPatchMiss("model_app_server_request_patch_not_found", {
             reason: "app_server_request_assets_missing",
           });
           return;
@@ -8393,6 +8470,689 @@
     return conversationViewFindByClasses(conversationViewComposerClasses);
   }
 
+  const codexNativeServiceTierPickerVersion = "2";
+  const codexNativeServiceTierSelectionSyncVersion = "2";
+  const codexNativeServiceTierPendingRefreshes = new WeakSet();
+
+  function codexServiceTierNativeTrigger() {
+    const triggers = Array.from(document.querySelectorAll(`[data-codex-intelligence-trigger="true"]`));
+    return triggers.reverse().find(codexServiceTierBadgeVisibleElement)
+      || triggers.find((trigger) => trigger.isConnected)
+      || null;
+  }
+
+  function codexNativeServiceTierMemoValues(fiber) {
+    const values = [];
+    const seen = new Set();
+    for (const candidate of [fiber, fiber?.alternate]) {
+      const data = candidate?.updateQueue?.memoCache?.data;
+      if (!Array.isArray(data)) continue;
+      for (const row of data) {
+        for (const value of Array.isArray(row) ? row : [row]) {
+          if (!value || typeof value !== "object" || seen.has(value)) continue;
+          seen.add(value);
+          values.push(value);
+        }
+      }
+    }
+    return values;
+  }
+
+  function codexNativeServiceTierMemoMarker(value) {
+    if (!value || typeof value !== "object") return false;
+    if (Object.prototype.hasOwnProperty.call(value, "isServiceTierAllowed")) return true;
+    const settings = value.serviceTierSettings;
+    return !!settings && typeof settings === "object"
+      && (Object.prototype.hasOwnProperty.call(settings, "selectedServiceTier")
+        || Object.prototype.hasOwnProperty.call(settings, "isServiceTierAllowed"));
+  }
+
+  function codexServiceTierNativePickerFiber(trigger) {
+    if (!trigger) return null;
+    for (const key of reactFiberKeys(trigger)) {
+      let fiber = trigger[key];
+      for (let depth = 0; fiber && depth < 48; depth += 1, fiber = fiber.return) {
+        if (codexNativeServiceTierMemoValues(fiber).some(codexNativeServiceTierMemoMarker)) return fiber;
+      }
+    }
+    return null;
+  }
+
+  function codexServiceTierNativeApiKeyAuth(fiber) {
+    for (const candidate of [fiber, fiber?.alternate]) {
+      let hook = candidate?.memoizedState;
+      for (let index = 0; hook && index < 300; index += 1, hook = hook.next) {
+        for (const value of [hook.memoizedState, hook.baseState]) {
+          const method = value && typeof value === "object" ? String(value.authMethod || "").toLowerCase() : "";
+          if (method === "apikey" || method === "api_key") return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function setCodexNativeServiceTierMemoField(target, key, nextValue) {
+    if (!target || typeof target !== "object" || Object.is(target[key], nextValue)) return false;
+    try {
+      target[key] = nextValue;
+      return Object.is(target[key], nextValue);
+    } catch {
+      return false;
+    }
+  }
+
+  function codexServiceTierNativeAuthRefreshDispatch(fiber) {
+    const seen = new Set();
+    for (const candidate of [fiber, fiber?.alternate]) {
+      let hook = candidate?.memoizedState;
+      for (let index = 0; hook && index < 300; index += 1, hook = hook.next) {
+        const state = hook.memoizedState;
+        const method = state && typeof state === "object" ? String(state.authMethod || "").toLowerCase() : "";
+        const dispatch = hook.queue?.dispatch;
+        if ((method === "apikey" || method === "api_key")
+          && typeof dispatch === "function"
+          && !seen.has(dispatch)) return dispatch;
+        if (typeof dispatch === "function") seen.add(dispatch);
+      }
+    }
+    return null;
+  }
+
+  function codexServiceTierNativeAuthRefreshAction(current) {
+    return current && typeof current === "object" ? { ...current } : current;
+  }
+
+  function codexServiceTierForceNativePickerRefresh(trigger, fiber) {
+    if (!trigger || !fiber || codexNativeServiceTierPendingRefreshes.has(trigger)) return false;
+    const dispatch = codexServiceTierNativeAuthRefreshDispatch(fiber);
+    if (!dispatch) return false;
+    codexNativeServiceTierPendingRefreshes.add(trigger);
+    try {
+      dispatch(codexServiceTierNativeAuthRefreshAction);
+    } catch {
+      codexNativeServiceTierPendingRefreshes.delete(trigger);
+      return false;
+    }
+    requestAnimationFrame(() => {
+      codexNativeServiceTierPendingRefreshes.delete(trigger);
+    });
+    return true;
+  }
+
+  function syncCodexNativeServiceTierPicker() {
+    const trigger = codexServiceTierNativeTrigger();
+    const fiber = codexServiceTierNativePickerFiber(trigger);
+    if (!trigger || !fiber || !codexServiceTierNativeApiKeyAuth(fiber)) return false;
+    const availability = codexServiceTierFastAvailability();
+    const allowed = !!codexPlusSettings().serviceTierControls && availability.supported;
+    const desiredTier = allowed && codexServiceTierState.effectiveMode === "fast"
+      ? codexFastServiceTierValue()
+      : null;
+    let changed = false;
+    for (const value of codexNativeServiceTierMemoValues(fiber)) {
+      for (const settings of [value, value.serviceTierSettings]) {
+        if (!settings || typeof settings !== "object") continue;
+        if (Object.prototype.hasOwnProperty.call(settings, "isServiceTierAllowed")) {
+          changed = setCodexNativeServiceTierMemoField(settings, "isServiceTierAllowed", allowed) || changed;
+        }
+        if (!Array.isArray(settings.availableOptions)
+          || !Object.prototype.hasOwnProperty.call(settings, "selectedServiceTier")) continue;
+        changed = setCodexNativeServiceTierMemoField(settings, "selectedServiceTier", desiredTier) || changed;
+        if (Object.prototype.hasOwnProperty.call(settings, "serviceTierForRequest")) {
+          changed = setCodexNativeServiceTierMemoField(settings, "serviceTierForRequest", desiredTier) || changed;
+        }
+      }
+    }
+    const signature = [
+      codexNativeServiceTierPickerVersion,
+      availability.modelName,
+      allowed ? "allowed" : "blocked",
+      desiredTier || "standard",
+    ].join(":");
+    const signatureChanged = trigger.dataset.codexNativeServiceTierSignature !== signature;
+    if (!changed && !signatureChanged) return false;
+    if (trigger.getAttribute("aria-expanded") === "true") return changed;
+    if (!codexServiceTierForceNativePickerRefresh(trigger, fiber)) return changed;
+    trigger.dataset.codexNativeServiceTierSignature = signature;
+    return true;
+  }
+
+  function codexNativeServiceTierModeFromMenuItem(item) {
+    if (!item || item.closest?.(`[data-codex-service-tier-menu-content="true"]`)) return "";
+    const menu = item.closest?.(`[role="menu"]`);
+    if (!menu) return "";
+    const strings = codexServiceTierMenuStrings();
+    const speedLabels = new Set([strings.speed, "Speed", "速度"]);
+    const hasSpeedHeader = Array.from(menu.querySelectorAll?.("span, div") || []).some((child) => {
+      if (child.closest?.(`[role="menuitem"], [role="menuitemradio"]`)) return false;
+      return speedLabels.has(String(child.textContent || "").replace(/\s+/g, " ").trim());
+    });
+    if (!hasSpeedHeader) return "";
+    const labels = [
+      item.getAttribute?.("aria-label") || "",
+      ...Array.from(item.querySelectorAll?.("span") || []).map((node) => node.textContent || ""),
+      item.textContent || "",
+    ].map((label) => String(label).replace(/\s+/g, " ").trim());
+    const standardLabels = [strings.standard, "Standard", "标准"];
+    const fastLabels = [strings.fast, "Fast", "快速"];
+    if (labels.some((label) => standardLabels.some((candidate) => label === candidate || label.startsWith(candidate)))) return "standard";
+    if (labels.some((label) => fastLabels.some((candidate) => label === candidate || label.startsWith(candidate)))) return "fast";
+    return "";
+  }
+
+  function syncCodexServiceTierFromNativeSelection(mode) {
+    const normalizedMode = normalizeCodexThreadServiceTierMode(mode);
+    const state = readThreadServiceTierState();
+    const controlMode = normalizeCodexServiceTierControlMode(state.mode);
+    if (controlMode === "custom") {
+      setCodexThreadServiceTierOverride(codexServiceTierMenuContext().threadId, normalizedMode);
+      refreshCodexServiceTierControls();
+    } else {
+      state.mode = normalizedMode === "fast" ? "global-fast" : "global-standard";
+      state.defaultMode = normalizedMode;
+      state.entries = Object.create(null);
+      state.draft = null;
+      writeThreadServiceTierState(state);
+      refreshCodexServiceTierControls();
+    }
+    setTimeout(() => void loadCodexServiceTierState(), 0);
+    setTimeout(() => void loadCodexServiceTierState(), 180);
+  }
+
+  function installCodexNativeServiceTierSelectionSync() {
+    if (window.__codexNativeServiceTierSelectionSyncVersion === codexNativeServiceTierSelectionSyncVersion) return;
+    if (window.__codexNativeServiceTierSelectionSyncHandler) {
+      document.removeEventListener("click", window.__codexNativeServiceTierSelectionSyncHandler, true);
+      document.removeEventListener("keydown", window.__codexNativeServiceTierSelectionSyncHandler, true);
+    }
+    const handler = (event) => {
+      if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+      const item = event.target?.closest?.(`[role="menuitem"], [role="menuitemradio"]`);
+      const mode = codexNativeServiceTierModeFromMenuItem(item);
+      if (!mode) return;
+      const signature = `${mode}:${String(item?.textContent || "")}`;
+      const now = Date.now();
+      if (window.__codexNativeServiceTierSelectionSignature === signature
+        && now - Number(window.__codexNativeServiceTierSelectionAt || 0) < 100) return;
+      window.__codexNativeServiceTierSelectionSignature = signature;
+      window.__codexNativeServiceTierSelectionAt = now;
+      queueMicrotask(() => syncCodexServiceTierFromNativeSelection(mode));
+    };
+    window.__codexNativeServiceTierSelectionSyncHandler = handler;
+    window.__codexNativeServiceTierSelectionSyncVersion = codexNativeServiceTierSelectionSyncVersion;
+    document.addEventListener("click", handler, true);
+    document.addEventListener("keydown", handler, true);
+  }
+
+  const codexServiceTierMenuVersion = "7";
+  let codexServiceTierMenuCloseTimer = 0;
+  let codexServiceTierMenuSelectionRevision = 0;
+
+  function codexServiceTierMenuStrings() {
+    const language = String(document.documentElement?.lang || navigator.language || "").toLowerCase();
+    const chineseUi = language.startsWith("zh")
+      || !!document.querySelector(`[role="menuitem"][aria-label^="模型 "], [role="menuitem"][aria-label^="推理强度 "]`);
+    if (chineseUi) {
+      return {
+        speed: "速度",
+        standard: "标准",
+        standardDescription: "默认速度",
+        fast: "快速",
+        fastDescription: "1.5 倍速度，用量更多",
+      };
+    }
+    return {
+      speed: "Speed",
+      standard: "Standard",
+      standardDescription: "Default speed",
+      fast: "Fast",
+      fastDescription: "1.5x speed, increased usage",
+    };
+  }
+
+  function codexServiceTierMenuTrigger() {
+    const triggers = Array.from(document.querySelectorAll(`[data-codex-service-tier-menu-trigger="true"]`));
+    return triggers.reverse().find((trigger) => codexServiceTierBadgeVisibleElement(trigger))
+      || triggers.find((trigger) => trigger.isConnected)
+      || null;
+  }
+
+  function codexServiceTierMenuContent(trigger = codexServiceTierMenuTrigger()) {
+    const contents = Array.from(document.querySelectorAll(`[data-codex-service-tier-menu-content="true"]`));
+    return contents.reverse().find((content) => !trigger || content.__codexServiceTierMenuTrigger === trigger) || null;
+  }
+
+  function closeCodexServiceTierMenu({ focusTrigger = false } = {}) {
+    clearTimeout(codexServiceTierMenuCloseTimer);
+    codexServiceTierMenuCloseTimer = 0;
+    const trigger = codexServiceTierMenuTrigger();
+    document.querySelectorAll(`[data-codex-service-tier-menu-content="true"]`).forEach((content) => content.remove());
+    document.querySelectorAll(`[data-codex-service-tier-menu-trigger="true"]`).forEach((item) => {
+      item.setAttribute("aria-expanded", "false");
+      item.removeAttribute("aria-activedescendant");
+      item.removeAttribute("aria-controls");
+    });
+    if (trigger && focusTrigger) {
+      trigger.dataset.codexServiceTierMenuSuppressFocus = "true";
+      trigger.focus();
+    }
+  }
+
+  function scheduleCodexServiceTierMenuClose() {
+    clearTimeout(codexServiceTierMenuCloseTimer);
+    codexServiceTierMenuCloseTimer = setTimeout(() => closeCodexServiceTierMenu(), 180);
+  }
+
+  function cancelCodexServiceTierMenuClose() {
+    clearTimeout(codexServiceTierMenuCloseTimer);
+    codexServiceTierMenuCloseTimer = 0;
+  }
+
+  function codexServiceTierMenuSelectedMode() {
+    return codexServiceTierState.effectiveMode === "fast" ? "fast" : "standard";
+  }
+
+  function codexServiceTierMenuCheck() {
+    const check = document.createElement("span");
+    check.className = "icon-xs inline-flex shrink-0 items-center justify-center";
+    check.setAttribute("aria-hidden", "true");
+    check.textContent = "✓";
+    return check;
+  }
+
+  async function ensureCodexServiceTierMenuBackendReady(selectionRevision) {
+    let nextStatus;
+    try {
+      nextStatus = await withBackendTimeout(postJson("/backend/status", {}));
+    } catch (error) {
+      nextStatus = { status: "failed", message: error?.message || "后端未连接，无法切换服务模式" };
+    }
+    if (selectionRevision !== codexServiceTierMenuSelectionRevision) return false;
+    if (nextStatus?.status === "ok") {
+      codexPlusBackendStatus = nextStatus;
+      renderBackendStatus();
+      return true;
+    }
+    codexPlusBackendStatus = nextStatus || { status: "failed", message: "后端未连接，无法切换服务模式" };
+    renderBackendStatus();
+    showToast(nextStatus?.message || "后端未连接，无法切换服务模式", null);
+    return false;
+  }
+
+  function codexServiceTierMenuContext() {
+    const ref = currentSessionRef();
+    const threadId = validThreadScrollSessionKey(ref.session_id);
+    return {
+      threadId,
+      draftKey: threadId ? "" : `${location.pathname}${location.search}${location.hash}|${String(ref.title || "")}`,
+    };
+  }
+
+  async function setCodexServiceTierModeFromMenu(mode, selectionContext, selectionRevision) {
+    if (!await ensureCodexServiceTierMenuBackendReady(selectionRevision)) return false;
+    if (selectionRevision !== codexServiceTierMenuSelectionRevision) return false;
+    const currentContext = codexServiceTierMenuContext();
+    if (currentContext.threadId !== selectionContext.threadId
+      || currentContext.draftKey !== selectionContext.draftKey) {
+      showToast("任务已切换，请在当前任务重新选择服务模式", null);
+      return false;
+    }
+    const normalizedMode = normalizeCodexThreadServiceTierMode(mode);
+    if (normalizedMode === "fast") {
+      const fastAvailability = codexServiceTierFastAvailability();
+      if (!fastAvailability.supported) {
+        codexServiceTierMaybeLoadModelCatalog(true);
+        showToast(codexServiceTierFastUnsupportedMessage(fastAvailability.modelName), null);
+        refreshCodexServiceTierControls();
+        return false;
+      }
+    }
+    setCodexThreadServiceTierOverride(selectionContext.threadId, normalizedMode);
+    refreshCodexServiceTierControls();
+    const target = selectionContext.threadId ? "当前 thread" : "新 thread 草稿";
+    showToast(`${target}服务模式：${normalizedMode}`, null);
+    return true;
+  }
+
+  function createCodexServiceTierMenuOption(mode, label, description, selected, disabled) {
+    const option = document.createElement("div");
+    option.className = `no-drag text-token-foreground outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm group focus:bg-token-list-hover-background flex flex-col ${disabled ? "cursor-not-allowed opacity-50" : "cursor-interaction hover:bg-token-list-hover-background"}`;
+    option.dataset.codexServiceTierMenuOption = mode;
+    option.id = `codex-plus-service-tier-menu-option-${mode}`;
+    option.setAttribute("role", "menuitemradio");
+    option.setAttribute("tabindex", "-1");
+    option.setAttribute("aria-disabled", String(!!disabled));
+    option.setAttribute("aria-checked", String(!!selected));
+
+    const labelRow = document.createElement("span");
+    labelRow.className = "flex w-full min-w-0 items-center justify-between gap-2";
+    const labelText = document.createElement("span");
+    labelText.className = "min-w-0 truncate";
+    labelText.textContent = label;
+    labelRow.appendChild(labelText);
+    if (selected) labelRow.appendChild(codexServiceTierMenuCheck());
+
+    const subText = document.createElement("span");
+    subText.className = "text-token-description-foreground whitespace-normal";
+    subText.textContent = description;
+    option.append(labelRow, subText);
+
+    const select = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (disabled) {
+        if (mode === "fast") {
+          const availability = codexServiceTierFastAvailability();
+          if (!availability.supported) showToast(codexServiceTierFastUnsupportedMessage(availability.modelName), null);
+        }
+        return;
+      }
+      option.dataset.codexServiceTierMenuSelectedAt = String(Date.now());
+      const selectionContext = codexServiceTierMenuContext();
+      const selectionRevision = ++codexServiceTierMenuSelectionRevision;
+      if (await setCodexServiceTierModeFromMenu(mode, selectionContext, selectionRevision)) {
+        closeCodexServiceTierMenu({ focusTrigger: true });
+      }
+    };
+    option.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    option.addEventListener("click", select);
+    option.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") select(event);
+    });
+    return option;
+  }
+
+  function codexServiceTierMenuFocusOption(content, current, direction) {
+    if (!content) return;
+    const options = Array.from(content.querySelectorAll(`[role="menuitemradio"]`))
+      .filter((option) => option.getAttribute("aria-disabled") !== "true");
+    if (!options.length) return;
+    let next;
+    if (direction === "first") {
+      next = options[0];
+    } else if (direction === "last") {
+      next = options[options.length - 1];
+    } else if (direction === "selected") {
+      next = options.find((option) => option.getAttribute("aria-checked") === "true") || options[0];
+    } else {
+      const activeId = content.__codexServiceTierMenuTrigger?.getAttribute("aria-activedescendant");
+      const active = options.find((option) => option.id === activeId) || current;
+      const index = Math.max(0, options.indexOf(active));
+      const offset = direction === "previous" ? -1 : 1;
+      next = options[(index + offset + options.length) % options.length];
+    }
+    options.forEach((option) => {
+      const active = option === next;
+      option.dataset.codexServiceTierMenuKeyboardActive = String(active);
+      option.classList.toggle("bg-token-list-hover-background", active);
+    });
+    content.__codexServiceTierMenuTrigger?.setAttribute("aria-activedescendant", next.id);
+    return next;
+  }
+
+  function positionCodexServiceTierMenu(content, trigger, parentMenu) {
+    if (!content.isConnected || !trigger.isConnected || !parentMenu?.isConnected) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const parentRect = parentMenu.getBoundingClientRect();
+    const contentRect = content.getBoundingClientRect();
+    const gap = 2;
+    const right = parentRect.right + gap;
+    const left = right + contentRect.width <= window.innerWidth - 8
+      ? right
+      : Math.max(8, parentRect.left - contentRect.width - gap);
+    const top = Math.min(
+      Math.max(8, triggerRect.top - 8),
+      Math.max(8, window.innerHeight - contentRect.height - 8)
+    );
+    content.style.left = `${Math.round(left)}px`;
+    content.style.top = `${Math.round(top)}px`;
+  }
+
+  function watchCodexServiceTierMenuLifecycle(content, trigger, parentMenu) {
+    const check = () => {
+      if (!content.isConnected) return;
+      if (!trigger.isConnected || !parentMenu.isConnected || !codexServiceTierBadgeVisibleElement(parentMenu)) {
+        content.remove();
+        return;
+      }
+      requestAnimationFrame(check);
+    };
+    requestAnimationFrame(check);
+  }
+
+  function openCodexServiceTierMenu(trigger, parentMenu) {
+    cancelCodexServiceTierMenuClose();
+    closeCodexServiceTierMenu();
+    syncCodexServiceTierEffectiveState();
+    const strings = codexServiceTierMenuStrings();
+    const selectedMode = codexServiceTierMenuSelectedMode();
+    const fastAvailability = codexServiceTierFastAvailability();
+    const disabled = codexPlusBackendStatus.status === "failed";
+
+    const content = document.createElement("div");
+    content.className = "z-50 flex min-w-[180px] select-none flex-col overflow-y-auto m-px px-1 py-1 bg-token-dropdown-background/90 text-token-foreground ring-token-border rounded-xl ring-[0.5px] shadow-xl-spread backdrop-blur-sm w-[233px]";
+    content.dataset.codexServiceTierMenuContent = "true";
+    content.id = "codex-plus-service-tier-menu-content";
+    content.dataset.codexServiceTierBackendStatus = codexPlusBackendStatus.status || "";
+    content.dataset.codexServiceTierStateStatus = codexServiceTierState.status || "";
+    content.dataset.codexServiceTierFastSupported = String(!!fastAvailability.supported);
+    content.__codexServiceTierMenuTrigger = trigger;
+    content.__codexServiceTierParentMenu = parentMenu;
+    content.setAttribute("role", "menu");
+    content.setAttribute("aria-label", strings.speed);
+    content.style.position = "fixed";
+    content.style.zIndex = "2147483646";
+
+    const header = document.createElement("div");
+    header.className = "text-token-description-foreground flex min-h-6 items-center truncate px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm leading-4";
+    header.textContent = strings.speed;
+    content.append(
+      header,
+      createCodexServiceTierMenuOption("standard", strings.standard, strings.standardDescription, selectedMode === "standard", disabled),
+      createCodexServiceTierMenuOption("fast", strings.fast, strings.fastDescription, selectedMode === "fast", disabled || !fastAvailability.supported)
+    );
+    content.addEventListener("pointerenter", cancelCodexServiceTierMenuClose);
+    content.addEventListener("pointerleave", scheduleCodexServiceTierMenuClose);
+    content.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeCodexServiceTierMenu({ focusTrigger: true });
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopPropagation();
+        codexServiceTierMenuFocusOption(content, document.activeElement, event.key === "ArrowDown" ? "next" : "previous");
+        return;
+      }
+      if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        event.stopPropagation();
+        codexServiceTierMenuFocusOption(content, document.activeElement, event.key === "Home" ? "first" : "last");
+      }
+    });
+    document.body.appendChild(content);
+    trigger.setAttribute("aria-expanded", "true");
+    trigger.setAttribute("aria-controls", content.id);
+    const selectedOption = content.querySelector(`[role="menuitemradio"][aria-checked="true"]`);
+    if (selectedOption) trigger.setAttribute("aria-activedescendant", selectedOption.id);
+    positionCodexServiceTierMenu(content, trigger, parentMenu);
+    watchCodexServiceTierMenuLifecycle(content, trigger, parentMenu);
+  }
+
+  function refreshCodexServiceTierMenu() {
+    const trigger = codexServiceTierMenuTrigger();
+    if (!trigger) return;
+    const strings = codexServiceTierMenuStrings();
+    const value = trigger.querySelector(`[data-codex-service-tier-menu-value="true"]`);
+    const selectedLabel = codexServiceTierMenuSelectedMode() === "fast" ? strings.fast : strings.standard;
+    if (value) value.textContent = selectedLabel;
+    trigger.setAttribute("aria-label", `${strings.speed} ${selectedLabel}`);
+    const content = codexServiceTierMenuContent(trigger);
+    const parentMenu = trigger.closest(`[role="menu"]`);
+    if (content && parentMenu?.isConnected) openCodexServiceTierMenu(trigger, parentMenu);
+  }
+
+  function removeCodexServiceTierMenu() {
+    closeCodexServiceTierMenu();
+    document.querySelectorAll(`[data-codex-service-tier-menu-trigger="true"]`).forEach((trigger) => trigger.remove());
+  }
+
+  function installCodexServiceTierMenu() {
+    if (!codexPlusSettings().serviceTierControls || codexPlusBackendStatus.status === "failed") {
+      removeCodexServiceTierMenu();
+      return;
+    }
+    const modelLabel = Array.from(document.querySelectorAll(`[data-model-picker-model-row]`))
+      .find((node) => codexServiceTierBadgeVisibleElement(node)
+        && node.closest?.(`[role="menuitem"]`)?.closest?.(`[role="menu"]`));
+    const modelRow = modelLabel?.closest?.(`[role="menuitem"]`);
+    const parentMenu = modelRow?.closest?.(`[role="menu"]`);
+    const container = modelRow?.parentElement;
+    if (!modelRow || !parentMenu || !container) {
+      closeCodexServiceTierMenu();
+      return;
+    }
+    const strings = codexServiceTierMenuStrings();
+    const rows = Array.from(container.children).filter((node) => node.matches?.(`[role="menuitem"]`));
+    const nativeSpeedRow = rows.find((row) => {
+      if (row.dataset.codexServiceTierMenuTrigger === "true" || row === modelRow) return false;
+      const firstLabel = row.querySelector("span")?.textContent?.trim() || "";
+      const ariaLabel = row.getAttribute("aria-label")?.trim() || "";
+      const rowText = String(row.textContent || "").replace(/\s+/g, " ").trim();
+      return [firstLabel, ariaLabel].includes(strings.speed)
+        || [firstLabel, ariaLabel].includes("Speed")
+        || [firstLabel, ariaLabel].includes("速度")
+        || rowText.startsWith(strings.speed)
+        || rowText.startsWith("Speed")
+        || rowText.startsWith("速度");
+    });
+    if (nativeSpeedRow) {
+      removeCodexServiceTierMenu();
+      return;
+    }
+
+    let trigger = rows.find((row) => row.dataset.codexServiceTierMenuTrigger === "true");
+    if (trigger && trigger.dataset.codexServiceTierMenuVersion !== codexServiceTierMenuVersion) {
+      closeCodexServiceTierMenu();
+      trigger.remove();
+      trigger = null;
+    }
+    if (!trigger) {
+      trigger = modelRow.cloneNode(false);
+      for (const attribute of Array.from(trigger.attributes)) {
+        if (attribute.name === "id" || attribute.name.startsWith("data-radix-")) {
+          trigger.removeAttribute(attribute.name);
+        }
+      }
+      trigger.dataset.codexServiceTierMenuTrigger = "true";
+      trigger.dataset.codexServiceTierMenuVersion = codexServiceTierMenuVersion;
+      trigger.setAttribute("role", "menuitem");
+      trigger.setAttribute("tabindex", "-1");
+      trigger.setAttribute("aria-haspopup", "menu");
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.setAttribute("aria-label", `${strings.speed} ${codexServiceTierMenuSelectedMode() === "fast" ? strings.fast : strings.standard}`);
+
+      const rowContent = document.createElement("div");
+      rowContent.className = "flex w-full min-w-0 items-center gap-3";
+      const label = document.createElement("span");
+      label.textContent = strings.speed;
+      const value = document.createElement("span");
+      value.className = "flex min-w-0 flex-1 justify-end text-token-text-tertiary";
+      value.dataset.codexServiceTierMenuValue = "true";
+      const chevron = modelRow.querySelector("svg")?.cloneNode(true) || document.createElement("span");
+      if (chevron instanceof HTMLElement) {
+        chevron.className = "text-token-text-tertiary";
+        chevron.textContent = "›";
+        chevron.setAttribute("aria-hidden", "true");
+      }
+      rowContent.append(label, value, chevron);
+      trigger.appendChild(rowContent);
+
+      trigger.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      trigger.addEventListener("pointerenter", () => openCodexServiceTierMenu(trigger, parentMenu));
+      trigger.addEventListener("pointerleave", scheduleCodexServiceTierMenuClose);
+      trigger.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (codexServiceTierMenuContent(trigger)) closeCodexServiceTierMenu();
+        else openCodexServiceTierMenu(trigger, parentMenu);
+      });
+      trigger.addEventListener("keydown", (event) => {
+        const content = codexServiceTierMenuContent(trigger);
+        if (content && ["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+          event.preventDefault();
+          event.stopPropagation();
+          const direction = event.key === "ArrowDown"
+            ? "next"
+            : event.key === "ArrowUp"
+              ? "previous"
+              : event.key === "Home" ? "first" : "last";
+          codexServiceTierMenuFocusOption(content, null, direction);
+          return;
+        }
+        if (content && (event.key === "Escape" || event.key === "ArrowLeft")) {
+          event.preventDefault();
+          event.stopPropagation();
+          closeCodexServiceTierMenu({ focusTrigger: true });
+          return;
+        }
+        if (content && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          event.stopPropagation();
+          const activeId = trigger.getAttribute("aria-activedescendant");
+          const activeOption = activeId ? document.getElementById(activeId) : null;
+          const fallbackOption = content.querySelector(`[role="menuitemradio"][aria-checked="true"]`);
+          (content.contains(activeOption) ? activeOption : fallbackOption)?.click();
+          return;
+        }
+        if (!["Enter", " ", "ArrowRight", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        openCodexServiceTierMenu(trigger, parentMenu);
+        codexServiceTierMenuFocusOption(codexServiceTierMenuContent(trigger), null, "selected");
+      });
+      (rows[rows.length - 1] || modelRow).after(trigger);
+    }
+    if (parentMenu.__codexServiceTierMenuKeyboardVersion !== codexServiceTierMenuVersion) {
+      parentMenu.__codexServiceTierMenuKeyboardVersion = codexServiceTierMenuVersion;
+      parentMenu.addEventListener("keydown", (event) => {
+        const activeTrigger = codexServiceTierMenuTrigger();
+        if (!activeTrigger || codexServiceTierMenuContent(activeTrigger)) return;
+        const activeRows = Array.from(container.children).filter((node) => node.matches?.(`[role="menuitem"]`));
+        const nativeRows = activeRows.filter((row) => row !== activeTrigger);
+        const previousRow = nativeRows[nativeRows.length - 1];
+        const targetRow = event.target?.closest?.(`[role="menuitem"]`);
+        let next;
+        if (event.key === "ArrowDown" && targetRow === previousRow) next = activeTrigger;
+        if (event.key === "ArrowUp" && targetRow === activeTrigger) next = previousRow;
+        if (event.key === "ArrowDown" && targetRow === activeTrigger) next = nativeRows[0];
+        if (event.key === "ArrowUp" && targetRow === nativeRows[0]) next = activeTrigger;
+        if (!next) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        next.focus();
+      }, true);
+    }
+    refreshCodexServiceTierMenu();
+  }
+
+  if (!window.__codexServiceTierMenuOutsideHandlerInstalled) {
+    window.__codexServiceTierMenuOutsideHandlerInstalled = true;
+    document.addEventListener("pointerdown", (event) => {
+      const target = event.target;
+      if (target?.closest?.(`[data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"]`)) return;
+      closeCodexServiceTierMenu();
+    }, true);
+  }
+
   function codexServiceTierBadgeVisibleElement(element) {
     if (!(element instanceof HTMLElement) || !element.isConnected) return false;
     const style = getComputedStyle(element);
@@ -8445,7 +9205,10 @@
     const footers = [
       ...(root?.matches?.(".composer-footer") ? [root] : []),
       ...Array.from(root?.querySelectorAll?.(".composer-footer") || []),
-    ];
+      ...(root?.matches?.("[class*='_footer_']") ? [root] : []),
+      ...Array.from(root?.querySelectorAll?.("[class*='_footer_']") || []),
+    ].filter((footer, index, all) => all.indexOf(footer) === index)
+      .filter((footer) => footer.matches?.(".composer-footer") || footer.querySelector?.("[contenteditable='true']"));
     return footers
       .filter(codexServiceTierBadgeVisibleElement)
       .sort((left, right) => {
@@ -9414,7 +10177,10 @@
     scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
-    installCodexServiceTierBadge();
+    removeCodexServiceTierBadges();
+    syncCodexNativeServiceTierPicker();
+    installCodexNativeServiceTierSelectionSync();
+    installCodexServiceTierMenu();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
     schedulePluginAutoExpand();
@@ -9435,7 +10201,7 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, [data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"], .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
   }
 
   function scanRelevantSelector() {
@@ -9448,6 +10214,7 @@
       "[data-codex-archive-delete-all]",
       '[data-message-author-role]',
       '[data-testid="conversation-turn"]',
+      '[data-model-picker-model-row]',
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",

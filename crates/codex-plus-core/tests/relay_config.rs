@@ -3247,6 +3247,13 @@ experimental_bearer_token = "sk-new"
     assert_eq!(sol["context_window"], 272_000);
     assert_eq!(sol["default_reasoning_level"], "low");
     assert_eq!(sol["service_tiers"][0]["id"], "priority");
+    assert_eq!(sol["supports_search_tool"], serde_json::json!(true));
+    assert_eq!(
+        sol["web_search_tool_type"],
+        serde_json::json!("text_and_image")
+    );
+    assert!(sol.get("tool_mode").is_none());
+    assert!(sol.get("use_responses_lite").is_none());
 }
 
 #[test]
