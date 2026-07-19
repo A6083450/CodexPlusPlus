@@ -112,36 +112,36 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
 
 #[test]
 fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
-    let manager_exe = std::path::Path::new(
-        "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager",
-    );
+    let temp = tempfile::tempdir().unwrap();
+    let manager_exe = temp
+        .path()
+        .join("Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager");
 
-    let companion = companion_binary_path_from_exe(manager_exe, SILENT_BINARY);
+    let companion = companion_binary_path_from_exe(&manager_exe, SILENT_BINARY);
 
     assert_eq!(
         companion,
-        std::path::PathBuf::from("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus")
+        temp.path().join("Codex++.app/Contents/MacOS/CodexPlusPlus")
     );
     assert_ne!(
         companion,
-        std::path::PathBuf::from(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/codex-plus-plus"
-        )
+        temp.path()
+            .join("Codex++ 管理工具.app/Contents/MacOS/codex-plus-plus")
     );
 }
 
 #[test]
 fn companion_binary_path_resolves_macos_manager_app_next_to_silent_app() {
-    let silent_exe = std::path::Path::new("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus");
+    let temp = tempfile::tempdir().unwrap();
+    let silent_exe = temp.path().join("Codex++.app/Contents/MacOS/CodexPlusPlus");
 
     let companion =
-        companion_binary_path_from_exe(silent_exe, codex_plus_core::install::MANAGER_BINARY);
+        companion_binary_path_from_exe(&silent_exe, codex_plus_core::install::MANAGER_BINARY);
 
     assert_eq!(
         companion,
-        std::path::PathBuf::from(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager"
-        )
+        temp.path()
+            .join("Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager")
     );
 }
 
@@ -179,30 +179,23 @@ fn macos_companion_launch_keeps_bare_binary_development_mode() {
 
 #[test]
 fn macos_bundle_does_not_wrap_the_bundle_executable_in_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let launcher_path = temp.path().join("Codex++.app/Contents/MacOS/CodexPlusPlus");
+    let manager_path = temp
+        .path()
+        .join("Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager");
     let options = InstallOptions {
-        install_root: Some("/Applications".into()),
-        launcher_path: Some("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus".into()),
-        manager_path: Some(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager".into(),
-        ),
+        install_root: Some(temp.path().into()),
+        launcher_path: Some(launcher_path.clone()),
+        manager_path: Some(manager_path.clone()),
         remove_owned_data: false,
     };
 
     let silent = build_macos_app_bundle(&options, false);
     let manager = build_macos_app_bundle(&options, true);
 
-    assert_eq!(
-        silent.binary_source,
-        Some(std::path::PathBuf::from(
-            "/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus"
-        ))
-    );
-    assert_eq!(
-        manager.binary_source,
-        Some(std::path::PathBuf::from(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager"
-        ))
-    );
+    assert_eq!(silent.binary_source, Some(launcher_path));
+    assert_eq!(manager.binary_source, Some(manager_path));
     assert!(silent.launch_script.contains("$DIR/codex-plus-plus"));
     assert!(
         manager
