@@ -18,7 +18,7 @@ pub fn run() {
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "manager.start",
         serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION")
+            "version": codex_plus_core::version::VERSION
         }),
     );
     let Some(_guard) = acquire_single_instance_guard() else {
