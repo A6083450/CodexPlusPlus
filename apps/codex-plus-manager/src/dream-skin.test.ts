@@ -156,12 +156,29 @@ describe("dream skin theme helpers", () => {
     assert.doesNotMatch(source, /当前 Codex 无法实时切换完整主题，需要重启 Codex\+\+。是否立即重启/);
   });
 
+  it("restores the original appearance as pending without reloading or restarting Codex", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    const commands = await readFile(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
+    const restoreStart = app.indexOf("const restoreDreamSkin = async () =>");
+    const restoreEnd = app.indexOf("const verifyDreamSkin", restoreStart);
+    const restoreHandler = app.slice(restoreStart, restoreEnd);
+    const commandStart = commands.indexOf("pub async fn restore_dream_skin");
+    const commandEnd = commands.indexOf("pub fn reset_dream_skin_theme", commandStart);
+    const restoreCommand = commands.slice(commandStart, commandEnd);
+
+    assert.match(restoreHandler, /Codex 原始外观/);
+    assert.match(restoreHandler, /setPendingDreamSkinRestart/);
+    assert.doesNotMatch(restoreHandler, /window\.confirm|await restart\(\)/);
+    assert.doesNotMatch(restoreCommand, /reload_dream_skin_live/);
+    assert.match(restoreCommand, /pending_restart\(false, false\)/);
+  });
+
   it("renders responsive three-column theme grids with platform guidance", async () => {
     const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
     const css = await readFile(new URL("./styles.css", import.meta.url), "utf8");
 
     assert.match(app, /dream-skin-theme-library/);
-    assert.match(app, /Windows 原版样式固定/);
+    assert.match(app, /Windows 使用亮暗模式、图片取色和可选强调色/);
     assert.match(css, /\.dream-skin-market-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,/s);
     assert.match(css, /\.dream-skin-theme-list\s*\{[^}]*grid-template-columns:\s*repeat\(3,/s);
     assert.match(css, /@media \(max-width:\s*760px\)[\s\S]*\.dream-skin-theme-list\s*\{[^}]*grid-template-columns:\s*1fr/s);
@@ -188,6 +205,19 @@ describe("dream skin theme helpers", () => {
     assert.match(customizer, /t\("从图片创建"\)/);
     assert.match(customizer, /t\("保存主题"\)/);
     assert.match(customizer, /t\("恢复 Dream Skin 默认主题"\)/);
+    assert.match(customizer, /t\("恢复 Codex 默认配色"\)/);
+  });
+
+  it("exposes only effective Windows appearance and accent controls", async () => {
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(app, /dream-skin-windows-theme-controls/);
+    assert.match(app, /自动/);
+    assert.match(app, /亮色/);
+    assert.match(app, /暗色/);
+    assert.match(app, /跟随图片配色/);
+    assert.match(app, /isWindowsPlatform \? \([\s\S]*dream-skin-windows-theme-controls[\s\S]*dream-skin-colors/);
+    assert.match(app, /if \(isWindowsPlatform\) \{[\s\S]*delete config\.colors;[\s\S]*delete config\.palette;/);
   });
 
   it("separates the remote marketplace from local theme editing", async () => {

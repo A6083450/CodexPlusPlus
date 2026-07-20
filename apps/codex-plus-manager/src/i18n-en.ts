@@ -51,8 +51,14 @@ export const EN_PLAIN: Record<string, string> = {
   "Dream Skin 状态": "Dream Skin status",
   "主题库": "Theme library",
   "恢复 Dream Skin 默认主题": "Restore the default Dream Skin theme",
-  "当前 Codex 无法实时更新完整外观，需要重启 Codex++。是否立即重启？":
-    "Codex cannot update the complete appearance live. Restart Codex++ now?",
+  "恢复 Codex 默认配色": "Restore Codex default colors",
+  "外观模式": "Appearance mode",
+  "自动": "Auto",
+  "亮色": "Light",
+  "暗色": "Dark",
+  "跟随图片配色": "Use image colors",
+  "亮暗模式直接控制 Codex 外观；强调色留空时自动从主题图片提取。":
+    "The appearance mode directly controls Codex. Leave the accent empty to derive it from the theme image.",
   "主题市场": "Theme marketplace",
   "主题视图": "Theme view",
   "社区主题": "Community themes",
@@ -78,6 +84,7 @@ export const EN_PLAIN: Record<string, string> = {
   "保存并应用主题；需要重启时只会标记为待应用": "Save and apply the theme; when a restart is required it will only be marked as pending",
   "应用皮肤": "Apply skin",
   "恢复 Codex 外观": "Restore Codex appearance",
+  "Codex 原始外观": "Original Codex appearance",
   "刷新状态": "Refresh status",
   "图片与主题": "Image and theme",
   "自定义图片会被导入 Codex++ 托管目录；主题字段与目标项目 theme.json 对齐":
@@ -108,8 +115,8 @@ export const EN_PLAIN: Record<string, string> = {
   "主题操作": "Theme actions",
   "重命名": "Rename",
   "正在加载主题库…": "Loading theme library...",
-  "Windows 原版样式固定，主题配置主要用于图片和跨平台迁移。":
-    "The original Windows styling is fixed; theme configuration primarily controls images and cross-platform migration.",
+  "Windows 使用亮暗模式、图片取色和可选强调色；完整色板仅在 macOS 生效。":
+    "Windows uses appearance mode, image-derived colors, and an optional accent; the full palette applies only on macOS.",
   "macOS 会应用主题中的图片、文字和颜色配置。":
     "macOS applies the image, text, and color settings from the theme.",
   "Dream Skin 图片预览": "Dream Skin image preview",

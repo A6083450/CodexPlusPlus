@@ -201,17 +201,20 @@ keep = "before"
     let theme = DreamSkinThemeConfig::default();
 
     sync_dream_skin_base_theme_in_home(&home, &state, true, &theme).unwrap();
+    let backup: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.join("dream-skin-base-theme-backup.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(backup["schemaVersion"], 2);
     let applied = std::fs::read_to_string(home.join("config.toml")).unwrap();
     let applied_doc = applied.parse::<toml_edit::DocumentMut>().unwrap();
     assert_eq!(
         applied_doc["desktop"]["appearanceTheme"].as_str(),
         Some("dark")
     );
-    assert!(applied.contains("appearanceLightCodeThemeId = \"codex\""));
-    assert!(applied.contains("accent = \"#B65CFF\""));
-    assert!(applied.contains("ink = \"#4A235F\""));
-    assert!(applied.contains("surface = \"#FFF4FA\""));
-    assert!(applied.contains("opaqueWindows = true"));
+    assert!(applied.contains("appearanceLightCodeThemeId = \"custom-light\""));
+    assert!(applied.contains("accent = \"#112233\""));
+    assert!(applied.contains("opaqueWindows = false"));
     assert!(applied.contains("keep = \"before\""));
 
     std::fs::write(
@@ -235,6 +238,132 @@ keep = "before"
     assert_eq!(chrome["accent"].as_str(), Some("#112233"));
     assert_eq!(chrome["opaqueWindows"].as_bool(), Some(false));
     assert!(restored.contains("keep = \"after\""));
+    assert!(!state.join("dream-skin-base-theme-backup.json").exists());
+}
+
+#[test]
+fn base_theme_restores_current_codex_nested_chrome_theme() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        r##"model = "gpt-5"
+
+[desktop]
+appearanceTheme = "dark"
+appearanceLightCodeThemeId = "custom-light"
+keep = "before"
+
+[desktop.appearanceLightChromeTheme]
+accent = "#339cff"
+contrast = 100
+opaqueWindows = false
+
+[desktop.appearanceLightChromeTheme.fonts]
+code = "Berkeley Mono"
+ui = "Inter"
+
+[desktop.appearanceLightChromeTheme.semanticColors]
+diffAdded = "#123456"
+diffRemoved = "#654321"
+"##,
+    )
+    .unwrap();
+
+    let theme = DreamSkinThemeConfig::default();
+    sync_dream_skin_base_theme_in_home(&home, &state, true, &theme).unwrap();
+    sync_dream_skin_base_theme_in_home(&home, &state, false, &theme).unwrap();
+
+    let restored = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    let restored_doc = restored.parse::<toml_edit::DocumentMut>().unwrap();
+    let chrome = restored_doc["desktop"]["appearanceLightChromeTheme"]
+        .as_table()
+        .unwrap();
+    assert_eq!(chrome["accent"].as_str(), Some("#339cff"));
+    assert_eq!(chrome["contrast"].as_integer(), Some(100));
+    assert_eq!(chrome["opaqueWindows"].as_bool(), Some(false));
+    assert_eq!(chrome["fonts"]["code"].as_str(), Some("Berkeley Mono"));
+    assert_eq!(chrome["fonts"]["ui"].as_str(), Some("Inter"));
+    assert_eq!(
+        chrome["semanticColors"]["diffAdded"].as_str(),
+        Some("#123456")
+    );
+    assert_eq!(
+        chrome["semanticColors"]["diffRemoved"].as_str(),
+        Some("#654321")
+    );
+    assert_eq!(restored_doc["desktop"]["keep"].as_str(), Some("before"));
+}
+
+#[test]
+fn base_theme_recovers_regular_table_from_legacy_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let config_path = home.join("config.toml");
+    let original = r##"[desktop]
+appearanceTheme = "dark"
+appearanceLightCodeThemeId = "custom-light"
+
+[desktop.appearanceLightChromeTheme]
+accent = "#339cff"
+contrast = 100
+
+[desktop.appearanceLightChromeTheme.fonts]
+code = "Berkeley Mono"
+
+[desktop.appearanceLightChromeTheme.semanticColors]
+diffAdded = "#123456"
+"##;
+    let original_doc = original.parse::<toml_edit::DocumentMut>().unwrap();
+    let legacy_chrome = original_doc["desktop"]["appearanceLightChromeTheme"].to_string();
+    std::fs::write(
+        &config_path,
+        r##"[desktop]
+appearanceTheme = "dark"
+appearanceLightCodeThemeId = "codex"
+appearanceLightChromeTheme = { accent = "#B65CFF" }
+"##,
+    )
+    .unwrap();
+    let backup = serde_json::json!({
+        "schemaVersion": 1,
+        "configPath": config_path.to_string_lossy(),
+        "desktopExisted": true,
+        "values": {
+            "appearanceTheme": "\"dark\"",
+            "appearanceLightCodeThemeId": "\"custom-light\"",
+            "appearanceLightChromeTheme": legacy_chrome
+        }
+    });
+    std::fs::write(
+        state.join("dream-skin-base-theme-backup.json"),
+        serde_json::to_vec_pretty(&backup).unwrap(),
+    )
+    .unwrap();
+
+    sync_dream_skin_base_theme_in_home(&home, &state, false, &DreamSkinThemeConfig::default())
+        .unwrap();
+
+    let restored = std::fs::read_to_string(config_path).unwrap();
+    let restored_doc = restored.parse::<toml_edit::DocumentMut>().unwrap();
+    let chrome = restored_doc["desktop"]["appearanceLightChromeTheme"]
+        .as_table()
+        .unwrap();
+    assert_eq!(
+        restored_doc["desktop"]["appearanceTheme"].as_str(),
+        Some("dark")
+    );
+    assert_eq!(
+        restored_doc["desktop"]["appearanceLightCodeThemeId"].as_str(),
+        Some("custom-light")
+    );
+    assert_eq!(chrome["accent"].as_str(), Some("#339cff"));
+    assert_eq!(chrome["contrast"].as_integer(), Some(100));
     assert!(!state.join("dream-skin-base-theme-backup.json").exists());
 }
 
@@ -270,7 +399,11 @@ fn snow_base_theme_matches_the_target_project_and_switching_back_restores_appear
         dream_doc["desktop"]["appearanceTheme"].as_str(),
         Some("dark")
     );
-    assert!(dream_config.contains("accent = \"#B65CFF\""));
+    assert!(
+        dream_doc["desktop"]
+            .get("appearanceLightChromeTheme")
+            .is_none()
+    );
 }
 
 #[test]
@@ -293,6 +426,64 @@ fn glass_vision_base_theme_matches_the_target_project() {
     assert!(config.contains("contrast = 54"));
     assert!(config.contains("opaqueWindows = false"));
     assert!(config.contains("surface = \"#EAF7FF\""));
+}
+
+#[test]
+fn base_theme_applies_explicit_appearance_and_palette_accent() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[desktop]\nappearanceTheme = \"light\"\n",
+    )
+    .unwrap();
+    let mut theme = DreamSkinThemeConfig::default();
+    theme.extra_fields.insert(
+        "appearance".to_string(),
+        serde_json::Value::String("dark".to_string()),
+    );
+    theme.extra_fields.insert(
+        "palette".to_string(),
+        serde_json::json!({ "accent": "#123456" }),
+    );
+
+    sync_dream_skin_base_theme_in_home(&home, &state, true, &theme).unwrap();
+
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    let document = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        document["desktop"]["appearanceTheme"].as_str(),
+        Some("dark")
+    );
+    assert_eq!(
+        document["desktop"]["appearanceLightChromeTheme"]["accent"].as_str(),
+        Some("#123456")
+    );
+}
+
+#[test]
+fn non_fixed_preset_without_accent_preserves_native_chrome_theme() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[desktop]\nappearanceLightCodeThemeId = \"native\"\nappearanceLightChromeTheme = { accent = \"#112233\" }\n",
+    )
+    .unwrap();
+    let mut theme = DreamSkinThemeConfig::default();
+    theme.id = "preset-cyber-neon".to_string();
+    theme.style_preset = "cyber-neon".to_string();
+
+    sync_dream_skin_base_theme_in_home(&home, &state, true, &theme).unwrap();
+
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(config.contains("appearanceLightCodeThemeId = \"native\""));
+    assert!(config.contains("accent = \"#112233\""));
+    assert!(!config.contains("#B65CFF"));
 }
 
 #[test]

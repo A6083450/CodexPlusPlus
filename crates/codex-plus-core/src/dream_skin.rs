@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 use crate::settings::DreamSkinThemeConfig;
 
 const BACKUP_FILE: &str = "dream-skin-base-theme-backup.json";
+const BACKUP_SCHEMA_VERSION: u32 = 2;
 const MANAGED_THEME_DIR: &str = "dream-skin/theme";
 const MANAGED_IMAGE_PREFIX: &str = "current.";
 pub const DREAM_SKIN_SOURCE_LIMIT: u64 = 50 * 1024 * 1024;
@@ -253,12 +254,12 @@ fn apply_base_theme(
                     .get("desktop")
                     .and_then(Item::as_table)
                     .and_then(|desktop| desktop.get(key))
-                    .map(ToString::to_string);
+                    .map(serialize_item);
                 ((*key).to_string(), item)
             })
             .collect();
         let backup = DreamSkinThemeBackup {
-            schema_version: 1,
+            schema_version: BACKUP_SCHEMA_VERSION,
             config_path: config_path.to_string_lossy().to_string(),
             desktop_existed,
             values,
@@ -277,23 +278,16 @@ fn apply_base_theme(
     let desktop = desktop_table_mut(&mut document)?;
     match profile.appearance_theme {
         Some(appearance) => desktop["appearanceTheme"] = value(appearance),
-        None => match backup
-            .values
-            .get("appearanceTheme")
-            .and_then(Option::as_deref)
-        {
-            Some(serialized) => {
-                desktop["appearanceTheme"] = parse_item(serialized)
-                    .context("failed to restore Dream Skin setting appearanceTheme")?;
-            }
-            None => {
-                desktop.remove("appearanceTheme");
-            }
-        },
+        None => restore_backup_setting(desktop, &backup, "appearanceTheme")?,
     }
-    desktop["appearanceLightCodeThemeId"] = value("codex");
-    desktop["appearanceLightChromeTheme"] =
-        Item::Value(Value::InlineTable(target_chrome_theme(profile)));
+    if uses_native_chrome_theme(theme) {
+        restore_backup_setting(desktop, &backup, "appearanceLightCodeThemeId")?;
+        restore_backup_setting(desktop, &backup, "appearanceLightChromeTheme")?;
+    } else {
+        desktop["appearanceLightCodeThemeId"] = value("codex");
+        desktop["appearanceLightChromeTheme"] =
+            Item::Value(Value::InlineTable(target_chrome_theme(theme, profile)));
+    }
     write_config(config_path, document.to_string().as_bytes())
 }
 
@@ -315,7 +309,7 @@ fn restore_base_theme(config_path: &Path, backup_path: &Path) -> anyhow::Result<
     for key in APPEARANCE_KEYS {
         match backup.values.get(key).and_then(Option::as_deref) {
             Some(serialized) => {
-                desktop[key] = parse_item(serialized)
+                desktop[key] = parse_backup_item(&backup, serialized)
                     .with_context(|| format!("failed to restore Dream Skin setting {key}"))?;
             }
             None => {
@@ -361,7 +355,7 @@ struct TargetBaseTheme {
 
 fn target_base_theme(theme: &DreamSkinThemeConfig) -> TargetBaseTheme {
     let preset = crate::settings::resolve_dream_skin_style_preset(&theme.id, &theme.style_preset);
-    match preset.as_str() {
+    let mut profile = match preset.as_str() {
         "codex-snow" => TargetBaseTheme {
             appearance_theme: Some("light"),
             accent: "#1F7FE8",
@@ -395,10 +389,58 @@ fn target_base_theme(theme: &DreamSkinThemeConfig) -> TargetBaseTheme {
             skill: "#C47BFF",
             surface: "#FFF4FA",
         },
-    }
+    };
+    profile.appearance_theme = match theme
+        .extra_fields
+        .get("appearance")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("light") => Some("light"),
+        Some("dark") => Some("dark"),
+        _ => profile.appearance_theme,
+    };
+    profile
 }
 
-fn target_chrome_theme(profile: TargetBaseTheme) -> InlineTable {
+fn target_palette_accent(theme: &DreamSkinThemeConfig) -> Option<&str> {
+    theme
+        .extra_fields
+        .get("palette")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|palette| palette.get("accent"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|accent| !accent.is_empty())
+}
+
+fn uses_native_chrome_theme(theme: &DreamSkinThemeConfig) -> bool {
+    let preset = crate::settings::resolve_dream_skin_style_preset(&theme.id, &theme.style_preset);
+    !matches!(preset.as_str(), "codex-snow" | "glass-vision")
+        && target_palette_accent(theme).is_none()
+}
+
+fn restore_backup_setting(
+    desktop: &mut Table,
+    backup: &DreamSkinThemeBackup,
+    key: &str,
+) -> anyhow::Result<()> {
+    match backup.values.get(key).and_then(Option::as_deref) {
+        Some(serialized) => {
+            desktop[key] = parse_backup_item(backup, serialized)
+                .with_context(|| format!("failed to restore Dream Skin setting {key}"))?;
+        }
+        None => {
+            desktop.remove(key);
+        }
+    }
+    Ok(())
+}
+
+fn target_chrome_theme(
+    theme_config: &DreamSkinThemeConfig,
+    profile: TargetBaseTheme,
+) -> InlineTable {
+    let accent = target_palette_accent(theme_config).unwrap_or(profile.accent);
     let mut fonts = InlineTable::new();
     fonts.insert("code", "Cascadia Code".into());
     fonts.insert("ui", "Microsoft YaHei UI".into());
@@ -409,7 +451,7 @@ fn target_chrome_theme(profile: TargetBaseTheme) -> InlineTable {
     semantic_colors.insert("skill", profile.skill.into());
 
     let mut theme = InlineTable::new();
-    theme.insert("accent", profile.accent.into());
+    theme.insert("accent", accent.into());
     theme.insert("contrast", profile.contrast.into());
     theme.insert("fonts", Value::InlineTable(fonts));
     theme.insert("ink", profile.ink.into());
@@ -419,8 +461,36 @@ fn target_chrome_theme(profile: TargetBaseTheme) -> InlineTable {
     theme
 }
 
-fn parse_item(serialized: &str) -> anyhow::Result<Item> {
-    let mut document = format!("value = {serialized}\n").parse::<DocumentMut>()?;
+fn serialize_item(item: &Item) -> String {
+    let mut document = DocumentMut::new();
+    document["value"] = item.clone();
+    document.to_string()
+}
+
+fn parse_backup_item(backup: &DreamSkinThemeBackup, serialized: &str) -> anyhow::Result<Item> {
+    match backup.schema_version {
+        1 => parse_legacy_item(serialized),
+        BACKUP_SCHEMA_VERSION => parse_document_item(serialized),
+        _ => bail!("unsupported Dream Skin backup schema"),
+    }
+}
+
+fn parse_legacy_item(serialized: &str) -> anyhow::Result<Item> {
+    match format!("value = {serialized}\n").parse::<DocumentMut>() {
+        Ok(mut document) => document
+            .remove("value")
+            .context("serialized Dream Skin backup value is missing"),
+        Err(_) => parse_legacy_table(serialized),
+    }
+}
+
+fn parse_legacy_table(serialized: &str) -> anyhow::Result<Item> {
+    let document = serialized.parse::<DocumentMut>()?;
+    Ok(Item::Table(document.as_table().clone()))
+}
+
+fn parse_document_item(serialized: &str) -> anyhow::Result<Item> {
+    let mut document = serialized.parse::<DocumentMut>()?;
     document
         .remove("value")
         .context("serialized Dream Skin backup value is missing")
@@ -431,7 +501,7 @@ fn read_backup(path: &Path) -> anyhow::Result<DreamSkinThemeBackup> {
         .with_context(|| format!("failed to read Dream Skin backup {}", path.display()))?;
     let backup: DreamSkinThemeBackup = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse Dream Skin backup {}", path.display()))?;
-    if backup.schema_version != 1 {
+    if !matches!(backup.schema_version, 1 | BACKUP_SCHEMA_VERSION) {
         bail!("unsupported Dream Skin backup schema");
     }
     Ok(backup)
