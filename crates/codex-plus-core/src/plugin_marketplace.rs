@@ -662,7 +662,7 @@ fn merge_marketplace_configs_and_plugins_into_text(
         }
         marketplaces[marketplace_name]["source_type"] = toml_edit::value("local");
         marketplaces[marketplace_name]["source"] =
-            toml_edit::value(windows_extended_path(marketplace_root));
+            toml_edit::value(marketplace_source_path(marketplace_root));
     }
     if !plugin_ids.is_empty() {
         let plugins = table_mut_or_insert(&mut doc, "plugins")?;
@@ -713,12 +713,21 @@ fn normalize_windows_extended_path(value: &str) -> String {
     value.strip_prefix(r"\\?\").unwrap_or(value).to_string()
 }
 
-fn windows_extended_path(path: &Path) -> String {
+fn marketplace_source_path(path: &Path) -> String {
     let value = path.to_string_lossy();
-    if value.starts_with(r"\\?\") {
+
+    #[cfg(windows)]
+    {
+        if value.starts_with(r"\\?\") {
+            value.into_owned()
+        } else {
+            format!(r"\\?\{value}")
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
         value.into_owned()
-    } else {
-        format!(r"\\?\{value}")
     }
 }
 
@@ -806,8 +815,22 @@ mod tests {
         .unwrap();
     }
 
+    fn expected_marketplace_source(path: &Path) -> String {
+        let value = path.to_string_lossy();
+
+        #[cfg(windows)]
+        {
+            return format!(r"\\?\{value}");
+        }
+
+        #[cfg(not(windows))]
+        {
+            value.into_owned()
+        }
+    }
+
     #[test]
-    fn ensure_openai_curated_marketplace_config_registers_local_marketplace() {
+    fn ensure_openai_curated_marketplace_config_uses_native_marketplace_paths() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         write_marketplace(home);
@@ -818,13 +841,15 @@ mod tests {
         assert!(changed);
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         let parsed = config.parse::<DocumentMut>().unwrap();
+        let local_source = expected_marketplace_source(&home.join(".tmp").join("plugins"));
+        let remote_source = expected_marketplace_source(&home.join(".tmp").join("plugins-remote"));
         assert_eq!(
             parsed["marketplaces"]["openai-curated"]["source_type"].as_str(),
             Some("local")
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated"]["source"].as_str(),
-            Some(format!(r"\\?\{}", home.join(".tmp").join("plugins").display()).as_str())
+            Some(local_source.as_str())
         );
         assert_eq!(
             parsed["marketplaces"]["openai-api-curated"]["source_type"].as_str(),
@@ -832,7 +857,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-api-curated"]["source"].as_str(),
-            Some(format!(r"\\?\{}", home.join(".tmp").join("plugins").display()).as_str())
+            Some(local_source.as_str())
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source_type"].as_str(),
@@ -840,13 +865,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(remote_source.as_str())
         );
     }
 
@@ -883,12 +902,11 @@ mod tests {
         assert_eq!(
             parsed["marketplaces"]["role-specific-plugins"]["source"].as_str(),
             Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp")
+                expected_marketplace_source(
+                    &home
+                        .join(".tmp")
                         .join("marketplaces")
-                        .join("role-specific-plugins")
-                        .display()
+                        .join("role-specific-plugins"),
                 )
                 .as_str()
             )
@@ -1002,13 +1020,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(expected_marketplace_source(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 
@@ -1043,13 +1055,7 @@ mod tests {
         );
         assert_eq!(
             parsed["marketplaces"]["openai-curated-remote"]["source"].as_str(),
-            Some(
-                format!(
-                    r"\\?\{}",
-                    home.join(".tmp").join("plugins-remote").display()
-                )
-                .as_str()
-            )
+            Some(expected_marketplace_source(&home.join(".tmp").join("plugins-remote")).as_str())
         );
     }
 

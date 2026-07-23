@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use codex_plus_core::launcher::{
     CodexLaunch, LaunchHooks, LaunchOptions, ProcessWaitStrategy, launch_and_inject_with_hooks,
 };
-use codex_plus_core::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
+use codex_plus_core::models::{
+    DeleteResult, DeleteStatus, ExportResult, ExportStatus, GeneratedImage, GeneratedImagesResult,
+    GeneratedImagesStatus, SessionRef,
+};
 use codex_plus_core::routes::{
     BridgeContext, BridgeDataService, BridgeRuntimeService, BridgeSettingsService,
     CoreRuntimeService, handle_bridge_request,
@@ -77,6 +80,10 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/undo", json!({"undo_token": "undo-1"})),
         (
             "/export-markdown",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        (
+            "/thread-generated-images",
             json!({"session_id": "s1", "title": "First"}),
         ),
         (
@@ -480,6 +487,27 @@ async fn data_routes_forward_payloads_to_data_service() {
         )
         .await["filename"],
         "First.md"
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/thread-generated-images",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({
+            "status": "found",
+            "session_id": "s1",
+            "message": "found 1 generated image",
+            "images": [{
+                "id": "ig-1",
+                "assistant_message_id": "msg-final",
+                "assistant_response_index": 0,
+                "media_type": "image/png",
+                "base64_data": "iVBORw0KGgo=",
+                "revised_prompt": "A tower at sunset"
+            }]
+        })
     );
     assert_eq!(
         handle_bridge_request(
@@ -1285,6 +1313,22 @@ impl BridgeDataService for FakeData {
             message: "exported".to_string(),
             filename: Some("First.md".to_string()),
             markdown: Some("# First\n".to_string()),
+        })
+    }
+
+    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
+        Ok(GeneratedImagesResult {
+            status: GeneratedImagesStatus::Found,
+            session_id: session.session_id,
+            message: "found 1 generated image".to_string(),
+            images: vec![GeneratedImage {
+                id: "ig-1".to_string(),
+                assistant_message_id: "msg-final".to_string(),
+                assistant_response_index: Some(0),
+                media_type: "image/png".to_string(),
+                base64_data: "iVBORw0KGgo=".to_string(),
+                revised_prompt: Some("A tower at sunset".to_string()),
+            }],
         })
     }
 

@@ -4611,6 +4611,8 @@
     return { session_id: locationThreadId(), title: "" };
   }
 
+  window.__codexPlusCurrentSessionRef = currentSessionRef;
+
   function readThreadScrollEntries() {
     if (window.__codexThreadScrollEntries && typeof window.__codexThreadScrollEntries === "object") {
       return { ...window.__codexThreadScrollEntries };
@@ -5280,6 +5282,8 @@
       throw error;
     }
   }
+
+  window.__codexPlusPostJson = postJson;
 
   function downloadMarkdownFallback(filename, markdown) {
     if (!filename || typeof markdown !== "string") {

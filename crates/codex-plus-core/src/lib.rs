@@ -16,6 +16,7 @@ pub mod dream_skin_market;
 pub mod dream_skin_runtime;
 pub mod env_conflicts;
 pub mod http_client;
+pub mod imagegen_skill;
 pub mod install;
 pub mod launcher;
 pub mod model_catalog;

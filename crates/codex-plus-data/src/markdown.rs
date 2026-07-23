@@ -96,13 +96,14 @@ impl MarkdownExportService {
 }
 
 #[derive(Debug)]
-struct ThreadRecord {
-    title: Option<String>,
-    rollout_path: Option<PathBuf>,
+pub(crate) struct ThreadRecord {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) rollout_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
-enum ThreadLookup {
+pub(crate) enum ThreadLookup {
     Found(ThreadRecord),
     Missing,
     Unsupported,
@@ -125,7 +126,7 @@ fn failed(session_id: &str, message: impl Into<String>) -> ExportResult {
     }
 }
 
-fn lookup_thread_record(
+pub(crate) fn lookup_thread_record(
     db: &Connection,
     db_path: &Path,
     thread_id: &str,
@@ -136,6 +137,7 @@ fn lookup_thread_record(
             [thread_id],
             |row| {
                 Ok(ThreadRecord {
+                    id: thread_id.to_string(),
                     title: row.get::<_, Option<String>>(0)?,
                     rollout_path: row
                         .get::<_, Option<String>>(1)?
@@ -168,6 +170,7 @@ fn lookup_thread_record(
         );
         return match row {
             Ok(title) => Ok(ThreadLookup::Found(ThreadRecord {
+                id: thread_id.to_string(),
                 title,
                 rollout_path: discover_rollout_path(db_path, thread_id)?,
             })),
@@ -177,6 +180,44 @@ fn lookup_thread_record(
     }
 
     Ok(ThreadLookup::Unsupported)
+}
+
+pub(crate) fn lookup_thread_record_by_title(
+    db: &Connection,
+    title: &str,
+) -> anyhow::Result<ThreadLookup> {
+    let columns = table_columns(db, "threads")?;
+    if !["id", "title", "rollout_path"]
+        .iter()
+        .all(|column| columns.iter().any(|existing| existing == column))
+    {
+        return Ok(ThreadLookup::Unsupported);
+    }
+    let order_column = if columns.iter().any(|column| column == "updated_at_ms") {
+        "updated_at_ms"
+    } else if columns.iter().any(|column| column == "updated_at") {
+        "updated_at"
+    } else {
+        "rowid"
+    };
+    let sql = format!(
+        "SELECT id, title, rollout_path FROM threads WHERE title = ?1 ORDER BY {order_column} DESC LIMIT 1"
+    );
+    let row = db.query_row(&sql, [title], |row| {
+        Ok(ThreadRecord {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            rollout_path: row
+                .get::<_, Option<String>>(2)?
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from),
+        })
+    });
+    match row {
+        Ok(record) => Ok(ThreadLookup::Found(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ThreadLookup::Missing),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn discover_rollout_path(db_path: &Path, thread_id: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -415,7 +456,7 @@ fn render_markdown(title: &str, messages: &[Message]) -> String {
     format!("{}\n", lines.join("\n").trim_end())
 }
 
-fn normalize_session_id(session_id: &str) -> String {
+pub(crate) fn normalize_session_id(session_id: &str) -> String {
     session_id
         .strip_prefix("local:")
         .unwrap_or(session_id)

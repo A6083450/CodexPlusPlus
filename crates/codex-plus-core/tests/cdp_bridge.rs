@@ -67,6 +67,301 @@ fn injection_script_prefixes_helper_url_and_sponsor_images() {
 }
 
 #[test]
+fn injection_script_recovers_generated_images_through_the_bridge() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("/thread-generated-images"));
+    assert!(script.contains("data-codex-generated-images"));
+    assert!(script.contains("window.__codexPlusPostJson"));
+    assert!(script.contains("window.__codexPlusCurrentSessionRef"));
+}
+
+#[test]
+fn generated_image_waits_for_its_exact_assistant_message_target() {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("generated-images-inject.js");
+    let harness_path = temp.path().join("generated-images-target-harness.cjs");
+    std::fs::write(&script_path, assets::generated_images_script())
+        .expect("generated images script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+let timers = [];
+let observer = null;
+
+function element(tagName = "div") {{
+  const attributes = new Map();
+  const listeners = new Map();
+  return {{
+    tagName, attributes, children: [], style: {{}}, className: "", parentElement: null,
+    setAttribute(name, value) {{ attributes.set(name, String(value)); }},
+    getAttribute(name) {{ return attributes.get(name) ?? null; }},
+    appendChild(child) {{ child.parentElement = this; this.children.push(child); return child; }},
+    addEventListener(name, callback) {{ listeners.set(name, callback); }},
+    click() {{ listeners.get("click")?.({{ target: this }}); }},
+    showModal() {{ this.setAttribute("open", ""); }},
+    close() {{ listeners.get("close")?.({{ target: this }}); }},
+    remove() {{
+      if (!this.parentElement) return;
+      this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+      this.parentElement = null;
+    }},
+    querySelector(selector) {{
+      if (selector === ':scope > [data-codex-generated-images]') {{
+        return this.children.find((child) => child.getAttribute?.("data-codex-generated-images") !== null) || null;
+      }}
+      return null;
+    }},
+  }};
+}}
+
+function responseTarget(messageId) {{
+  const target = element();
+  target.setAttribute("data-response-annotation-target", messageId);
+  const markdown = element();
+  markdown.setAttribute("data-selected-text-overlay-target", "markdown");
+  const actions = element();
+  actions.setAttribute("data-test-actions", "true");
+  target.appendChild(markdown);
+  target.appendChild(actions);
+  target.markdown = markdown;
+  return target;
+}}
+
+function descendants(root) {{
+  return root.children.flatMap((child) => [child, ...descendants(child)]);
+}}
+
+function imageCount(root) {{
+  return descendants(root).filter((child) => child.getAttribute?.("data-codex-generated-image-id") !== null).length;
+}}
+
+const targets = [responseTarget("msg-last")];
+globalThis.window = globalThis;
+window.innerWidth = 1800;
+window.innerHeight = 1130;
+globalThis.document = {{
+  body: element("body"), documentElement: element("html"),
+  createElement: (tagName) => element(tagName),
+  querySelectorAll(selector) {{
+    if (selector === "[data-response-annotation-target]") return targets;
+    if (selector === "[data-codex-generated-image-id]") {{
+      return targets.flatMap((target) => descendants(target)).filter(
+        (child) => child.getAttribute?.("data-codex-generated-image-id") !== null,
+      );
+    }}
+    return [];
+  }},
+}};
+globalThis.MutationObserver = class MutationObserver {{
+  constructor(callback) {{ this.callback = callback; observer = this; }}
+  observe() {{}}
+  disconnect() {{}}
+}};
+globalThis.setTimeout = (callback) => {{ timers.push(callback); return timers.length; }};
+globalThis.clearTimeout = () => {{}};
+window.__codexPlusCurrentSessionRef = () => ({{ session_id: "thread-1" }});
+window.__codexPlusPostJson = async () => ({{
+  status: "found",
+  images: [{{
+    id: "image-1", assistant_message_id: "msg-final", media_type: "image/png",
+    assistant_response_index: 1,
+    base64_data: "aW1hZ2U=",
+    revised_prompt: "Use case: historical-scene Asset type: scenic travel image Primary request: a serene landmark",
+  }}],
+}});
+
+async function flushTimers() {{
+  while (timers.length) {{
+    const callbacks = timers.splice(0);
+    callbacks.forEach((callback) => callback());
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+  }}
+}}
+
+(async () => {{
+  require(scriptPath);
+  await flushTimers();
+  const beforeExactTarget = imageCount(targets[0]);
+
+  const exactTarget = responseTarget("msg-final");
+  targets.push(exactTarget);
+  observer.callback();
+  await flushTimers();
+  const afterExactTarget = {{ old: imageCount(targets[0]), exact: imageCount(exactTarget) }};
+  const renderedImage = descendants(exactTarget).find(
+    (child) => child.getAttribute?.("data-codex-generated-image-id") === "image-1",
+  );
+  const renderedContainer = descendants(exactTarget).find(
+    (child) => child.getAttribute?.("data-codex-generated-images") !== null,
+  );
+  renderedImage.naturalWidth = 1536;
+  renderedImage.naturalHeight = 1024;
+  renderedImage?.parentElement?.click();
+  const previewDialog = descendants(document.body).find(
+    (child) => child.getAttribute?.("data-codex-generated-image-preview") !== null,
+  );
+  const previewDescendants = previewDialog ? descendants(previewDialog) : [];
+  const zoomLevel = previewDescendants.find(
+    (child) => child.getAttribute?.("data-codex-generated-image-zoom-level") !== null,
+  );
+  const zoomIn = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "放大图片");
+  const zoomOut = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "缩小图片");
+  const download = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "下载图片");
+  const close = previewDescendants.find(
+    (child) => child.getAttribute?.("aria-label") === "关闭图片预览",
+  );
+  const previewTitle = previewDescendants.find(
+    (child) => child.getAttribute?.("data-codex-generated-image-preview-title") !== null,
+  );
+  const imageViewport = previewDescendants.find(
+    (child) => child.getAttribute?.("data-codex-generated-image-preview-viewport") !== null,
+  );
+  const initialZoom = zoomLevel?.textContent || "";
+  zoomIn?.click();
+  const zoomedIn = zoomLevel?.textContent || "";
+  zoomOut?.click();
+  const zoomedBackOut = zoomLevel?.textContent || "";
+  const nativePreview = {{
+    containerInMarkdown: renderedContainer?.parentElement === exactTarget.markdown,
+    targetChildren: exactTarget.children.length,
+    imageParentTag: renderedImage?.parentElement?.tagName || "",
+    imageClass: renderedImage?.className || "",
+    imageStyle: renderedImage?.style?.cssText || "",
+    previewDialogTag: previewDialog?.tagName || "",
+    previewDialogClass: previewDialog?.className || "",
+    previewDialogOpen: previewDialog?.getAttribute?.("open") !== null,
+    previewTitle: previewTitle?.textContent || "",
+    imageViewportClass: imageViewport?.className || "",
+    downloadTag: download?.tagName || "",
+    downloadHref: download?.getAttribute?.("href") || "",
+    downloadName: download?.getAttribute?.("download") || "",
+    hasZoomOut: Boolean(zoomOut),
+    hasZoomIn: Boolean(zoomIn),
+    initialZoom,
+    zoomedIn,
+    zoomedBackOut,
+    hasClose: Boolean(close),
+  }};
+  close?.click();
+  nativePreview.previewRemovedAfterClose = !descendants(document.body).includes(previewDialog);
+
+  delete require.cache[require.resolve(scriptPath)];
+  require(scriptPath);
+  await flushTimers();
+  const afterReinjection = {{ old: imageCount(targets[0]), exact: imageCount(exactTarget) }};
+
+  targets.splice(
+    0,
+    targets.length,
+    responseTarget("item-4"),
+    responseTarget("item-5"),
+    responseTarget("item-6"),
+  );
+  delete window.__codexPlusGeneratedImagesState;
+  window.__codexPlusPostJson = async () => ({{
+    status: "found",
+    images: [{{
+      id: "image-cold-start", assistant_message_id: "msg-stable", media_type: "image/png",
+      assistant_response_index: 1,
+      base64_data: "aW1hZ2U=", revised_prompt: "A restored image",
+    }}],
+  }});
+  delete require.cache[require.resolve(scriptPath)];
+  require(scriptPath);
+  await flushTimers();
+  const coldStartFallback = {{
+    first: imageCount(targets[0]),
+    middle: imageCount(targets[1]),
+    last: imageCount(targets[2]),
+  }};
+
+  process.stdout.write(JSON.stringify({{
+    beforeExactTarget, afterExactTarget, afterReinjection, coldStartFallback, nativePreview,
+  }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run generated image target harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON");
+    assert_eq!(result["beforeExactTarget"], 0);
+    assert_eq!(result["afterExactTarget"], json!({ "old": 0, "exact": 1 }));
+    assert_eq!(result["afterReinjection"], json!({ "old": 0, "exact": 1 }));
+    assert_eq!(
+        result["coldStartFallback"],
+        json!({ "first": 0, "middle": 1, "last": 0 })
+    );
+    assert_eq!(result["nativePreview"]["containerInMarkdown"], true);
+    assert_eq!(result["nativePreview"]["targetChildren"], 2);
+    assert_eq!(result["nativePreview"]["imageParentTag"], "button");
+    assert_eq!(result["nativePreview"]["previewDialogTag"], "dialog");
+    assert_eq!(result["nativePreview"]["previewDialogOpen"], true);
+    assert!(
+        result["nativePreview"]["previewDialogClass"]
+            .as_str()
+            .is_some_and(|classes| classes.contains("codex-dialog")
+                && classes.contains("h-[100dvh]")
+                && classes.contains("w-screen"))
+    );
+    assert_eq!(result["nativePreview"]["previewTitle"], "生成的图片");
+    assert!(
+        result["nativePreview"]["imageViewportClass"]
+            .as_str()
+            .is_some_and(|classes| classes.contains("flex-1")
+                && classes.contains("touch-none")
+                && classes.contains("overflow-auto"))
+    );
+    assert_eq!(result["nativePreview"]["downloadTag"], "a");
+    assert!(
+        result["nativePreview"]["downloadHref"]
+            .as_str()
+            .is_some_and(|href| href.starts_with("data:image/png;base64,"))
+    );
+    assert_eq!(result["nativePreview"]["downloadName"], "生成的图片");
+    assert_eq!(result["nativePreview"]["hasZoomOut"], true);
+    assert_eq!(result["nativePreview"]["hasZoomIn"], true);
+    assert_ne!(
+        result["nativePreview"]["initialZoom"],
+        result["nativePreview"]["zoomedIn"]
+    );
+    assert_eq!(
+        result["nativePreview"]["initialZoom"],
+        result["nativePreview"]["zoomedBackOut"]
+    );
+    assert_eq!(result["nativePreview"]["hasClose"], true);
+    assert_eq!(result["nativePreview"]["previewRemovedAfterClose"], true);
+    assert!(
+        result["nativePreview"]["imageClass"]
+            .as_str()
+            .is_some_and(|classes| classes.contains("max-h-[10rem]")
+                && classes.contains("border-token-border"))
+    );
+    assert!(
+        result["nativePreview"]["imageStyle"]
+            .as_str()
+            .is_some_and(|style| !style.contains("70vh"))
+    );
+}
+
+#[test]
 fn pet_real_mouse_settings_are_gated_to_windows_in_injected_ui() {
     let script = assets::injection_script(57321);
 
