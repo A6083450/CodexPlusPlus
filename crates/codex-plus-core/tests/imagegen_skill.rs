@@ -1,5 +1,5 @@
 use codex_plus_core::imagegen_skill::{
-    bundled_imagegen_materializer_script, bundled_imagegen_skill,
+    bundled_imagegen_materializer_script, bundled_imagegen_skill, bundled_imagegen_skill_status,
     bundled_responses_imagegen_script, bundled_responses_transport_script,
     install_bundled_imagegen_skill,
 };
@@ -101,6 +101,36 @@ fn install_bundled_imagegen_skill_creates_expected_path() {
         .unwrap(),
         bundled_responses_transport_script()
     );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/LICENSE.txt")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/agents/openai.yaml")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/assets/imagegen.png")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/scripts/image_gen.py")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/scripts/remove_chroma_key.py")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("skills/.system/imagegen/references/prompting.md")
+            .exists()
+    );
 }
 
 #[test]
@@ -115,6 +145,58 @@ fn install_bundled_imagegen_skill_overwrites_stale_content() {
     assert_eq!(
         std::fs::read_to_string(skill_path).unwrap(),
         bundled_imagegen_skill()
+    );
+}
+
+#[test]
+fn bundled_imagegen_skill_status_reports_missing_files_before_install() {
+    let temp = tempfile::tempdir().unwrap();
+
+    let status = bundled_imagegen_skill_status(temp.path());
+
+    assert!(!status.covered);
+    assert_eq!(
+        status.skill_dir,
+        temp.path().join("skills/.system/imagegen")
+    );
+    assert_eq!(
+        status.skill_file,
+        temp.path().join("skills/.system/imagegen/SKILL.md")
+    );
+    assert!(status.missing_files.contains(&"SKILL.md".to_string()));
+    assert!(status.changed_files.is_empty());
+}
+
+#[test]
+fn bundled_imagegen_skill_status_reports_covered_after_install() {
+    let temp = tempfile::tempdir().unwrap();
+
+    install_bundled_imagegen_skill(temp.path()).unwrap();
+    let status = bundled_imagegen_skill_status(temp.path());
+
+    assert!(status.covered);
+    assert!(status.missing_files.is_empty());
+    assert!(status.changed_files.is_empty());
+}
+
+#[test]
+fn bundled_imagegen_skill_status_reports_changed_files() {
+    let temp = tempfile::tempdir().unwrap();
+    install_bundled_imagegen_skill(temp.path()).unwrap();
+    std::fs::write(
+        temp.path()
+            .join("skills/.system/imagegen/scripts/responses_transport.py"),
+        "changed transport\n",
+    )
+    .unwrap();
+
+    let status = bundled_imagegen_skill_status(temp.path());
+
+    assert!(!status.covered);
+    assert!(status.missing_files.is_empty());
+    assert_eq!(
+        status.changed_files,
+        vec!["scripts/responses_transport.py".to_string()]
     );
 }
 

@@ -38,20 +38,6 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
-    let codex_home = codex_plus_core::codex_home::default_codex_home_dir();
-    let imagegen_skill_path = codex_plus_core::imagegen_skill::install_bundled_imagegen_skill(
-        &codex_home,
-    )
-    .with_context(|| {
-        format!(
-            "failed to install bundled imagegen skill under {}",
-            codex_home.display()
-        )
-    })?;
-    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-        "launcher.imagegen_skill_installed",
-        json!({ "path": imagegen_skill_path }),
-    );
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -900,19 +886,6 @@ mod tests {
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
-    }
-
-    #[test]
-    fn launcher_installs_bundled_imagegen_skill_before_single_instance_check() {
-        let source = include_str!("main.rs");
-        let install = source
-            .find("install_bundled_imagegen_skill")
-            .expect("launcher should install the bundled imagegen skill");
-        let guard = source
-            .find("acquire_single_instance_guard(options.debug_port)?")
-            .expect("launcher should acquire its single-instance guard");
-
-        assert!(install < guard);
     }
 
     #[test]

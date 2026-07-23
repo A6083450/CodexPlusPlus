@@ -171,6 +171,21 @@ type RemotePluginMarketplaceResult = CommandResult<{
   skillCount: number;
 }>;
 
+type ImagegenSkillResult = CommandResult<{
+  codexHome: string;
+  skillDir: string;
+  skillFile: string;
+}>;
+
+type ImagegenSkillStatusResult = CommandResult<{
+  codexHome: string;
+  skillDir: string;
+  skillFile: string;
+  covered: boolean;
+  missingFiles: string[];
+  changedFiles: string[];
+}>;
+
 type BackendSettings = {
   codexAppPath: string;
   codexExtraArgs: string[];
@@ -908,6 +923,7 @@ export function App() {
     message: t("尚未运行插件市场修复。"),
   });
   const [remotePluginMarketplace, setRemotePluginMarketplace] = useState<RemotePluginMarketplaceResult | null>(null);
+  const [imagegenSkillStatus, setImagegenSkillStatus] = useState<ImagegenSkillStatusResult | null>(null);
   const [remotePluginMarketplaceProgress, setRemotePluginMarketplaceProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -1715,6 +1731,27 @@ export function App() {
     return result;
   };
 
+  const refreshImagegenSkillStatus = async (silent = false) => {
+    const result = await run(() => call<ImagegenSkillStatusResult>("imagegen_skill_status"));
+    if (result) {
+      setImagegenSkillStatus(result);
+      if (!silent) showNotice(t("imagegen 状态"), result.message, result.status);
+    }
+    return result;
+  };
+
+  const overwriteImagegenSkill = async () => {
+    const confirmed = window.confirm(
+      t("将使用 Codex++ 内置 imagegen 覆盖当前 CODEX_HOME 下的本地系统技能。此操作会替换 SKILL.md 和 scripts 目录中的内置脚本，是否继续？"),
+    );
+    if (!confirmed) return;
+    const result = await run(() => call<ImagegenSkillResult>("overwrite_imagegen_skill"));
+    if (result) {
+      showNotice(t("imagegen 覆盖"), result.message, result.status);
+      if (result.status === "ok") await refreshImagegenSkillStatus(true);
+    }
+  };
+
   const repairRemotePluginMarketplace = async () => {
     if (remotePluginMarketplaceProgress.active) return;
     setRemotePluginMarketplaceProgress({
@@ -2444,6 +2481,8 @@ export function App() {
       restart,
       repairPluginMarketplace,
       refreshRemotePluginMarketplace,
+      refreshImagegenSkillStatus,
+      overwriteImagegenSkill,
       repairRemotePluginMarketplace,
       installEntrypoints,
       uninstallEntrypoints,
@@ -2761,6 +2800,7 @@ export function App() {
               form={settingsForm}
               pluginMarketplaceProgress={pluginMarketplaceProgress}
               remotePluginMarketplace={remotePluginMarketplace}
+              imagegenSkillStatus={imagegenSkillStatus}
               remotePluginMarketplaceProgress={remotePluginMarketplaceProgress}
               onFormChange={setSettingsForm}
               actions={actions}
@@ -2887,6 +2927,8 @@ type Actions = {
   restart: () => Promise<void>;
   repairPluginMarketplace: () => Promise<void>;
   refreshRemotePluginMarketplace: (silent?: boolean) => Promise<RemotePluginMarketplaceResult | null>;
+  refreshImagegenSkillStatus: (silent?: boolean) => Promise<ImagegenSkillStatusResult | null>;
+  overwriteImagegenSkill: () => Promise<void>;
   repairRemotePluginMarketplace: () => Promise<void>;
   installEntrypoints: () => Promise<void>;
   uninstallEntrypoints: () => Promise<void>;
@@ -3374,6 +3416,7 @@ function EnhanceScreen({
   form,
   pluginMarketplaceProgress,
   remotePluginMarketplace,
+  imagegenSkillStatus,
   remotePluginMarketplaceProgress,
   onFormChange,
   actions,
@@ -3381,6 +3424,7 @@ function EnhanceScreen({
   form: BackendSettings;
   pluginMarketplaceProgress: TaskProgress;
   remotePluginMarketplace: RemotePluginMarketplaceResult | null;
+  imagegenSkillStatus: ImagegenSkillStatusResult | null;
   remotePluginMarketplaceProgress: TaskProgress;
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
@@ -3404,11 +3448,13 @@ function EnhanceScreen({
         String(remotePluginMarketplace.skillCount),
       ])
     : t("未发现本地缓存；点击按钮会从 Codex++ 内置快照释放并注册，无需官方账号预缓存。");
+  const imagegenStatusBadge = imagegenSkillStatus ? (imagegenSkillStatus.covered ? "ok" : "failed") : "not_checked";
+  const imagegenStatusLabel = imagegenSkillStatus ? (imagegenSkillStatus.covered ? t("已覆盖") : t("未覆盖")) : t("未检查");
   return (
     <>
       <Panel className="enhance-panel">
         <CardHead title={t("Codex增强")} detail={t("会话删除、导出、项目移动和用户脚本等界面能力")} />
-        <CardContent>
+        <CardContent className="enhance-panel-content">
           <label className="switch-row">
             <input
               checked={form.enhancementsEnabled}
@@ -3496,6 +3542,21 @@ function EnhanceScreen({
               <FeatureToggle title={t("同步 Zed settings")} detail={t("高级选项，默认关闭；当前实现不主动改写 Zed settings。")} checked={form.zedRemoteSyncToZedSettings} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("zedRemoteSyncToZedSettings", value)} />
               <FeatureToggle title="Upstream worktree" detail={t("从最新 upstream 分支创建 Git worktree。")} checked={form.codexAppUpstreamWorktreeCreate} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppUpstreamWorktreeCreate", value)} />
             </FeatureGroup>
+            <div className="feature-action-row enhance-maintenance-row">
+              <div>
+                <strong>{t("本地 imagegen")}</strong>
+                <small>{t("将 Codex++ 内置 imagegen 覆盖到当前 CODEX_HOME 的 skills/.system/imagegen。")}</small>
+                <small>{t("不会在 Codex++ 启动时自动覆盖；仅点击按钮并确认后写入。")}</small>
+              </div>
+              <Badge status={imagegenStatusBadge} />
+              <Button onClick={() => void actions.overwriteImagegenSkill()} variant="secondary">
+                {t("覆盖本地 imagegen")}
+              </Button>
+              <Button onClick={() => void actions.refreshImagegenSkillStatus()} variant="outline">
+                {t("刷新")}
+              </Button>
+              <span className="feature-action-status">{imagegenStatusLabel}</span>
+            </div>
           </div>
           <div className="hint-line">
             <Wrench className="h-4 w-4" />
