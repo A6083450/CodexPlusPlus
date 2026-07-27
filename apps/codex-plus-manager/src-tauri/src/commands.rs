@@ -143,6 +143,25 @@ pub struct RemotePluginMarketplacePayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ImagegenSkillPayload {
+    pub codex_home: String,
+    pub skill_dir: String,
+    pub skill_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagegenSkillStatusPayload {
+    pub codex_home: String,
+    pub skill_dir: String,
+    pub skill_file: String,
+    pub covered: bool,
+    pub missing_files: Vec<String>,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CcsProvidersPayload {
     pub db_path: String,
     pub providers: Vec<codex_plus_core::ccs_import::CcsProviderImport>,
@@ -2229,6 +2248,59 @@ pub async fn repair_plugin_marketplace() -> CommandResult<PluginMarketplaceRepai
                 initialized: false,
                 configured: false,
                 needs_repair: true,
+            },
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn imagegen_skill_status() -> CommandResult<ImagegenSkillStatusPayload> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    let status = codex_plus_core::imagegen_skill::bundled_imagegen_skill_status(&home);
+    ok(
+        if status.covered {
+            "本地 imagegen 已覆盖。"
+        } else {
+            "本地 imagegen 未覆盖或内容不一致。"
+        },
+        ImagegenSkillStatusPayload {
+            codex_home: home.to_string_lossy().to_string(),
+            skill_dir: status.skill_dir.to_string_lossy().to_string(),
+            skill_file: status.skill_file.to_string_lossy().to_string(),
+            covered: status.covered,
+            missing_files: status.missing_files,
+            changed_files: status.changed_files,
+        },
+    )
+}
+
+#[tauri::command]
+pub fn overwrite_imagegen_skill() -> CommandResult<ImagegenSkillPayload> {
+    let home = codex_plus_core::codex_home::default_codex_home_dir();
+    let fallback_skill_dir = home.join("skills/.system/imagegen");
+    let fallback_skill_file = fallback_skill_dir.join("SKILL.md");
+
+    match codex_plus_core::imagegen_skill::install_bundled_imagegen_skill(&home) {
+        Ok(skill_file) => {
+            let skill_dir = skill_file
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| fallback_skill_dir.clone());
+            ok(
+                &format!("已覆盖本地 imagegen：{}", skill_dir.display()),
+                ImagegenSkillPayload {
+                    codex_home: home.to_string_lossy().to_string(),
+                    skill_dir: skill_dir.to_string_lossy().to_string(),
+                    skill_file: skill_file.to_string_lossy().to_string(),
+                },
+            )
+        }
+        Err(error) => failed(
+            &format!("覆盖本地 imagegen 失败：{error}"),
+            ImagegenSkillPayload {
+                codex_home: home.to_string_lossy().to_string(),
+                skill_dir: fallback_skill_dir.to_string_lossy().to_string(),
+                skill_file: fallback_skill_file.to_string_lossy().to_string(),
             },
         ),
     }

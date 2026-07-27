@@ -41,6 +41,18 @@ export const EN_PLAIN: Record<string, string> = {
   "Vision Analysis Provider": "Vision Analysis Provider",
   "插件与模型": "Plugins and models",
   "管理插件市场、模型列表和服务档位相关增强。": "Manage enhancements for the plugin marketplace, model list and service tier.",
+  "本地 imagegen": "Local imagegen",
+  "将 Codex++ 内置 imagegen 覆盖到当前 CODEX_HOME 的 skills/.system/imagegen。":
+    "Overwrite the current CODEX_HOME skills/.system/imagegen with Codex++'s bundled imagegen.",
+  "不会在 Codex++ 启动时自动覆盖；仅点击按钮并确认后写入。":
+    "Codex++ no longer overwrites it on startup; files are written only after clicking and confirming.",
+  "覆盖本地 imagegen": "Overwrite local imagegen",
+  "imagegen 覆盖": "imagegen overwrite",
+  "imagegen 状态": "imagegen status",
+  "已覆盖": "Covered",
+  "未覆盖": "Not covered",
+  "将使用 Codex++ 内置 imagegen 覆盖当前 CODEX_HOME 下的本地系统技能。此操作会替换 SKILL.md 和 scripts 目录中的内置脚本，是否继续？":
+    "This will overwrite the local system imagegen skill under the current CODEX_HOME using Codex++'s bundled imagegen. It replaces SKILL.md and bundled scripts under scripts. Continue?",
   "对话与输入": "Conversation and input",
   "调整会话管理、输入行为和对话阅读体验。": "Adjust session management, input behavior and conversation reading experience.",
   "界面与启动": "Interface and startup",

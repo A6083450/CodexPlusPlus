@@ -2062,6 +2062,10 @@ body {
   white-space: nowrap;
 }
 
+.enhance-maintenance-row {
+  margin: 0 0 12px;
+}
+
 .dream-skin-image-row {
   grid-column: 1 / -1;
   display: grid;
@@ -3792,6 +3796,8 @@ select {
 }
 
 .panel.enhance-panel {
+  display: grid;
+  align-content: start;
   justify-self: center;
   width: min(100%, 1200px);
   max-width: 100%;
@@ -3800,6 +3806,19 @@ select {
   background: transparent;
   box-shadow: none;
   min-height: max-content;
+}
+
+.enhance-panel-content {
+  display: grid;
+  gap: 12px;
+}
+
+.enhance-panel-content > .switch-row,
+.enhance-panel-content > .hint-line,
+.enhance-panel-content > .task-progress-box,
+.enhance-panel-content > .zed-remote-settings,
+.enhance-panel-content > .toolbar {
+  margin-block: 0;
 }
 
 .panel.enhance-panel:hover {

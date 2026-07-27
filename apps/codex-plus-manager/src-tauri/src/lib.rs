@@ -110,6 +110,8 @@ pub fn run() {
             commands::repair_shortcuts,
             commands::plugin_marketplace_status,
             commands::repair_plugin_marketplace,
+            commands::imagegen_skill_status,
+            commands::overwrite_imagegen_skill,
             commands::remote_plugin_marketplace_status,
             commands::repair_remote_plugin_marketplace,
             commands::check_update,
