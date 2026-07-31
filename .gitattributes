@@ -11,11 +11,6 @@
 assets/inject/upstream/snow-skin/*.js text eol=lf
 assets/inject/upstream/snow-skin/*.css text eol=lf
 
-# Preserve CRLF bytes from the remaining vendored theme text assets.
-assets/inject/upstream/dream-skin/**/*.js -text whitespace=cr-at-eol
-assets/inject/upstream/dream-skin/**/*.css -text whitespace=cr-at-eol
-assets/inject/upstream/cidala-tiger/**/*.js -text whitespace=cr-at-eol
-assets/inject/upstream/cidala-tiger/**/*.css -text whitespace=cr-at-eol
-assets/inject/upstream/glass-vision/*.js -text whitespace=cr-at-eol
-assets/inject/upstream/glass-vision/*.css -text whitespace=cr-at-eol
-assets/inject/upstream/skin-packs/packs/**/theme.json -text whitespace=cr-at-eol
+# Keep byte-exact macOS theme assets identical on every checkout platform.
+assets/inject/upstream/*/macos/*.js text eol=lf
+assets/inject/upstream/*/macos/*.css text eol=lf
