@@ -1993,6 +1993,11 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["nativeAuthRefresh"]["unrelatedDispatchCalls"], 0);
     assert_eq!(cases["nativeAuthRefresh"]["authMethod"], "apikey");
     assert_eq!(cases["nativeAuthRefresh"]["sameReference"], false);
+    assert_eq!(
+        cases["reactFiberKeys"],
+        json!(["__reactFiber$test", "__reactProps$test"])
+    );
+    assert_eq!(cases["semanticModelMenuRowFound"], true);
     assert_eq!(cases["nativeSelectionStandard"]["mode"], "global-standard");
     assert_eq!(cases["nativeSelectionStandard"]["defaultMode"], "standard");
     assert_eq!(cases["nativeSelectionFast"]["mode"], "global-fast");
@@ -2063,6 +2068,17 @@ globalThis.navigator = {{ userAgent: "node-test" }};
 globalThis.performance = {{ getEntriesByType: () => [] }};
 require(scriptPath);
 const api = window.__codexPlusServiceTierTest;
+const reactFiberKeys = api.reactFiberKeys({{
+  "__reactFiber$test": {{}},
+  "__reactProps$test": {{}},
+  ordinary: {{}},
+}});
+const semanticModelMenuRow = {{ ariaLabel: "模型 5.6 Sol" }};
+document.querySelectorAll = (selector) => selector.includes('[aria-label^="模型 "]')
+  ? [semanticModelMenuRow]
+  : [];
+const semanticModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(semanticModelMenuRow);
+document.querySelectorAll = () => [];
 api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
 
@@ -2292,6 +2308,8 @@ process.stdout.write(JSON.stringify({{
   dispatcherFromCurrentSingleton,
   dispatcherFromClass,
   nativeAuthRefresh,
+  reactFiberKeys,
+  semanticModelMenuRowFound,
   nativeSelectionStandard,
   nativeSelectionFast,
   nestedNativeMenuStandard,

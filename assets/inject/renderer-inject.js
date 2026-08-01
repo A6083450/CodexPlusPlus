@@ -6262,6 +6262,8 @@
       patchAppServerResult: (method, result) => patchAppServerModelResult(method, result),
       nativeAuthRefreshDispatch: (fiber) => codexServiceTierNativeAuthRefreshDispatch(fiber),
       nativeAuthRefreshAction: codexServiceTierNativeAuthRefreshAction,
+      reactFiberKeys,
+      serviceTierMenuModelCandidates: codexServiceTierMenuModelCandidates,
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
           status: "ok",
@@ -9502,6 +9504,10 @@
         || Object.prototype.hasOwnProperty.call(settings, "isServiceTierAllowed"));
   }
 
+  function reactFiberKeys(element) {
+    return Object.keys(element).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
+  }
+
   function codexServiceTierNativePickerFiber(trigger) {
     if (!trigger) return null;
     for (const key of reactFiberKeys(trigger)) {
@@ -9997,12 +10003,23 @@
     document.querySelectorAll(`[data-codex-service-tier-menu-trigger="true"]`).forEach((trigger) => trigger.remove());
   }
 
+  function codexServiceTierSemanticModelMenuRowSelector() {
+    return `[role="menuitem"][aria-label^="模型 "], [role="menuitem"][aria-label^="Model "]`;
+  }
+
+  function codexServiceTierMenuModelCandidates() {
+    return [...new Set([
+      ...document.querySelectorAll(`[data-model-picker-model-row]`),
+      ...document.querySelectorAll(codexServiceTierSemanticModelMenuRowSelector()),
+    ])];
+  }
+
   function installCodexServiceTierMenu() {
     if (!codexPlusSettings().serviceTierControls || codexPlusBackendStatus.status === "failed") {
       removeCodexServiceTierMenu();
       return;
     }
-    const modelLabel = Array.from(document.querySelectorAll(`[data-model-picker-model-row]`))
+    const modelLabel = codexServiceTierMenuModelCandidates()
       .find((node) => codexServiceTierBadgeVisibleElement(node)
         && node.closest?.(`[role="menuitem"]`)?.closest?.(`[role="menu"]`));
     const modelRow = modelLabel?.closest?.(`[role="menuitem"]`);
@@ -11211,6 +11228,7 @@
       '[data-message-author-role]',
       '[data-testid="conversation-turn"]',
       '[data-model-picker-model-row]',
+      codexServiceTierSemanticModelMenuRowSelector(),
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",
