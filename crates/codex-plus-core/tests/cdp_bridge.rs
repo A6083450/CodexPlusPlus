@@ -1799,7 +1799,8 @@ fn injection_script_uses_native_fast_indicator_beside_model_name() {
     assert!(script.contains("installCodexNativeServiceTierSelectionSync"));
     assert!(script.contains("codexNativeServiceTierModeFromMenuItem"));
     assert!(script.contains("label === candidate || label.startsWith(candidate)"));
-    assert!(!script.contains("data-codex-service-tier-icon=\"true\""));
+    assert!(script.contains("syncCodexNativeSolidFastIcon"));
+    assert!(script.contains("data-codex-service-tier-icon=\"solid\""));
 }
 
 #[test]
@@ -2006,6 +2007,12 @@ fn injection_script_applies_fast_service_tier_contract() {
         json!(["__reactFiber$test", "__reactProps$test"])
     );
     assert_eq!(cases["semanticModelMenuRowFound"], true);
+    assert_eq!(cases["solidFastIcon"]["patched"], true);
+    assert_eq!(cases["solidFastIcon"]["viewBox"], "0 0 24 24");
+    assert_eq!(cases["solidFastIcon"]["marker"], "solid");
+    assert_eq!(cases["solidFastIcon"]["fill"], "currentColor");
+    assert_eq!(cases["solidFastIcon"]["solidPath"], true);
+    assert_eq!(cases["unrelatedFastIconPatched"], false);
     assert_eq!(cases["nativeSelectionStandard"]["mode"], "global-standard");
     assert_eq!(cases["nativeSelectionStandard"]["defaultMode"], "standard");
     assert_eq!(cases["nativeSelectionFast"]["mode"], "global-fast");
@@ -2089,6 +2096,41 @@ document.querySelectorAll = (selector) => selector.includes('[aria-label^="æ¨¡åž
   : [];
 const semanticModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(semanticModelMenuRow);
 document.querySelectorAll = () => [];
+const svgNode = (pathData) => {{
+  const attributes = new Map([["viewBox", "0 0 20 20"]]);
+  const pathAttributes = new Map([["d", pathData], ["fill", "currentColor"]]);
+  const path = {{
+    getAttribute: (name) => pathAttributes.get(name) ?? null,
+    setAttribute: (name, value) => pathAttributes.set(name, String(value)),
+  }};
+  return {{
+    dataset: {{}},
+    getAttribute: (name) => attributes.get(name) ?? null,
+    setAttribute: (name, value) => attributes.set(name, String(value)),
+    querySelector: (selector) => selector === "path" ? path : null,
+    snapshot: () => ({{
+      viewBox: attributes.get("viewBox"),
+      marker: attributes.get("data-codex-service-tier-icon"),
+      fill: pathAttributes.get("fill"),
+      path: pathAttributes.get("d"),
+    }}),
+  }};
+}};
+const outlineFastSvg = svgNode("M9.80999 17.8302 outline-fast-icon");
+const solidFastIconPatched = typeof api.patchNativeFastIcon === "function"
+  ? api.patchNativeFastIcon(outlineFastSvg)
+  : false;
+const solidFastIconSnapshot = outlineFastSvg.snapshot();
+const solidFastIcon = {{
+  patched: solidFastIconPatched,
+  viewBox: solidFastIconSnapshot.viewBox,
+  marker: solidFastIconSnapshot.marker,
+  fill: solidFastIconSnapshot.fill,
+  solidPath: solidFastIconSnapshot.path?.startsWith("M11.9125 21.4125") || false,
+}};
+const unrelatedFastIconPatched = typeof api.patchNativeFastIcon === "function"
+  ? api.patchNativeFastIcon(svgNode("M0 0 unrelated-icon"))
+  : false;
 api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
 
@@ -2339,6 +2381,8 @@ process.stdout.write(JSON.stringify({{
   nativeAuthRefresh,
   reactFiberKeys,
   semanticModelMenuRowFound,
+  solidFastIcon,
+  unrelatedFastIconPatched,
   nativeSelectionStandard,
   nativeSelectionFast,
   nestedNativeMenuStandard,

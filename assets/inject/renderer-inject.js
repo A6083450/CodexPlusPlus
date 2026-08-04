@@ -2275,6 +2275,8 @@
   const codexServiceTierReadTimeoutMs = 1500;
   const codexServiceTierModulePromises = new Map();
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
+  const codexNativeFastOutlinePathPrefix = "M9.80999 17.8302";
+  const codexNativeFastSolidPath = "M11.9125 21.4125C11.5292 21.8625 11.0292 22.0958 10.4125 22.1125C9.79586 22.1291 9.29586 21.9208 8.91252 21.4875C8.53752 21.0541 8.45836 20.4541 8.67503 19.6875L9.68752 16H4.57502C4.00836 16 3.56669 15.8375 3.25002 15.5125C2.93336 15.1791 2.77502 14.7791 2.77502 14.3125C2.77502 13.8375 2.92919 13.4125 3.23752 13.0375L12.1375 2.47497C12.5209 2.02497 13.0209 1.79164 13.6375 1.77497C14.2542 1.75831 14.75 1.96664 15.125 2.39997C15.5084 2.83331 15.5917 3.43331 15.375 4.19997L14.3125 7.99998H19.425C19.9917 7.99998 20.4334 8.16664 20.75 8.49997C21.075 8.83331 21.2375 9.23748 21.2375 9.71247C21.2375 10.1791 21.0792 10.5958 20.7625 10.9625L11.9125 21.4125Z";
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
   ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
@@ -2907,6 +2909,7 @@
     });
     refreshCodexServiceTierBadges();
     syncCodexNativeServiceTierPicker();
+    syncCodexNativeSolidFastIcon();
     refreshCodexServiceTierMenu();
   }
 
@@ -5884,6 +5887,7 @@
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
       patchAppServerClient: patchAppServerModelRequestClient,
+      patchNativeFastIcon: patchCodexNativeSolidFastIcon,
     };
     return;
   }
@@ -8883,6 +8887,29 @@
       || null;
   }
 
+  function patchCodexNativeSolidFastIcon(svg) {
+    if (!svg || svg.getAttribute?.("data-codex-service-tier-icon") === "solid") return false;
+    const path = svg.querySelector?.("path");
+    const pathData = String(path?.getAttribute?.("d") || "");
+    if (!pathData.startsWith(codexNativeFastOutlinePathPrefix)) return false;
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("data-codex-service-tier-icon", "solid");
+    path.setAttribute("d", codexNativeFastSolidPath);
+    path.setAttribute("fill", "currentColor");
+    return true;
+  }
+
+  function syncCodexNativeSolidFastIcon() {
+    const trigger = codexServiceTierNativeTrigger();
+    const availability = codexServiceTierFastAvailability();
+    if (!trigger
+      || !codexPlusSettings().serviceTierControls
+      || !availability.supported
+      || codexServiceTierState.effectiveMode !== "fast") return false;
+    return Array.from(trigger.querySelectorAll?.('svg:not([data-codex-service-tier-icon="solid"])') || [])
+      .some(patchCodexNativeSolidFastIcon);
+  }
+
   function codexNativeServiceTierMemoValues(fiber) {
     const values = [];
     const seen = new Set();
@@ -10567,6 +10594,7 @@
     refreshConversationView();
     removeCodexServiceTierBadges();
     syncCodexNativeServiceTierPicker();
+    syncCodexNativeSolidFastIcon();
     installCodexNativeServiceTierSelectionSync();
     installCodexServiceTierMenu();
     scheduleThreadScrollSync();
