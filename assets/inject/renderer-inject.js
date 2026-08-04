@@ -393,7 +393,6 @@
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const upstreamBranchSelectionKey = "codexUpstreamBranchSelection";
   const upstreamProjectContextKey = "codexUpstreamProjectContext";
-  const zedRemoteOpenVersion = "1";
   const zedRemoteOpenInMenuVersion = "1";
   const zedRemoteOpenInMenuActivationWindowMs = 600;
   const projectMoveProjectionKey = "codexProjectMoveProjection";
@@ -467,8 +466,8 @@
   const codexThreadServiceTierKey = "codexThreadServiceTierOverrides";
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
-  const codexServiceTierRequestOverrideVersion = "4";
-  const codexAppServerModelRequestPatchVersion = "3";
+  const codexServiceTierRequestOverrideVersion = "5";
+  const codexAppServerModelRequestPatchVersion = "4";
   const codexPluginMarketplaceUnlockVersion = "14";
   const codexPluginAutoExpandVersion = "1";
   const codexPluginAutoExpandMaxClicks = 80;
@@ -482,9 +481,6 @@
   const codexThreadScrollRouteHooksVersion = "dispatcher:2";
   const codexThreadScrollListenerVersion = "4";
   const codexThreadScrollUserIntentVersion = "dispatcher:2";
-  const codexProjectlessMainWindowVersion = "5";
-  const codexProjectlessMainWindowSetting = { key: "hotkey-window-projectless-default-enabled", default: false };
-  const codexProjectlessMainWindowRetryDelaysMs = [0, 250, 750, 1500, 3000];
   const codexPlusImageOverlayId = "codex-plus-image-overlay";
   const codexPlusDreamSkinStyleId = "codex-dream-skin-style";
   const codexPlusDreamSkinPlatform = String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || "macos");
@@ -1455,6 +1451,29 @@
     return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
   }
 
+  const codexPlusDreamSkinMainSurfaceMarker = "data-codex-plus-dream-skin-main-surface";
+
+  function ensureDreamSkinMainSurface() {
+    const existing = document.querySelector("main.main-surface");
+    if (existing) return existing;
+
+    const modularSurface = document.querySelector('main[class*="_MainContentSurface_"]');
+    const mainCandidates = modularSurface ? [] : [...document.querySelectorAll("main")];
+    const shellMain = modularSurface || (mainCandidates.length === 1 ? mainCandidates[0] : null);
+    if (!shellMain) return null;
+
+    shellMain.classList.add("main-surface");
+    shellMain.setAttribute(codexPlusDreamSkinMainSurfaceMarker, "true");
+    return shellMain;
+  }
+
+  function clearDreamSkinMainSurfaceCompatibility() {
+    document.querySelectorAll(`main[${codexPlusDreamSkinMainSurfaceMarker}="true"]`).forEach((node) => {
+      node.classList.remove("main-surface");
+      node.removeAttribute(codexPlusDreamSkinMainSurfaceMarker);
+    });
+  }
+
   function detectDreamSkinShellMode() {
     const root = document.documentElement;
     const body = document.body;
@@ -1493,7 +1512,7 @@
 
     const samples = [
       body,
-      document.querySelector("main.main-surface"),
+      ensureDreamSkinMainSurface(),
       document.querySelector("aside.app-shell-left-panel"),
     ].filter(Boolean);
     let lightVotes = 0;
@@ -1786,6 +1805,7 @@
     document.getElementById("codex-glass-vision-skin-chrome")?.remove();
     document.getElementById("codex-theme-chrome")?.remove();
     removeDreamSkinCompanion();
+    clearDreamSkinMainSurfaceCompatibility();
     const state = window.__CODEX_DREAM_SKIN_STATE__;
     const descriptor = state?.descriptor;
     if (descriptor) {
@@ -1928,7 +1948,7 @@
       if (window.__CODEX_DREAM_SKIN_DISABLED__) return;
       const root = document.documentElement;
       if (!root || !document.body) return;
-      const shellMain = document.querySelector("main.main-surface") || document.querySelector("main");
+      const shellMain = ensureDreamSkinMainSurface();
       if (!shellMain) {
         clearDreamSkinPresentation();
         return;
@@ -2038,6 +2058,7 @@
 
   function refreshDreamSkin() {
     const settings = codexPlusSettings();
+    if (settings.dreamSkinEnabled && !settings.dreamSkinPaused) ensureDreamSkinMainSurface();
     if (window.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__) {
       if (codexPlusBackendSettingsLoaded && (!settings.dreamSkinEnabled || settings.dreamSkinPaused)) {
         cleanupDreamSkin();
@@ -2561,12 +2582,6 @@
     if (controlMode === "global-standard") return "standard";
     if (controlMode === "inherit") return "inherit";
     return normalizeCodexThreadServiceTierMode(fallback);
-  }
-
-  function codexServiceTierControlModeForDefaultMode(defaultMode) {
-    if (defaultMode === "fast") return "global-fast";
-    if (defaultMode === "standard") return "global-standard";
-    return "inherit";
   }
 
   function codexServiceTierEffectiveThreadMode(threadMode = "inherit", defaultMode = "inherit") {
@@ -3191,11 +3206,9 @@
     const patch = async () => {
       try {
         const { dispatcher, assetPrefix } = await loadDispatcher();
-        if (dispatcher.__codexServiceTierOriginalDispatchMessage) {
-          window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
-          return;
+        if (!dispatcher.__codexServiceTierOriginalDispatchMessage) {
+          dispatcher.__codexServiceTierOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
         }
-        dispatcher.__codexServiceTierOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
         dispatcher.dispatchMessage = (type, payload) => {
           return dispatchCodexPlusMessage(dispatcher, type, payload);
         };
@@ -4843,20 +4856,6 @@
     return rows;
   }
 
-  function archivedSessionRows() {
-    if (!archivePageHintVisible()) return [];
-    return sessionRows().filter((row) => row.querySelector('button[aria-label="取消归档对话"]') || row.outerHTML.includes("取消归档") || row.outerHTML.includes("unarchive"));
-  }
-
-  function archivedRows() {
-    if (!archivePageHintVisible()) return [];
-    return [...archivedSessionRows(), ...archivedPageRows()];
-  }
-
-  function archivedPageVisible() {
-    return archivePageHintVisible() && archivedRows().length > 0;
-  }
-
   function sessionRefFromRow(row) {
     const href = row.getAttribute("href") || row.querySelector("a")?.getAttribute("href") || "";
     const idMatch = href.match(/(?:session|conversation|thread)[=/:-]([A-Za-z0-9_.-]+)/i) || href.match(/([A-Za-z0-9_-]{8,})$/);
@@ -5815,424 +5814,11 @@
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
 
-  const codexProjectlessMainWindowStateDefaults = {
-    loaded: false,
-    enabled: false,
-    intent: "",
-    source: "",
-    revision: 0,
-    contextRevision: 0,
-    draftContext: null,
-    contextPromise: null,
-    lastGenericBeginAt: 0,
-    homeRouteRevision: -1,
-  };
-  const codexProjectlessMainWindowState = window.__codexProjectlessMainWindowState
-    && typeof window.__codexProjectlessMainWindowState === "object"
-    ? window.__codexProjectlessMainWindowState
-    : {};
-  Object.entries(codexProjectlessMainWindowStateDefaults).forEach(([key, value]) => {
-    if (!Object.prototype.hasOwnProperty.call(codexProjectlessMainWindowState, key)) {
-      codexProjectlessMainWindowState[key] = value;
-    }
-  });
-  window.__codexProjectlessMainWindowState = codexProjectlessMainWindowState;
-
-  function codexProjectlessMainWindowEnabled() {
-    return codexProjectlessMainWindowState.loaded
-      && codexProjectlessMainWindowState.enabled
-      && codexPlusBackendSettings.enhancementsEnabled !== false;
-  }
-
-  function clearCodexProjectlessMainWindowTimers() {
-    (window.__codexProjectlessMainWindowTimers || []).forEach((timer) => clearTimeout(timer));
-    window.__codexProjectlessMainWindowTimers = [];
-  }
-
-  function setCodexProjectlessMainWindowIntent(intent, source) {
-    const normalizedIntent = intent === "generic" || intent === "project" ? intent : "";
-    codexProjectlessMainWindowState.intent = normalizedIntent;
-    codexProjectlessMainWindowState.source = String(source || "");
-    codexProjectlessMainWindowState.revision += 1;
-    codexProjectlessMainWindowState.contextRevision = codexProjectlessMainWindowState.revision;
-    codexProjectlessMainWindowState.draftContext = null;
-    codexProjectlessMainWindowState.contextPromise = null;
-    if (normalizedIntent !== "generic") clearCodexProjectlessMainWindowTimers();
-  }
-
-  function codexProjectlessMainWindowShouldEnforce() {
-    return codexProjectlessMainWindowEnabled()
-      && codexProjectlessMainWindowState.intent === "generic";
-  }
-
-  function codexProjectlessContextValid(context) {
-    return !!context
-      && typeof context === "object"
-      && typeof context.cwd === "string"
-      && context.cwd.trim().length > 0
-      && typeof context.projectlessOutputDirectory === "string"
-      && context.projectlessOutputDirectory.trim().length > 0
-      && Array.isArray(context.workspaceRoots)
-      && context.workspaceRoots.length > 0;
-  }
-
-  function codexProjectlessPromptFromValue(value, visited = new WeakSet(), depth = 0) {
-    if (typeof value === "string") return depth > 0 ? value.trim() : "";
-    if (!value || typeof value !== "object" || depth > 5 || visited.has(value)) return "";
-    visited.add(value);
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item?.type === "text" && typeof item.text === "string" && item.text.trim()) return item.text.trim();
-        const prompt = codexProjectlessPromptFromValue(item, visited, depth + 1);
-        if (prompt) return prompt;
-      }
-      return "";
-    }
-    for (const key of ["input", "prompt", "message", "params", "request", "payload"]) {
-      const prompt = codexProjectlessPromptFromValue(value[key], visited, depth + 1);
-      if (prompt) return prompt;
-    }
-    return "";
-  }
-
-  async function prepareCodexProjectlessDraftContext(prompt = "") {
-    if (!codexProjectlessMainWindowShouldEnforce()) return null;
-    const revision = codexProjectlessMainWindowState.revision;
-    if (codexProjectlessMainWindowState.contextRevision === revision
-        && codexProjectlessContextValid(codexProjectlessMainWindowState.draftContext)) {
-      return codexProjectlessMainWindowState.draftContext;
-    }
-    if (codexProjectlessMainWindowState.contextRevision === revision
-        && codexProjectlessMainWindowState.contextPromise) {
-      return await codexProjectlessMainWindowState.contextPromise;
-    }
-    const contextPromise = Promise.resolve().then(async () => {
-      const module = await loadCodexAppModule("projectless-thread-");
-      if (typeof module.n !== "function") throw new Error("Codex projectless-thread 生成器不可用");
-      const options = String(prompt || "").trim() ? { prompt: String(prompt).trim() } : {};
-      const context = await module.n(["~"], options);
-      if (!codexProjectlessContextValid(context)) throw new Error("Codex projectless-thread 返回了无效目录");
-      return {
-        cwd: context.cwd,
-        projectlessOutputDirectory: context.projectlessOutputDirectory,
-        workspaceRoots: [...context.workspaceRoots],
-      };
-    });
-    codexProjectlessMainWindowState.contextRevision = revision;
-    codexProjectlessMainWindowState.contextPromise = contextPromise;
-    try {
-      const context = await contextPromise;
-      if (revision === codexProjectlessMainWindowState.revision
-          && codexProjectlessMainWindowShouldEnforce()) {
-        codexProjectlessMainWindowState.draftContext = context;
-      }
-      return context;
-    } finally {
-      if (codexProjectlessMainWindowState.contextPromise === contextPromise) {
-        codexProjectlessMainWindowState.contextPromise = null;
-      }
-    }
-  }
-
-  function codexProjectlessStartParams(message) {
-    if (!message || typeof message !== "object") return null;
-    if (message.type === "send-cli-request-for-host" && message.method === "thread/start") return message.params;
-    if ((message.type === "mcp-request" || message.type === "worker-request")
-        && message.request?.method === "thread/start") return message.request.params;
-    if (message.type === "thread-prewarm-start" && message.request?.params) return message.request.params;
-    if (message.type === "prewarm-thread-start-for-host" && message.params) return message.params;
-    if (message.type === "start-conversation" || message.type === "start-thread-for-host") return message;
-    return null;
-  }
-
-  function patchCodexProjectlessStartParams(params, context) {
-    if (!params || typeof params !== "object" || !codexProjectlessContextValid(context)) return params;
-    const next = {
-      ...params,
-      cwd: context.cwd,
-      workspaceRoots: [...context.workspaceRoots],
-      workspaceKind: "projectless",
-      projectlessOutputDirectory: context.projectlessOutputDirectory,
-    };
-    delete next.projectAssignment;
-    if (next.permissions && typeof next.permissions === "object") {
-      const permissions = { ...next.permissions, runtimeWorkspaceRoots: [...context.workspaceRoots] };
-      if (permissions.sandboxPolicy?.type === "workspaceWrite") {
-        permissions.sandboxPolicy = {
-          ...permissions.sandboxPolicy,
-          writableRoots: [...context.workspaceRoots],
-        };
-      }
-      next.permissions = permissions;
-    }
-    return next;
-  }
-
-  function applyCodexProjectlessRequestOverride(message, context) {
-    const params = codexProjectlessStartParams(message);
-    if (!params) return message;
-    const nextParams = patchCodexProjectlessStartParams(params, context);
-    if (nextParams === params) return message;
-    if (message.type === "send-cli-request-for-host") return { ...message, params: nextParams };
-    if (message.type === "mcp-request" || message.type === "worker-request") {
-      return { ...message, request: { ...message.request, params: nextParams } };
-    }
-    if (message.type === "thread-prewarm-start") {
-      return { ...message, request: { ...message.request, params: nextParams } };
-    }
-    if (message.type === "prewarm-thread-start-for-host") return { ...message, params: nextParams };
-    return nextParams;
-  }
-
-  function codexProjectlessRequestNeedsOverride(message) {
-    if (!codexProjectlessMainWindowShouldEnforce()) return false;
-    const params = codexProjectlessStartParams(message);
-    if (!params) return false;
-    return params.workspaceKind !== "projectless"
-      || typeof params.projectlessOutputDirectory !== "string"
-      || !params.projectlessOutputDirectory.trim();
-  }
-
   function dispatchCodexPlusMessage(dispatcher, type, payload) {
-    const originalMessage = { ...(payload || {}), type };
-    const dispatch = (message) => {
-      const serviceTierMessage = codexServiceTierRequestOverride(message);
-      const nextType = serviceTierMessage?.type || type;
-      const { type: _type, ...nextPayload } = serviceTierMessage || {};
-      return dispatcher.__codexServiceTierOriginalDispatchMessage(nextType, nextPayload);
-    };
-    if (!codexProjectlessRequestNeedsOverride(originalMessage)) return dispatch(originalMessage);
-    const revision = codexProjectlessMainWindowState.revision;
-    const prompt = codexProjectlessPromptFromValue(originalMessage);
-    return prepareCodexProjectlessDraftContext(prompt).then((context) => {
-      if (revision !== codexProjectlessMainWindowState.revision
-          || !codexProjectlessMainWindowShouldEnforce()) {
-        return dispatch(originalMessage);
-      }
-      const message = applyCodexProjectlessRequestOverride(originalMessage, context);
-      sendCodexPlusDiagnostic("projectless_thread_start_overridden", {
-        type: String(type || ""),
-        workspaceRootCount: context.workspaceRoots.length,
-        hasOutputDirectory: !!context.projectlessOutputDirectory,
-      });
-      return dispatch(message);
-    }).catch((error) => {
-      sendCodexPlusDiagnostic("projectless_thread_start_override_failed", {
-        type: String(type || ""),
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-      showToast("无项目会话准备失败，请重试", null);
-      throw error;
-    });
-  }
-
-  function codexProjectlessMainWindowLooksLikeHome() {
-    return Array.from(document.querySelectorAll("button, [role='button']")).some((element) => {
-      const label = String(
-        element.getAttribute?.("aria-label")
-        || element.getAttribute?.("title")
-        || element.innerText
-        || element.textContent
-        || ""
-      ).replace(/\s+/g, " ").trim();
-      return /^(select|choose) project$/i.test(label) || /^(选择|选取)项目$/.test(label);
-    });
-  }
-
-  async function navigateCodexProjectlessMainWindowHome(source, revision) {
-    if (!codexProjectlessMainWindowShouldEnforce()
-        || revision !== codexProjectlessMainWindowState.revision
-        || codexProjectlessMainWindowState.homeRouteRevision === revision
-        || !codexProjectlessMainWindowLooksLikeHome()) {
-      return false;
-    }
-    const module = await loadCodexAppModule("vscode-api-");
-    const dispatcher = module?.g;
-    if (!dispatcher || typeof dispatcher.dispatchHostMessage !== "function") {
-      throw new Error("Codex 内部导航接口不可用");
-    }
-    dispatcher.dispatchHostMessage({
-      type: "navigate-to-route",
-      path: "/",
-      state: { focusComposerNonce: Date.now() },
-    });
-    codexProjectlessMainWindowState.homeRouteRevision = revision;
-    sendCodexPlusDiagnostic("projectless_main_window_home_route_cleared", {
-      source: String(source || "runtime"),
-    });
-    return true;
-  }
-
-  async function enforceCodexProjectlessMainWindow(source, revision) {
-    if (!codexProjectlessMainWindowShouldEnforce()) return false;
-    if (revision != null && revision !== codexProjectlessMainWindowState.revision) return false;
-    let changed = false;
-    try {
-      const activeRoots = await getCodexGlobalState("active-workspace-roots").catch(() => null);
-      if (!codexProjectlessMainWindowShouldEnforce()) return false;
-      if (revision != null && revision !== codexProjectlessMainWindowState.revision) return false;
-      if (!Array.isArray(activeRoots) || activeRoots.length > 0) {
-        await setCodexGlobalState("active-workspace-roots", []);
-        sendCodexPlusDiagnostic("projectless_main_window_runtime_prepared", {
-          source: String(source || "runtime"),
-          previousRootCount: Array.isArray(activeRoots) ? activeRoots.length : activeRoots == null ? 0 : 1,
-        });
-        changed = true;
-      }
-      if (await navigateCodexProjectlessMainWindowHome(
-        source,
-        revision == null ? codexProjectlessMainWindowState.revision : revision
-      )) changed = true;
-    } catch (error) {
-      sendCodexPlusDiagnostic("projectless_main_window_runtime_failed", {
-        source: String(source || "runtime"),
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-    }
-    return changed;
-  }
-
-  function scheduleCodexProjectlessMainWindowEnforcement(source) {
-    clearCodexProjectlessMainWindowTimers();
-    if (!codexProjectlessMainWindowShouldEnforce()) return;
-    const revision = codexProjectlessMainWindowState.revision;
-    window.__codexProjectlessMainWindowTimers = codexProjectlessMainWindowRetryDelaysMs.map((delay) => setTimeout(() => {
-      void enforceCodexProjectlessMainWindow(source, revision);
-    }, delay));
-  }
-
-  function codexProjectlessMainWindowTriggerKind(target) {
-    if (!target?.closest) return "";
-    const explicitProject = target.closest(
-      'button[aria-label^="Start new chat in "], [data-app-action-sidebar-project-row][data-app-action-sidebar-project-id], [role="menuitem"][data-project-id], [role="menuitem"][data-workspace-root]'
-    );
-    if (explicitProject) return "project";
-    const trigger = target.closest('button, a, [role="button"], [role="menuitem"]');
-    if (!trigger) return "";
-    const labels = [
-      trigger.getAttribute?.("aria-label"),
-      trigger.getAttribute?.("title"),
-      trigger.innerText || trigger.textContent,
-    ].map((value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase()).filter(Boolean);
-    return labels.some((label) => /^(new (task|chat)|quick chat|新建(任务|对话)|快速对话)(?:\s|ctrl\+|cmd\+|⌘|$)/i.test(label))
-      ? "generic"
-      : "";
-  }
-
-  function beginCodexProjectlessGenericNewTask(source) {
-    const now = Date.now();
-    if (codexProjectlessMainWindowState.intent !== "generic"
-        || now - codexProjectlessMainWindowState.lastGenericBeginAt > 400) {
-      setCodexProjectlessMainWindowIntent("generic", source);
-    } else {
-      codexProjectlessMainWindowState.source = String(source || "");
-    }
-    codexProjectlessMainWindowState.lastGenericBeginAt = now;
-    try {
-      sessionStorage.removeItem(upstreamProjectContextKey);
-    } catch {
-    }
-    scheduleCodexProjectlessMainWindowEnforcement(source);
-  }
-
-  function installCodexProjectlessNewTaskButtons() {
-    if (!codexProjectlessMainWindowEnabled()) return;
-    Array.from(document.querySelectorAll("button, a, [role='button'], [role='menuitem']")).forEach((trigger) => {
-      if (trigger.closest?.('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]')) return;
-      if (codexProjectlessMainWindowTriggerKind(trigger) !== "generic") return;
-      if (trigger.dataset?.codexProjectlessMainWindow === codexProjectlessMainWindowVersion) return;
-      if (trigger.dataset) trigger.dataset.codexProjectlessMainWindow = codexProjectlessMainWindowVersion;
-      trigger.addEventListener("click", () => beginCodexProjectlessGenericNewTask("generic-new-task-button"), true);
-    });
-  }
-
-  function handleCodexProjectlessMainWindowNavigation(event) {
-    const target = event?.target?.closest ? event.target : event?.target?.parentElement;
-    const kind = codexProjectlessMainWindowTriggerKind(target);
-    if (kind === "project") {
-      setCodexProjectlessMainWindowIntent("project", "explicit-project");
-      return;
-    }
-    if (kind !== "generic") return;
-    beginCodexProjectlessGenericNewTask("generic-new-task");
-  }
-
-  function installCodexProjectlessMainWindowProtection() {
-    if (window.__codexProjectlessMainWindowProtectionVersion === codexProjectlessMainWindowVersion) return;
-    document.removeEventListener("pointerdown", window.__codexProjectlessMainWindowNavigationHandler, true);
-    document.removeEventListener("click", window.__codexProjectlessMainWindowNavigationHandler, true);
-    window.__codexProjectlessMainWindowNavigationHandler = handleCodexProjectlessMainWindowNavigation;
-    document.addEventListener("pointerdown", window.__codexProjectlessMainWindowNavigationHandler, true);
-    document.addEventListener("click", window.__codexProjectlessMainWindowNavigationHandler, true);
-    window.__codexProjectlessMainWindowProtectionVersion = codexProjectlessMainWindowVersion;
-  }
-
-  async function getCodexProjectlessMainWindowSetting() {
-    try {
-      const settingStorage = await codexSettingStorageModule();
-      return await settingStorage.n(codexProjectlessMainWindowSetting);
-    } catch (error) {
-      if (typeof codexStateCall === "function") {
-        const result = await codexStateCall("get-setting", { params: { key: codexProjectlessMainWindowSetting.key } });
-        return result && Object.prototype.hasOwnProperty.call(result, "value")
-          ? result.value
-          : codexProjectlessMainWindowSetting.default;
-      }
-      throw error;
-    }
-  }
-
-  async function loadCodexProjectlessMainWindowSetting(attempt = 0) {
-    try {
-      codexProjectlessMainWindowState.enabled = (await getCodexProjectlessMainWindowSetting()) === true;
-      codexProjectlessMainWindowState.loaded = true;
-      if (!codexProjectlessMainWindowState.enabled) {
-        setCodexProjectlessMainWindowIntent("", "setting-disabled");
-        return;
-      }
-      if (!codexProjectlessMainWindowState.intent) {
-        setCodexProjectlessMainWindowIntent("generic", "startup");
-      }
-      installAppServerModelRequestPatch();
-      scheduleCodexProjectlessMainWindowEnforcement("startup");
-      installCodexProjectlessNewTaskButtons();
-    } catch (error) {
-      if (attempt < 60) {
-        setTimeout(() => void loadCodexProjectlessMainWindowSetting(attempt + 1), 250);
-        return;
-      }
-      sendCodexPlusDiagnostic("projectless_main_window_setting_failed", {
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-    }
-  }
-
-  if (window.__CODEX_PLUS_TEST_PROJECTLESS__) {
-    window.__codexPlusProjectlessTest = {
-      triggerKind: codexProjectlessMainWindowTriggerKind,
-      setEnabled: (enabled) => {
-        codexProjectlessMainWindowState.loaded = true;
-        codexProjectlessMainWindowState.enabled = enabled === true;
-      },
-      setIntent: setCodexProjectlessMainWindowIntent,
-      shouldEnforce: codexProjectlessMainWindowShouldEnforce,
-      requestNeedsOverride: codexProjectlessRequestNeedsOverride,
-      applyRequestOverride: applyCodexProjectlessRequestOverride,
-      appServerRequestNeedsOverride: codexProjectlessAppServerRequestNeedsOverride,
-      applyAppServerRequestOverride: applyCodexProjectlessAppServerRequestOverride,
-      patchAppServerClient: patchAppServerModelRequestClient,
-      contextValid: codexProjectlessContextValid,
-      setDraftContext: (context) => {
-        codexProjectlessMainWindowState.contextRevision = codexProjectlessMainWindowState.revision;
-        codexProjectlessMainWindowState.draftContext = context;
-        codexProjectlessMainWindowState.contextPromise = null;
-      },
-      dispatchMessage: dispatchCodexPlusMessage,
-      state: () => ({ ...codexProjectlessMainWindowState }),
-    };
+    const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
+    const nextType = message?.type || type;
+    const { type: _type, ...nextPayload } = message || {};
+    return dispatcher.__codexServiceTierOriginalDispatchMessage(nextType, nextPayload);
   }
 
   function objectGlobalState(value) {
@@ -6297,6 +5883,7 @@
       settingStorageFromModule: codexSettingStorageFromModule,
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
+      patchAppServerClient: patchAppServerModelRequestClient,
     };
     return;
   }
@@ -6714,85 +6301,16 @@
     return result;
   }
 
-  function codexProjectlessAppServerStartRequest(method, params) {
-    const requestMethod = String(method || "");
-    if (requestMethod === "send-cli-request-for-host"
-        && params?.method === "thread/start"
-        && params.params
-        && typeof params.params === "object") {
-      return {
-        params: params.params,
-        apply: (nextParams) => ({ ...params, params: nextParams }),
-      };
-    }
-    if (requestMethod === "prewarm-thread-start-for-host"
-        && params?.params
-        && typeof params.params === "object") {
-      return {
-        params: params.params,
-        apply: (nextParams) => ({ ...params, params: nextParams }),
-      };
-    }
-    if (requestMethod === "start-conversation"
-        || requestMethod === "start-thread-for-host"
-        || requestMethod === "prewarm-thread-start-for-host"
-        || requestMethod === "thread/start") {
-      return params && typeof params === "object"
-        ? { params, apply: (nextParams) => nextParams }
-        : null;
-    }
-    return null;
-  }
-
-  function codexProjectlessAppServerRequestNeedsOverride(method, params) {
-    if (!codexProjectlessMainWindowShouldEnforce()) return false;
-    const request = codexProjectlessAppServerStartRequest(method, params);
-    if (!request) return false;
-    return request.params.workspaceKind !== "projectless"
-      || typeof request.params.projectlessOutputDirectory !== "string"
-      || !request.params.projectlessOutputDirectory.trim();
-  }
-
-  function applyCodexProjectlessAppServerRequestOverride(method, params, context) {
-    const request = codexProjectlessAppServerStartRequest(method, params);
-    if (!request) return params;
-    return request.apply(patchCodexProjectlessStartParams(request.params, context));
-  }
-
   function patchAppServerModelRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
     if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
     const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
-      let nextParams = params;
-      if (codexProjectlessAppServerRequestNeedsOverride(method, params)) {
-        const revision = codexProjectlessMainWindowState.revision;
-        try {
-          const context = await prepareCodexProjectlessDraftContext(codexProjectlessPromptFromValue(params));
-          if (revision === codexProjectlessMainWindowState.revision
-              && codexProjectlessMainWindowShouldEnforce()) {
-            nextParams = applyCodexProjectlessAppServerRequestOverride(method, params, context);
-            sendCodexPlusDiagnostic("projectless_app_server_start_overridden", {
-              method: String(method || ""),
-              workspaceRootCount: context.workspaceRoots.length,
-              hasOutputDirectory: !!context.projectlessOutputDirectory,
-            });
-          }
-        } catch (error) {
-          sendCodexPlusDiagnostic("projectless_app_server_start_override_failed", {
-            method: String(method || ""),
-            errorName: error?.name || "",
-            errorMessage: error?.message || String(error),
-          });
-          showToast("无项目会话准备失败，请重试", null);
-          throw error;
-        }
-      }
-      const result = await originalSendRequest(method, nextParams, options);
+      const result = await originalSendRequest(method, params, options);
       if (!codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), nextParams), result);
+      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), params), result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
@@ -6913,15 +6431,6 @@
       }
     };
     tick();
-  }
-
-  function patchCodexModelWhitelist() {
-    ensureCodexModelWhitelistInstalls();
-    if (!codexPlusModelNames().length) {
-      loadCodexModelCatalog();
-      return;
-    }
-    runCodexModelWhitelistRefreshPass();
   }
 
   function refreshCodexModelWhitelistFromScan(mutations) {
@@ -7892,25 +7401,6 @@
     return sidebarProjectRows().filter((row) => visibleElement(row));
   }
 
-  function currentProjectRepoPathFromStartButton() {
-    const startButtons = [...document.querySelectorAll('button[aria-label^="Start new chat in "]')]
-      .filter((button) => visibleElement(button));
-    const bottomHalf = window.innerHeight * 0.5;
-    startButtons.sort((left, right) => {
-      const leftRect = left.getBoundingClientRect();
-      const rightRect = right.getBoundingClientRect();
-      const leftScore = Math.abs(leftRect.y - bottomHalf) + Math.max(0, bottomHalf - leftRect.y) * 0.5;
-      const rightScore = Math.abs(rightRect.y - bottomHalf) + Math.max(0, bottomHalf - rightRect.y) * 0.5;
-      return leftScore - rightScore;
-    });
-    for (const button of startButtons) {
-      const row = button.closest('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]');
-      const path = projectRowPath(row);
-      if (path?.startsWith?.("/")) return path;
-    }
-    return "";
-  }
-
   function currentProjectContextFromStartButton() {
     const startButtons = [...document.querySelectorAll('button[aria-label^="Start new chat in "]')]
       .filter((button) => visibleElement(button));
@@ -7963,10 +7453,6 @@
     return context.projectId ? { ...remoteProjectContextFromGlobalState(context.projectId), label: context.label } : context;
   }
 
-  function repoPathFromProjectLabel(label) {
-    return projectContextFromProjectLabel(label)?.repoPath || "";
-  }
-
   function contextMatchesProjectLabel(context, label) {
     const expected = normalizeProjectLabel(label);
     if (!expected) return true;
@@ -7997,21 +7483,11 @@
       || currentProjectContext();
   }
 
-  function currentProjectRepoPathForBranchMenu(menu, trigger = branchMenuTriggerFromMenu(menu)) {
-    return currentProjectContextForBranchMenu(menu, trigger)?.repoPath || "";
-  }
-
   function currentProjectRepoPathFromExpandedRows() {
     const expandedRows = visibleProjectRows().filter((row) => row.getAttribute("data-app-action-sidebar-project-collapsed") === "false");
     const pathRows = expandedRows.filter((row) => projectRowPath(row).startsWith("/"));
     if (pathRows.length === 1) return projectRowPath(pathRows[0]);
     return "";
-  }
-
-  function currentProjectRepoPath() {
-    return currentProjectRepoPathFromSelectedProjectButton()
-      || currentProjectRepoPathFromStartButton()
-      || currentProjectRepoPathFromExpandedRows();
   }
 
   function currentProjectContext() {
@@ -8498,64 +7974,6 @@
       && (left.baseBranch || "main") === (right.baseBranch || "main");
   }
 
-  function pendingWorktreeRequestMatchesSelection(request, selection) {
-    if (!selection || !request || request.launchMode !== "start-conversation") return false;
-    const sourceRoot = request.sourceWorkspaceRoot || "";
-    if (selection.repoPath && sourceRoot) return sameWorkspacePath(sourceRoot, selection.repoPath);
-    if (selection.projectId) return true;
-    return !selection.repoPath || sameWorkspacePath(sourceRoot, selection.repoPath);
-  }
-
-  function applyUpstreamPendingWorktreeOverride(payload) {
-    const selection = readUpstreamBranchSelection();
-    const request = payload?.request;
-    const sourceRef = upstreamQualifiedSourceRef(selection);
-    if (!codexPlusSettings().upstreamWorktreeCreate || !sourceRef) return payload;
-    if (!pendingWorktreeRequestMatchesSelection(request, selection)) return payload;
-    if (request?.startingState?.type !== "branch") return payload;
-    if (request.startingState.branchName === sourceRef) return payload;
-    const nextRequest = {
-      ...request,
-      startingState: { ...request.startingState, branchName: sourceRef },
-    };
-    prepareUpstreamBranchSelection(selection);
-    sendCodexPlusDiagnostic("upstream_pending_worktree_override_applied", {
-      label: selection.label || "",
-      sourceRef,
-      sourceWorkspaceRoot: request.sourceWorkspaceRoot || "",
-    });
-    return { ...(payload || {}), request: nextRequest };
-  }
-
-  function installUpstreamPendingWorktreeDispatcherPatch() {
-    const patchVersion = "1";
-    if (window.__codexUpstreamPendingWorktreeDispatcherPatch === patchVersion) return;
-    const patch = async () => {
-      try {
-        const module = await loadCodexAppModule("setting-storage-");
-        const dispatcherClass = typeof module.v === "function" && String(module.v).includes("dispatchMessage") ? module.v : null;
-        const dispatcher = dispatcherClass?.getInstance?.();
-        if (!dispatcher || typeof dispatcher.dispatchMessage !== "function") throw new Error("Codex dispatcher unavailable");
-        if (!dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage) {
-          dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
-          dispatcher.dispatchMessage = (type, payload) => {
-            const nextPayload = type === "pending-worktree-create"
-              ? applyUpstreamPendingWorktreeOverride(payload)
-              : payload;
-            return dispatcher.__codexUpstreamWorktreeOriginalDispatchMessage(type, nextPayload);
-          };
-        }
-        window.__codexUpstreamPendingWorktreeDispatcherPatch = patchVersion;
-      } catch (error) {
-        sendCodexPlusDiagnostic("upstream_pending_worktree_patch_failed", {
-          errorName: error?.name || "",
-          errorMessage: error?.message || String(error),
-        });
-      }
-    };
-    void patch();
-  }
-
   function upstreamWorktreeNativePayloadFromElement(element) {
     const trigger = element?.closest?.("[data-codex-worktree-create], [data-worktree-create]") || element;
     const scopes = [
@@ -8628,7 +8046,6 @@
 
   function installUpstreamWorktreeNativeAdapter() {
     const adapterVersion = "2";
-    installUpstreamPendingWorktreeDispatcherPatch();
     if (window.__codexUpstreamWorktreeNativeAdapterInstalled === adapterVersion) return;
     window.__codexUpstreamWorktreeNativeAdapterInstalled = adapterVersion;
     document.addEventListener("click", (event) => {
@@ -9335,18 +8752,6 @@
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation?.();
-  }
-
-  function isArchiveTitleText(value) {
-    return value === "已归档对话" || value === "Archived conversations";
-  }
-
-  function archiveTitleContainer() {
-    const heading = Array.from(document.querySelectorAll("h1, h2, h3"))
-      .find((element) => isArchiveTitleText((element.textContent || "").trim()));
-    if (heading) return heading;
-    return Array.from(document.querySelectorAll("h1, h2, h3, div, span"))
-      .find((element) => isArchiveTitleText((element.textContent || "").trim()) && element.getBoundingClientRect().x > 350);
   }
 
   function attachArchivedPageDeleteButton(row) {
@@ -10559,7 +9964,6 @@
   function scanLightweight() {
     installStyle();
     installCodexServiceTierDispatcherPatch();
-    installCodexProjectlessNewTaskButtons();
     installCodexPlusMenu();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
@@ -10659,10 +10063,6 @@
     if (remoteWorkspaceRoot) payload.remoteWorkspaceRoot = remoteWorkspaceRoot;
     if (remoteProjectId) payload.remoteProjectId = remoteProjectId;
     return payload;
-  }
-
-  function zedRemoteCurrentThreadId() {
-    return zedRemoteCurrentFallbackPayload().threadId || "";
   }
 
   async function resolveZedRemoteFallbackRequest() {
@@ -10989,31 +10389,6 @@
     }
   }
 
-  async function openBestZedRemoteTarget() {
-    const request = zedRemoteBestOpenRequest(document) || await resolveZedRemoteFallbackRequest();
-    if (!request) {
-      showZedRemoteToast("Cannot find a remote workspace or file for Zed");
-      return;
-    }
-    openZedRemote(request);
-  }
-
-  function attachZedRemoteButton(candidate) {
-    const anchor = candidate.node;
-    if (anchor.dataset.codexZedRemoteVersion === zedRemoteOpenVersion) return;
-    anchor.dataset.codexZedRemoteVersion = zedRemoteOpenVersion;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = zedRemoteButtonClass;
-    button.textContent = "Open in Zed Remote";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openZedRemote(candidate.request);
-    }, true);
-    anchor.insertAdjacentElement("afterend", button);
-  }
-
   function removeZedRemoteButtons() {
     document.querySelectorAll(`[data-codex-zed-remote-version]`).forEach((node) => {
       delete node.dataset.codexZedRemoteVersion;
@@ -11291,8 +10666,6 @@
   }
 
   void loadBackendSettingsForStartup();
-  installCodexProjectlessMainWindowProtection();
-  if (!window.__CODEX_PLUS_TEST_PROJECTLESS__) void loadCodexProjectlessMainWindowSetting();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
