@@ -68,6 +68,24 @@ fn injection_script_prefixes_helper_url_and_metadata() {
 }
 
 #[test]
+fn injection_script_omits_sponsorship_and_recommendation_ui() {
+    let script = assets::injection_script(57321);
+
+    for forbidden in [
+        "data-codex-plus-tab=\"sponsor\"",
+        "data-codex-plus-panel=\"sponsor\"",
+        "fetchCodexPlusAds",
+        "BigPizzaV3/Ad-List",
+        "请作者喝杯咖啡",
+    ] {
+        assert!(
+            !script.contains(forbidden),
+            "injection script still contains {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn injection_script_recovers_generated_images_through_the_bridge() {
     let script = assets::injection_script(57321);
 
@@ -964,19 +982,6 @@ fn injection_script_marks_diagnostic_build_and_reports_script_loaded() {
     assert!(script.contains(codex_plus_core::assets::DIAGNOSTIC_BUILD_ID));
     assert!(script.contains("script_loaded"));
     assert!(script.contains("data-codex-plus-build"));
-}
-
-#[test]
-fn injection_script_fetches_ads_without_bridge() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("directFetchCodexPlusAds"));
-    assert!(script.contains("cacheBustCodexPlusAdUrl"));
-    assert!(script.contains("Date.now()"));
-    assert!(script.contains("BigPizzaV3/Ad-List"));
-    assert!(
-        !script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));")
-    );
 }
 
 #[test]

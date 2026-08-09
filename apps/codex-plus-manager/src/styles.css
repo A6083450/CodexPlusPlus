@@ -463,76 +463,6 @@ body {
   letter-spacing: 0;
 }
 
-.jojocode-overview {
-  border-color: hsl(var(--border));
-  background: hsl(var(--card));
-}
-
-.light .jojocode-overview {
-  background: hsl(var(--card));
-}
-
-.jojocode-overview-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
-  align-items: center;
-}
-
-.jojocode-overview-main {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
-}
-
-.jojocode-overview-mark {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  border: 1px solid hsl(var(--brand-accent) / 0.38);
-  border-radius: 8px;
-  background: hsl(var(--brand-accent) / 0.16);
-  color: hsl(var(--brand-accent));
-}
-
-.jojocode-overview h2 {
-  margin: 2px 0 4px;
-  font-size: 20px;
-  line-height: 1.25;
-}
-
-.jojocode-overview p {
-  margin: 0;
-  color: hsl(var(--muted-foreground));
-  line-height: 1.5;
-}
-
-.jojocode-overview-side {
-  display: grid;
-  justify-items: end;
-  gap: 10px;
-}
-
-.jojocode-model-tags {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  max-width: 390px;
-}
-
-.jojocode-model-tags span {
-  border: 1px solid hsl(var(--brand-accent) / 0.28);
-  border-radius: 999px;
-  background: hsl(var(--background) / 0.5);
-  color: hsl(var(--foreground));
-  font-size: 12px;
-  line-height: 1;
-  padding: 6px 8px;
-}
-
 .fill {
   min-height: calc(100vh - 188px);
 }
@@ -2676,116 +2606,6 @@ body {
   color: hsl(var(--primary));
 }
 
-.recommend-hero {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.recommend-hero strong,
-.recommend-hero span {
-  display: block;
-}
-
-.recommend-hero span {
-  margin-top: 3px;
-  color: hsl(var(--muted-foreground));
-  line-height: 1.45;
-}
-
-.ad-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.ad-card {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
-  gap: 10px;
-  align-content: space-between;
-  min-height: 280px;
-  width: 100%;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--background));
-  color: hsl(var(--foreground));
-  cursor: pointer;
-  font: inherit;
-  padding: 12px;
-  text-decoration: none;
-  text-align: left;
-  transition:
-    border-color 140ms ease,
-    background-color 140ms ease,
-    box-shadow 140ms ease,
-    transform 140ms ease;
-}
-
-.ad-card:hover {
-  border-color: hsl(var(--ring));
-  background: hsl(var(--accent));
-  box-shadow: 0 12px 26px hsl(var(--foreground) / 0.08);
-  transform: translateY(-1px);
-}
-
-.ad-image {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 5;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: #080808;
-  object-fit: cover;
-}
-
-.ad-card strong {
-  display: block;
-  margin-bottom: 5px;
-  font-size: 15px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ad-card p {
-  display: -webkit-box;
-  margin: 0;
-  overflow: hidden;
-  color: hsl(var(--muted-foreground));
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-height: 1.5;
-}
-
-.ad-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  max-height: 54px;
-  overflow: hidden;
-}
-
-.ad-tags span {
-  border: 1px solid hsl(var(--border));
-  border-radius: 999px;
-  background: hsl(var(--muted));
-  color: hsl(var(--foreground));
-  font-size: 12px;
-  line-height: 1;
-  padding: 5px 8px;
-}
-
-.ad-link {
-  display: inline-flex;
-  align-items: center;
-  align-self: end;
-  gap: 6px;
-  color: hsl(var(--foreground));
-  font-weight: 700;
-}
-
 .toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -4132,8 +3952,7 @@ select {
   padding: 18px;
 }
 
-.hero-layout h2,
-.jojocode-overview h2 {
+.hero-layout h2 {
   font-size: 19px;
   font-weight: 600;
 }
@@ -4144,20 +3963,10 @@ select {
   font-weight: 600;
 }
 
-.jojocode-overview,
 .hero-panel {
   background: hsl(var(--card));
 }
 
-.jojocode-overview-mark {
-  border-color: hsl(var(--brand-accent) / 0.28);
-  border-radius: 8px;
-  background: hsl(var(--brand-accent) / 0.1);
-  color: hsl(var(--brand-accent));
-}
-
-.jojocode-model-tags span,
-.ad-tags span,
 .script-market-tag {
   border-color: hsl(var(--border));
   background: hsl(var(--foreground) / 0.045);
@@ -4220,7 +4029,6 @@ select {
 .mobile-server-card,
 .session-row,
 .script-market-card,
-.ad-card,
 .health-item,
 .feature-item,
 .feature-toggle,
@@ -4250,7 +4058,6 @@ select {
 .relay-profile-card:focus-visible,
 .session-row:hover,
 .script-market-card:hover,
-.ad-card:hover,
 .mobile-server-card:hover,
 .health-item:hover,
 .feature-item:hover,
@@ -4463,14 +4270,8 @@ select {
   color: hsl(var(--brand-accent));
 }
 
-.ad-card,
 .script-market-card {
   padding: 14px;
-}
-
-.ad-image {
-  border-color: hsl(var(--border));
-  border-radius: 8px;
 }
 
 .log-lines {
@@ -4590,19 +4391,8 @@ select {
     margin-inline: 16px;
   }
 
-  .jojocode-overview-layout,
-  .jojocode-overview-main,
-  .ad-grid,
   .mobile-server-grid {
     grid-template-columns: 1fr;
-  }
-
-  .jojocode-overview-side {
-    justify-items: start;
-  }
-
-  .jojocode-model-tags {
-    justify-content: flex-start;
   }
 
   .script-market-toolbar {
