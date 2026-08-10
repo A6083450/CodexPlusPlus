@@ -97,7 +97,7 @@
     if (!config) return;
     const enabled = config.enabled === true;
     const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
-    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
+    const installationKey = `4:${enabled ? "on" : "off"}:${locale}`;
     if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
     window.__codexPlusForceChineseLocaleInstalled = installationKey;
     const languages = [locale, "zh", "en-US", "en"];
@@ -174,7 +174,7 @@
         requestId,
         method: "POST",
         url: `vscode://codex/${method}`,
-        body: JSON.stringify({ params }),
+        body: JSON.stringify(params),
       };
       Promise.resolve(bridge.sendMessageFromView(message)).catch((error) => {
         cleanup();
@@ -209,7 +209,7 @@
 
       if (enabled) {
         if (currentValue === locale) {
-          clearLocaleReloadMarker();
+          reloadAfterLocaleChange(locale);
           return;
         }
         if (!managed) {
@@ -306,9 +306,35 @@
       }
     };
 
+    const statsigInstancesProxies = new WeakMap();
+    const patchStatsigInstances = (instances) => {
+      if (!instances || typeof instances !== "object") return instances;
+      const existing = statsigInstancesProxies.get(instances);
+      if (existing) return existing;
+      Object.values(instances).forEach(patchStatsigClient);
+      const proxy = new Proxy(instances, {
+        set(target, key, value, receiver) {
+          const updated = Reflect.set(target, key, value, receiver);
+          if (updated) patchStatsigClient(value);
+          return updated;
+        },
+        defineProperty(target, key, descriptor) {
+          const updated = Reflect.defineProperty(target, key, descriptor);
+          if (updated && Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+            patchStatsigClient(descriptor.value);
+          }
+          return updated;
+        },
+      });
+      statsigInstancesProxies.set(instances, proxy);
+      statsigInstancesProxies.set(proxy, proxy);
+      return proxy;
+    };
+
     const patchStatsigRoot = (root) => {
-      if (!root || typeof root !== "object" || root.__codexPlusForceChineseLocaleRootPatched) return;
-      root.__codexPlusForceChineseLocaleRootPatched = true;
+      const rootPatchVersion = "3";
+      if (!root || typeof root !== "object" || root.__codexPlusForceChineseLocaleRootPatched === rootPatchVersion) return;
+      root.__codexPlusForceChineseLocaleRootPatched = rootPatchVersion;
       ["firstInstance", "instance"].forEach((key) => {
         let current;
         try {
@@ -329,6 +355,26 @@
         } catch {
         }
       });
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(root, "instances");
+        if (!descriptor || (Object.prototype.hasOwnProperty.call(descriptor, "value") && descriptor.configurable !== false)) {
+          const initialInstances = root.instances && typeof root.instances === "object"
+            ? root.instances
+            : {};
+          let currentInstances = patchStatsigInstances(initialInstances);
+          Object.defineProperty(root, "instances", {
+            configurable: true,
+            enumerable: descriptor?.enumerable ?? true,
+            get: () => currentInstances,
+            set: (next) => {
+              currentInstances = patchStatsigInstances(next);
+            },
+          });
+        } else {
+          Object.values(root.instances || {}).forEach(patchStatsigClient);
+        }
+      } catch {
+      }
     };
 
     const installStatsigRootSetter = () => {
@@ -350,6 +396,77 @@
       }
     };
 
+    let reactI18nCachePatched = false;
+    const patchReactI18nConfigCache = () => {
+      if (reactI18nCachePatched) return false;
+      const rootElement = document.getElementById("root");
+      if (!rootElement) return false;
+      const reactContainerKey = Object.keys(rootElement)
+        .find((key) => key.startsWith("__reactContainer$"));
+      const rootFiber = reactContainerKey ? rootElement[reactContainerKey] : null;
+      if (!rootFiber) return false;
+
+      let patched = false;
+      const fibers = [rootFiber];
+      while (fibers.length) {
+        const fiber = fibers.pop();
+        for (const candidate of [fiber, fiber?.alternate]) {
+          const rows = candidate?.updateQueue?.memoCache?.data;
+          if (!Array.isArray(rows)) continue;
+          for (const row of rows) {
+            if (!Array.isArray(row)) continue;
+            for (let index = 0; index < row.length; index += 1) {
+              const dynamicConfig = row[index];
+              if (
+                !dynamicConfig
+                || typeof dynamicConfig !== "object"
+                || dynamicConfig.name !== "72216192"
+                || typeof dynamicConfig.get !== "function"
+              ) {
+                continue;
+              }
+              patchI18nConfig(dynamicConfig);
+              if (typeof row[index + 1] === "boolean" && row[index + 1] !== true) {
+                row[index + 1] = true;
+                patched = true;
+              }
+            }
+          }
+        }
+        if (fiber?.sibling) fibers.push(fiber.sibling);
+        if (fiber?.child) fibers.push(fiber.child);
+      }
+
+      if (patched) {
+        reactI18nCachePatched = true;
+        window.__codexPlusForceChineseLocaleReactCachePatched = true;
+      }
+      return patched;
+    };
+
+    const notifyStatsigValuesUpdated = () => {
+      statsigClients().forEach((client) => {
+        const listeners = client?._listeners?.values_updated;
+        const callbacks = Array.isArray(listeners)
+          ? [...listeners]
+          : listeners instanceof Set
+            ? [...listeners]
+            : [];
+        let values = null;
+        try {
+          values = client.getContext?.().values ?? null;
+        } catch {
+        }
+        const event = { status: "Ready", values };
+        callbacks.forEach((callback) => {
+          try {
+            callback(event);
+          } catch {
+          }
+        });
+      });
+    };
+
     const patchStatsigI18nConfig = () => {
       installStatsigRootSetter();
       const root = window.__STATSIG__ || globalThis.__STATSIG__;
@@ -358,6 +475,7 @@
         if (typeof client.getDynamicConfig !== "function") return;
         patchStatsigClient(client);
       });
+      if (patchReactI18nConfigCache()) notifyStatsigValuesUpdated();
     };
 
     patchStatsigI18nConfig();
