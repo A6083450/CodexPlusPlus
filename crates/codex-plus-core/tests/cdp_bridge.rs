@@ -58,6 +58,8 @@ fn screenshot_command_uses_png_from_surface() {
 fn injection_script_prefixes_helper_url_and_metadata() {
     let script = assets::injection_script(57321);
 
+    assert!(script.contains("!window.electronBridge"));
+    assert!(script.contains(r#"!/^app:\/\/\-\//i.test(window.location.href)"#));
     assert!(script.contains("window.__CODEX_SESSION_DELETE_HELPER__"));
     assert!(script.contains("http://127.0.0.1:57321"));
     assert!(!script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
@@ -1135,12 +1137,12 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
 }
 
 #[test]
-fn injection_script_disables_plugin_auto_expand_in_relay_mode() {
+fn injection_script_omits_plugin_auto_expand() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("settings.pluginAutoExpand = false"));
-    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
-    assert!(script.contains("if (!codexPlusSettings().pluginAutoExpand) return"));
+    assert!(!script.contains("pluginAutoExpand"));
+    assert!(!script.contains("codexPluginAutoExpand"));
+    assert!(!script.contains("plugin_auto_expand"));
 }
 
 #[test]
@@ -1225,7 +1227,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"14\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -1237,9 +1239,10 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"14\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
+    assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
     assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
     assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
     assert!(!script.contains("if (!source.includes(\"name\")) return false"));
@@ -1249,7 +1252,7 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"14\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
@@ -1277,6 +1280,8 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("if (!nextKinds.includes(\"local\")) nextKinds.push(\"local\")"));
     assert!(script.contains("if (!nextKinds.includes(\"vertical\")) nextKinds.push(\"vertical\")"));
     assert!(script.contains("next.marketplaceKinds = Array.from(new Set(nextKinds))"));
+    assert!(script.contains("codexPluginBroadCatalogKindsFromVersion = \"26.803.0\""));
+    assert!(script.contains("broadCatalogPreserved: true"));
     assert!(script.contains("patchPluginMarketplaceResult"));
     assert!(script.contains("__CODEX_PLUS_PLUGIN_MARKETPLACES__"));
     assert!(script.contains("mergeLocalPluginMarketplaces(result)"));
@@ -1340,6 +1345,11 @@ fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
     let cases = run_plugin_marketplace_search_contract_harness();
 
     assert_eq!(cases["initialKinds"], json!(["local", "vertical"]));
+    assert_eq!(cases["latestBroadOmittedHasKinds"], false);
+    assert_eq!(cases["latestBroadOmittedKinds"], serde_json::Value::Null);
+    assert_eq!(cases["latestBroadNullHasKinds"], true);
+    assert_eq!(cases["latestBroadNullKinds"], serde_json::Value::Null);
+    assert_eq!(cases["latestExplicitKinds"], json!(["local", "vertical"]));
     assert_eq!(cases["searchKinds"], json!(["created-by-me-remote"]));
     assert_eq!(cases["searchCwds"], serde_json::Value::Null);
     assert_eq!(cases["searchRemoteOnly"], true);
@@ -1354,6 +1364,10 @@ fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
     assert_eq!(cases["subsequentCwds"], serde_json::Value::Null);
     assert_eq!(
         cases["generalAfterFallbackKinds"],
+        json!(["local", "vertical"])
+    );
+    assert_eq!(
+        cases["latestBroadAfterFallbackKinds"],
         json!(["local", "vertical"])
     );
     assert_eq!(cases["generalAfterFallbackCwds"], json!(["C:/workspace"]));
@@ -1417,6 +1431,11 @@ window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
 const api = window.__codexPlusPluginMarketplaceTest;
 api.reset();
 const initial = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
+api.setCodexAppVersion("26.803.41515");
+const latestBroadOmitted = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
+const latestBroadNull = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"], marketplaceKinds: null }});
+const latestExplicit = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["local"] }});
+api.setCodexAppVersion("");
 const searchMessage = api.patchRequestMessage({{
   type: "mcp-request",
   request: {{
@@ -1433,6 +1452,8 @@ const response = {{
 const responsePatched = api.patchResponseData(response);
 const subsequent = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote"] }});
 const generalAfterFallback = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote", "local", "vertical"] }});
+api.setCodexAppVersion("26.803.41515");
+const latestBroadAfterFallback = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
 const fallbackMarketplaces = response.message.result?.marketplaces || [];
 const localFallbackMarketplaces = api.localFallback().marketplaces || [];
 const remoteUnavailable = api.remoteCatalogUnavailable();
@@ -1440,6 +1461,11 @@ api.reset();
 const chatGpt = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote"] }});
 const cases = {{
   initialKinds: initial.marketplaceKinds,
+  latestBroadOmittedHasKinds: Object.prototype.hasOwnProperty.call(latestBroadOmitted, "marketplaceKinds"),
+  latestBroadOmittedKinds: latestBroadOmitted.marketplaceKinds ?? null,
+  latestBroadNullHasKinds: Object.prototype.hasOwnProperty.call(latestBroadNull, "marketplaceKinds"),
+  latestBroadNullKinds: latestBroadNull.marketplaceKinds,
+  latestExplicitKinds: latestExplicit.marketplaceKinds,
   searchKinds: searchMessage.request.params.marketplaceKinds,
   searchCwds: searchMessage.request.params.cwds ?? null,
   searchRemoteOnly: api.requestProfile({{ marketplaceKinds: ["created-by-me-remote"] }}).remoteOnly,
@@ -1454,6 +1480,7 @@ const cases = {{
   subsequentCwds: subsequent.cwds ?? null,
   generalAfterFallbackKinds: generalAfterFallback.marketplaceKinds,
   generalAfterFallbackCwds: generalAfterFallback.cwds,
+  latestBroadAfterFallbackKinds: latestBroadAfterFallback.marketplaceKinds,
   localFallbackMarketplaceNames: localFallbackMarketplaces.map((marketplace) => marketplace.name),
   localFallbackPluginNames: localFallbackMarketplaces.flatMap((marketplace) => marketplace.plugins || []).map((plugin) => plugin.name),
   chatGptKinds: chatGpt.marketplaceKinds,
@@ -1564,6 +1591,56 @@ fn injection_script_keeps_session_action_buttons_in_pr_style() {
     assert!(script.contains("background: transparent;"));
     assert!(script.contains("background: #363839;"));
     assert!(script.contains("cursor: default;"));
+}
+
+#[test]
+fn injection_script_activates_session_delete_once_per_click() {
+    let script = assets::injection_script(57321);
+    let delegated_delete = script
+        .split_once("function installDeleteButtonEventDelegation()")
+        .expect("delete event delegation should exist")
+        .1
+        .split_once("function actionGroupFromRow")
+        .expect("delete event delegation should end before action group helpers")
+        .0;
+    let action_button_events = script
+        .split_once("function installActionButtonEvents")
+        .expect("action button event setup should exist")
+        .1
+        .split_once("function installMoreButtonEvents")
+        .expect("action button setup should end before more button setup")
+        .0;
+
+    assert!(delegated_delete.contains("document.addEventListener(\"click\", handler, true);"));
+    assert!(!delegated_delete.contains("document.addEventListener(\"pointerup\", handler, true);"));
+    assert!(
+        !action_button_events.contains("button.addEventListener(\"pointerup\", onActivate, true);")
+    );
+    assert!(action_button_events.contains("button.addEventListener(\"click\", (event) => {"));
+}
+
+#[test]
+fn injection_script_refreshes_sidebar_after_session_undo() {
+    let script = assets::injection_script(57321);
+    let refresh = script
+        .split_once("async function refreshRecentConversationsForHost()")
+        .expect("recent conversation refresh helper should exist")
+        .1
+        .split_once("function refreshAfterProjectMove")
+        .expect("refresh helper should end before project move refresh")
+        .0;
+    let toast = script
+        .split_once("function showToast(message, undoToken)")
+        .expect("undo toast should exist")
+        .1
+        .split_once("function upstreamWorktreeField")
+        .expect("undo toast should end before worktree helpers")
+        .0;
+
+    assert!(refresh.contains("loadOptionalCodexAppModule(\"app-server-manager-signals-\")"));
+    assert!(!refresh.contains("app-server-manager-signals-C1h8B-R-.js"));
+    assert!(toast.contains("const refreshed = await refreshRecentConversationsForHost();"));
+    assert!(toast.contains("if (!refreshed) window.location.reload();"));
 }
 
 #[test]
@@ -1713,7 +1790,12 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("codexServiceTierBadgeWired"));
     assert!(script.contains("setAttribute(\"role\", \"button\")"));
     assert!(script.contains("setAttribute(\"tabindex\", \"0\")"));
+    assert!(script.contains("继承 Codex 默认设置"));
     assert!(script.contains("继承 config.toml"));
+    assert!(script.contains("serviceTierInheritSourceLabel"));
+    assert!(script.contains("resolveInheritedServiceTier"));
+    assert!(script.contains("getConfigTomlServiceTier"));
+    assert!(script.contains("catalog.service_tier"));
     assert!(script.contains("service_tier=\\\"priority\\\""));
     assert!(script.contains("Fast 仅支持"));
     assert!(script.contains("当前 thread"));
@@ -1922,6 +2004,19 @@ fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash(
 }
 
 #[test]
+fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("loadOptionalCodexAppModule(\"app-server-manager-signals-\")"));
+    assert!(script.contains("Object.values(signals || {}).find"));
+    assert!(script.contains("refresh-recent-conversations-for-host"));
+    assert!(script.contains("const refreshed = await refreshRecentConversationsForHost()"));
+    assert!(script.contains("if (!refreshed) window.location.reload()"));
+    assert!(!script.contains("app-server-manager-signals-C1h8B-R-.js"));
+    assert!(!script.contains("typeof signals.rn"));
+}
+
+#[test]
 fn injection_script_clears_project_state_when_moving_to_projectless() {
     let script = assets::injection_script(57321);
 
@@ -1961,6 +2056,38 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     assert_eq!(
         cases["customInheritUnsupported"]["service_tier"],
+        serde_json::Value::Null
+    );
+
+    assert_eq!(cases["inheritUnsetStatus"], "继承 Codex 默认设置：默认");
+    assert_eq!(cases["inheritFastStatus"], "继承 Codex 默认设置：fast");
+    assert_eq!(
+        cases["inheritStandardStatus"],
+        "继承 Codex 默认设置：standard"
+    );
+    assert_eq!(
+        cases["inheritConfigTomlFastStatus"],
+        "继承 config.toml：fast"
+    );
+    assert_eq!(cases["resolvedConfigTomlTier"]["configServiceTier"], "fast");
+    assert_eq!(
+        cases["resolvedConfigTomlTier"]["serviceTierSource"],
+        "config-toml"
+    );
+    assert_eq!(
+        cases["resolvedUnsetTier"]["configServiceTier"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        cases["resolvedUnsetTier"]["serviceTierSource"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        cases["inheritedConfigFastBlocked"]["serviceTier"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        cases["inheritedConfigFastBlocked"]["service_tier"],
         serde_json::Value::Null
     );
 
@@ -2137,7 +2264,38 @@ const unrelatedFastIconPatched = typeof api.patchNativeFastIcon === "function"
   ? api.patchNativeFastIcon(svgNode("M0 0 unrelated-icon"))
   : false;
 api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
+api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
+
+const inheritUnsetStatus = api.statusSummary({{
+  controlMode: "inherit",
+  threadMode: "inherit",
+  defaultMode: "inherit",
+  effectiveMode: "standard",
+  effectiveServiceTier: null,
+}});
+const inheritFastStatus = api.statusSummary({{
+  controlMode: "inherit",
+  threadMode: "inherit",
+  defaultMode: "inherit",
+  effectiveMode: "fast",
+  effectiveServiceTier: "priority",
+}});
+const inheritStandardStatus = api.statusSummary({{
+  controlMode: "inherit",
+  threadMode: "inherit",
+  defaultMode: "inherit",
+  effectiveMode: "standard",
+  effectiveServiceTier: "standard",
+}});
+const inheritConfigTomlFastStatus = api.statusSummary({{
+  controlMode: "inherit",
+  threadMode: "inherit",
+  defaultMode: "inherit",
+  effectiveMode: "fast",
+  effectiveServiceTier: "fast",
+  serviceTierSource: "config-toml",
+}});
 
 api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 const supportedFast = api.applyServiceTierOverride("turn/start", {{
@@ -2361,7 +2519,19 @@ const appServerClient = {{
 }};
 api.patchAppServerClient(appServerClient);
 
-appServerClient.sendRequest("start-conversation", nativeAppServerParams, {{ signal: "native" }}).then(() => {{
+appServerClient.sendRequest("start-conversation", nativeAppServerParams, {{ signal: "native" }}).then(async () => {{
+api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
+const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
+api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
+const resolvedUnsetTier = await api.resolveInheritedServiceTier();
+api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
+api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
+api.setServiceTierState({{ status: "ok", serviceTier: null, configServiceTier: "fast", serviceTierSource: "config-toml" }});
+const inheritedConfigFastBlocked = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  model: "gpt-4.1",
+  service_tier: null,
+}}, "");
 const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerParams
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
@@ -2372,6 +2542,13 @@ process.stdout.write(JSON.stringify({{
   turnWithoutModel,
   turnWithoutModelDiagnosticModel,
   customInheritUnsupported,
+  inheritUnsetStatus,
+  inheritFastStatus,
+  inheritStandardStatus,
+  inheritConfigTomlFastStatus,
+  resolvedConfigTomlTier,
+  resolvedUnsetTier,
+  inheritedConfigFastBlocked,
   startConversation,
   fetchStartConversation,
   fetchSendCliRequest,
@@ -2502,10 +2679,16 @@ fn injection_script_installs_upstream_branch_dropdown_adapter() {
     assert!(script.contains("cleanupInvalidUpstreamBranchOptions"));
     assert!(script.contains("branchMenuInNewWorktreeMode"));
     assert!(script.contains("branchMenuTriggerIsBranchControl"));
-    assert!(script.contains("actual-upstream-refs-v16"));
+    assert!(script.contains("actual-upstream-refs-v17"));
     assert!(script.contains("create and checkout new branch"));
     assert!(script.contains("if (/^start in"));
     assert!(script.contains("if (!branchMenuInNewWorktreeMode(trigger))"));
+    assert!(script.contains("window.__codexUpstreamBranchDropdownObserver?.disconnect?.()"));
+    assert!(script.contains("record.addedNodes"));
+    assert!(script.contains("addedNodeContainsBranchMenu"));
+    assert!(!script.contains("new MutationObserver(schedule).observe"));
+    assert!(script.contains(r#".composer-footer button, .composer-footer [role="button"]"#));
+    assert!(!script.contains("return [...document.querySelectorAll('button')]"));
 }
 
 #[test]
@@ -2528,7 +2711,7 @@ fn injection_script_rebuilds_upstream_options_for_each_project_branch_menu() {
     assert!(script.contains("projectContextFromProjectLabel"));
     assert!(script.contains("upstreamBranchOptionsMatchRefs"));
     assert!(script.contains("upstreamBranchDefaultsCache = new Map()"));
-    assert!(script.contains("actual-upstream-refs-v16"));
+    assert!(script.contains("actual-upstream-refs-v17"));
 }
 
 #[test]
@@ -2548,16 +2731,15 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
 }
 
 #[test]
-fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
+fn manager_ui_omits_plugin_auto_expand() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-plus-core");
     let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
 
-    assert!(source.contains(
-        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode}"
-    ));
+    assert!(!source.contains("codexAppPluginAutoExpand"));
+    assert!(!source.contains("插件列表全量展示"));
 }
 
 #[test]
@@ -2728,6 +2910,51 @@ fn pick_injectable_codex_page_target_rejects_non_codex_pages() {
 
     let error = pick_injectable_codex_page_target(&targets)
         .expect_err("non-Codex page must not be selected for injection");
+
+    assert!(
+        error
+            .to_string()
+            .contains("No injectable Codex page target found")
+    );
+}
+
+#[test]
+fn pick_injectable_codex_page_target_ignores_embedded_browser_page_named_codex() {
+    let targets = vec![
+        target(
+            "browser-pr",
+            "page",
+            "Fix Codex++ menu anchoring · Pull Request",
+            "https://github.com/BigPizzaV3/CodexPlusPlus/pull/1743",
+            Some("ws://browser-pr"),
+        ),
+        target(
+            "main",
+            "page",
+            "Codex",
+            "app://-/index.html",
+            Some("ws://main"),
+        ),
+    ];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("Codex app page should win over embedded browser content");
+
+    assert_eq!(picked.id, "main");
+}
+
+#[test]
+fn pick_injectable_codex_page_target_rejects_embedded_browser_only_page() {
+    let targets = vec![target(
+        "browser-pr",
+        "page",
+        "Fix Codex++ menu anchoring · Pull Request",
+        "https://github.com/BigPizzaV3/CodexPlusPlus/pull/1743",
+        Some("ws://browser-pr"),
+    )];
+
+    let error = pick_injectable_codex_page_target(&targets)
+        .expect_err("embedded browser content must not be selected for injection");
 
     assert!(
         error

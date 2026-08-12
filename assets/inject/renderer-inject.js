@@ -1,4 +1,8 @@
 (() => {
+  // The launcher targets the Codex app page, but keep a renderer-side guard
+  // so this bundle cannot create UI in embedded browser documents.
+  const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
+  if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
   function installCodexPlusFastStartup() {
@@ -586,10 +590,7 @@
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "5";
   const codexAppServerModelRequestPatchVersion = "4";
-  const codexPluginMarketplaceUnlockVersion = "14";
-  const codexPluginAutoExpandVersion = "1";
-  const codexPluginAutoExpandMaxClicks = 80;
-  const codexPluginAutoExpandClickDelayMs = 90;
+  const codexPluginMarketplaceUnlockVersion = "15";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -700,7 +701,7 @@
   const selectors = {
     sidebarThread: "[data-app-action-sidebar-thread-id]",
     threadTitle: "[data-thread-title]",
-    appHeader: ".app-header-tint",
+    appHeader: '[class*="ApplicationMenuTopBar"], .app-header-tint',
     nativeMenuBar: "[class*=\"ms-auto\"][class*=\"flex\"][class*=\"items-center\"]",
     headerContextMenuSurface: '[data-testid="app-shell-header-context-menu-surface"]',
     archiveNav: 'button[aria-label="已归档对话"], button[aria-label="Archived conversations"]',
@@ -1394,12 +1395,11 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
-    pluginAutoExpand: "codexAppPluginAutoExpand",
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
@@ -1437,7 +1437,6 @@
     if (codexPlusBackendSettings.enhancementsEnabled === false) {
       return {
         pluginMarketplaceUnlock: false,
-        pluginAutoExpand: false,
         modelWhitelistUnlock: false,
         sessionDelete: false,
         markdownExport: false,
@@ -1463,14 +1462,12 @@
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
       }
       return settings;
     } catch {
       const settings = { ...defaultCodexPlusSettings(), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
       }
       return settings;
     }
@@ -1885,6 +1882,9 @@
       "--dream-skin-project-label",
     ].forEach((name) => root?.style.removeProperty(name));
     document.querySelectorAll(".dream-home").forEach((node) => node.classList.remove("dream-home"));
+    document.querySelectorAll('[role="main"][data-dream-home-layout]').forEach((node) => {
+      node.removeAttribute("data-dream-home-layout");
+    });
     document.querySelectorAll(".dream-home-shell").forEach((node) => node.classList.remove("dream-home-shell"));
     document.querySelectorAll(".dream-skin-home").forEach((node) => node.classList.remove("dream-skin-home"));
     document.querySelectorAll(".dream-skin-home-shell").forEach((node) => node.classList.remove("dream-skin-home-shell"));
@@ -2062,21 +2062,41 @@
       ensureDreamSkinCompanion(theme);
 
       const homeIndicator = document.querySelector('[data-testid="home-icon"]');
-      const home = homeIndicator?.closest('[role="main"]')
+      const homeCandidate = homeIndicator?.closest('[role="main"]')
         || [...document.querySelectorAll('[role="main"]')].find((candidate) =>
           candidate.querySelector('[data-feature="game-source"]')
           && candidate.querySelector('.group\\/home-suggestions'))
         || null;
+      const homeHasClassicChrome = !!(
+        homeCandidate
+        && homeCandidate.querySelector('[data-feature="game-source"]')
+        && (
+          homeCandidate.querySelector('.group\\/home-suggestions')
+          || homeCandidate.querySelector('[class*="home-suggestions"]')
+          || homeCandidate.querySelector('[class*="_homeUtilityBar_"]')
+        )
+      );
+      const home = homeHasClassicChrome ? homeCandidate : null;
       for (const candidate of document.querySelectorAll(`[role="main"].${descriptor.homeClass}`)) {
-        if (candidate !== home) candidate.classList.remove(descriptor.homeClass);
+        if (candidate !== home && candidate !== homeCandidate) candidate.classList.remove(descriptor.homeClass);
       }
       if (home) home.classList.add(descriptor.homeClass);
+      else if (homeCandidate && descriptor.homeClass) homeCandidate.classList.add(descriptor.homeClass);
       if (descriptor.taskClass) {
         for (const candidate of document.querySelectorAll('[role="main"]')) {
-          candidate.classList.toggle(descriptor.taskClass, candidate !== home);
+          candidate.classList.toggle(descriptor.taskClass, candidate !== home && candidate !== homeCandidate);
         }
       }
-      shellMain.classList.toggle(descriptor.shellClass, Boolean(home));
+      for (const candidate of document.querySelectorAll('[role="main"]')) {
+        if (candidate === home) {
+          const hero = candidate.querySelector(':scope > div > div > div');
+          const structured = !!(hero && hero.querySelector('[data-feature="game-source"], [data-testid="home-icon"]'));
+          candidate.setAttribute('data-dream-home-layout', structured ? 'structured' : 'soft');
+        } else {
+          candidate.setAttribute('data-dream-home-layout', 'soft');
+        }
+      }
+      shellMain.classList.toggle(descriptor.shellClass, Boolean(homeCandidate));
       if (descriptor.taskShellClass) shellMain.classList.toggle(descriptor.taskShellClass, !home);
 
       let chrome = document.getElementById(descriptor.chromeId);
@@ -2234,12 +2254,6 @@
         refreshCodexServiceTierControls();
       }
     }
-    if (key === "pluginAutoExpand" && !value) {
-      clearTimeout(window.__codexPluginAutoExpandTimer);
-      window.__codexPluginAutoExpandTimer = null;
-      window.__codexPluginAutoExpandRunning = false;
-      window.__codexPluginAutoExpandLastSignature = "";
-    }
     if (key === "stepwise") syncStepwisePanel(value);
     renderCodexPlusMenu();
     scan();
@@ -2302,6 +2316,7 @@
   let codexPlusBackendSettingsSeq = 0;
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
+  const codexPluginBroadCatalogKindsFromVersion = "26.803.0";
 
   function parseCodexVersionParts(version) {
     const raw = String(version || "").trim();
@@ -2354,10 +2369,18 @@
     return comparison >= 0 ? "bridge" : "client";
   }
 
+  function codexPluginUsesBroadCatalogKinds() {
+    const version = String(codexPlusBackendSettings.codexAppVersion || "").trim();
+    const comparison = compareCodexVersions(version, codexPluginBroadCatalogKindsFromVersion);
+    return comparison != null && comparison >= 0;
+  }
+
   let codexPlusBackendSettingsLoaded = false;
   let codexServiceTierState = {
     status: "loading",
     serviceTier: null,
+    configServiceTier: null,
+    serviceTierSource: null,
     message: "正在读取…",
     fastTierValue: "priority",
     controlMode: "inherit",
@@ -2672,10 +2695,15 @@
     };
   }
 
+  function codexServiceTierInheritedValue() {
+    if (codexServiceTierState.serviceTier != null) return codexServiceTierState.serviceTier;
+    return codexServiceTierState.configServiceTier ?? null;
+  }
+
   function codexServiceTierValueForMode(mode) {
     if (mode === "fast") return codexFastServiceTierValue();
     if (mode === "standard") return null;
-    return codexServiceTierState.serviceTier || null;
+    return codexServiceTierInheritedValue();
   }
 
   function codexServiceTierDefaultModeForControlMode(controlMode, fallback = "inherit") {
@@ -2695,7 +2723,7 @@
     if (controlMode === "global-fast") return codexFastServiceTierValue();
     if (controlMode === "global-standard") return null;
     if (controlMode === "custom") return codexServiceTierValueForMode(codexServiceTierEffectiveThreadMode(threadMode, defaultMode));
-    return codexServiceTierState.serviceTier || null;
+    return codexServiceTierInheritedValue();
   }
 
   function codexServiceTierEffectiveMode(value) {
@@ -2718,15 +2746,25 @@
     return `当前：${serviceTier}`;
   }
 
+  function serviceTierInheritSourceLabel(serviceTierSource) {
+    if (serviceTierSource === "config-toml") return "继承 config.toml";
+    return "继承 Codex 默认设置";
+  }
+
   function serviceTierStatusMessage(
     controlMode = codexServiceTierState.controlMode || "inherit",
     threadMode = codexServiceTierState.threadMode || "inherit",
     effectiveMode = codexServiceTierState.effectiveMode || "standard",
-    defaultMode = codexServiceTierState.defaultMode || "inherit"
+    defaultMode = codexServiceTierState.defaultMode || "inherit",
+    effectiveServiceTier = codexServiceTierState.effectiveServiceTier,
+    serviceTierSource = codexServiceTierState.serviceTierSource
   ) {
     if (codexServiceTierState.status === "loading") return "正在读取…";
     if (codexServiceTierState.status === "failed") return "读取失败";
-    if (controlMode === "inherit") return `继承 config.toml：${effectiveMode}`;
+    if (controlMode === "inherit") {
+      if (effectiveServiceTier == null) return "继承 Codex 默认设置：默认";
+      return `${serviceTierInheritSourceLabel(serviceTierSource)}：${effectiveMode}`;
+    }
     if (controlMode === "global-standard") return "全局 Standard";
     if (controlMode === "global-fast") return "全局 Fast";
     if (threadMode === "inherit") return `自定义：默认 ${defaultMode}`;
@@ -2874,7 +2912,7 @@
     writeThreadServiceTierState(state);
     refreshCodexServiceTierControls();
     const labels = {
-      inherit: "继承 config.toml",
+      inherit: "继承 Codex 默认设置",
       "global-standard": "全局 Standard",
       "global-fast": "全局 Fast",
       custom: "自定义",
@@ -2906,7 +2944,7 @@
     const fastAvailability = codexServiceTierFastAvailability();
     const message = effectiveMode === "fast" && !fastAvailability.supported
       ? codexServiceTierFastUnsupportedMessage(fastAvailability.modelName)
-      : serviceTierStatusMessage(controlMode, threadMode, effectiveMode, defaultMode);
+      : serviceTierStatusMessage(controlMode, threadMode, effectiveMode, defaultMode, effectiveServiceTier, codexServiceTierState.serviceTierSource);
     codexServiceTierState = {
       ...codexServiceTierState,
       controlMode,
@@ -2928,9 +2966,10 @@
     if (codexServiceTierState.status === "failed") return { tier: "failed", label: "?", title: "服务模式：读取失败" };
     const fastAvailability = codexServiceTierFastAvailability();
     const effectiveMode = codexServiceTierState.effectiveMode || "standard";
+    const inheritedDefault = codexServiceTierState.controlMode === "inherit" && codexServiceTierState.effectiveServiceTier == null;
     const scope = codexServiceTierState.controlMode === "custom" && codexServiceTierState.threadMode !== "inherit"
       ? `当前 thread：${codexServiceTierState.threadMode}`
-      : serviceTierStatusMessage(codexServiceTierState.controlMode, codexServiceTierState.threadMode, effectiveMode, codexServiceTierState.defaultMode);
+      : serviceTierStatusMessage(codexServiceTierState.controlMode, codexServiceTierState.threadMode, effectiveMode, codexServiceTierState.defaultMode, codexServiceTierState.effectiveServiceTier, codexServiceTierState.serviceTierSource);
     const title = [
       `服务模式：${scope}`,
       "Standard：使用标准处理；不在请求上设置 priority。",
@@ -2940,6 +2979,7 @@
       return { tier: "unsupported", label: "不支持", title: `${title}\n${codexServiceTierFastUnsupportedMessage(fastAvailability.modelName)}；当前请求会按 Standard 发送。` };
     }
     if (effectiveMode === "fast") return { tier: "fast", label: "fast", title };
+    if (inheritedDefault) return { tier: "default", label: "默认", title };
     return { tier: "standard", label: "standard", title };
   }
 
@@ -3012,6 +3052,34 @@
     refreshCodexServiceTierMenu();
   }
 
+  async function getConfigTomlServiceTier() {
+    const catalog = await loadCodexModelCatalog();
+    const rawTier = catalog && typeof catalog === "object" ? catalog.service_tier : null;
+    const normalized = String(rawTier || "").trim();
+    return normalized ? normalized : null;
+  }
+
+  async function resolveInheritedServiceTier() {
+    let appSetting = null;
+    let appSettingError = null;
+    try {
+      appSetting = await getCodexServiceTierSetting();
+    } catch (error) {
+      appSettingError = error;
+    }
+    if (appSetting != null && String(appSetting).trim() === "") appSetting = null;
+    let configTier = null;
+    let configError = null;
+    try {
+      configTier = await getConfigTomlServiceTier();
+    } catch (error) {
+      configError = error;
+    }
+    if (appSettingError && configError && appSetting == null && configTier == null) throw appSettingError;
+    const serviceTierSource = appSetting != null ? "codex-app" : (configTier != null ? "config-toml" : null);
+    return { serviceTier: appSetting, configServiceTier: configTier, serviceTierSource };
+  }
+
   async function loadCodexServiceTierState() {
     if (!codexPlusSettings().serviceTierControls) {
       codexServiceTierState = { ...codexServiceTierState, status: "idle", message: "未启用" };
@@ -3022,20 +3090,23 @@
     refreshCodexServiceTierControls();
     let readTimeout;
     try {
-      const serviceTier = await Promise.race([
-        getCodexServiceTierSetting(),
+      const inheritedServiceTier = await Promise.race([
+        resolveInheritedServiceTier(),
         new Promise((resolve) => {
           readTimeout = setTimeout(() => {
             sendCodexPlusDiagnostic("service_tier_read_timeout", { timeoutMs: codexServiceTierReadTimeoutMs });
-            resolve(codexDefaultServiceTierSetting.default);
+            resolve({ serviceTier: codexDefaultServiceTierSetting.default, configServiceTier: null, serviceTierSource: "timeout" });
           }, codexServiceTierReadTimeoutMs);
         }),
       ]);
+      const { serviceTier, configServiceTier, serviceTierSource } = inheritedServiceTier;
       codexServiceTierState = {
         ...codexServiceTierState,
         status: "ok",
         serviceTier,
-        message: serviceTierGlobalStatusMessage(serviceTier),
+        configServiceTier,
+        serviceTierSource,
+        message: serviceTierGlobalStatusMessage(serviceTier ?? configServiceTier),
       };
     } catch (error) {
       codexServiceTierState = {
@@ -3128,7 +3199,7 @@
     const controlMode = normalizeCodexServiceTierControlMode(state.mode);
     const defaultMode = normalizeCodexThreadServiceTierMode(state.defaultMode);
     if (controlMode === "inherit") {
-      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierState.serviceTier;
+      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierInheritedValue();
       const override = codexServiceTierOverrideResult(method, params, threadIdHint, "inherit", inheritedServiceTier);
       return override.fastBlocked ? override : null;
     }
@@ -3145,7 +3216,7 @@
     const override = threadId ? codexThreadServiceTierOverride(threadId) : codexThreadServiceTierDraft();
     const mode = codexServiceTierEffectiveThreadMode(override?.mode, defaultMode);
     if (mode === "inherit") {
-      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierState.serviceTier;
+      const inheritedServiceTier = params.serviceTier ?? params.service_tier ?? codexServiceTierInheritedValue();
       const inheritedOverride = codexServiceTierOverrideResult(method, params, threadIdHint, "inherit", inheritedServiceTier);
       return inheritedOverride.fastBlocked ? { ...inheritedOverride, threadId, mode } : null;
     }
@@ -3570,7 +3641,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
             </div>
             <div class="codex-plus-row" data-codex-service-tier-controls="true">
-              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承使用 config.toml 的 service tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
+              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
               <div class="codex-plus-service-tier-control">
                 <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
                 <div class="codex-plus-service-tier-actions">
@@ -3581,7 +3652,7 @@
                 </div>
                 <div class="codex-plus-service-tier-actions codex-plus-service-tier-thread-actions">
                   <span class="codex-plus-service-tier-thread-label">当前 thread 覆盖</span>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 config.toml">继承</button>
+                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 Codex 默认设置">继承</button>
                   <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-standard="true" title="仅当前 thread 使用 Standard，并切到自定义模式">Standard</button>
                   <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-fast="true" title="仅当前 thread 使用 Fast，并切到自定义模式">Fast</button>
                 </div>
@@ -3919,7 +3990,7 @@
 
   function updateFloatingCodexPlusMenuPosition(menu) {
     if (!menu?.classList?.contains(codexPlusMenuFloatingClass)) return;
-    const header = document.querySelector(selectors.appHeader) || document.querySelector("header");
+    const header = document.querySelector(selectors.appHeader);
     if (!header) return;
     const toolbarButtons = Array.from(header.querySelectorAll("button"))
       .map((button) => ({ button, rect: button.getBoundingClientRect() }))
@@ -3938,8 +4009,9 @@
 
     const headerRect = header.getBoundingClientRect();
     if (headerRect.height) {
-      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${headerRect.top}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${headerRect.height}px`);
+      const isApplicationMenuTopBar = header.matches?.('[class*="ApplicationMenuTopBar"]');
+      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${isApplicationMenuTopBar ? Math.max(4, headerRect.top) : headerRect.top}px`);
+      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${isApplicationMenuTopBar ? 28 : headerRect.height}px`);
     }
     menu.style.removeProperty("--codex-plus-menu-right");
   }
@@ -4030,10 +4102,24 @@
       next.cwds = [...window.__codexPluginMarketplaceLastCwds];
     }
     const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
+    const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
+      && (!hadMarketplaceKinds || next.marketplaceKinds == null);
+    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
+    if (broadCatalogRequest && !remoteCatalogUnavailable) {
+      sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
+        hadMarketplaceKinds,
+        marketplaceKinds: hadMarketplaceKinds ? next.marketplaceKinds : null,
+        broadCatalogPreserved: true,
+        cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
+        cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
+        remoteCatalogUnavailable,
+        remoteOnly: requestProfile.remoteOnly,
+      });
+      return next;
+    }
     let nextKinds = Array.isArray(next.marketplaceKinds)
       ? next.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))
       : ["local"];
-    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
     if (!requestProfile.remoteOnly && remoteCatalogUnavailable) {
       nextKinds = nextKinds.filter((kind) => kind !== "created-by-me-remote" && kind !== "shared-with-me");
     }
@@ -4045,6 +4131,7 @@
     sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
       hadMarketplaceKinds,
       marketplaceKinds: next.marketplaceKinds,
+      broadCatalogPreserved: false,
       cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
       cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
       remoteCatalogUnavailable,
@@ -4193,7 +4280,8 @@
       return false;
     }
     const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n");
+      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
+      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
     if (!isKnownFilterSource) return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin));
@@ -4349,101 +4437,6 @@
 
   function remoteOnlyPluginMarketplaceFallbackResult() {
     return pluginMarketplaceFallbackResult(false);
-  }
-
-  function pluginAutoExpandVisibleElement(el) {
-    if (!(el instanceof HTMLElement) || !el.isConnected) return false;
-    const style = getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-
-  function pluginAutoExpandPageLooksRelevant() {
-    const text = String(document.body?.innerText || "");
-    return /插件|Plugins?|Marketplace|市场/i.test(text) && !!document.querySelector('button, [role="button"]');
-  }
-
-  function pluginAutoExpandButtonLooksScoped(button) {
-    let node = button;
-    for (let depth = 0; node instanceof HTMLElement && node !== document.body && depth < 8; depth += 1, node = node.parentElement) {
-      const text = String(node.innerText || "");
-      if (text.length > 16000) continue;
-      if (/插件|Plugins?|Marketplace|市场/i.test(text)) return true;
-    }
-    return false;
-  }
-
-  function pluginAutoExpandButtonText(button) {
-    return String(button?.textContent || button?.getAttribute?.("aria-label") || button?.getAttribute?.("title") || "")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function pluginAutoExpandButtonLooksLikeMore(button) {
-    const text = pluginAutoExpandButtonText(button);
-    if (!text || text.length > 120) return false;
-    if (/^(更多|显示更多|查看更多|加载更多|Show more|Load more|More)$/i.test(text)) return true;
-    if (/^查看\s+.+以及另外\s*\d+\s*个$/i.test(text)) return true;
-    if (/^View\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
-    if (/^Show\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
-    return false;
-  }
-
-  function pluginAutoExpandButtonCandidates() {
-    if (!codexPlusSettings().pluginAutoExpand || !pluginAutoExpandPageLooksRelevant()) return [];
-    return Array.from(document.querySelectorAll('button, [role="button"]'))
-      .filter(pluginAutoExpandVisibleElement)
-      .filter((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true")
-      .filter(pluginAutoExpandButtonLooksLikeMore)
-      .filter(pluginAutoExpandButtonLooksScoped)
-      .filter((button) => !button.closest?.(`.${moreMenuClass}, #${codexPlusMenuId}, .codex-plus-modal-overlay`));
-  }
-
-  function pluginAutoExpandSignature() {
-    return pluginAutoExpandButtonCandidates()
-      .map((button) => {
-        const rect = button.getBoundingClientRect();
-        return `${pluginAutoExpandButtonText(button)}:${Math.round(rect.top)}:${Math.round(rect.left)}`;
-      })
-      .join("|");
-  }
-
-  function schedulePluginAutoExpand(force = false) {
-    if (!codexPlusSettings().pluginAutoExpand) return;
-    if (window.__codexPluginAutoExpandRunning && !force) return;
-    clearTimeout(window.__codexPluginAutoExpandTimer);
-    window.__codexPluginAutoExpandTimer = setTimeout(() => runPluginAutoExpand(force), force ? 30 : 180);
-  }
-
-  function runPluginAutoExpand(force = false) {
-    if (!codexPlusSettings().pluginAutoExpand) return;
-    const currentSignature = pluginAutoExpandSignature();
-    if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
-    window.__codexPluginAutoExpandLastSignature = currentSignature;
-    window.__codexPluginAutoExpandRunning = true;
-    window.__codexPluginAutoExpandClicks = 0;
-    const clickNext = () => {
-      if (!codexPlusSettings().pluginAutoExpand) {
-        window.__codexPluginAutoExpandRunning = false;
-        return;
-      }
-      const button = pluginAutoExpandButtonCandidates()[0];
-      if (!button || window.__codexPluginAutoExpandClicks >= codexPluginAutoExpandMaxClicks) {
-        window.__codexPluginAutoExpandRunning = false;
-        sendCodexPlusDiagnostic("plugin_auto_expand_finished", {
-          version: codexPluginAutoExpandVersion,
-          clicks: window.__codexPluginAutoExpandClicks || 0,
-          exhausted: !!button,
-        });
-        return;
-      }
-      window.__codexPluginAutoExpandClicks = (window.__codexPluginAutoExpandClicks || 0) + 1;
-      button.dataset.codexPluginAutoExpandClicked = String(Date.now());
-      button.click();
-      setTimeout(clickNext, codexPluginAutoExpandClickDelayMs);
-    };
-    clickNext();
   }
 
   function patchPluginMarketplaceRequestClient(client) {
@@ -4651,6 +4644,9 @@
       localFallback: localPluginMarketplaceFallbackResult,
       remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
       requestProfile: pluginMarketplaceRequestProfile,
+      setCodexAppVersion: (version) => {
+        codexPlusBackendSettings.codexAppVersion = String(version || "");
+      },
       remoteCatalogUnavailable: () => window.__codexPluginMarketplaceRemoteCatalogUnavailable === true,
       reset: () => {
         delete window.__codexPluginMarketplaceLastCwds;
@@ -5818,6 +5814,18 @@
       applyServiceTierOverride: (method, params, threadIdHint = "") => applyCodexServiceTierRequestOverride(method, params, threadIdHint),
       requestOverride: (message) => codexServiceTierRequestOverride(message),
       diagnostics: () => [...(window.__codexPlusServiceTierTestDiagnostics || [])],
+      statusSummary: (state = {}) => {
+        const summaryState = { ...codexServiceTierState, ...state };
+        return serviceTierStatusMessage(
+          summaryState.controlMode,
+          summaryState.threadMode,
+          summaryState.effectiveMode,
+          summaryState.defaultMode,
+          summaryState.effectiveServiceTier,
+          summaryState.serviceTierSource
+        );
+      },
+      resolveInheritedServiceTier: () => resolveInheritedServiceTier(),
       currentModelName: () => codexServiceTierCurrentModelName(),
       fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
@@ -7042,11 +7050,23 @@
 
   async function refreshRecentConversationsForHost() {
     try {
-      const signals = await import("./assets/app-server-manager-signals-C1h8B-R-.js");
-      if (typeof signals.rn === "function") await signals.rn("refresh-recent-conversations-for-host", { hostId: "local", sortKey: "updated_at" });
+      const signals = await loadOptionalCodexAppModule("app-server-manager-signals-");
+      const sendRequest = Object.values(signals || {}).find((candidate) => {
+        if (typeof candidate !== "function") return false;
+        try {
+          const source = Function.prototype.toString.call(candidate).replace(/\s+/g, "");
+          return /^function[$\w]+\(e,t\)\{return[$\w]+\.sendRequest\(e,t\)\}$/.test(source);
+        } catch {
+          return false;
+        }
+      });
+      if (typeof sendRequest !== "function") return false;
+      await sendRequest("refresh-recent-conversations-for-host", { hostId: "local", sortKey: "updated_at" });
+      return true;
     } catch (error) {
       window.__codexProjectMoveRefreshFailures = window.__codexProjectMoveRefreshFailures || [];
       window.__codexProjectMoveRefreshFailures.push(String(error?.stack || error));
+      return false;
     }
   }
 
@@ -7241,7 +7261,10 @@
       undo.addEventListener("click", async () => {
         const result = await postJson("/undo", { undo_token: undoToken });
         toast.textContent = result.message || "撤销完成";
-        if (result.status === "undone") window.location.reload();
+        if (result.status === "undone") {
+          const refreshed = await refreshRecentConversationsForHost();
+          if (!refreshed) window.location.reload();
+        }
         setTimeout(() => toast.remove(), 5000);
       });
       toast.appendChild(undo);
@@ -7716,7 +7739,7 @@
       const trigger = document.getElementById(labelledBy);
       if (trigger instanceof Element) return trigger;
     }
-    return [...document.querySelectorAll('button')]
+    return [...document.querySelectorAll('.composer-footer button, .composer-footer [role="button"]')]
       .filter((button) => (button.innerText || button.textContent || "").trim() === "main")
       .sort((left, right) => right.getBoundingClientRect().x - left.getBoundingClientRect().x)[0] || null;
   }
@@ -7868,13 +7891,23 @@
   }
 
   function installUpstreamBranchDropdownAdapter() {
-    const adapterVersion = "actual-upstream-refs-v16";
+    const adapterVersion = "actual-upstream-refs-v17";
     window.__codexUpstreamBranchDropdownAdapterVersion = adapterVersion;
     if (window.__codexUpstreamBranchDropdownAdapterInstalled === adapterVersion) return;
+    window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
     window.__codexUpstreamBranchDropdownAdapterInstalled = adapterVersion;
+    let upstreamBranchInjectTimer = null;
+    const schedule = () => {
+      clearTimeout(upstreamBranchInjectTimer);
+      upstreamBranchInjectTimer = setTimeout(() => {
+        injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
+      }, 80);
+    };
     document.addEventListener("click", (event) => {
       rememberStartNewChatProjectContext(event);
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const control = target?.closest?.('button, [role="button"]');
+      if (control && branchMenuTriggerIsBranchControl(control)) schedule();
       const option = target?.closest?.(`[${upstreamBranchOptionAttribute}]`);
       if (!option) {
         handleNativeBranchSelection(event);
@@ -7895,14 +7928,16 @@
       syncUpstreamBranchMenuSelection(option.closest?.('[role="menu"], [data-radix-menu-content], [cmdk-list]'));
       showToast(`将从 ${upstreamBranchOptionLabel(option) || "upstream/main"} 创建新 worktree`, null);
     }, true);
-    let upstreamBranchInjectTimer = null;
-    const schedule = () => {
-      clearTimeout(upstreamBranchInjectTimer);
-      upstreamBranchInjectTimer = setTimeout(() => {
-        injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
-      }, 80);
+    const branchMenuSelector = '[role="menu"], [data-radix-menu-content], [cmdk-list]';
+    const addedNodeContainsBranchMenu = (node) => {
+      if (!(node instanceof Element)) return false;
+      return node.matches(branchMenuSelector) || !!node.querySelector(branchMenuSelector);
     };
-    new MutationObserver(schedule).observe(document.body || document.documentElement, { childList: true, subtree: true });
+    const observer = new MutationObserver((records) => {
+      if (records.some((record) => [...record.addedNodes].some(addedNodeContainsBranchMenu))) schedule();
+    });
+    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    window.__codexUpstreamBranchDropdownObserver = observer;
     schedule();
   }
 
@@ -8346,7 +8381,6 @@
   }
 
   function installDeleteButtonEventDelegation() {
-    document.removeEventListener("pointerup", window.__codexSessionDeleteDocumentDeleteHandler, true);
     document.removeEventListener("click", window.__codexSessionDeleteDocumentDeleteHandler, true);
     const handler = (event) => {
       const button = event.target?.closest?.(`.${buttonClass}`);
@@ -8357,7 +8391,6 @@
       openDeleteConfirmForRow(row, button, ref, event);
     };
     window.__codexSessionDeleteDocumentDeleteHandler = handler;
-    document.addEventListener("pointerup", handler, true);
     document.addEventListener("click", handler, true);
   }
 
@@ -8437,7 +8470,6 @@
     button.addEventListener("pointerleave", hideActionButtonTooltip);
     button.addEventListener("focus", () => showActionButtonTooltip(button));
     button.addEventListener("blur", hideActionButtonTooltip);
-    button.addEventListener("pointerup", onActivate, true);
     button.addEventListener("click", (event) => {
       hideActionButtonTooltip();
       onActivate(event);
@@ -10573,7 +10605,6 @@
     installCodexServiceTierMenu();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
-    schedulePluginAutoExpand();
   }
 
   function runScanStep(step) {
