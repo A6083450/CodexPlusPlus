@@ -906,9 +906,7 @@ fn user_script_manager_upgrades_older_bundled_translation_script() {
     let upgraded = manager.install_missing_bundled_market_scripts().unwrap();
 
     assert_eq!(
-        upgraded
-            .scripts
-            .get("user:market-codex-zhcn-translate.js"),
+        upgraded.scripts.get("user:market-codex-zhcn-translate.js"),
         Some(&false)
     );
     let upgraded_source =
