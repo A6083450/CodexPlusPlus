@@ -184,8 +184,14 @@ fn completed_generation_is_materialized_once_for_native_history() {
     let markdown = native_messages[0]["payload"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(markdown.contains("![已生成图像](<"));
-    assert!(markdown.contains(image_path.to_string_lossy().as_ref()));
+    let markdown_path = markdown
+        .strip_prefix("![已生成图像](<")
+        .and_then(|value| value.strip_suffix(">)"))
+        .unwrap();
+    assert_eq!(
+        Path::new(markdown_path).canonicalize().unwrap(),
+        image_path.canonicalize().unwrap()
+    );
 }
 
 #[test]
