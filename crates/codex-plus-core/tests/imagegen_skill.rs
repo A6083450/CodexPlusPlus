@@ -270,12 +270,8 @@ x-codex-plus-test = "enabled"
     let summary: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(summary["status"], "completed");
     assert_eq!(
-        summary["path"],
-        output_path
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .as_ref()
+        std::fs::canonicalize(summary["path"].as_str().unwrap()).unwrap(),
+        output_path.canonicalize().unwrap()
     );
     assert!(!stdout.contains("test-secret-key"));
 }
