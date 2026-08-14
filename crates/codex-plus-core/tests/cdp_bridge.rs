@@ -1610,6 +1610,10 @@ fn injection_script_exposes_conversation_view_width_control() {
     assert!(script.contains("data-codex-plus-conversation-view-width"));
     assert!(script.contains("conversationViewWidth()"));
     assert!(script.contains("normalizeConversationViewWidth"));
+    assert!(
+        !script.contains("conversationViewState.mo"),
+        "conversation view must not observe the entire document mutation stream"
+    );
 }
 
 #[test]
@@ -2067,6 +2071,17 @@ fn injection_script_uses_native_fast_indicator_beside_model_name() {
     assert!(script.contains("label === candidate || label.startsWith(candidate)"));
     assert!(script.contains("syncCodexNativeSolidFastIcon"));
     assert!(script.contains("data-codex-service-tier-icon=\"solid\""));
+
+    let icon_sync = script
+        .find("function syncCodexNativeSolidFastIcon")
+        .expect("script should define the native Fast icon synchronizer");
+    let icon_sync_body = &script[icon_sync
+        ..script[icon_sync..]
+            .find("function codexNativeServiceTierMemoValues")
+            .map(|offset| icon_sync + offset)
+            .expect("icon synchronizer should end before the native memo helper")];
+    assert!(icon_sync_body.contains("patchCodexNativeSolidFastIcon"));
+    assert!(!icon_sync_body.contains("codexServiceTierState.effectiveMode"));
 }
 
 #[test]
@@ -2135,6 +2150,15 @@ fn injection_script_places_service_tier_control_in_native_model_menu() {
     assert!(scan_body.contains("installCodexServiceTierMenu();"));
     assert!(scan_body.contains("removeCodexServiceTierBadges();"));
     assert!(scan_body.contains("syncCodexNativeServiceTierPicker();"));
+}
+
+#[test]
+fn injection_script_anchors_floating_menu_before_open_location_button() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("function isCodexHeaderOpenLocationButton(button)"));
+    assert!(script.contains("打开位置|Open location"));
+    assert!(script.contains("if (isCodexHeaderOpenLocationButton(button)) return true;"));
 }
 
 #[test]
@@ -2326,6 +2350,8 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["unrelatedFastIconPatched"], false);
     assert_eq!(cases["nativeSelectionStandard"]["mode"], "global-standard");
     assert_eq!(cases["nativeSelectionStandard"]["defaultMode"], "standard");
+    assert_eq!(cases["nativeSelectionStandardGuard"]["mode"], "standard");
+    assert_eq!(cases["nativeSelectionStandardGuard"]["active"], true);
     assert_eq!(cases["nativeSelectionFast"]["mode"], "global-fast");
     assert_eq!(cases["nativeSelectionFast"]["defaultMode"], "fast");
     assert_eq!(cases["nestedNativeMenuStandard"], "standard");
@@ -2335,6 +2361,27 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["capabilitySettingStorage"], true);
     assert_eq!(cases["legacyStateApi"], true);
     assert_eq!(cases["currentStateApi"], true);
+    assert_eq!(cases["currentHeaderFound"], true);
+    assert_eq!(cases["panelHeaderRejected"], true);
+    assert_eq!(cases["textOnlyOpenLocationRecognized"], true);
+    assert_eq!(cases["floatingMenuRightBoundary"], 1568.0);
+    assert_eq!(cases["nativeMenuInsertionWithExternalStatus"], true);
+    assert_eq!(cases["currentHeaderMountSchedulesScan"], true);
+    assert_eq!(cases["composerFastIconReplacementSchedulesScan"], true);
+    assert_eq!(cases["delayedNativeMenuRetryAvailable"], true);
+    assert_eq!(cases["delayedNativeMenuRetryScheduled"], true);
+    assert_eq!(cases["delayedNativeMenuHiddenWhileWaiting"], true);
+    assert_eq!(cases["delayedNativeMenuRetryUsesLowFrequencyDelay"], true);
+    assert_eq!(cases["delayedNativeMenuRetryPersists"], true);
+    assert_eq!(cases["delayedNativeMenuRetryMigrated"], true);
+    assert_eq!(cases["delayedNativeMenuRetryStopped"], true);
+    assert_eq!(cases["nativePlacementNotifiesStatusRender"], true);
+    assert_eq!(cases["statusUiMutationIgnored"], true);
+    assert_eq!(cases["conversationViewFirstOffset"], 96.0);
+    assert_eq!(cases["conversationViewRepeatedOffset"], 96.0);
+    assert_eq!(cases["conversationViewInitialFrameBudget"], 2);
+    assert_eq!(cases["conversationViewResizeFrameBudget"], 1);
+    assert_eq!(cases["conversationViewPollFrameBudget"], 1);
     assert_eq!(cases["appServerParamsUnchanged"], true);
     assert_eq!(cases["appServerSentCount"], 2);
     assert_eq!(
@@ -2386,6 +2433,27 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["pureOfficialProviderUnchanged"], true);
 }
 
+#[test]
+fn injection_script_handles_irrelevant_mutations_without_runtime_errors() {
+    let cases = run_service_tier_contract_harness();
+
+    assert_eq!(cases["irrelevantMutationScanSucceeded"], true);
+}
+
+#[test]
+fn injection_script_places_menu_in_home_header_action_slot() {
+    let cases = run_service_tier_contract_harness();
+
+    assert_eq!(cases["homeHeaderInsertionUsesActionSlot"], true);
+}
+
+#[test]
+fn injection_script_normalizes_logical_direction_group_classes() {
+    let cases = run_service_tier_contract_harness();
+
+    assert_eq!(cases["logicalDirectionGroupClassesNormalized"], true);
+}
+
 fn run_service_tier_contract_harness() -> serde_json::Value {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("renderer-inject.js");
@@ -2398,7 +2466,10 @@ fn run_service_tier_contract_harness() -> serde_json::Value {
         r#"
 const scriptPath = {script_path};
 const store = new Map();
-store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
+store.set("codexPlusSettings", JSON.stringify({{
+  serviceTierControls: true,
+  nativeMenuPlacement: true,
+}}));
 function node() {{
   return {{
     appendChild() {{}},
@@ -2448,6 +2519,16 @@ globalThis.navigator = {{ userAgent: "node-test" }};
 globalThis.performance = {{ getEntriesByType: () => [] }};
 require(scriptPath);
 const api = window.__codexPlusServiceTierTest;
+const normalizedLogicalDirectionClasses = new Set(
+  api.normalizeCodexPlusTriggerClassName(
+    "native gap-0 rounded-s-none border-s-0 ps-0.5 pe-1.5"
+  ).split(/\s+/).filter(Boolean)
+);
+const logicalDirectionGroupClassesNormalized =
+  !["gap-0", "rounded-s-none", "border-s-0", "ps-0.5", "pe-1.5"]
+    .some((name) => normalizedLogicalDirectionClasses.has(name))
+  && ["native", "gap-1", "rounded-full", "border-l", "px-2"]
+    .every((name) => normalizedLogicalDirectionClasses.has(name));
 const reactFiberKeys = api.reactFiberKeys({{
   "__reactFiber$test": {{}},
   "__reactProps$test": {{}},
@@ -2669,6 +2750,7 @@ const nativeAuthRefresh = {{
 api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
 api.syncNativeSelection("standard");
 const nativeSelectionStandard = api.threadState();
+const nativeSelectionStandardGuard = api.nativeSelectionGuard();
 api.syncNativeSelection("fast");
 const nativeSelectionFast = api.threadState();
 const speedHeader = {{
@@ -2735,6 +2817,251 @@ const currentStateApi = api.stateApiFromModule({{
   n: legacyStateCall,
   qut: currentStateCall,
 }}, "app-initial-") === currentStateCall;
+const rect = (left, top, width, height) => ({{
+  left,
+  right: left + width,
+  top,
+  bottom: top + height,
+  width,
+  height,
+}});
+const openLocationButton = {{
+  getAttribute: (name) => name === "aria-label" ? null : null,
+  textContent: "打开位置",
+}};
+const currentHeader = {{
+  getBoundingClientRect: () => rect(0, 0, 1792, 46),
+  querySelectorAll: (selector) => selector === "button" ? [openLocationButton] : [],
+}};
+const panelHeader = {{
+  getBoundingClientRect: () => rect(1476, 68, 300, 28),
+  querySelectorAll: () => [],
+}};
+const headerRoot = {{
+  querySelector: () => null,
+  querySelectorAll: (selector) => selector === "header" ? [panelHeader, currentHeader] : [],
+}};
+const selectedHeader = api.findAppHeader(headerRoot);
+const currentHeaderFound = selectedHeader === currentHeader;
+const panelHeaderRejected = selectedHeader !== panelHeader;
+const textOnlyOpenLocationRecognized = api.isOpenLocationButton(openLocationButton);
+currentHeader.contains = () => false;
+const floatingHeaderButton = {{
+  getBoundingClientRect: () => rect(1428, 0, 72, 30),
+}};
+const floatingControlRoot = {{
+  querySelectorAll: (selector) => selector === "button" ? [floatingHeaderButton] : [],
+}};
+const floatingMenuRightBoundary = api.floatingMenuRightBoundary(
+  currentHeader,
+  null,
+  rect(1568, 9, 91, 28),
+  floatingControlRoot,
+);
+const nativeMenuBar = {{
+  getBoundingClientRect: () => rect(1280, 0, 379, 46),
+  querySelectorAll: (selector) => selector === "button" ? [nativeOpenLocationButton] : [],
+  closest: () => null,
+}};
+const nativeOpenLocationGroup = {{ parentElement: nativeMenuBar }};
+const nativeOpenLocationButton = {{
+  className: "native-text-button",
+  textContent: "打开位置",
+  parentElement: nativeOpenLocationGroup,
+  getAttribute: () => null,
+  getBoundingClientRect: () => rect(1568, 9, 91, 28),
+  closest: (selector) => selector === ".inline-flex.self-start.items-stretch.overflow-hidden.rounded-lg"
+    ? nativeOpenLocationGroup
+    : null,
+}};
+const nativeHeader = {{
+  contains: (candidate) => candidate === nativeMenuBar || candidate === nativeOpenLocationButton,
+  querySelectorAll: (selector) => selector.includes("ms-auto")
+    ? [nativeMenuBar]
+    : selector === "button" ? [nativeOpenLocationButton] : [],
+}};
+const externalTodayButton = {{
+  getBoundingClientRect: () => rect(1490, 8, 72, 30),
+}};
+document.querySelector = (selector) => selector.includes("ApplicationMenuTopBar") ? nativeHeader : null;
+document.querySelectorAll = (selector) => selector === "button" ? [externalTodayButton] : [];
+document.getElementById = () => null;
+const nativeInsertionPoint = api.findNativeMenuInsertionPoint();
+const nativeMenuInsertionWithExternalStatus = nativeInsertionPoint?.parent === nativeMenuBar
+  && nativeInsertionPoint?.before === nativeOpenLocationGroup;
+const homeTitleGrid = {{
+  className: "grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4",
+}};
+const homeActionSlot = {{
+  className: "flex items-center justify-end gap-1.5",
+  parentElement: homeTitleGrid,
+  firstChild: null,
+}};
+const homeIconButton = {{
+  className: "native-icon-button aspect-square",
+  closest: () => null,
+}};
+const homeIconMenuBar = {{
+  getBoundingClientRect: () => rect(1730, 9, 28, 28),
+  querySelectorAll: (selector) => selector === "button" ? [homeIconButton] : [],
+  closest: () => null,
+}};
+const homeHeader = {{
+  querySelectorAll: (selector) => selector.includes("ms-auto")
+    ? [homeIconMenuBar]
+    : selector === "div" ? [homeActionSlot] : [],
+}};
+document.querySelector = (selector) => selector.includes("ApplicationMenuTopBar") ? homeHeader : null;
+const homeInsertionPoint = api.findNativeMenuInsertionPoint();
+const homeHeaderInsertionUsesActionSlot = homeInsertionPoint?.parent === homeActionSlot
+  && homeInsertionPoint?.before === null
+  && !String(homeInsertionPoint?.nativeButtonClass || "").includes("aspect-square");
+document.querySelector = (selector) => selector.includes("ApplicationMenuTopBar") ? nativeHeader : null;
+const mountedCurrentHeader = {{
+  nodeType: 1,
+  closest: () => null,
+  matches: (selector) => selector.split(", ").includes("header"),
+  querySelector: () => null,
+}};
+const currentHeaderMountSchedulesScan = api.shouldScheduleScan([{{
+  target: {{ nodeType: 3 }},
+  addedNodes: [mountedCurrentHeader],
+  removedNodes: [],
+}}]);
+const composerReasoningTrigger = {{
+  nodeType: 1,
+  closest: (selector) => selector.split(", ").includes('[data-codex-intelligence-trigger="true"]')
+    ? composerReasoningTrigger
+    : null,
+  matches: () => false,
+  querySelector: () => null,
+}};
+const composerFastIconReplacementSchedulesScan = api.shouldScheduleScan([{{
+  target: composerReasoningTrigger,
+  addedNodes: [],
+  removedNodes: [],
+}}]);
+const statusUiNode = {{
+  nodeType: 1,
+  closest: (selector) => selector.includes('#codex-live-token-cost') ? statusUiNode : null,
+  matches: () => true,
+  querySelector: () => null,
+}};
+const statusUiMutationIgnored = !api.shouldScheduleScan([{{
+  target: statusUiNode,
+  addedNodes: [],
+  removedNodes: [],
+}}]);
+api.scheduleScan([]);
+const irrelevantMutationScanSucceeded = true;
+const delayedNativeMenuRetryAvailable = typeof api.scheduleNativeMenuPlacementRetry === "function"
+  && typeof api.nativeMenuPlacementRetryState === "function";
+let delayedNativeMenuRetryScheduled = false;
+let delayedNativeMenuHiddenWhileWaiting = false;
+let delayedNativeMenuRetryUsesLowFrequencyDelay = false;
+let delayedNativeMenuRetryPersists = false;
+let delayedNativeMenuRetryMigrated = false;
+let delayedNativeMenuRetryStopped = false;
+let nativePlacementNotifiesStatusRender = false;
+if (delayedNativeMenuRetryAvailable) {{
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+  const originalDocumentGetElementById = document.getElementById;
+  const originalDocumentQuerySelector = document.querySelector;
+  const originalDocumentQuerySelectorAll = document.querySelectorAll;
+  const pendingTimers = [];
+  const retryTrigger = {{
+    className: "",
+    dataset: {{ codexPlusTriggerInstalled: "5" }},
+    querySelector: () => null,
+    prepend() {{}},
+  }};
+  const retryMenu = {{
+    id: "codex-plus-menu",
+    className: "codex-plus-menu-floating",
+    dataset: {{ codexPlusMenu: "true", codexPlusMenuVersion: "6" }},
+    hidden: false,
+    parentElement: document.documentElement,
+    nextSibling: null,
+    style: {{ removeProperty() {{}} }},
+    querySelector: (selector) => selector === "button" ? retryTrigger : null,
+    classList: {{
+      contains: (name) => retryMenu.className.split(/\s+/).includes(name),
+    }},
+  }};
+  let delayedHeaderMounted = false;
+  let statusRenderCalls = 0;
+  window.__codexLiveTokenCost = {{ render: () => {{ statusRenderCalls += 1; }} }};
+  nativeMenuBar.insertBefore = (candidate) => {{
+    candidate.parentElement = nativeMenuBar;
+    candidate.className = "";
+  }};
+  window.setTimeout = (callback, delay) => {{
+    const id = pendingTimers.length + 1;
+    pendingTimers.push({{ id, callback, delay, cleared: false, fired: false }});
+    return id;
+  }};
+  window.clearTimeout = (id) => {{
+    const timer = pendingTimers.find((candidate) => candidate.id === id);
+    if (timer) timer.cleared = true;
+  }};
+  document.getElementById = (id) => id === "codex-plus-menu" ? retryMenu : null;
+  document.querySelector = (selector) => delayedHeaderMounted && selector.includes("ApplicationMenuTopBar")
+    ? nativeHeader
+    : null;
+  document.querySelectorAll = (selector) => selector === "button" ? [externalTodayButton] : [];
+
+  api.scheduleNativeMenuPlacementRetry();
+  const nextPendingTimer = () => pendingTimers.find((timer) => !timer.cleared && !timer.fired);
+  const firstRetryTimer = nextPendingTimer();
+  delayedNativeMenuRetryScheduled = !!firstRetryTimer;
+  delayedNativeMenuHiddenWhileWaiting = retryMenu.hidden === true;
+  delayedNativeMenuRetryUsesLowFrequencyDelay = firstRetryTimer?.delay === 500;
+  for (let index = 0; index < 8; index += 1) {{
+    const timer = nextPendingTimer();
+    if (!timer) break;
+    timer.fired = true;
+    timer.callback();
+  }}
+  delayedNativeMenuRetryPersists = api.nativeMenuPlacementRetryState().timerActive === true
+    && !!nextPendingTimer();
+  delayedHeaderMounted = true;
+  const nativePlacementTimer = nextPendingTimer();
+  if (nativePlacementTimer) {{
+    nativePlacementTimer.fired = true;
+    nativePlacementTimer.callback();
+  }}
+  const retryState = api.nativeMenuPlacementRetryState();
+  delayedNativeMenuRetryMigrated = retryMenu.parentElement === nativeMenuBar
+    && retryMenu.className === ""
+    && retryMenu.hidden === false;
+  delayedNativeMenuRetryStopped = retryState.timerActive === false
+    && retryState.attempt === 0;
+  nativePlacementNotifiesStatusRender = statusRenderCalls === 1;
+
+  window.setTimeout = originalSetTimeout;
+  window.clearTimeout = originalClearTimeout;
+  document.getElementById = originalDocumentGetElementById;
+  document.querySelector = originalDocumentQuerySelector;
+  document.querySelectorAll = originalDocumentQuerySelectorAll;
+  delete window.__codexLiveTokenCost;
+}}
+const conversationBounds = rect(300, 0, 1192, 900);
+const conversationViewFirstOffset = api.conversationViewOffset(
+  rect(400, 0, 800, 600),
+  conversationBounds,
+  896,
+  0,
+);
+const conversationViewRepeatedOffset = api.conversationViewOffset(
+  rect(496, 0, 800, 600),
+  conversationBounds,
+  896,
+  conversationViewFirstOffset,
+);
+const conversationViewInitialFrameBudget = api.conversationViewFrameBudget("initial");
+const conversationViewResizeFrameBudget = api.conversationViewFrameBudget("resize");
+const conversationViewPollFrameBudget = api.conversationViewFrameBudget("poll");
 const nativeAppServerParams = {{
   cwd: "C:/native/work",
   workspaceRoots: ["C:/native/work"],
@@ -2951,6 +3278,7 @@ process.stdout.write(JSON.stringify({{
   solidFastIcon,
   unrelatedFastIconPatched,
   nativeSelectionStandard,
+  nativeSelectionStandardGuard,
   nativeSelectionFast,
   nestedNativeMenuStandard,
   nestedNativeMenuFast,
@@ -2959,6 +3287,30 @@ process.stdout.write(JSON.stringify({{
   capabilitySettingStorage,
   legacyStateApi,
   currentStateApi,
+  currentHeaderFound,
+  panelHeaderRejected,
+  textOnlyOpenLocationRecognized,
+  floatingMenuRightBoundary,
+  nativeMenuInsertionWithExternalStatus,
+  homeHeaderInsertionUsesActionSlot,
+  logicalDirectionGroupClassesNormalized,
+  currentHeaderMountSchedulesScan,
+  composerFastIconReplacementSchedulesScan,
+  statusUiMutationIgnored,
+  irrelevantMutationScanSucceeded,
+  delayedNativeMenuRetryAvailable,
+  delayedNativeMenuRetryScheduled,
+  delayedNativeMenuHiddenWhileWaiting,
+  delayedNativeMenuRetryUsesLowFrequencyDelay,
+  delayedNativeMenuRetryPersists,
+  delayedNativeMenuRetryMigrated,
+  delayedNativeMenuRetryStopped,
+  nativePlacementNotifiesStatusRender,
+  conversationViewFirstOffset,
+  conversationViewRepeatedOffset,
+  conversationViewInitialFrameBudget,
+  conversationViewResizeFrameBudget,
+  conversationViewPollFrameBudget,
   appServerParamsUnchanged,
   appServerSentCount: appServerCalls.length,
   providerFromMissing,
@@ -3829,6 +4181,123 @@ async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() 
         .await
         .expect("server task should finish without panicking");
     assert!(handled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn reinstall_bridge_replaces_message_pump_and_reevaluates_renderer_scripts_without_reregistering()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let url = format!("ws://{address}");
+    let server = tokio::spawn(async move {
+        let (first_stream, _) = listener
+            .accept()
+            .await
+            .expect("first client should connect");
+        let mut first = accept_async(first_stream)
+            .await
+            .expect("first websocket should upgrade");
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut first).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut first, json!({ "id": expected_id, "result": {} })).await;
+        }
+        let first_renderer_add = recv_json(&mut first).await;
+        assert_eq!(
+            first_renderer_add["method"],
+            "Page.addScriptToEvaluateOnNewDocument"
+        );
+        send_json(
+            &mut first,
+            json!({ "id": first_renderer_add["id"], "result": {} }),
+        )
+        .await;
+        let first_renderer_eval = recv_json(&mut first).await;
+        assert_eq!(first_renderer_eval["method"], "Runtime.evaluate");
+        send_json(
+            &mut first,
+            json!({ "id": first_renderer_eval["id"], "result": {} }),
+        )
+        .await;
+
+        let (second_stream, _) = listener
+            .accept()
+            .await
+            .expect("second client should connect");
+        let mut second = accept_async(second_stream)
+            .await
+            .expect("second websocket should upgrade");
+        for expected_id in 1..=3 {
+            let command = recv_json(&mut second).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut second, json!({ "id": expected_id, "result": {} })).await;
+        }
+        let bridge_eval = recv_json(&mut second).await;
+        assert_eq!(bridge_eval["id"], 5);
+        assert_eq!(bridge_eval["method"], "Runtime.evaluate");
+        assert!(
+            bridge_eval["params"]["expression"]
+                .as_str()
+                .expect("bridge expression should be text")
+                .contains("__codexSessionDeleteBridge")
+        );
+        send_json(&mut second, json!({ "id": 5, "result": {} })).await;
+
+        let renderer_eval =
+            tokio::time::timeout(Duration::from_millis(500), recv_json(&mut second))
+                .await
+                .expect("reinstall should promptly evaluate the renderer bundle");
+        assert_eq!(renderer_eval["method"], "Runtime.evaluate");
+        assert!(
+            renderer_eval["params"]["expression"]
+                .as_str()
+                .expect("renderer expression should be text")
+                .contains("rendererInstalled"),
+            "reinstall should evaluate the renderer bundle without registering it again"
+        );
+        send_json(
+            &mut second,
+            json!({ "id": renderer_eval["id"], "result": {} }),
+        )
+        .await;
+        let unexpected_renderer_registration =
+            tokio::time::timeout(Duration::from_millis(250), second.next()).await;
+        assert!(
+            unexpected_renderer_registration.is_err(),
+            "reinstall must not register the renderer bundle again"
+        );
+        let first_closed = tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("the replaced message pump should close promptly");
+        assert!(
+            matches!(first_closed, None | Some(Ok(Message::Close(_)))),
+            "the previous message pump must be closed after replacement"
+        );
+        close_socket(&mut second).await;
+    });
+
+    bridge::install_bridge(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &["window.rendererInstalled = true;".to_string()],
+    )
+    .await
+    .expect("first bridge install should succeed");
+    bridge::install_bridge(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &["window.rendererInstalled = true;".to_string()],
+    )
+    .await
+    .expect("bridge reinstall should succeed");
+
+    server
+        .await
+        .expect("server should finish without panicking");
 }
 
 #[tokio::test]

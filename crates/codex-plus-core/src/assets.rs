@@ -48,7 +48,7 @@ const DREAM_SKIN_DEFAULT_IMAGE: &[u8] =
     include_bytes!("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png");
 const PET_REAL_MOUSE_SCRIPT: &str = include_str!("../../../assets/inject/pet-real-mouse-inject.js");
 const STEPWISE_SCRIPT: &str = include_str!("../../../assets/inject/stepwise-inject.js");
-pub const DIAGNOSTIC_BUILD_ID: &str = "diag-20260518-1";
+pub const DIAGNOSTIC_BUILD_ID: &str = "fixed6-20260814";
 const DREAM_SKIN_RENDERER_REVISION: &str = "19-newchat-fix";
 
 pub fn renderer_script() -> &'static str {
@@ -729,6 +729,11 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_build_id_matches_fixed6_version() {
+        assert_eq!(DIAGNOSTIC_BUILD_ID, "fixed6-20260814");
+    }
 
     #[test]
     fn image_overlay_config_includes_fit_mode() {

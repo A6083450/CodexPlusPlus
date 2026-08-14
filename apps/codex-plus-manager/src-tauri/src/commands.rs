@@ -2580,6 +2580,18 @@ pub fn delete_user_script(key: String) -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
+pub fn reinstall_bundled_market_scripts() -> CommandResult<SettingsPayload> {
+    let manager = default_user_script_manager();
+    match manager.reinstall_bundled_market_scripts() {
+        Ok(_) => settings_payload("内置脚本已重新安装并启用。", "重新安装内置脚本失败"),
+        Err(error) => failed(
+            &format!("重新安装内置脚本失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn open_external_url(url: String) -> CommandResult<Value> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
@@ -4563,11 +4575,15 @@ fn market_script_payload(script: &MarketScript, installed: &BTreeMap<String, Str
 
 fn default_user_script_manager() -> UserScriptManager {
     let config_dir = user_scripts_config_dir();
-    UserScriptManager::new(
+    let manager = UserScriptManager::new(
         builtin_user_scripts_dir(),
         config_dir.join("user_scripts"),
         config_dir.join("user_scripts.json"),
-    )
+    );
+    if let Err(error) = manager.install_missing_bundled_market_scripts() {
+        eprintln!("failed to install missing bundled market scripts: {error}");
+    }
+    manager
 }
 
 fn user_scripts_config_dir() -> PathBuf {

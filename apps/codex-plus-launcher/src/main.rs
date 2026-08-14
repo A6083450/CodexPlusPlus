@@ -1078,11 +1078,15 @@ fn open_url(url: &str) -> anyhow::Result<()> {
 
 fn default_user_script_manager() -> UserScriptManager {
     let config_dir = default_user_scripts_config_dir();
-    UserScriptManager::new(
+    let manager = UserScriptManager::new(
         builtin_user_scripts_dir(),
         config_dir.join("user_scripts"),
         config_dir.join("user_scripts.json"),
-    )
+    );
+    if let Err(error) = manager.install_missing_bundled_market_scripts() {
+        eprintln!("failed to install missing bundled market scripts: {error}");
+    }
+    manager
 }
 
 fn default_user_scripts_config_dir() -> PathBuf {

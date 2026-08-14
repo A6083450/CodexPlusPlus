@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -25,6 +25,18 @@ pub type BridgeHandler = Arc<
 >;
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(100);
+
+struct BridgeMessagePump {
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+static BRIDGE_MESSAGE_PUMPS: OnceLock<tokio::sync::Mutex<HashMap<String, BridgeMessagePump>>> =
+    OnceLock::new();
+
+fn bridge_message_pumps() -> &'static tokio::sync::Mutex<HashMap<String, BridgeMessagePump>> {
+    BRIDGE_MESSAGE_PUMPS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
 
 pub fn build_bridge_script(binding_name: &str) -> String {
     format!(
@@ -190,6 +202,17 @@ pub async fn install_bridge(
     handler: BridgeHandler,
     new_document_scripts: &[String],
 ) -> anyhow::Result<()> {
+    let pump_key = format!("{websocket_url}\n{binding_name}");
+    let replacing_active_pump = {
+        let mut pumps = bridge_message_pumps().lock().await;
+        if pumps
+            .get(&pump_key)
+            .is_some_and(|runtime| runtime.task.is_finished())
+        {
+            pumps.remove(&pump_key);
+        }
+        pumps.contains_key(&pump_key)
+    };
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket).with_handler(handler);
 
@@ -202,13 +225,15 @@ pub async fn install_bridge(
         .await?;
 
     let bridge_script = build_bridge_script(binding_name);
-    session
-        .send_command(
-            4,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": bridge_script }),
-        )
-        .await?;
+    if !replacing_active_pump {
+        session
+            .send_command(
+                4,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": bridge_script }),
+            )
+            .await?;
+    }
     session
         .send_command(
             5,
@@ -218,14 +243,16 @@ pub async fn install_bridge(
         .await?;
 
     for script in new_document_scripts {
-        let message_id = next_message_id();
-        session
-            .send_command(
-                message_id,
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": script }),
-            )
-            .await?;
+        if !replacing_active_pump {
+            let message_id = next_message_id();
+            session
+                .send_command(
+                    message_id,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": script }),
+                )
+                .await?;
+        }
         let message_id = next_message_id();
         session
             .send_command(
@@ -237,17 +264,36 @@ pub async fn install_bridge(
     }
 
     session.drain_binding_queue().await?;
-    tokio::spawn(async move {
-        loop {
-            if session.drain_binding_queue().await.is_err() {
-                break;
-            }
-            match session.next_message().await {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        {
+            let pump = async {
+                loop {
+                    if session.drain_binding_queue().await.is_err() {
+                        break;
+                    }
+                    match session.next_message().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            };
+            tokio::pin!(pump);
+            tokio::select! {
+                _ = &mut shutdown_rx => {}
+                _ = &mut pump => {}
             }
         }
+        let _ = session.socket.close(None).await;
     });
+    let previous = bridge_message_pumps()
+        .lock()
+        .await
+        .insert(pump_key, BridgeMessagePump { shutdown, task });
+    if let Some(previous) = previous {
+        let _ = previous.shutdown.send(());
+        let _ = previous.task.await;
+    }
 
     Ok(())
 }

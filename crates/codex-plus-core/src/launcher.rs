@@ -4,9 +4,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -25,6 +25,66 @@ const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 
 const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Throttles bridge health checks and reinjections.
+///
+/// A slow-but-alive renderer cannot answer a CDP health check within the 5 s timeout, which the
+/// watchdog misreads as "bridge lost" and answers by re-evaluating the full injection bundle
+/// (renderer script plus user scripts, roughly 1 MB). Each queued evaluation forces the busy
+/// renderer to parse and compile the bundle again, keeping it busy, so the next health check
+/// times out too. Backing off both the health checks and the reinjections lets the renderer
+/// drain its queue and recover instead of being pinned at 100% CPU for minutes.
+#[derive(Debug)]
+struct ReinjectThrottle {
+    consecutive_failures: u32,
+    next_check_at: Option<Instant>,
+}
+
+const REINJECT_THROTTLE_BASE_BACKOFF: Duration = Duration::from_secs(30);
+const REINJECT_THROTTLE_MAX_BACKOFF: Duration = Duration::from_secs(600);
+/// Grace period after a successful reinjection before health checks resume.
+const REINJECT_SUCCESS_GRACE: Duration = Duration::from_secs(30);
+
+impl ReinjectThrottle {
+    fn should_check(&self, now: Instant) -> bool {
+        match self.next_check_at {
+            Some(next) => now >= next,
+            None => true,
+        }
+    }
+
+    fn backoff_after_failure(&mut self, now: Instant) {
+        self.consecutive_failures += 1;
+        let shift = self.consecutive_failures.saturating_sub(1).min(5);
+        let delay = REINJECT_THROTTLE_BASE_BACKOFF
+            .saturating_mul(2u32.saturating_pow(shift))
+            .min(REINJECT_THROTTLE_MAX_BACKOFF);
+        self.next_check_at = Some(now + delay);
+    }
+
+    /// Successful reinjections resume checking after a short grace period so the freshly
+    /// evaluated bundle can settle before the next health check probes it.
+    fn record_reinject_success(&mut self, now: Instant) {
+        self.consecutive_failures = 0;
+        self.next_check_at = Some(now + REINJECT_SUCCESS_GRACE);
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_check_at = None;
+    }
+}
+
+static REINJECT_THROTTLE: OnceLock<Mutex<ReinjectThrottle>> = OnceLock::new();
+
+fn reinject_throttle() -> &'static Mutex<ReinjectThrottle> {
+    REINJECT_THROTTLE.get_or_init(|| {
+        Mutex::new(ReinjectThrottle {
+            consecutive_failures: 0,
+            next_check_at: None,
+        })
+    })
+}
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
@@ -2366,14 +2426,28 @@ pub fn build_packaged_activation_with_native_menu_inspector(
     })
 }
 
+/// Attempts the full injection a bounded number of times with real backoff.
+///
+/// Every attempt evaluates the ~1 MB bundle in the renderer; when the renderer is merely slow
+/// (rather than missing the bridge), retrying 20 times with a 500 ms gap queues twenty bundle
+/// evaluations and pins the renderer at 100% CPU. Fewer attempts with longer gaps let a busy
+/// renderer recover instead of drowning it.
+const INJECT_ATTEMPT_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
 async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     let mut last_error = None;
-    for _ in 0..20 {
+    for (attempt, delay) in INJECT_ATTEMPT_DELAYS.iter().enumerate() {
         match try_inject(debug_port, helper_port).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if attempt + 1 < INJECT_ATTEMPT_DELAYS.len() {
+                    tokio::time::sleep(*delay).await;
+                }
             }
         }
     }
@@ -2402,6 +2476,16 @@ async fn check_and_reinject_bridge_inner(
     browser_identity_changed: bool,
     bridge_reinjector: Option<BridgeReinjector>,
 ) -> bool {
+    // A page navigation wipes the bridge, so an identity change must reinject immediately and
+    // clear any backoff left over from a previous busy-renderer episode.
+    if browser_identity_changed {
+        reinject_throttle().lock().await.reset();
+    } else {
+        let throttle = reinject_throttle().lock().await;
+        if !throttle.should_check(Instant::now()) {
+            return false;
+        }
+    }
     let healthy = if browser_identity_changed {
         false
     } else {
@@ -2421,6 +2505,7 @@ async fn check_and_reinject_bridge_inner(
         }
     };
     if healthy {
+        reinject_throttle().lock().await.reset();
         return false;
     }
 
@@ -2437,6 +2522,10 @@ async fn check_and_reinject_bridge_inner(
     let reinject_result = run_bridge_reinjector(bridge_reinjector, default_reinjector).await;
     match reinject_result {
         Ok(()) => {
+            reinject_throttle()
+                .lock()
+                .await
+                .record_reinject_success(Instant::now());
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "bridge.reinject_ok",
                 serde_json::json!({
@@ -2447,6 +2536,10 @@ async fn check_and_reinject_bridge_inner(
             true
         }
         Err(error) => {
+            reinject_throttle()
+                .lock()
+                .await
+                .backoff_after_failure(Instant::now());
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "bridge.reinject_failed",
                 serde_json::json!({
@@ -3185,6 +3278,78 @@ mod tests {
             .unwrap();
 
         assert_eq!(default_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reinject_throttle_allows_first_check_and_resets_on_healthy_check() {
+        let mut throttle = ReinjectThrottle {
+            consecutive_failures: 0,
+            next_check_at: None,
+        };
+        let now = Instant::now();
+        assert!(throttle.should_check(now));
+
+        throttle.backoff_after_failure(now);
+        assert!(!throttle.should_check(now));
+
+        throttle.reset();
+        assert!(throttle.should_check(now + REINJECT_THROTTLE_MAX_BACKOFF));
+    }
+
+    #[test]
+    fn reinject_throttle_backs_off_exponentially_after_failures() {
+        let mut throttle = ReinjectThrottle {
+            consecutive_failures: 0,
+            next_check_at: None,
+        };
+        let now = Instant::now();
+
+        throttle.backoff_after_failure(now);
+        assert!(
+            !throttle.should_check(now + REINJECT_THROTTLE_BASE_BACKOFF - Duration::from_secs(1))
+        );
+        assert!(
+            throttle.should_check(now + REINJECT_THROTTLE_BASE_BACKOFF + Duration::from_secs(1))
+        );
+
+        let second = now + REINJECT_THROTTLE_BASE_BACKOFF;
+        throttle.backoff_after_failure(second);
+        let doubled = REINJECT_THROTTLE_BASE_BACKOFF.saturating_mul(2);
+        assert!(!throttle.should_check(second + doubled - Duration::from_secs(1)));
+        assert!(throttle.should_check(second + doubled + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn reinject_throttle_backoff_caps_at_ten_minutes() {
+        let mut throttle = ReinjectThrottle {
+            consecutive_failures: 0,
+            next_check_at: None,
+        };
+        let now = Instant::now();
+        for _ in 0..6 {
+            throttle.backoff_after_failure(now);
+        }
+        assert!(
+            !throttle.should_check(now + REINJECT_THROTTLE_MAX_BACKOFF - Duration::from_secs(1))
+        );
+        assert!(
+            throttle.should_check(now + REINJECT_THROTTLE_MAX_BACKOFF + Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn reinject_throttle_grants_grace_period_after_successful_reinject() {
+        let mut throttle = ReinjectThrottle {
+            consecutive_failures: 0,
+            next_check_at: None,
+        };
+        let now = Instant::now();
+        throttle.backoff_after_failure(now);
+
+        throttle.record_reinject_success(now);
+        assert!(!throttle.should_check(now + REINJECT_SUCCESS_GRACE - Duration::from_secs(1)));
+        assert!(throttle.should_check(now + REINJECT_SUCCESS_GRACE + Duration::from_secs(1)));
+        assert_eq!(throttle.consecutive_failures, 0);
     }
 
     #[test]

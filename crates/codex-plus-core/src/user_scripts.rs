@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -8,6 +8,19 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::script_market::MarketScript;
+
+const DS_STYLE_COST_SCRIPT_FILE_NAME: &str = "market-codex-ds-style-cost.js";
+const LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME: &str = "market-codex-live-token-cost.js";
+const BUNDLED_MARKET_SCRIPTS: [(&str, &str); 2] = [
+    (
+        DS_STYLE_COST_SCRIPT_FILE_NAME,
+        include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js"),
+    ),
+    (
+        "market-codex-zhcn-translate.js",
+        include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js"),
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserScriptConfig {
@@ -108,6 +121,99 @@ impl UserScriptManager {
         config.scripts.insert(key.to_string(), enabled);
         self.save_config_unlocked(&config)?;
         Ok(config)
+    }
+
+    /// 安装缺失的内置脚本，并升级带有旧版 UserScript 版本头的副本。
+    pub fn install_missing_bundled_market_scripts(&self) -> anyhow::Result<UserScriptConfig> {
+        self.install_bundled_market_scripts(false, false)
+    }
+
+    /// 管理器主动重新安装时覆盖脚本，并重新启用。
+    pub fn reinstall_bundled_market_scripts(&self) -> anyhow::Result<UserScriptConfig> {
+        self.install_bundled_market_scripts(true, true)
+    }
+
+    fn install_bundled_market_scripts(
+        &self,
+        overwrite_existing: bool,
+        enable_scripts: bool,
+    ) -> anyhow::Result<UserScriptConfig> {
+        let _guard = self.config_lock.lock().unwrap();
+        let mut config = self.load_config_unlocked();
+        let migrated_legacy_name = self.migrate_legacy_cost_script_name(&mut config)?;
+        let scripts_to_install = BUNDLED_MARKET_SCRIPTS
+            .iter()
+            .filter(|(file_name, source)| {
+                let path = self.user_dir.join(file_name);
+                overwrite_existing || !path.is_file() || bundled_script_is_newer(&path, source)
+            })
+            .collect::<Vec<_>>();
+        if scripts_to_install.is_empty() {
+            if migrated_legacy_name {
+                self.save_config_unlocked(&config)?;
+            }
+            return Ok(config);
+        }
+        fs::create_dir_all(&self.user_dir).with_context(|| {
+            format!(
+                "failed to create user scripts directory {}",
+                self.user_dir.display()
+            )
+        })?;
+
+        for &(file_name, source) in scripts_to_install {
+            let path = self.user_dir.join(file_name);
+            crate::settings::atomic_write(&path, source.as_bytes())
+                .with_context(|| format!("failed to install bundled script {}", path.display()))?;
+            let key = format!("user:{file_name}");
+            if enable_scripts {
+                config.scripts.insert(key, true);
+            } else {
+                config.scripts.entry(key).or_insert(true);
+            }
+        }
+        self.save_config_unlocked(&config)?;
+        Ok(config)
+    }
+
+    fn migrate_legacy_cost_script_name(
+        &self,
+        config: &mut UserScriptConfig,
+    ) -> anyhow::Result<bool> {
+        let legacy_path = self.user_dir.join(LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME);
+        if !legacy_path.is_file() {
+            return Ok(false);
+        }
+
+        let replacement_path = self.user_dir.join(DS_STYLE_COST_SCRIPT_FILE_NAME);
+        let legacy_key = format!("user:{LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME}");
+        let replacement_key = format!("user:{DS_STYLE_COST_SCRIPT_FILE_NAME}");
+        let legacy_enabled = config.scripts.remove(&legacy_key).unwrap_or(true);
+
+        if replacement_path.exists() {
+            config
+                .scripts
+                .entry(replacement_key)
+                .or_insert(legacy_enabled);
+            config.scripts.insert(legacy_key, false);
+            return Ok(true);
+        }
+
+        fs::rename(&legacy_path, &replacement_path).with_context(|| {
+            format!(
+                "failed to rename bundled script {} to {}",
+                legacy_path.display(),
+                replacement_path.display()
+            )
+        })?;
+        config
+            .scripts
+            .entry(replacement_key.clone())
+            .or_insert(legacy_enabled);
+        if let Some(market) = config.market.remove(&legacy_key) {
+            config.market.entry(replacement_key).or_insert(market);
+        }
+        Ok(true)
     }
 
     pub fn delete_user_script(&self, key: &str) -> anyhow::Result<UserScriptConfig> {
@@ -376,6 +482,30 @@ fn config_from_object(raw: &Map<String, Value>) -> UserScriptConfig {
         scripts,
         market,
     }
+}
+
+fn user_script_version(source: &str) -> Option<&str> {
+    source.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("//")?
+            .trim_start()
+            .strip_prefix("@version")?
+            .split_whitespace()
+            .next()
+    })
+}
+
+fn bundled_script_is_newer(installed_path: &Path, bundled_source: &str) -> bool {
+    let Ok(installed_source) = fs::read_to_string(installed_path) else {
+        return false;
+    };
+    let Some(installed_version) = user_script_version(&installed_source) else {
+        return false;
+    };
+    let Some(bundled_version) = user_script_version(bundled_source) else {
+        return false;
+    };
+    crate::update::is_newer_version(bundled_version, installed_version).unwrap_or(false)
 }
 
 pub fn market_script_filename(id: &str) -> String {
