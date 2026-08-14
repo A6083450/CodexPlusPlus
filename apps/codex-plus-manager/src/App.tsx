@@ -1066,6 +1066,15 @@ export function App() {
     }
   };
 
+  const reinstallBundledMarketScripts = async () => {
+    const result = await run(() => call<SettingsResult>("reinstall_bundled_market_scripts"));
+    if (result) {
+      setSettings(result);
+      setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+      showResultNotice(t("内置脚本"), result);
+    }
+  };
+
   const refreshRelay = async (silent = false) => {
     const result = await run(() => call<RelayResult>("relay_status"));
     if (result) {
@@ -2767,6 +2776,7 @@ export function App() {
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
+      reinstallBundledMarketScripts,
       refreshLocalSessions,
       deleteLocalSession,
       deleteLocalSessions,
@@ -3124,6 +3134,7 @@ type Actions = {
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
+  reinstallBundledMarketScripts: () => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
@@ -4835,6 +4846,10 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             <Metric label={t("本地整体")} value={inventory?.enabled === false ? t("关闭") : t("开启")} />
           </div>
           <Toolbar>
+            <Button onClick={() => void actions.reinstallBundledMarketScripts()} variant="secondary">
+              <Download className="h-4 w-4" />
+              {t("重新安装内置脚本")}
+            </Button>
             <Button onClick={() => void actions.refreshScriptMarket()}>
               <RefreshCw className="h-4 w-4" />
               {t("刷新市场")}

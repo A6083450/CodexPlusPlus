@@ -528,6 +528,7 @@
   const codexDeleteStyleVersion = "14";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
+  const codexPlusNativeMenuRetryMs = 500;
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
   const codexProjectMoveVersion = "1";
@@ -610,6 +611,9 @@
   clearTimeout(window.__codexProjectMoveChatsSortTimer);
   window.__codexProjectMoveProjectionTimer = null;
   window.__codexProjectMoveChatsSortTimer = null;
+  clearTimeout(window.__codexPlusNativeMenuPlacementRetryTimer);
+  window.__codexPlusNativeMenuPlacementRetryTimer = null;
+  window.__codexPlusNativeMenuPlacementRetryAttempt = 0;
   clearTimeout(window.__codexThreadScrollSaveTimer);
   window.__codexThreadScrollSaveTimer = null;
   (window.__codexThreadScrollRestoreTimers || []).forEach((timer) => clearTimeout(timer));
@@ -2395,6 +2399,8 @@
   const codexDefaultServiceTierSetting = { key: "default-service-tier", default: null };
   const codexServiceTierFallbackFastValue = "priority";
   const codexServiceTierReadTimeoutMs = 1500;
+  const codexNativeServiceTierSelectionGuardMs = 750;
+  let codexNativeServiceTierSelectionGuard = { mode: "", until: 0 };
   const codexServiceTierModulePromises = new Map();
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexNativeFastOutlinePathPrefix = "M9.80999 17.8302";
@@ -3878,8 +3884,16 @@
 
   function findNativeMenuInsertionPoint() {
     if (!codexPlusSettings().nativeMenuPlacement) return null;
-    const header = document.querySelector(selectors.appHeader);
+    const header = findCodexAppHeader();
     const isIconOnlyButton = (button) => String(button.className || "").includes("aspect-square");
+    const headerActionSlot = Array.from(header?.querySelectorAll?.("div") || [])
+      .find((node) => {
+        const className = String(node.className || "");
+        const parentClassName = String(node.parentElement?.className || "");
+        return className.includes("items-center")
+          && className.includes("justify-end")
+          && parentClassName.includes("grid-cols-");
+      });
     const menuBar = Array.from(header?.querySelectorAll?.(selectors.nativeMenuBar) || [])
       .find((node) => {
         const rect = node.getBoundingClientRect();
@@ -3887,8 +3901,12 @@
       });
     if (menuBar) {
       const buttons = Array.from(menuBar.querySelectorAll("button")).filter((button) => !button.closest(`#${codexPlusMenuId}`));
-      if (buttons.length && buttons.every(isIconOnlyButton)) return null;
-      const openLocationButton = buttons.find((button) => /^(打开位置|Open location)$/i.test(button.getAttribute("aria-label") || ""));
+      if (buttons.length && buttons.every(isIconOnlyButton)) {
+        return headerActionSlot
+          ? { parent: headerActionSlot, before: headerActionSlot.firstChild, nativeButtonClass: headerIconTextButtonClass }
+          : null;
+      }
+      const openLocationButton = buttons.find(isCodexHeaderOpenLocationButton);
       const openLocationGroup = openLocationButton?.closest?.(".inline-flex.self-start.items-stretch.overflow-hidden.rounded-lg");
       const openLocationIndex = buttons.indexOf(openLocationButton);
       const nativeButtonClass = openLocationButton
@@ -3928,14 +3946,38 @@
 
   function normalizeCodexPlusTriggerClassName(className) {
     const classes = String(className || "").split(/\s+/).filter(Boolean);
-    const incompatibleNativeGroupClasses = new Set(["gap-0", "rounded-l-none", "border-l-0", "pl-0.5", "pr-1.5"]);
+    const nativeRadiusClasses = new Set([
+      "rounded-none",
+      "rounded-sm",
+      "rounded",
+      "rounded-md",
+      "rounded-lg",
+      "rounded-xl",
+      "rounded-2xl",
+      "rounded-3xl",
+      "rounded-full",
+    ]);
+    const incompatibleNativeGroupClasses = new Set([
+      "gap-0",
+      "rounded-l-none",
+      "rounded-s-none",
+      "border-l-0",
+      "border-s-0",
+      "pl-0.5",
+      "ps-0.5",
+      "pr-1.5",
+      "pe-1.5",
+    ]);
     const hasIncompatibleNativeGroupClass = classes.some((name) => incompatibleNativeGroupClasses.has(name));
-    const normalized = classes.filter((name) => !incompatibleNativeGroupClasses.has(name));
+    const normalized = classes.filter((name) => (
+      !nativeRadiusClasses.has(name) && !incompatibleNativeGroupClasses.has(name)
+    ));
     if (hasIncompatibleNativeGroupClass) {
-      ["gap-1", "rounded-lg", "border-l", "px-2"].forEach((name) => {
+      ["gap-1", "border-l", "px-2"].forEach((name) => {
         if (!normalized.includes(name)) normalized.push(name);
       });
     }
+    normalized.push("rounded-full");
     return normalized.join(" ");
   }
 
@@ -3978,9 +4020,43 @@
     }) || null;
   }
 
+  function isCodexHeaderOpenLocationButton(button) {
+    const label = [button?.getAttribute?.("aria-label"), button?.textContent]
+      .filter((value) => typeof value === "string" && value.trim())
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return /^(?:打开位置|Open location)(?:\s|$)/i.test(label);
+  }
+
+  function findCodexAppHeader(root = document) {
+    const knownHeader = root?.querySelector?.(selectors.appHeader);
+    if (knownHeader) return knownHeader;
+    const headers = Array.from(root?.querySelectorAll?.("header") || []);
+    const openLocationHeader = headers.find((header) =>
+      Array.from(header?.querySelectorAll?.("button") || []).some(isCodexHeaderOpenLocationButton)
+    );
+    if (openLocationHeader) return openLocationHeader;
+    const viewportWidth = Number(window.innerWidth) || 0;
+    return headers.find((header) => {
+      const rect = header?.getBoundingClientRect?.();
+      return !!rect
+        && rect.width > 0
+        && rect.height >= 20
+        && rect.height <= 80
+        && rect.top <= 4
+        && (!viewportWidth || rect.width >= viewportWidth * 0.6);
+    }) || null;
+  }
+
+  function floatingMenuRightBoundary(header, menu, anchorRect, root = document) {
+    return anchorRect.left;
+  }
+
   function isHeaderToolbarButton(button, header, rect) {
     if (!button || button.closest?.(`#${codexPlusMenuId}`)) return false;
     if (!(rect.width > 0 && rect.height > 0 && rect.left > window.innerWidth / 2)) return false;
+    if (isCodexHeaderOpenLocationButton(button)) return true;
     const buttonCluster = button.closest(".ms-auto.flex.shrink-0.items-center");
     if (buttonCluster && header?.contains(buttonCluster)) return true;
     const titleRegion = headerTitleRegion(header);
@@ -3990,7 +4066,7 @@
 
   function updateFloatingCodexPlusMenuPosition(menu) {
     if (!menu?.classList?.contains(codexPlusMenuFloatingClass)) return;
-    const header = document.querySelector(selectors.appHeader);
+    const header = findCodexAppHeader();
     if (!header) return;
     const toolbarButtons = Array.from(header.querySelectorAll("button"))
       .map((button) => ({ button, rect: button.getBoundingClientRect() }))
@@ -4000,10 +4076,11 @@
     if (anchor) {
       const measuredGap = toolbarButtons[1] ? toolbarButtons[1].rect.left - toolbarButtons[0].rect.right : 0;
       const styles = anchor.button.parentElement ? getComputedStyle(anchor.button.parentElement) : null;
-      const gap = Math.max(numericCssValue(styles?.columnGap || styles?.gap), measuredGap, 0);
+      const gap = Math.max(numericCssValue(styles?.columnGap || styles?.gap), measuredGap, 4);
+      const rightBoundary = floatingMenuRightBoundary(header, menu, anchor.rect);
       setCssPropIfChanged(menu, "--codex-plus-menu-top", `${anchor.rect.top}px`);
       setCssPropIfChanged(menu, "--codex-plus-menu-height", `${anchor.rect.height}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-right", `${Math.max(0, window.innerWidth - anchor.rect.left + gap)}px`);
+      setCssPropIfChanged(menu, "--codex-plus-menu-right", `${Math.max(0, window.innerWidth - rightBoundary + gap)}px`);
       return;
     }
 
@@ -4016,6 +4093,93 @@
     menu.style.removeProperty("--codex-plus-menu-right");
   }
 
+  function cancelNativeMenuPlacementRetry() {
+    clearTimeout(window.__codexPlusNativeMenuPlacementRetryTimer);
+    window.__codexPlusNativeMenuPlacementRetryTimer = null;
+    window.__codexPlusNativeMenuPlacementRetryAttempt = 0;
+  }
+
+  function prepareCodexPlusMenuWaiting(menu) {
+    if (!menu) return;
+    menu.className = codexPlusMenuFloatingClass;
+    menu.hidden = true;
+    if (menu.dataset) menu.dataset.codexPlusNativePlacement = "waiting";
+    menu.style?.setProperty?.("display", "none", "important");
+    if (menu.parentElement !== document.documentElement) document.documentElement.appendChild(menu);
+  }
+
+  function prepareCodexPlusMenuNative(menu) {
+    if (!menu) return;
+    menu.classList?.remove?.(codexPlusMenuFloatingClass);
+    if (menu.className === codexPlusMenuFloatingClass) menu.className = "";
+    menu.hidden = false;
+    if (menu.dataset) delete menu.dataset.codexPlusNativePlacement;
+    [
+      "display",
+      "position",
+      "left",
+      "right",
+      "top",
+      "--codex-plus-menu-top",
+      "--codex-plus-menu-height",
+      "--codex-plus-menu-right",
+    ].forEach((property) => menu.style?.removeProperty?.(property));
+  }
+
+  function placeCodexPlusMenuNative(menu, insertionPoint) {
+    if (!menu || !insertionPoint?.parent) return false;
+    const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
+    const alreadyNative = menu.parentElement === insertionPoint.parent
+      && menu.nextSibling === safeBefore
+      && menu.hidden !== true
+      && menu.dataset?.codexPlusNativePlacement !== "waiting"
+      && !menu.classList?.contains(codexPlusMenuFloatingClass);
+    cancelNativeMenuPlacementRetry();
+    configureCodexPlusTrigger(menu, menu.querySelector("button"), insertionPoint.nativeButtonClass);
+    prepareCodexPlusMenuNative(menu);
+    if (menu.parentElement !== insertionPoint.parent || menu.nextSibling !== safeBefore) {
+      insertionPoint.parent.insertBefore(menu, safeBefore);
+    }
+    removeDuplicateCodexPlusMenus(menu);
+    if (!alreadyNative) window.__codexLiveTokenCost?.render?.();
+    return true;
+  }
+
+  function nativeMenuPlacementRetryState() {
+    return {
+      attempt: Number(window.__codexPlusNativeMenuPlacementRetryAttempt) || 0,
+      timerActive: window.__codexPlusNativeMenuPlacementRetryTimer != null,
+    };
+  }
+
+  function scheduleNativeMenuPlacementRetry() {
+    const menu = document.getElementById(codexPlusMenuId);
+    const waiting = menu?.dataset?.codexPlusNativePlacement === "waiting"
+      || menu?.classList?.contains(codexPlusMenuFloatingClass);
+    if (!codexPlusSettings().nativeMenuPlacement || !waiting) {
+      cancelNativeMenuPlacementRetry();
+      return false;
+    }
+    prepareCodexPlusMenuWaiting(menu);
+    if (window.__codexPlusNativeMenuPlacementRetryTimer != null) return true;
+    const attempt = Number(window.__codexPlusNativeMenuPlacementRetryAttempt) || 0;
+    window.__codexPlusNativeMenuPlacementRetryAttempt = attempt + 1;
+    window.__codexPlusNativeMenuPlacementRetryTimer = setTimeout(() => {
+      window.__codexPlusNativeMenuPlacementRetryTimer = null;
+      const current = document.getElementById(codexPlusMenuId);
+      const insertionPoint = findNativeMenuInsertionPoint();
+      if (current && insertionPoint) {
+        placeCodexPlusMenuNative(current, insertionPoint);
+      } else if (current?.dataset?.codexPlusNativePlacement === "waiting"
+        || current?.classList?.contains(codexPlusMenuFloatingClass)) {
+        scheduleNativeMenuPlacementRetry();
+      } else {
+        cancelNativeMenuPlacementRetry();
+      }
+    }, codexPlusNativeMenuRetryMs);
+    return true;
+  }
+
   function installCodexPlusMenu() {
     const existing = document.getElementById(codexPlusMenuId);
     removeDuplicateCodexPlusMenus(existing);
@@ -4024,24 +4188,16 @@
       existing.remove();
       insertionPoint = findNativeMenuInsertionPoint();
     } else if (existing && insertionPoint && existing.parentElement === insertionPoint.parent) {
-      configureCodexPlusTrigger(existing, existing.querySelector("button"), insertionPoint.nativeButtonClass);
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      if (existing.nextSibling !== safeBefore) insertionPoint.parent.insertBefore(existing, safeBefore);
-      removeDuplicateCodexPlusMenus(existing);
+      placeCodexPlusMenuNative(existing, insertionPoint);
       return;
     } else if (existing && insertionPoint) {
-      configureCodexPlusTrigger(existing, existing.querySelector("button"), insertionPoint.nativeButtonClass);
-      existing.className = "";
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      insertionPoint.parent.insertBefore(existing, safeBefore);
-      removeDuplicateCodexPlusMenus(existing);
+      placeCodexPlusMenuNative(existing, insertionPoint);
       return;
     } else if (existing) {
       configureCodexPlusTrigger(existing, existing.querySelector("button"), headerIconTextButtonClass);
-      existing.className = codexPlusMenuFloatingClass;
-      document.documentElement.appendChild(existing);
-      updateFloatingCodexPlusMenuPosition(existing);
+      prepareCodexPlusMenuWaiting(existing);
       removeDuplicateCodexPlusMenus(existing);
+      scheduleNativeMenuPlacementRetry();
       return;
     }
     const menu = document.createElement("div");
@@ -4057,13 +4213,10 @@
     configureCodexPlusTrigger(menu, trigger, nativeButtonClass);
     menu.appendChild(trigger);
     if (insertionPoint) {
-      menu.className = "";
-      const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-      insertionPoint.parent.insertBefore(menu, safeBefore);
+      placeCodexPlusMenuNative(menu, insertionPoint);
     } else {
-      menu.className = codexPlusMenuFloatingClass;
-      document.documentElement.appendChild(menu);
-      updateFloatingCodexPlusMenuPosition(menu);
+      prepareCodexPlusMenuWaiting(menu);
+      scheduleNativeMenuPlacementRetry();
     }
     removeDuplicateCodexPlusMenus(menu);
   }
@@ -5864,7 +6017,22 @@
       },
       threadState: () => readThreadServiceTierState(),
       syncNativeSelection: (mode) => syncCodexServiceTierFromNativeSelection(mode),
+      nativeSelectionGuard: () => ({
+        mode: codexNativeServiceTierSelectionGuard.mode,
+        active: codexNativeServiceTierSelectionGuardActive(),
+      }),
       nativeModeFromMenuItem: (item) => codexNativeServiceTierModeFromMenuItem(item),
+      findAppHeader: (root) => findCodexAppHeader(root),
+      isOpenLocationButton: (button) => isCodexHeaderOpenLocationButton(button),
+      findNativeMenuInsertionPoint: () => findNativeMenuInsertionPoint(),
+      normalizeCodexPlusTriggerClassName: (className) => normalizeCodexPlusTriggerClassName(className),
+      floatingMenuRightBoundary: (header, menu, anchorRect, root) => floatingMenuRightBoundary(header, menu, anchorRect, root),
+      scheduleNativeMenuPlacementRetry: () => scheduleNativeMenuPlacementRetry(),
+      nativeMenuPlacementRetryState: () => nativeMenuPlacementRetryState(),
+      scheduleScan: (mutations) => scheduleScan(mutations),
+      shouldScheduleScan: (mutations) => shouldScheduleScan(mutations),
+      conversationViewOffset: (currentRect, bounds, htmlCenter, previousOffset) => conversationViewOffset(currentRect, bounds, htmlCenter, previousOffset),
+      conversationViewFrameBudget: (reason) => conversationViewFrameBudget(reason),
       settingStorageFromModule: codexSettingStorageFromModule,
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
@@ -8853,10 +9021,8 @@
     composerEl: null,
     rafId: 0,
     settleFramesLeft: 0,
-    mo: null,
     ro: null,
     pollId: 0,
-    moObserved: false,
     observed: new WeakSet(),
     elements: new Set(),
   };
@@ -8907,13 +9073,20 @@
 
   function syncCodexNativeSolidFastIcon() {
     const trigger = codexServiceTierNativeTrigger();
-    const availability = codexServiceTierFastAvailability();
-    if (!trigger
-      || !codexPlusSettings().serviceTierControls
-      || !availability.supported
-      || codexServiceTierState.effectiveMode !== "fast") return false;
+    if (!trigger || !codexPlusSettings().serviceTierControls) return false;
     return Array.from(trigger.querySelectorAll?.('svg:not([data-codex-service-tier-icon="solid"])') || [])
       .some(patchCodexNativeSolidFastIcon);
+  }
+
+  function setCodexNativeServiceTierSelectionGuard(mode) {
+    codexNativeServiceTierSelectionGuard = {
+      mode: normalizeCodexThreadServiceTierMode(mode),
+      until: Date.now() + codexNativeServiceTierSelectionGuardMs,
+    };
+  }
+
+  function codexNativeServiceTierSelectionGuardActive() {
+    return Date.now() < codexNativeServiceTierSelectionGuard.until;
   }
 
   function codexNativeServiceTierMemoValues(fiber) {
@@ -9019,6 +9192,7 @@
   }
 
   function syncCodexNativeServiceTierPicker() {
+    if (codexNativeServiceTierSelectionGuardActive()) return false;
     const trigger = codexServiceTierNativeTrigger();
     const fiber = codexServiceTierNativePickerFiber(trigger);
     if (!trigger || !fiber || !codexServiceTierNativeApiKeyAuth(fiber)) return false;
@@ -9081,6 +9255,7 @@
 
   function syncCodexServiceTierFromNativeSelection(mode) {
     const normalizedMode = normalizeCodexThreadServiceTierMode(mode);
+    setCodexNativeServiceTierSelectionGuard(normalizedMode);
     const state = readThreadServiceTierState();
     const controlMode = normalizeCodexServiceTierControlMode(state.mode);
     if (controlMode === "custom") {
@@ -9853,18 +10028,13 @@
       el.style.boxSizing = el.dataset.codexPlusConversationViewOriginalBoxSizing;
       delete el.dataset.codexPlusConversationViewOriginalBoxSizing;
     }
+    delete el.dataset.codexPlusConversationViewAppliedOffset;
   }
 
-  function conversationViewResetOwnOffset(el) {
+  function conversationViewResetOwnTransform(el) {
     if (!el) return;
     const originalTransform = el.dataset.codexPlusConversationViewOriginalTransform || "";
-    const originalLeft = el.dataset.codexPlusConversationViewOriginalLeft || "";
-    if (el.style.left !== originalLeft) el.style.left = originalLeft;
     if (el.style.transform !== originalTransform) el.style.transform = originalTransform;
-    const transform = String(el.style.transform || "").trim();
-    if (/^(translateX\([^)]*\)\s*)+$/i.test(transform)) {
-      el.style.transform = "";
-    }
   }
 
   function conversationViewApplyNativeWidth(el) {
@@ -9886,26 +10056,37 @@
     return rect.left + rect.width / 2;
   }
 
-  function conversationViewHasRoomForHtmlCenter(nativeRect, bounds) {
-    if (!nativeRect || !bounds) return false;
-    const targetLeft = conversationViewHtmlCenter() - nativeRect.width / 2;
-    const targetRight = targetLeft + nativeRect.width;
-    return targetLeft >= bounds.left - 0.5 && targetRight <= bounds.right + 0.5;
+  function conversationViewOffset(currentRect, bounds, htmlCenter, previousOffset = 0) {
+    if (!currentRect || !bounds) return null;
+    const center = Number(htmlCenter);
+    const appliedOffset = Number(previousOffset);
+    if (!Number.isFinite(center)) return null;
+    const targetLeft = center - currentRect.width / 2;
+    const targetRight = targetLeft + currentRect.width;
+    if (targetLeft < bounds.left - 0.5 || targetRight > bounds.right + 0.5) return null;
+    const nativeLeft = currentRect.left - (Number.isFinite(appliedOffset) ? appliedOffset : 0);
+    return targetLeft - nativeLeft;
   }
 
   function conversationViewAlignElement(el) {
     if (!el?.isConnected) return;
     conversationViewApplyNativeWidth(el);
-    conversationViewResetOwnOffset(el);
-    const nativeRect = el.getBoundingClientRect();
+    conversationViewResetOwnTransform(el);
+    const currentRect = el.getBoundingClientRect();
     const bounds = conversationViewSessionRectFor(el);
-    if (!conversationViewHasRoomForHtmlCenter(nativeRect, bounds)) return;
-    const targetLeft = conversationViewHtmlCenter() - nativeRect.width / 2;
-    const delta = targetLeft - nativeRect.left;
-    if (Math.abs(delta) > 0.5) {
-      const nextLeft = `${delta.toFixed(2)}px`;
-      if (el.style.left !== nextLeft) el.style.left = nextLeft;
+    const previousOffset = Number(el.dataset.codexPlusConversationViewAppliedOffset || 0);
+    const nextOffset = conversationViewOffset(currentRect, bounds, conversationViewHtmlCenter(), previousOffset);
+    if (nextOffset === null) {
+      if ("codexPlusConversationViewAppliedOffset" in el.dataset) {
+        const originalLeft = el.dataset.codexPlusConversationViewOriginalLeft || "";
+        if (el.style.left !== originalLeft) el.style.left = originalLeft;
+        delete el.dataset.codexPlusConversationViewAppliedOffset;
+      }
+      return;
     }
+    const nextLeft = Math.abs(nextOffset) > 0.5 ? `${nextOffset.toFixed(2)}px` : (el.dataset.codexPlusConversationViewOriginalLeft || "");
+    if (el.style.left !== nextLeft) el.style.left = nextLeft;
+    el.dataset.codexPlusConversationViewAppliedOffset = String(nextOffset);
   }
 
   function conversationViewObserveIfNeeded(el) {
@@ -9936,7 +10117,11 @@
     conversationViewAlignElement(conversationViewState.composerEl);
   }
 
-  function scheduleConversationViewAlign(frames = 16) {
+  function conversationViewFrameBudget(reason = "initial") {
+    return reason === "initial" ? 2 : 1;
+  }
+
+  function scheduleConversationViewAlign(frames = conversationViewFrameBudget("initial")) {
     conversationViewState.settleFramesLeft = Math.max(conversationViewState.settleFramesLeft, frames);
     if (conversationViewState.rafId) return;
     const tick = () => {
@@ -9955,11 +10140,8 @@
     if (conversationViewState.pollId) clearInterval(conversationViewState.pollId);
     conversationViewState.rafId = 0;
     conversationViewState.pollId = 0;
-    conversationViewState.mo?.disconnect();
     conversationViewState.ro?.disconnect();
-    conversationViewState.mo = null;
     conversationViewState.ro = null;
-    conversationViewState.moObserved = false;
     conversationViewState.observed = new WeakSet();
     conversationViewState.elements.forEach(conversationViewRestoreElement);
     conversationViewState.elements.clear();
@@ -9970,19 +10152,11 @@
   window.__codexPlusConversationViewCleanup = cleanupConversationView;
 
   function ensureConversationViewRuntime() {
-    if (conversationViewState.ro && conversationViewState.mo && conversationViewState.pollId) return;
-    conversationViewState.ro = conversationViewState.ro || new ResizeObserver(() => scheduleConversationViewAlign());
-    conversationViewState.mo = conversationViewState.mo || new MutationObserver(() => scheduleConversationViewAlign());
-    if (document.body && !conversationViewState.moObserved) {
-      conversationViewState.mo.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["class", "hidden", "data-state", "aria-hidden"],
-      });
-      conversationViewState.moObserved = true;
-    }
-    conversationViewState.pollId = conversationViewState.pollId || window.setInterval(() => scheduleConversationViewAlign(2), 350);
+    if (conversationViewState.ro && conversationViewState.pollId) return;
+    conversationViewState.ro = conversationViewState.ro
+      || new ResizeObserver(() => scheduleConversationViewAlign(conversationViewFrameBudget("resize")));
+    conversationViewState.pollId = conversationViewState.pollId
+      || window.setInterval(() => scheduleConversationViewAlign(conversationViewFrameBudget("poll")), 500);
   }
 
   function refreshConversationView() {
@@ -9991,7 +10165,7 @@
       return;
     }
     ensureConversationViewRuntime();
-    scheduleConversationViewAlign();
+    scheduleConversationViewAlign(conversationViewFrameBudget("initial"));
   }
 
   function scanLightweight() {
@@ -10622,7 +10796,7 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, [data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"], .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, [data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"], .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu, #codex-live-token-cost, #codex-live-token-cost-settings, .cltc-settings-overlay`);
   }
 
   function scanRelevantSelector() {
@@ -10636,10 +10810,12 @@
       '[data-message-author-role]',
       '[data-testid="conversation-turn"]',
       '[data-model-picker-model-row]',
+      '[data-codex-intelligence-trigger="true"]',
       codexServiceTierSemanticModelMenuRowSelector(),
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",
+      "header",
       selectors.appHeader,
       selectors.archiveNav,
       codexMenuLocalizationScopeSelector(),
@@ -10691,7 +10867,6 @@
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
     scheduleZedRemoteMenuRefresh(mutations);
-    schedulePluginAutoExpand();
     if (!shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;

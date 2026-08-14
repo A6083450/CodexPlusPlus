@@ -720,6 +720,185 @@ async fn user_script_manager_scans_and_persists_inventory_shape() {
     );
 }
 
+#[test]
+fn user_script_manager_installs_ds_style_cost_script_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+
+    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+
+    assert_eq!(
+        installed.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&true)
+    );
+    assert!(
+        !installed
+            .scripts
+            .contains_key("user:market-codex-live-token-cost.js")
+    );
+    assert!(user_dir.join("market-codex-ds-style-cost.js").is_file());
+    assert!(!user_dir.join("market-codex-live-token-cost.js").exists());
+}
+
+#[test]
+fn user_script_manager_migrates_legacy_cost_script_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(
+        user_dir.join("market-codex-live-token-cost.js"),
+        "window.localOverride = true;",
+    )
+    .unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    manager
+        .set_script_enabled("user:market-codex-live-token-cost.js", false)
+        .unwrap();
+
+    let migrated = manager.install_missing_bundled_market_scripts().unwrap();
+
+    assert!(!user_dir.join("market-codex-live-token-cost.js").exists());
+    assert_eq!(
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js")).unwrap(),
+        "window.localOverride = true;"
+    );
+    assert!(
+        !migrated
+            .scripts
+            .contains_key("user:market-codex-live-token-cost.js")
+    );
+    assert_eq!(
+        migrated.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&false)
+    );
+}
+
+#[test]
+fn user_script_manager_installs_missing_bundled_market_scripts_and_reinstalls_on_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+
+    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        installed.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&true)
+    );
+    assert_eq!(
+        installed.scripts.get("user:market-codex-zhcn-translate.js"),
+        Some(&true)
+    );
+    assert!(
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
+            .unwrap()
+            .contains("Codex Live Token Cost")
+    );
+    assert!(
+        std::fs::read_to_string(user_dir.join("market-codex-zhcn-translate.js"))
+            .unwrap()
+            .contains("Codex简体中文汉化")
+    );
+
+    manager
+        .set_script_enabled("user:market-codex-ds-style-cost.js", false)
+        .unwrap();
+    std::fs::write(
+        user_dir.join("market-codex-ds-style-cost.js"),
+        "// ==UserScript==\n// @version      0.8.0\n// ==/UserScript==\nwindow.oldBundle = true;",
+    )
+    .unwrap();
+    let upgraded = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        upgraded.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&false)
+    );
+    let upgraded_source =
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js")).unwrap();
+    assert_eq!(
+        upgraded_source,
+        include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js")
+    );
+
+    std::fs::write(
+        user_dir.join("market-codex-ds-style-cost.js"),
+        "window.localOverride = true;",
+    )
+    .unwrap();
+    let existing = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        existing.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&false)
+    );
+    assert_eq!(
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js")).unwrap(),
+        "window.localOverride = true;"
+    );
+
+    let reinstalled = manager.reinstall_bundled_market_scripts().unwrap();
+    assert_eq!(
+        reinstalled
+            .scripts
+            .get("user:market-codex-ds-style-cost.js"),
+        Some(&true)
+    );
+    assert!(
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
+            .unwrap()
+            .contains("Codex Live Token Cost")
+    );
+}
+
+#[test]
+fn user_script_manager_upgrades_older_bundled_translation_script() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(
+        user_dir.join("market-codex-zhcn-translate.js"),
+        "// ==UserScript==\n// @version      1.1\n// ==/UserScript==\nwindow.oldTranslation = true;",
+    )
+    .unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    manager
+        .set_script_enabled("user:market-codex-zhcn-translate.js", false)
+        .unwrap();
+
+    let upgraded = manager.install_missing_bundled_market_scripts().unwrap();
+
+    assert_eq!(
+        upgraded
+            .scripts
+            .get("user:market-codex-zhcn-translate.js"),
+        Some(&false)
+    );
+    let upgraded_source =
+        std::fs::read_to_string(user_dir.join("market-codex-zhcn-translate.js")).unwrap();
+    assert_eq!(
+        upgraded_source,
+        include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js")
+    );
+    assert!(upgraded_source.contains("@version      1.2"));
+    assert!(upgraded_source.contains("轻度(low)"));
+    assert!(upgraded_source.contains("极高(ultra)"));
+}
+
 #[tokio::test]
 async fn user_script_inventory_merges_renderer_runtime_status() {
     let temp = tempfile::tempdir().unwrap();
