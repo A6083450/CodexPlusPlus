@@ -4,11 +4,12 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
 function loadCodexPlusTriggerClassNormalizer(renderer: string) {
-  const start = renderer.indexOf("  function normalizeCodexPlusTriggerClassName");
-  const end = renderer.indexOf("\n\n  function configureCodexPlusTrigger", start);
+  const normalizedRenderer = renderer.replace(/\r\n/g, "\n");
+  const start = normalizedRenderer.indexOf("  function normalizeCodexPlusTriggerClassName");
+  const end = normalizedRenderer.indexOf("\n\n  function configureCodexPlusTrigger", start);
   assert.ok(start >= 0 && end > start, "Codex++ trigger class normalizer should exist");
 
-  const source = renderer.slice(start, end).trim();
+  const source = normalizedRenderer.slice(start, end).trim();
   return vm.runInNewContext(`(${source})`) as (className: string) => string;
 }
 
@@ -144,14 +145,17 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
   });
 
-  it("keeps the Codex++ trigger pill-shaped when copying native button classes", async () => {
+  it("keeps the Codex++ trigger pill-shaped across checkout line endings", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const normalize = loadCodexPlusTriggerClassNormalizer(renderer);
+    const lfRenderer = renderer.replace(/\r\n/g, "\n");
 
-    const classNames = normalize("flex h-7 rounded-lg rounded-l-none border-l-0 px-1.5").split(/\s+/);
+    for (const source of [lfRenderer, lfRenderer.replace(/\n/g, "\r\n")]) {
+      const normalize = loadCodexPlusTriggerClassNormalizer(source);
+      const classNames = normalize("flex h-7 rounded-lg rounded-l-none border-l-0 px-1.5").split(/\s+/);
 
-    assert.ok(classNames.includes("rounded-full"));
-    assert.ok(!classNames.includes("rounded-lg"));
-    assert.ok(!classNames.includes("rounded-l-none"));
+      assert.ok(classNames.includes("rounded-full"));
+      assert.ok(!classNames.includes("rounded-lg"));
+      assert.ok(!classNames.includes("rounded-l-none"));
+    }
   });
 });
