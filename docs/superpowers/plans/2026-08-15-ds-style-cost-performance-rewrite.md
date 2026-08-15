@@ -465,11 +465,11 @@ fn lazy_asset_source(asset: LazyAsset) -> String {
 - Create: `docs/superpowers/evidence/ds-style-cost-baseline/profile-page.png`
 - Create: `apps/codex-plus-manager/src/live-token-cost-visual-contract.test.ts`
 
-**Interfaces:** Add a characterization test that reads the old source and locks the visible labels, HUD field keys, setting panel order, element IDs, CSS variables, and the accepted animation differences.
+**Interfaces:** Add a characterization test that executes the checked-in old script in the VM DOM harness and locks its rendered labels, HUD field order, settings navigation, element IDs, computed CSS variables and accepted animation differences. Source-text matching is not behavior evidence; the test must drive the real script and assert observable DOM/style/interaction results.
 
 - [ ] **Step 1: Add the visual characterization test against the existing script**
 
-  Assert the exact HUD sequence `轮 · 步`, `LLM · 工具调用`, `首 token 平均 · tok/s`, `缓存命中`, `输入 tok · 输出 tok`; panel order `个人资料/数据与显示/使用统计/模型价格`; IDs `codex-live-token-cost` and `codex-live-token-cost-settings`; account trigger labels `打开个人资料菜单/Open profile menu/Open profile menu and settings`; and current `--cltc-*` color/spacing/radius variables. Lock the old enabled Profile menu row's role, disabled attributes, class, identity label/avatar geometry and keyboard behavior as the entry contract; do not lock its React implementation.
+  Execute version `0.8.3` against controlled composer, settings and account-menu fixtures. Assert the exact rendered HUD sequence `轮 · 步`, `LLM · 工具调用`, `首 token 平均 · tok/s`, `缓存命中`, `输入 tok · 输出 tok`; panel order `个人资料/数据与显示/使用统计/模型价格`; IDs `codex-live-token-cost` and `codex-live-token-cost-settings`; account trigger labels `打开个人资料菜单/Open profile menu/Open profile menu and settings`; and computed `--cltc-*` color/spacing/radius values. Drive click/keyboard behavior and lock the old enabled Profile menu row's role, disabled attributes, class, identity label/avatar geometry and behavior as the entry contract; do not lock its React implementation or grep the source for these strings.
 
 - [ ] **Step 2: Run the characterization test**
 
@@ -922,6 +922,7 @@ impl SnapshotCoalescer {
 - Replace: `assets/user_scripts/market-codex-ds-style-cost.js`
 - Replace: `apps/codex-plus-manager/src/live-token-cost.test.ts`
 - Modify: `apps/codex-plus-manager/src/live-token-cost-visual-contract.test.ts`
+- Create: `apps/codex-plus-manager/src/live-token-cost-performance.test.ts`
 
 **Interfaces:** Version becomes `1.0.0`. Startup creates only style, settings button, HUD root, one root click/change delegation pair, one lifecycle listener, one bridge bootstrap request, `window.__codexLiveTokenCostCaptureV1` and the fixed `window.__codexLiveTokenCostV1` entry. The lifecycle listener also performs the bounded Profile menu-row projection when `reason === 'profile_menu'`; it adds no document listener of its own. Capture remains false until bootstrap succeeds.
 
@@ -933,13 +934,15 @@ impl SnapshotCoalescer {
 
   Test Profile entry projection separately: `profile_visible=false` restores/skips the projection; otherwise only the exact lifecycle-supplied menu ID may be queried. The menu must match `role=menu`, `aria-labelledby`, disabled identity row and enabled Settings sibling; save original class/text/disabled/tabindex/avatar state on that DOM node before marking it with `data-codex-plus-token-cost-profile-entry`; render configured `display_name`/avatar with the baseline geometry; update only after config changes or another explicit menu lifecycle. Before each projection and on destroy/repeat injection, query and restore connected marked nodes; never retain menu nodes in a long-lived Set/Map, so detached menus are collectible. No timer, observer or account/auth mutation is allowed.
 
-- [ ] **Step 2: Add static forbidden and size assertions**
+- [ ] **Step 2: Add a separate static performance policy gate**
 
-  Assert startup source is `<= 61_440` bytes and does not contain `localStorage`, `indexedDB`, `MutationObserver`, `setInterval`, `.clone(`, `offsetWidth`, `Array.prototype`, `Promise.prototype`, `RegExp.prototype`, `window.fetch =`, `XMLHttpRequest`, `WebSocket`, `electronBridge =`, `Statsig`, `__reactFiber`, `eval(`, or `new Function`.
+  In `live-token-cost-performance.test.ts`, add a clearly named defense-in-depth policy gate asserting startup source is `<= 61_440` bytes and does not contain `localStorage`, `indexedDB`, `MutationObserver`, `setInterval`, `.clone(`, `offsetWidth`, `Array.prototype`, `Promise.prototype`, `RegExp.prototype`, `window.fetch =`, `XMLHttpRequest`, `WebSocket`, `electronBridge =`, `Statsig`, `__reactFiber`, `eval(`, or `new Function`. Keep this separate from behavior tests: it enforces the agreed performance denylist but is not evidence that the UI works or that CPU budgets pass.
 
 - [ ] **Step 3: Run userscript tests and verify RED**
 
   Run: `cd apps/codex-plus-manager && node --test src/live-token-cost.test.ts src/live-token-cost-visual-contract.test.ts`
+
+  Run: `cd apps/codex-plus-manager && node --test src/live-token-cost-performance.test.ts`
 
   Expected: old 496KB script fails size, forbidden API, and thin lifecycle assertions.
 
@@ -955,6 +958,8 @@ impl SnapshotCoalescer {
 
   Run: `cd apps/codex-plus-manager && node --test src/live-token-cost.test.ts src/live-token-cost-visual-contract.test.ts`
 
+  Run: `cd apps/codex-plus-manager && node --test src/live-token-cost-performance.test.ts`
+
   Run: `cd apps/codex-plus-manager && npm test`
 
   Run: `wc -c assets/user_scripts/market-codex-ds-style-cost.js`
@@ -964,7 +969,7 @@ impl SnapshotCoalescer {
 - [ ] **Step 7: Commit the bootstrap replacement**
 
   ```bash
-  git add assets/user_scripts/market-codex-ds-style-cost.js apps/codex-plus-manager/src/live-token-cost.test.ts apps/codex-plus-manager/src/live-token-cost-visual-contract.test.ts
+  git add assets/user_scripts/market-codex-ds-style-cost.js apps/codex-plus-manager/src/live-token-cost.test.ts apps/codex-plus-manager/src/live-token-cost-visual-contract.test.ts apps/codex-plus-manager/src/live-token-cost-performance.test.ts
   git commit -m "feat: replace ds style cost with thin hud bootstrap"
   ```
 
@@ -1115,7 +1120,7 @@ impl SnapshotCoalescer {
 ### Task 13: Add Static And Synthetic Performance Gates
 
 **Files:**
-- Create: `apps/codex-plus-manager/src/live-token-cost-performance.test.ts`
+- Modify: `apps/codex-plus-manager/src/live-token-cost-performance.test.ts`
 - Create: `scripts/measure-ds-style-cost-performance.mjs`
 - Modify: `apps/codex-plus-manager/src/live-token-cost.test.ts`
 - Modify: `crates/codex-plus-core/tests/token_cost.rs`
@@ -1127,9 +1132,9 @@ impl SnapshotCoalescer {
 
   Under fake time, apply 100,000 deltas, 2,000 tool events, 1,000 route events, 200 repeat injections, 100 settings/Profile/calendar open-close cycles, and 256 completed turns. Assert bounded queue/recent/dedupe sizes, at most 2 snapshot pushes per simulated second, zero idle timers after settling, stable owned node/listener counts, and no full-root reconstruction.
 
-- [ ] **Step 2: Add forbidden-code scans scoped to the cost feature**
+- [ ] **Step 2: Extend the separate static performance policy gate**
 
-  Scan the startup script and the marked `TOKEN_COST_BEGIN`/`TOKEN_COST_END` block in `renderer-inject.js`, not unrelated existing renderer features. Fail on all forbidden APIs from Global Constraints and on recursive helpers that enumerate arbitrary object keys/values.
+  Extend the defense-in-depth gate from Task 9 to scan the startup script and the marked `TOKEN_COST_BEGIN`/`TOKEN_COST_END` block in `renderer-inject.js`, not unrelated existing renderer features. Fail on all forbidden APIs from Global Constraints and on recursive helpers that enumerate arbitrary object keys/values. Keep behavior, DOM lifecycle, synthetic load and real-App CPU evidence in their executable tests; this source gate only enforces the explicit denylist.
 
 - [ ] **Step 3: Add payload and update-duration assertions**
 
