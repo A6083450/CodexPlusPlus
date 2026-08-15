@@ -569,6 +569,7 @@ pub struct RuntimeState {
     totals: AnalyticsTotals,
     day_rollups: BTreeMap<u64, AnalyticsTotals>,
     model_rollups: BTreeMap<String, AnalyticsTotals>,
+    day_model_rollups: BTreeMap<u64, BTreeMap<String, AnalyticsTotals>>,
     display_model: String,
     display_fast: bool,
     revision: u64,
@@ -591,6 +592,7 @@ impl RuntimeState {
             totals: AnalyticsTotals::default(),
             day_rollups: BTreeMap::new(),
             model_rollups: BTreeMap::new(),
+            day_model_rollups: BTreeMap::new(),
             display_model: String::new(),
             display_fast: false,
             revision: 0,
@@ -748,21 +750,36 @@ impl RuntimeState {
         let mut totals = AnalyticsTotals::default();
         let mut days = BTreeMap::<String, AnalyticsTotals>::new();
         let mut models = BTreeMap::<String, AnalyticsTotals>::new();
-        let mut inspected = 0_usize;
 
-        if model_filter.is_none() {
-            for (&epoch_day, row) in &self.day_rollups {
-                let epoch_day = epoch_day.min(i64::MAX as u64) as i64;
-                if epoch_day < from_epoch_day || epoch_day > to_epoch_day {
+        for (&epoch_day, day_totals) in &self.day_rollups {
+            let epoch_day = epoch_day.min(i64::MAX as u64) as i64;
+            if epoch_day < from_epoch_day || epoch_day > to_epoch_day {
+                continue;
+            }
+            let day = format_epoch_day(epoch_day);
+            if let Some(model_filter) = model_filter {
+                let Some(row) = self
+                    .day_model_rollups
+                    .get(&(epoch_day as u64))
+                    .and_then(|models| models.get(model_filter))
+                else {
                     continue;
-                }
+                };
                 add_totals(&mut totals, row);
-                days.insert(format_epoch_day(epoch_day), row.clone());
+                days.insert(day, row.clone());
+                add_totals(models.entry(model_filter.to_string()).or_default(), row);
+            } else {
+                add_totals(&mut totals, day_totals);
+                days.insert(day, day_totals.clone());
+                if let Some(day_models) = self.day_model_rollups.get(&(epoch_day as u64)) {
+                    for (model, row) in day_models {
+                        add_totals(models.entry(model.clone()).or_default(), row);
+                    }
+                }
             }
         }
 
         for turn in self.active_turns.values().take(RECENT_TURN_LIMIT) {
-            inspected += 1;
             let occurred_at_ms = turn.last_seen_at_ms.max(turn.started_at_ms);
             let row = turn.totals(now_ms.max(occurred_at_ms), config);
             add_analytics_row(
@@ -776,35 +793,6 @@ impl RuntimeState {
                 to_epoch_day,
                 model_filter,
             );
-        }
-        for completed in self
-            .recent_turns
-            .iter()
-            .rev()
-            .take(RECENT_TURN_LIMIT.saturating_sub(inspected))
-        {
-            if model_filter.is_some() {
-                add_analytics_row(
-                    &mut totals,
-                    &mut days,
-                    &mut models,
-                    &completed.turn.model,
-                    completed.completed_at_ms,
-                    &completed.totals,
-                    from_epoch_day,
-                    to_epoch_day,
-                    model_filter,
-                );
-            } else {
-                add_analytics_model_row(
-                    &mut models,
-                    &completed.turn.model,
-                    completed.completed_at_ms,
-                    &completed.totals,
-                    from_epoch_day,
-                    to_epoch_day,
-                );
-            }
         }
 
         AnalyticsSnapshot {
@@ -918,18 +906,26 @@ impl RuntimeState {
     fn add_rollups(&mut self, model: &str, occurred_at_ms: u64, totals: &AnalyticsTotals) {
         let day = occurred_at_ms / MILLIS_PER_DAY;
         add_totals(self.day_rollups.entry(day).or_default(), totals);
-        while self.day_rollups.len() > DAY_ROLLUP_LIMIT {
-            let Some(oldest) = self.day_rollups.keys().next().copied() else {
-                break;
-            };
-            self.day_rollups.remove(&oldest);
-        }
-
         if self.model_rollups.contains_key(model) || self.model_rollups.len() < MODEL_ROLLUP_LIMIT {
             add_totals(
                 self.model_rollups.entry(model.to_string()).or_default(),
                 totals,
             );
+            add_totals(
+                self.day_model_rollups
+                    .entry(day)
+                    .or_default()
+                    .entry(model.to_string())
+                    .or_default(),
+                totals,
+            );
+        }
+        while self.day_rollups.len() > DAY_ROLLUP_LIMIT {
+            let Some(oldest) = self.day_rollups.keys().next().copied() else {
+                break;
+            };
+            self.day_rollups.remove(&oldest);
+            self.day_model_rollups.remove(&oldest);
         }
     }
 
@@ -945,6 +941,13 @@ impl RuntimeState {
         }
         if let Some(model_totals) = self.model_rollups.get_mut(model) {
             replace_totals(model_totals, old, new);
+        }
+        if let Some(day_model_totals) = self
+            .day_model_rollups
+            .get_mut(&(occurred_at_ms / MILLIS_PER_DAY))
+            .and_then(|models| models.get_mut(model))
+        {
+            replace_totals(day_model_totals, old, new);
         }
     }
 }
@@ -970,23 +973,6 @@ fn add_analytics_row(
     }
     add_totals(totals, row);
     add_totals(days.entry(format_epoch_day(epoch_day)).or_default(), row);
-    if models.contains_key(model) || models.len() < MODEL_ROLLUP_LIMIT {
-        add_totals(models.entry(model.to_string()).or_default(), row);
-    }
-}
-
-fn add_analytics_model_row(
-    models: &mut BTreeMap<String, AnalyticsTotals>,
-    model: &str,
-    occurred_at_ms: u64,
-    row: &AnalyticsTotals,
-    from_epoch_day: i64,
-    to_epoch_day: i64,
-) {
-    let epoch_day = (occurred_at_ms / MILLIS_PER_DAY) as i64;
-    if epoch_day < from_epoch_day || epoch_day > to_epoch_day {
-        return;
-    }
     if models.contains_key(model) || models.len() < MODEL_ROLLUP_LIMIT {
         add_totals(models.entry(model.to_string()).or_default(), row);
     }

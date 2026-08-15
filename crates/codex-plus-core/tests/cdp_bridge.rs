@@ -4042,6 +4042,97 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
 }
 
 #[tokio::test]
+async fn install_bridge_rejects_duplicate_token_cost_fields_before_value_collapse() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        let duplicate_requests = [
+            (
+                "duplicate-wrapper",
+                r#"{"id":"duplicate-wrapper","path":"/token-cost/bootstrap","payload":{"instance_id":"first","instance_id":"second"}}"#,
+            ),
+            (
+                "duplicate-event",
+                r#"{"id":"duplicate-event","path":"/token-cost/event","payload":{"instance_id":"page-1","event":{"type":"turn_started","type":"turn_completed"}}}"#,
+            ),
+            (
+                "duplicate-action",
+                r#"{"id":"duplicate-action","path":"/token-cost/action","payload":{"action":{"type":"clear_history","type":"query_diagnostics"}}}"#,
+            ),
+        ];
+        for (request_id, payload) in duplicate_requests {
+            send_json(
+                &mut socket,
+                json!({
+                    "method": "Runtime.bindingCalled",
+                    "params": { "payload": payload },
+                }),
+            )
+            .await;
+            let response = recv_json(&mut socket).await;
+            let expression = response["params"]["expression"]
+                .as_str()
+                .expect("expression should be string");
+            assert!(expression.contains("__codexSessionDeleteResolve"));
+            assert!(expression.contains(request_id));
+            assert!(expression.contains("invalid_request"));
+            send_json(&mut socket, json!({ "id": response["id"], "result": {} })).await;
+        }
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": r#"{"id":"legacy-duplicate","path":"delete","payload":{"target":"first","target":"second"}}"#,
+                },
+            }),
+        )
+        .await;
+        let response = recv_json(&mut socket).await;
+        let expression = response["params"]["expression"]
+            .as_str()
+            .expect("expression should be string");
+        assert!(expression.contains("legacy-duplicate"));
+        assert!(expression.contains("\"status\":\"ok\""));
+        send_json(&mut socket, json!({ "id": response["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handled_legacy = Arc::new(AtomicBool::new(false));
+    let handler = {
+        let handled_legacy = Arc::clone(&handled_legacy);
+        Arc::new(move |path: String, payload: serde_json::Value| {
+            let handled_legacy = Arc::clone(&handled_legacy);
+            Box::pin(async move {
+                assert_eq!(path, "delete");
+                assert_eq!(payload["target"], "second");
+                handled_legacy.store(true, Ordering::SeqCst);
+                Ok(json!({ "status": "ok" }))
+            })
+                as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang while rejecting duplicate token cost fields")
+    .expect("bridge should reject duplicate token cost fields");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(handled_legacy.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn install_bridge_immediately_evaluates_new_document_scripts() {
     let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
         for expected_id in 1..=5 {

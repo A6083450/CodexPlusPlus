@@ -581,6 +581,26 @@ async fn token_cost_analytics_totals_and_days_survive_recent_turn_eviction() {
             (1_704_153_600_000, index - 1)
         };
         let turn_id = format!("evicted-turn-{index}");
+        let started = handle_bridge_request(
+            ctx.clone(),
+            "/token-cost/event",
+            json!({
+                "instance_id": "page-analytics",
+                "event": {
+                    "type": "turn_started",
+                    "meta": renderer_meta(
+                        &turn_id,
+                        &format!("{turn_id}-start"),
+                        &format!("correlation-{turn_id}"),
+                        day_start + day_index,
+                    ),
+                    "model": "model-eviction",
+                    "fast": false
+                }
+            }),
+        )
+        .await;
+        assert_eq!(started["status"], "ok", "index {index}: {started}");
         let response = handle_bridge_request(
             ctx.clone(),
             "/token-cost/event",
@@ -616,6 +636,22 @@ async fn token_cost_analytics_totals_and_days_survive_recent_turn_eviction() {
     assert_eq!(analytics["days"][0]["totals"]["turns"], 1);
     assert_eq!(analytics["days"][1]["day"], "2024-01-02");
     assert_eq!(analytics["days"][1]["totals"]["turns"], 256);
+    assert_eq!(analytics["models"].as_array().unwrap().len(), 1);
+    assert_eq!(analytics["models"][0]["model"], "model-eviction");
+    assert_eq!(analytics["models"][0]["totals"]["turns"], 257);
+
+    let filtered = token_cost_analytics_action(
+        &ctx,
+        json!({"type": "custom", "from_day": "2024-01-01", "to_day": "2024-01-02"}),
+        Some("model-eviction"),
+    )
+    .await;
+    let filtered = &filtered["response"]["analytics"];
+    assert_eq!(filtered["totals"]["turns"], 257);
+    assert_eq!(filtered["totals"]["input"], 257);
+    assert_eq!(filtered["days"].as_array().unwrap().len(), 2);
+    assert_eq!(filtered["days"][0]["totals"]["turns"], 1);
+    assert_eq!(filtered["days"][1]["totals"]["turns"], 256);
 }
 
 async fn ingest_analytics_turn(
@@ -837,6 +873,26 @@ async fn token_cost_cc_switch_sync_is_single_bounded_and_resets_its_guard() {
                 "model": "gpt-5.6-sol",
                 "occurred_at_ms": 1,
                 "usage": {"input": 1, "cached_input": 2, "cache_write": 0, "output": 1}
+            }]
+        }))
+        .unwrap(),
+        serde_json::to_vec(&json!({
+            "ok": true,
+            "turns": [{
+                "turn_id": "unsupported-calendar-day",
+                "model": "gpt-5.6-sol",
+                "occurred_at_ms": 253_402_300_800_000_u64,
+                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
+            }]
+        }))
+        .unwrap(),
+        serde_json::to_vec(&json!({
+            "ok": true,
+            "turns": [{
+                "turn_id": "maximum-u64-time",
+                "model": "gpt-5.6-sol",
+                "occurred_at_ms": u64::MAX,
+                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
             }]
         }))
         .unwrap(),

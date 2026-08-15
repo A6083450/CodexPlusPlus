@@ -41,6 +41,7 @@ const LAZY_PUSH_CAPACITY: usize = 8;
 const MAX_INSTANCE_ID_BYTES: usize = 128;
 const MAX_CC_SWITCH_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CC_SWITCH_TURNS: usize = RECENT_TURN_LIMIT;
+const MAX_CC_SWITCH_OCCURRED_AT_MS: u64 = 253_402_300_799_999;
 const CC_SWITCH_URL: &str = "http://127.0.0.1:17888/cc-switch/turns?refresh=1";
 
 pub const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
@@ -670,7 +671,7 @@ fn validate_cc_switch_payload(payload: &CcSwitchPayload<'_>) -> anyhow::Result<(
         );
         validate_model(turn.model).map_err(|_| anyhow::anyhow!("cc_switch: model is invalid"))?;
         ensure!(
-            turn.occurred_at_ms > 0,
+            (1..=MAX_CC_SWITCH_OCCURRED_AT_MS).contains(&turn.occurred_at_ms),
             "cc_switch: occurred_at_ms is invalid"
         );
         ensure!(

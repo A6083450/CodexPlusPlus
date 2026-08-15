@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -23,6 +25,123 @@ pub type BridgeHandler = Arc<
         + Send
         + Sync,
 >;
+
+struct DuplicateAwareValue {
+    value: Value,
+    has_duplicate_key: bool,
+}
+
+impl<'de> Deserialize<'de> for DuplicateAwareValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateAwareValueVisitor)
+    }
+}
+
+struct DuplicateAwareValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateAwareValueVisitor {
+    type Value = DuplicateAwareValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::Bool(value),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::Number(value.into()),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::Number(value.into()),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("non-finite JSON number"))?;
+        Ok(DuplicateAwareValue {
+            value: Value::Number(number),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::String(value.to_string()),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::String(value),
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::Null,
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateAwareValue {
+            value: Value::Null,
+            has_duplicate_key: false,
+        })
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        let mut has_duplicate_key = false;
+        while let Some(item) = sequence.next_element::<DuplicateAwareValue>()? {
+            has_duplicate_key |= item.has_duplicate_key;
+            values.push(item.value);
+        }
+        Ok(DuplicateAwareValue {
+            value: Value::Array(values),
+            has_duplicate_key,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        let mut has_duplicate_key = false;
+        while let Some((key, item)) = map.next_entry::<String, DuplicateAwareValue>()? {
+            has_duplicate_key |= item.has_duplicate_key || values.contains_key(&key);
+            values.insert(key, item.value);
+        }
+        Ok(DuplicateAwareValue {
+            value: Value::Object(values),
+            has_duplicate_key,
+        })
+    }
+}
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(100);
 
@@ -491,7 +610,7 @@ where
                 return Ok(());
             };
 
-            let parsed: Value = match serde_json::from_str(payload_text) {
+            let parsed: DuplicateAwareValue = match serde_json::from_str(payload_text) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     if let Some(request_id) = extract_string_field(payload_text, "id") {
@@ -504,7 +623,26 @@ where
                     return Ok(());
                 }
             };
-            self.route_parsed_binding_call(&handler, parsed).await
+            let path = parsed
+                .value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if path.starts_with("/token-cost/") && parsed.has_duplicate_key {
+                if let Some(request_id) = parsed.value.get("id").and_then(Value::as_str) {
+                    self.resolve_bridge_request(
+                        request_id,
+                        &json!({
+                            "status": "failed",
+                            "category": "invalid_request",
+                            "message": "invalid token cost request",
+                        }),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            self.route_parsed_binding_call(&handler, parsed.value).await
         })
     }
 
