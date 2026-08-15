@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use super::{
-    AnalyticsTotals, EventMeta, TokenCostEvent, TokenCostSnapshot, TokenUsage, UiConfig,
-    UsageSource, default_model_price, fast_multiplier_millis, usage_cost_nanos,
+    AnalyticsDay, AnalyticsModel, AnalyticsSnapshot, AnalyticsTotals, EventMeta, TokenCostEvent,
+    TokenCostSnapshot, TokenUsage, UiConfig, UsageSource, default_model_price,
+    fast_multiplier_millis, usage_cost_nanos,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -734,6 +735,95 @@ impl RuntimeState {
         }
     }
 
+    pub(crate) fn analytics_snapshot(
+        &self,
+        config: &UiConfig,
+        from_day: String,
+        to_day: String,
+        from_epoch_day: i64,
+        to_epoch_day: i64,
+        model_filter: Option<&str>,
+        now_ms: u64,
+    ) -> AnalyticsSnapshot {
+        let mut totals = AnalyticsTotals::default();
+        let mut days = BTreeMap::<String, AnalyticsTotals>::new();
+        let mut models = BTreeMap::<String, AnalyticsTotals>::new();
+        let mut inspected = 0_usize;
+
+        if model_filter.is_none() {
+            for (&epoch_day, row) in &self.day_rollups {
+                let epoch_day = epoch_day.min(i64::MAX as u64) as i64;
+                if epoch_day < from_epoch_day || epoch_day > to_epoch_day {
+                    continue;
+                }
+                add_totals(&mut totals, row);
+                days.insert(format_epoch_day(epoch_day), row.clone());
+            }
+        }
+
+        for turn in self.active_turns.values().take(RECENT_TURN_LIMIT) {
+            inspected += 1;
+            let occurred_at_ms = turn.last_seen_at_ms.max(turn.started_at_ms);
+            let row = turn.totals(now_ms.max(occurred_at_ms), config);
+            add_analytics_row(
+                &mut totals,
+                &mut days,
+                &mut models,
+                &turn.model,
+                occurred_at_ms,
+                &row,
+                from_epoch_day,
+                to_epoch_day,
+                model_filter,
+            );
+        }
+        for completed in self
+            .recent_turns
+            .iter()
+            .rev()
+            .take(RECENT_TURN_LIMIT.saturating_sub(inspected))
+        {
+            if model_filter.is_some() {
+                add_analytics_row(
+                    &mut totals,
+                    &mut days,
+                    &mut models,
+                    &completed.turn.model,
+                    completed.completed_at_ms,
+                    &completed.totals,
+                    from_epoch_day,
+                    to_epoch_day,
+                    model_filter,
+                );
+            } else {
+                add_analytics_model_row(
+                    &mut models,
+                    &completed.turn.model,
+                    completed.completed_at_ms,
+                    &completed.totals,
+                    from_epoch_day,
+                    to_epoch_day,
+                );
+            }
+        }
+
+        AnalyticsSnapshot {
+            from_day,
+            to_day,
+            totals,
+            days: days
+                .into_iter()
+                .take(DAY_ROLLUP_LIMIT)
+                .map(|(day, totals)| AnalyticsDay { day, totals })
+                .collect(),
+            models: models
+                .into_iter()
+                .take(MODEL_ROLLUP_LIMIT)
+                .map(|(model, totals)| AnalyticsModel { model, totals })
+                .collect(),
+        }
+    }
+
     pub(crate) fn bump_revision(&mut self) -> u64 {
         self.revision = self.revision.saturating_add(1);
         self.revision
@@ -857,6 +947,64 @@ impl RuntimeState {
             replace_totals(model_totals, old, new);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_analytics_row(
+    totals: &mut AnalyticsTotals,
+    days: &mut BTreeMap<String, AnalyticsTotals>,
+    models: &mut BTreeMap<String, AnalyticsTotals>,
+    model: &str,
+    occurred_at_ms: u64,
+    row: &AnalyticsTotals,
+    from_epoch_day: i64,
+    to_epoch_day: i64,
+    model_filter: Option<&str>,
+) {
+    let epoch_day = (occurred_at_ms / MILLIS_PER_DAY) as i64;
+    if epoch_day < from_epoch_day
+        || epoch_day > to_epoch_day
+        || model_filter.is_some_and(|filter| filter != model)
+    {
+        return;
+    }
+    add_totals(totals, row);
+    add_totals(days.entry(format_epoch_day(epoch_day)).or_default(), row);
+    if models.contains_key(model) || models.len() < MODEL_ROLLUP_LIMIT {
+        add_totals(models.entry(model.to_string()).or_default(), row);
+    }
+}
+
+fn add_analytics_model_row(
+    models: &mut BTreeMap<String, AnalyticsTotals>,
+    model: &str,
+    occurred_at_ms: u64,
+    row: &AnalyticsTotals,
+    from_epoch_day: i64,
+    to_epoch_day: i64,
+) {
+    let epoch_day = (occurred_at_ms / MILLIS_PER_DAY) as i64;
+    if epoch_day < from_epoch_day || epoch_day > to_epoch_day {
+        return;
+    }
+    if models.contains_key(model) || models.len() < MODEL_ROLLUP_LIMIT {
+        add_totals(models.entry(model.to_string()).or_default(), row);
+    }
+}
+
+fn format_epoch_day(days: i64) -> String {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn add_usage(target: &mut TokenUsage, value: TokenUsage) {

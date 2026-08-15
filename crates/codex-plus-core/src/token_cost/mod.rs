@@ -1,6 +1,15 @@
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::marker::PhantomData;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, ensure};
+use anyhow::ensure;
+use futures_util::StreamExt;
+use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch};
 
 pub mod config;
@@ -29,6 +38,10 @@ pub use state::{
 use push::{ActiveInstance, PushMetrics};
 
 const LAZY_PUSH_CAPACITY: usize = 8;
+const MAX_INSTANCE_ID_BYTES: usize = 128;
+const MAX_CC_SWITCH_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CC_SWITCH_TURNS: usize = RECENT_TURN_LIMIT;
+const CC_SWITCH_URL: &str = "http://127.0.0.1:17888/cc-switch/turns?refresh=1";
 
 pub const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_RENDERER_EVENT_BYTES: usize = 4 * 1024;
@@ -87,28 +100,51 @@ impl TokenCostService {
         self.ingest_batch(std::iter::once(event))
     }
 
+    pub(crate) fn ingest_for_instance(
+        &self,
+        instance_id: &str,
+        event: TokenCostEvent,
+    ) -> IngestOutcome {
+        self.ingest_batch_checked(Some(instance_id), std::iter::once(event))
+    }
+
     pub(crate) fn ingest_batch<I>(&self, events: I) -> IngestOutcome
     where
         I: IntoIterator<Item = TokenCostEvent>,
     {
+        self.ingest_batch_checked(None, events)
+    }
+
+    fn ingest_batch_checked<I>(
+        &self,
+        expected_instance_id: Option<&str>,
+        events: I,
+    ) -> IngestOutcome
+    where
+        I: IntoIterator<Item = TokenCostEvent>,
+    {
         let events = events.into_iter();
-        if !self.capture_enabled() {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let active = expected_instance_id.map_or_else(
+            || self.active_instance.is_active(),
+            |instance_id| self.active_instance.matches(instance_id),
+        );
+        if !active {
             let rejected = events.count() as u64;
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
             inner.events_rejected = inner.events_rejected.saturating_add(rejected);
             return IngestOutcome::Rejected {
-                reason: "capture_disabled",
+                reason: if expected_instance_id.is_some() {
+                    "stale_instance"
+                } else {
+                    "capture_disabled"
+                },
             };
         }
 
         let (outcome, push) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
             let mut before = inner.state.snapshot(&inner.config);
             before.revision = 0;
             let mut admitted = false;
@@ -186,11 +222,11 @@ impl TokenCostService {
 
     pub fn bootstrap(&self, instance_id: &str) -> anyhow::Result<TokenCostBootstrap> {
         validate_instance_id(instance_id)?;
-        self.active_instance.replace(instance_id.to_string());
         let inner = self
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        self.active_instance.replace(instance_id.to_string());
         Ok(TokenCostBootstrap {
             instance_id: instance_id.to_string(),
             config: inner.config.clone(),
@@ -204,33 +240,98 @@ impl TokenCostService {
     ) -> anyhow::Result<TokenCostActionResponse> {
         validate_instance_id(action.instance_id())?;
         match action {
-            TokenCostAction::DisposeInstance { instance_id } => {
+            TokenCostAction::SetVisibility {
+                instance_id,
+                hub_visible,
+                output_rate_visible,
+                profile_visible,
+            } => self.update_config(&instance_id, |config| {
+                config.hub_visible = hub_visible;
+                config.output_rate_visible = output_rate_visible;
+                config.profile_visible = profile_visible;
+                Ok(())
+            }),
+            TokenCostAction::SavePrice {
+                instance_id,
+                model,
+                price,
+            } => self.update_config(&instance_id, |config| {
+                validate_model(&model)?;
+                config.price_overrides.insert(model, price);
+                Ok(())
+            }),
+            TokenCostAction::DeletePrice { instance_id, model }
+            | TokenCostAction::ResetPrice { instance_id, model } => {
+                self.update_config(&instance_id, |config| {
+                    validate_model(&model)?;
+                    config.price_overrides.remove(&model);
+                    Ok(())
+                })
+            }
+            TokenCostAction::SaveProfile {
+                instance_id,
+                profile,
+            } => self.update_config(&instance_id, |config| {
+                config.profile = profile;
+                Ok(())
+            }),
+            TokenCostAction::QueryAnalytics {
+                instance_id,
+                range,
+                model,
+            } => {
                 ensure!(
-                    self.active_instance.clear_if(&instance_id),
-                    "stale token cost instance"
+                    self.active_instance.matches(&instance_id),
+                    "stale_instance: token cost instance is not active"
                 );
-                self.snapshot_tx.send_replace(None);
+                if let Some(model) = model.as_deref() {
+                    validate_model(model)?;
+                }
+                let inner = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                ensure!(
+                    self.active_instance.matches(&instance_id),
+                    "stale_instance: token cost instance is not active"
+                );
+                Ok(TokenCostActionResponse::Analytics {
+                    analytics: analytics_snapshot(&inner, range, model.as_deref())?,
+                })
+            }
+            TokenCostAction::SyncCcSwitch { instance_id } => {
+                self.sync_cc_switch(&instance_id).await
+            }
+            TokenCostAction::DisposeInstance { instance_id } => {
+                {
+                    let _inner = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    ensure!(
+                        self.active_instance.clear_if(&instance_id),
+                        "stale_instance: token cost instance is not active"
+                    );
+                    self.snapshot_tx.send_replace(None);
+                }
                 Ok(TokenCostActionResponse::Disposed)
             }
             TokenCostAction::QueryDiagnostics { instance_id } => {
                 ensure!(
                     self.active_instance.matches(&instance_id),
-                    "stale token cost instance"
+                    "stale_instance: token cost instance is not active"
                 );
                 let inner = self
                     .inner
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
+                ensure!(
+                    self.active_instance.matches(&instance_id),
+                    "stale_instance: token cost instance is not active"
+                );
                 Ok(TokenCostActionResponse::Diagnostics {
                     diagnostics: self.diagnostics_locked(&inner),
                 })
-            }
-            action => {
-                ensure!(
-                    self.active_instance.matches(action.instance_id()),
-                    "stale token cost instance"
-                );
-                bail!("token cost action is not implemented in the runtime core")
             }
         }
     }
@@ -239,7 +340,7 @@ impl TokenCostService {
         validate_instance_id(instance_id)?;
         ensure!(
             self.active_instance.matches(instance_id),
-            "stale token cost instance"
+            "stale_instance: token cost instance is not active"
         );
         self.lazy_tx
             .send(LazyAssetPush {
@@ -263,6 +364,220 @@ impl TokenCostService {
         self.active_instance.is_active()
     }
 
+    pub(crate) fn matches_instance(&self, instance_id: &str) -> bool {
+        self.active_instance.matches(instance_id)
+    }
+
+    fn update_config<F>(
+        &self,
+        instance_id: &str,
+        update: F,
+    ) -> anyhow::Result<TokenCostActionResponse>
+    where
+        F: FnOnce(&mut UiConfig) -> anyhow::Result<()>,
+    {
+        ensure!(
+            self.active_instance.matches(instance_id),
+            "stale_instance: token cost instance is not active"
+        );
+        let response = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            ensure!(
+                self.active_instance.matches(instance_id),
+                "stale_instance: token cost instance is not active"
+            );
+            let mut config = inner.config.clone();
+            update(&mut config)?;
+            config.validate()?;
+            let changed = config != inner.config;
+            if changed {
+                self.store.save(&config)?;
+                inner.config = config;
+                inner.state.bump_revision();
+            }
+            let snapshot = inner.state.snapshot(&inner.config);
+            let push = changed.then(|| {
+                inner.snapshots_published = inner.snapshots_published.saturating_add(1);
+                SnapshotPush::Snapshot {
+                    instance_id: instance_id.to_string(),
+                    snapshot: snapshot.clone(),
+                }
+            });
+            let response = TokenCostActionResponse::Updated {
+                config: inner.config.clone(),
+                snapshot,
+            };
+            if let Some(push) = push {
+                self.snapshot_tx.send_replace(Some(push));
+            }
+            response
+        };
+        Ok(response)
+    }
+
+    async fn sync_cc_switch(&self, instance_id: &str) -> anyhow::Result<TokenCostActionResponse> {
+        ensure!(
+            self.active_instance.matches(instance_id),
+            "stale_instance: token cost instance is not active"
+        );
+        ensure!(
+            self.cc_switch_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "sync_in_progress: CC Switch sync is already running"
+        );
+        let _guard = AtomicFlagGuard {
+            flag: &self.cc_switch_in_flight,
+        };
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| anyhow::anyhow!("cc_switch: client construction failed"))?;
+        let response = client
+            .get(CC_SWITCH_URL)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("cc_switch: request failed"))?;
+        ensure!(
+            response.status().is_success(),
+            "cc_switch: HTTP request failed"
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_CC_SWITCH_BODY_BYTES as u64),
+            "cc_switch: response body exceeds byte limit"
+        );
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_CC_SWITCH_BODY_BYTES as u64) as usize,
+        );
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow::anyhow!("cc_switch: response read failed"))?;
+            ensure!(
+                body.len().saturating_add(chunk.len()) <= MAX_CC_SWITCH_BODY_BYTES,
+                "cc_switch: response body exceeds byte limit"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        let payload = serde_json::from_slice::<CcSwitchPayload<'_>>(&body)
+            .map_err(|_| anyhow::anyhow!("cc_switch: response schema is invalid"))?;
+        validate_cc_switch_payload(&payload)?;
+        ensure!(
+            self.active_instance.matches(instance_id),
+            "stale_instance: token cost instance is not active"
+        );
+
+        let response = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            ensure!(
+                self.active_instance.matches(instance_id),
+                "stale_instance: token cost instance is not active"
+            );
+            let config = inner.config.clone();
+            let mut before = inner.state.snapshot(&inner.config);
+            before.revision = 0;
+            let mut imported_turns = 0_u32;
+            let mut min_epoch_day = current_epoch_day();
+            let mut max_epoch_day = min_epoch_day;
+            for turn in &payload.turns {
+                let epoch_day = (turn.occurred_at_ms / 86_400_000) as i64;
+                min_epoch_day = min_epoch_day.min(epoch_day);
+                max_epoch_day = max_epoch_day.max(epoch_day);
+                let turn_id = turn.turn_id.to_string();
+                let identity = cc_switch_identity(turn.turn_id);
+                let correlation_id = format!("cc-c-{identity}");
+                inner.state.apply(
+                    TokenCostEvent::TurnStarted {
+                        meta: cc_switch_meta(
+                            &turn_id,
+                            format!("cc-s-{identity}"),
+                            &correlation_id,
+                            turn.occurred_at_ms.saturating_sub(2),
+                        ),
+                        model: turn.model.to_string(),
+                        fast: false,
+                    },
+                    &config,
+                );
+                inner.state.apply(
+                    TokenCostEvent::Usage {
+                        meta: cc_switch_meta(
+                            &turn_id,
+                            format!("cc-u-{identity}"),
+                            &correlation_id,
+                            turn.occurred_at_ms.saturating_sub(1),
+                        ),
+                        usage: turn.usage,
+                        exact: true,
+                    },
+                    &config,
+                );
+                if inner.state.apply(
+                    TokenCostEvent::TurnCompleted {
+                        meta: cc_switch_meta(
+                            &turn_id,
+                            format!("cc-f-{identity}"),
+                            &correlation_id,
+                            turn.occurred_at_ms,
+                        ),
+                        usage: None,
+                    },
+                    &config,
+                ) {
+                    imported_turns = imported_turns
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("cc_switch: turn count overflow"))?;
+                }
+            }
+            let mut after = inner.state.snapshot(&inner.config);
+            after.revision = 0;
+            let changed = before != after;
+            if changed {
+                inner.state.bump_revision();
+            }
+            let snapshot = inner.state.snapshot(&inner.config);
+            let analytics = inner.state.analytics_snapshot(
+                &inner.config,
+                format_day(min_epoch_day),
+                format_day(max_epoch_day),
+                min_epoch_day,
+                max_epoch_day,
+                None,
+                current_time_ms(),
+            );
+            let push = changed.then(|| {
+                inner.snapshots_published = inner.snapshots_published.saturating_add(1);
+                SnapshotPush::Snapshot {
+                    instance_id: instance_id.to_string(),
+                    snapshot,
+                }
+            });
+            let response = TokenCostActionResponse::Synced {
+                imported_turns,
+                analytics,
+            };
+            if let Some(push) = push {
+                self.snapshot_tx.send_replace(Some(push));
+            }
+            response
+        };
+        Ok(response)
+    }
+
     fn diagnostics_locked(&self, inner: &ServiceInner) -> TokenCostDiagnostics {
         TokenCostDiagnostics {
             events_ingested: inner.events_ingested,
@@ -279,13 +594,254 @@ impl TokenCostService {
     }
 }
 
-fn validate_instance_id(instance_id: &str) -> anyhow::Result<()> {
-    ensure!(!instance_id.is_empty(), "instance_id must not be empty");
+struct AtomicFlagGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for AtomicFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Deserialize)]
+struct CcSwitchPayload<'a> {
+    ok: bool,
+    #[serde(borrow, deserialize_with = "deserialize_cc_switch_turns")]
+    turns: Vec<CcSwitchTurn<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CcSwitchTurn<'a> {
+    #[serde(borrow)]
+    turn_id: &'a str,
+    #[serde(borrow)]
+    model: &'a str,
+    occurred_at_ms: u64,
+    usage: TokenUsage,
+}
+
+fn deserialize_cc_switch_turns<'de, D>(deserializer: D) -> Result<Vec<CcSwitchTurn<'de>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedTurnsVisitor<'de>(PhantomData<&'de ()>);
+
+    impl<'de> Visitor<'de> for BoundedTurnsVisitor<'de> {
+        type Value = Vec<CcSwitchTurn<'de>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "at most {MAX_CC_SWITCH_TURNS} CC Switch turns")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut turns = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_CC_SWITCH_TURNS),
+            );
+            while turns.len() < MAX_CC_SWITCH_TURNS {
+                let Some(turn) = sequence.next_element()? else {
+                    return Ok(turns);
+                };
+                turns.push(turn);
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom("CC Switch turn count exceeds limit"));
+            }
+            Ok(turns)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedTurnsVisitor(PhantomData))
+}
+
+fn validate_cc_switch_payload(payload: &CcSwitchPayload<'_>) -> anyhow::Result<()> {
+    ensure!(payload.ok, "cc_switch: helper reported failure");
+    let mut aggregate = TokenUsage::default();
+    for turn in &payload.turns {
+        ensure!(
+            !turn.turn_id.is_empty() && turn.turn_id.len() <= MAX_ID_BYTES,
+            "cc_switch: turn_id is invalid"
+        );
+        validate_model(turn.model).map_err(|_| anyhow::anyhow!("cc_switch: model is invalid"))?;
+        ensure!(
+            turn.occurred_at_ms > 0,
+            "cc_switch: occurred_at_ms is invalid"
+        );
+        ensure!(
+            turn.usage.cached_input <= turn.usage.input,
+            "cc_switch: cached input exceeds input"
+        );
+        aggregate.input = aggregate
+            .input
+            .checked_add(turn.usage.input)
+            .ok_or_else(|| anyhow::anyhow!("cc_switch: input overflow"))?;
+        aggregate.cached_input = aggregate
+            .cached_input
+            .checked_add(turn.usage.cached_input)
+            .ok_or_else(|| anyhow::anyhow!("cc_switch: cached input overflow"))?;
+        aggregate.cache_write = aggregate
+            .cache_write
+            .checked_add(turn.usage.cache_write)
+            .ok_or_else(|| anyhow::anyhow!("cc_switch: cache write overflow"))?;
+        aggregate.output = aggregate
+            .output
+            .checked_add(turn.usage.output)
+            .ok_or_else(|| anyhow::anyhow!("cc_switch: output overflow"))?;
+    }
+    Ok(())
+}
+
+fn cc_switch_meta(
+    turn_id: &str,
+    event_id: String,
+    correlation_id: &str,
+    occurred_at_ms: u64,
+) -> EventMeta {
+    EventMeta {
+        source: UsageSource::ProtocolProxy,
+        session_id: "cc-switch".to_string(),
+        turn_id: turn_id.to_string(),
+        event_id,
+        correlation_id: correlation_id.to_string(),
+        occurred_at_ms,
+    }
+}
+
+fn cc_switch_identity(turn_id: &str) -> String {
+    format!("{:x}", Sha256::digest(turn_id.as_bytes()))
+}
+
+pub(crate) fn validate_instance_id(instance_id: &str) -> anyhow::Result<()> {
     ensure!(
-        instance_id.len() <= MAX_ID_BYTES,
-        "instance_id exceeds {MAX_ID_BYTES} bytes"
+        !instance_id.is_empty(),
+        "invalid_instance: instance_id must not be empty"
+    );
+    ensure!(
+        instance_id.len() <= MAX_INSTANCE_ID_BYTES,
+        "invalid_instance: instance_id exceeds {MAX_INSTANCE_ID_BYTES} bytes"
     );
     Ok(())
+}
+
+fn validate_model(model: &str) -> anyhow::Result<()> {
+    ensure!(!model.is_empty(), "model must not be empty");
+    ensure!(
+        model.len() <= MAX_MODEL_BYTES,
+        "model exceeds {MAX_MODEL_BYTES} bytes"
+    );
+    Ok(())
+}
+
+fn analytics_snapshot(
+    inner: &ServiceInner,
+    range: AnalyticsRange,
+    model_filter: Option<&str>,
+) -> anyhow::Result<AnalyticsSnapshot> {
+    let today = current_epoch_day();
+    let (from_day_number, to_day_number) = match range {
+        AnalyticsRange::Today => (today, today),
+        AnalyticsRange::LastSevenDays => (today.saturating_sub(6), today),
+        AnalyticsRange::LastThirtyDays => (today.saturating_sub(29), today),
+        AnalyticsRange::Custom { from_day, to_day } => {
+            let from = parse_day(&from_day)?;
+            let to = parse_day(&to_day)?;
+            ensure!(from <= to, "analytics range is reversed");
+            ensure!(to - from < 31, "analytics range exceeds 31 days");
+            (from, to)
+        }
+    };
+    let from_day = format_day(from_day_number);
+    let to_day = format_day(to_day_number);
+    Ok(inner.state.analytics_snapshot(
+        &inner.config,
+        from_day,
+        to_day,
+        from_day_number,
+        to_day_number,
+        model_filter,
+        current_time_ms(),
+    ))
+}
+
+fn current_epoch_day() -> i64 {
+    current_time_ms().min(i64::MAX as u64) as i64 / 86_400_000
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn parse_day(day: &str) -> anyhow::Result<i64> {
+    ensure!(day.len() == 10, "analytics day must use YYYY-MM-DD");
+    let bytes = day.as_bytes();
+    ensure!(
+        bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()),
+        "analytics day must use YYYY-MM-DD"
+    );
+    let year = day[0..4].parse::<i32>()?;
+    let month = day[5..7].parse::<u32>()?;
+    let day_of_month = day[8..10].parse::<u32>()?;
+    ensure!((1..=12).contains(&month), "analytics month is invalid");
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        28 + u32::from(leap),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    ensure!(
+        (1..=month_days[month as usize - 1]).contains(&day_of_month),
+        "analytics day is invalid"
+    );
+    Ok(days_from_civil(year, month, day_of_month))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let adjusted_year = i64::from(year) - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn format_day(days: i64) -> String {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 #[cfg(test)]
@@ -411,5 +967,29 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         assert_eq!(inner.state.recent_turn_count(), RECENT_TURN_LIMIT);
         assert_eq!(inner.state.retired_turn_count(), DEDUPE_FINGERPRINT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn matching_dispose_clears_a_precreated_snapshot_subscription() {
+        let service = TokenCostService::in_memory();
+        let pushes = service.subscribe();
+        service.bootstrap("page-1").unwrap();
+        service.ingest(TokenCostEvent::TurnStarted {
+            meta: meta("turn-1".to_string(), "start-1".to_string(), 1),
+            model: "gpt-5.6-sol".to_string(),
+            fast: false,
+        });
+        assert!(pushes.snapshots.borrow().is_some());
+
+        let response = service
+            .apply_action(TokenCostAction::DisposeInstance {
+                instance_id: "page-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response, TokenCostActionResponse::Disposed);
+        assert!(pushes.snapshots.borrow().is_none());
+        assert!(!service.capture_enabled());
     }
 }
