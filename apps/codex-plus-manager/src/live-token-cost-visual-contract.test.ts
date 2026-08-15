@@ -427,7 +427,6 @@ class FakeElement {
 
   getBoundingClientRect(): Rect {
     if (this.rect) return this.rect;
-    if (this.classList.contains("icon-sm")) return rectangle(0, 0, 16, 16);
     return rectangle(0, 0, 0, 0);
   }
 }
@@ -640,6 +639,88 @@ function parseDeclarations(body: string): Map<string, string> {
   return declarations;
 }
 
+type CascadeDeclaration = { property: string; value: string; important: boolean; order: number };
+type Specificity = [number, number, number];
+type CascadeValue = { value: string; important: boolean; specificity: Specificity; order: number };
+
+function cascadeDeclarations(body: string): CascadeDeclaration[] {
+  const declarations: CascadeDeclaration[] = [];
+  body.split(";").forEach((entry, order) => {
+    const separator = entry.indexOf(":");
+    if (separator < 0) return;
+    const property = entry.slice(0, separator).trim();
+    const rawValue = entry.slice(separator + 1).trim();
+    const important = /\s*!important\s*$/.test(rawValue);
+    const value = rawValue.replace(/\s*!important\s*$/, "");
+    if (property) declarations.push({ property, value, important, order });
+  });
+  return declarations;
+}
+
+function cssConditionActive(header: string): boolean {
+  if (header.startsWith("@supports")) return true;
+  if (!header.startsWith("@media")) return false;
+  if (/prefers-color-scheme\s*:\s*dark/.test(header)) return false;
+  if (/prefers-color-scheme\s*:\s*light/.test(header)) return true;
+  if (/prefers-reduced-motion\s*:\s*reduce/.test(header)) return false;
+  const maxWidth = header.match(/max-width\s*:\s*(\d+)px/);
+  if (maxWidth) return 1440 <= Number(maxWidth[1]);
+  if (/hover\s*:\s*hover/.test(header) || /pointer\s*:\s*fine/.test(header)) return true;
+  return true;
+}
+
+function cssRules(css: string): Array<{ selectors: string[]; declarations: CascadeDeclaration[]; order: number }> {
+  const rules: Array<{ selectors: string[]; declarations: CascadeDeclaration[]; order: number }> = [];
+  let order = 0;
+  const visit = (segment: string) => {
+    let cursor = 0;
+    while (cursor < segment.length) {
+      const open = segment.indexOf("{", cursor);
+      if (open < 0) break;
+      const header = segment.slice(cursor, open).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+      let depth = 1;
+      let close = open + 1;
+      while (close < segment.length && depth) {
+        if (segment[close] === "{") depth += 1;
+        else if (segment[close] === "}") depth -= 1;
+        close += 1;
+      }
+      if (depth) break;
+      const body = segment.slice(open + 1, close - 1);
+      if (header.startsWith("@media") || header.startsWith("@supports")) {
+        if (cssConditionActive(header)) visit(body);
+      } else if (!header.startsWith("@")) {
+        rules.push({ selectors: splitSelectorList(header), declarations: cascadeDeclarations(body), order: order++ });
+      }
+      cursor = close;
+    }
+  };
+  visit(css);
+  return rules;
+}
+
+function selectorSpecificity(selector: string): Specificity {
+  const withoutWhere = selector.replace(/:where\([^)]*\)/g, "");
+  const ids = withoutWhere.match(/#[\w-]+/g)?.length || 0;
+  const classes = withoutWhere.match(/\.[\w-]+|\[[^\]]+\]|:(?!:)[\w-]+(?:\([^)]*\))?/g)?.length || 0;
+  const stripped = withoutWhere
+    .replace(/#[\w-]+|\.[\w-]+|\[[^\]]+\]|::?[\w-]+(?:\([^)]*\))?/g, " ")
+    .replace(/[>+~*]/g, " ");
+  const elements = stripped.match(/(^|\s)[a-zA-Z][\w-]*/g)?.length || 0;
+  return [ids, classes, elements];
+}
+
+function compareSpecificity(left: Specificity, right: Specificity): number {
+  return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+}
+
+function cascadeWins(candidate: CascadeValue, current: CascadeValue | undefined): boolean {
+  if (!current) return true;
+  if (candidate.important !== current.important) return candidate.important;
+  const specificity = compareSpecificity(candidate.specificity, current.specificity);
+  return specificity > 0 || (specificity === 0 && candidate.order >= current.order);
+}
+
 function splitCssArguments(value: string): string[] {
   const result: string[] = [];
   let start = 0;
@@ -695,24 +776,35 @@ function resolveCssValue(value: string, variables: Map<string, string>): string 
 }
 
 function computedStyle(document: FakeDocument, element: FakeElement): Record<string, any> {
-  const values = new Map<string, string>();
+  const winners = new Map<string, CascadeValue>();
   if (element.parentElement) {
     const parent = computedStyle(document, element.parentElement);
     for (const name of parent.__variables.keys()) {
-      if (name.startsWith("--")) values.set(name, parent.getPropertyValue(name));
+      if (name.startsWith("--")) winners.set(name, { value: parent.getPropertyValue(name), important: false, specificity: [-1, -1, -1], order: -1 });
     }
   }
+  let styleSheetOrder = 0;
   for (const styleElement of document.querySelectorAll("style")) {
-    const css = styleElement.textContent;
-    for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-      const selectors = splitSelectorList(match[1].trim()).filter((selector) => !selector.startsWith("@"));
-      if (!selectors.some((selector) => element.matches(selector))) continue;
-      for (const [property, value] of parseDeclarations(match[2])) {
-        if (!values.has(property)) values.set(property, value);
+    for (const rule of cssRules(styleElement.textContent)) {
+      const matching = rule.selectors.filter((selector) => element.matches(selector));
+      if (!matching.length) continue;
+      const specificity = matching.map(selectorSpecificity).sort(compareSpecificity).at(-1)!;
+      for (const declaration of rule.declarations) {
+        const candidate = {
+          value: declaration.value,
+          important: declaration.important,
+          specificity,
+          order: styleSheetOrder + rule.order * 1000 + declaration.order,
+        };
+        if (cascadeWins(candidate, winners.get(declaration.property))) winners.set(declaration.property, candidate);
       }
     }
+    styleSheetOrder += 1_000_000;
   }
-  for (const [property, value] of element.style.entries()) values.set(property, value);
+  for (const [property, value] of element.style.entries()) {
+    winners.set(property, { value, important: false, specificity: [1_000_000, 0, 0], order: Number.MAX_SAFE_INTEGER });
+  }
+  const values = new Map(Array.from(winners, ([property, winner]) => [property, winner.value]));
   const getPropertyValue = (name: string) => resolveCssValue(values.get(name) || "", values);
   return new Proxy({ getPropertyValue, __variables: values }, {
     get(target, property, receiver) {
@@ -779,8 +871,7 @@ function installControlledFixtures(document: FakeDocument, accountLabel: string,
   profileItem.setAttribute("aria-disabled", "true");
   profileItem.setAttribute("data-disabled", "");
   const identityRow = document.createElement("div");
-  const menuAvatar = appendTextElement(document, identityRow, "span", "L", "size-8 rounded-full");
-  menuAvatar.rect = rectangle(0, 0, 32, 32);
+  appendTextElement(document, identityRow, "span", "L", "size-8 rounded-full");
   appendTextElement(document, identityRow, "span", "Account", "flex-1 min-w-0 truncate");
   profileItem.appendChild(identityRow);
   const settingsItem = appendTextElement(document, menu, "button", "设置");
@@ -941,7 +1032,7 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
       Object.fromEntries(["--cltc-text", "--cltc-muted", "--cltc-border", "--cltc-surface", "--cltc-arc-bg", "--cltc-arc-radius"].map((name) => [name, style.getPropertyValue(name)])),
       {
         "--cltc-text": "#111827",
-        "--cltc-muted": "#6b7280",
+        "--cltc-muted": "rgba(26, 28, 31, .494)",
         "--cltc-border": "#d1d5db",
         "--cltc-surface": "#ffffff",
         "--cltc-arc-bg": "rgb(246, 246, 246)",
@@ -952,6 +1043,33 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
     assert.equal(style.gap, "0");
     assert.equal(style.borderRadius, "20px 20px 0 0");
     assert.equal(harness.getComputedStyle(root.querySelector(".cltc-roll")!).getPropertyValue("--cltc-roll-row"), "16px");
+  });
+
+  it("applies light media, source order, specificity, and important in the style oracle", () => {
+    const document = new FakeDocument();
+    const style = document.createElement("style");
+    style.textContent = `
+      #cascade { --specific: id; --important: id; }
+      .cascade { --ordered: first; }
+      @media (prefers-color-scheme: light) {
+        .cascade { --media: light; --ordered: media; }
+      }
+      @media (prefers-color-scheme: dark) {
+        #cascade { --media: dark; }
+      }
+      .cascade { --ordered: last; --specific: class; --important: class !important; }
+    `;
+    document.head.appendChild(style);
+    const element = document.createElement("div");
+    element.id = "cascade";
+    element.className = "cascade";
+    document.body.appendChild(element);
+
+    const computed = computedStyle(document, element);
+    assert.equal(computed.getPropertyValue("--media"), "light");
+    assert.equal(computed.getPropertyValue("--ordered"), "last");
+    assert.equal(computed.getPropertyValue("--specific"), "id");
+    assert.equal(computed.getPropertyValue("--important"), "class");
   });
 
   it("drives the old settings navigation and keyboard close behavior", async () => {
@@ -989,7 +1107,7 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
       const identityAvatar = identityRow.querySelector(".size-8")!;
 
       assert.equal(normalizedText(trigger.querySelector("span.min-w-0.flex-1.truncate")!), "Local Usage");
-      assert.deepEqual(triggerAvatar.getBoundingClientRect(), rectangle(0, 0, 16, 16));
+      assert.equal(triggerAvatar.classList.contains("icon-sm"), true);
       assert.equal(trigger.querySelector("svg")!.style.display, "none");
       assert.equal(profileItem.getAttribute("role"), "menuitem");
       assert.equal(profileItem.hasAttribute("aria-disabled"), false);
@@ -997,14 +1115,17 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
       assert.equal(profileItem.getAttribute("tabindex"), "0");
       assert.equal(profileItem.className, "menu-enabled");
       assert.equal(normalizedText(identityRow.querySelector("span.flex-1.min-w-0.truncate")!), "Local Usage");
-      assert.deepEqual(identityAvatar.getBoundingClientRect(), rectangle(0, 0, 32, 32));
+      assert.ok(identityAvatar, "the enhanced menu entry must retain its host avatar");
 
       profileItem.click();
       assert.deepEqual(harness.profileClicks, { settings: 1, profile: 1 });
       profileItem.dispatchEvent(new FakeEvent("keydown", { key: "Enter", bubbles: true }));
-      assert.deepEqual(harness.profileClicks, { settings: 2, profile: 2 });
+      const space = new FakeEvent("keydown", { key: " ", bubbles: true });
+      profileItem.dispatchEvent(space);
+      assert.deepEqual(harness.profileClicks, { settings: 3, profile: 3 });
+      assert.equal(space.defaultPrevented, true);
       profileItem.dispatchEvent(new FakeEvent("keydown", { key: "ArrowDown", bubbles: true }));
-      assert.deepEqual(harness.profileClicks, { settings: 2, profile: 2 });
+      assert.deepEqual(harness.profileClicks, { settings: 3, profile: 3 });
     });
   }
 });
