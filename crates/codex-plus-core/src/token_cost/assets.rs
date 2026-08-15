@@ -20,13 +20,13 @@ pub fn snapshot_expression(push: &SnapshotPush) -> anyhow::Result<String> {
 
 pub fn lazy_asset_expression(push: &LazyAssetPush) -> anyhow::Result<String> {
     let instance_id = serde_json::to_string(&push.instance_id)?;
-    let source = serde_json::to_string(lazy_asset_source(push.asset))?;
+    let source = lazy_asset_source(push.asset);
     let css = serde_json::to_string(match push.asset {
         LazyAsset::Flatpickr => FLATPICKR_CSS,
         _ => "",
     })?;
     Ok(format!(
-        "(()=>{{const api=window.__codexLiveTokenCostV1;if(!api || api.instanceId !== {instance_id})return;const source={source};const css={css};eval(source);}})()"
+        "(()=>{{const api=window.__codexLiveTokenCostV1;if(!api || api.instanceId !== {instance_id})return;const css={css};(()=>{{\n{source}\n}})();}})()"
     ))
 }
 

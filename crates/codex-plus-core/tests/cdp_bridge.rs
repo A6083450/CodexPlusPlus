@@ -4983,7 +4983,9 @@ async fn token_cost_push_sends_one_static_lazy_module_and_counts_after_schedulin
         assert!(expression.contains("window.__codexLiveTokenCostV1"));
         assert!(expression.contains("api.instanceId !=="));
         assert!(expression.contains(&quoted_instance));
-        assert!(expression.contains(r#"registerModule(\"analytics\""#));
+        assert!(expression.contains(r#"registerModule("analytics""#));
+        assert!(!expression.contains("eval("));
+        assert!(!expression.contains("new Function"));
         assert!(!expression.contains("flatpickr v4.6.13"));
         assert!(
             tokio::time::timeout(Duration::from_millis(150), socket.next())

@@ -327,9 +327,28 @@ fn lazy_asset_expressions_are_static_inert_and_json_quote_instance_ids() {
         assert!(expression.contains(&serde_json::to_string(quoted_instance).unwrap()));
         let source = codex_plus_core::token_cost::assets::lazy_asset_source(asset);
         assert!(source.contains(&format!("registerModule(\"{module_name}\"")));
-        assert!(expression.contains(&serde_json::to_string(source).unwrap()));
+        assert!(expression.contains(source));
+        for forbidden in ["eval(", "new Function"] {
+            assert!(
+                !source.contains(forbidden),
+                "{module_name} source uses {forbidden}"
+            );
+            assert!(
+                !expression.contains(forbidden),
+                "{module_name} expression uses {forbidden}"
+            );
+        }
         assert!(!expression.contains("__codexSessionDeleteBridge"));
     }
+
+    let flatpickr_css = include_str!("../../../assets/live_token_cost/flatpickr.css");
+    let flatpickr_expression =
+        codex_plus_core::token_cost::assets::lazy_asset_expression(&LazyAssetPush {
+            instance_id: quoted_instance.to_string(),
+            asset: LazyAsset::Flatpickr,
+        })
+        .unwrap();
+    assert!(flatpickr_expression.contains(&serde_json::to_string(flatpickr_css).unwrap()));
 
     let snapshot_expression = codex_plus_core::token_cost::assets::snapshot_expression(
         &snapshot_push(1, true, "flatpickr sentinel"),
@@ -347,23 +366,29 @@ fn lazy_module_sources_register_without_dom_or_mount_side_effects() {
         (LazyAsset::Profile, "profile"),
         (LazyAsset::Flatpickr, "flatpickr"),
     ] {
-        let source = codex_plus_core::token_cost::assets::lazy_asset_source(asset);
+        let instance_id = "page-inert";
+        let expression =
+            codex_plus_core::token_cost::assets::lazy_asset_expression(&LazyAssetPush {
+                instance_id: instance_id.to_string(),
+                asset,
+            })
+            .unwrap();
         let harness = format!(
             r#"
 globalThis.window = globalThis;
 const registrations = [];
-const api = {{
+window.__codexLiveTokenCostV1 = {{
+  instanceId: {},
   registerModule(name, factory) {{
     if (typeof factory !== "function") throw new Error("factory required");
     registrations.push(name);
   }},
 }};
-const css = "";
-const source = {};
-new Function("api", "css", source)(api, css);
+{}
 process.stdout.write(JSON.stringify({{ registrations, flatpickr: typeof window.flatpickr }}));
 "#,
-            serde_json::to_string(source).unwrap()
+            serde_json::to_string(instance_id).unwrap(),
+            expression
         );
         let output = Command::new("node")
             .arg("-e")
@@ -380,6 +405,43 @@ process.stdout.write(JSON.stringify({{ registrations, flatpickr: typeof window.f
             json!({ "registrations": [module_name], "flatpickr": "undefined" })
         );
     }
+}
+
+#[test]
+fn lazy_expression_uses_an_exact_send_time_instance_guard() {
+    let expression = codex_plus_core::token_cost::assets::lazy_asset_expression(&LazyAssetPush {
+        instance_id: "page-exact".to_string(),
+        asset: LazyAsset::Settings,
+    })
+    .unwrap();
+    let harness = format!(
+        r#"
+globalThis.window = globalThis;
+let registrations = 0;
+{}
+window.__codexLiveTokenCostV1 = {{
+  instanceId: "page-exact-other",
+  registerModule() {{ registrations += 1; }},
+}};
+{}
+if (registrations !== 0) throw new Error("stale instance registered");
+window.__codexLiveTokenCostV1.instanceId = "page-exact";
+{}
+process.stdout.write(String(registrations));
+"#,
+        expression, expression, expression
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "exact instance guard failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1");
 }
 
 fn bridge_startup_source() -> String {
