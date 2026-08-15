@@ -10,6 +10,9 @@ use super::{
     MAX_TOOL_NAME_BYTES, TokenCostEvent, TokenUsage, UsageSource,
 };
 
+const MAX_ESCAPED_JSON_STRING_BYTES: usize = 1024 * 1024;
+const MAX_NON_STREAM_JSON_DEPTH: usize = 64;
+
 pub struct ResponsesUsageTap {
     state: UsageTapState,
 }
@@ -42,13 +45,16 @@ enum ProtocolKind {
 }
 
 #[derive(Debug)]
-enum BoundedModel<'a> {
+enum BoundedString<'a, const TRIM: bool> {
     Borrowed(&'a str),
     Owned(String),
     Ignored,
 }
 
-impl BoundedModel<'_> {
+type BoundedModel<'a> = BoundedString<'a, true>;
+type BoundedLiteral<'a> = BoundedString<'a, false>;
+
+impl<const TRIM: bool> BoundedString<'_, TRIM> {
     fn as_str(&self) -> Option<&str> {
         match self {
             Self::Borrowed(value) => Some(value),
@@ -58,61 +64,64 @@ impl BoundedModel<'_> {
     }
 }
 
-struct BoundedModelVisitor<'a>(std::marker::PhantomData<&'a str>);
+struct BoundedStringVisitor<'a, const TRIM: bool>(std::marker::PhantomData<&'a str>);
 
-impl<'de: 'a, 'a> Visitor<'de> for BoundedModelVisitor<'a> {
-    type Value = BoundedModel<'a>;
+impl<'de: 'a, 'a, const TRIM: bool> Visitor<'de> for BoundedStringVisitor<'a, TRIM> {
+    type Value = BoundedString<'a, TRIM>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded model string")
+        formatter.write_str("a bounded identity string")
     }
 
     fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        let value = if TRIM { value.trim() } else { value };
         Ok(if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
-            BoundedModel::Borrowed(value)
+            BoundedString::Borrowed(value)
         } else {
-            BoundedModel::Ignored
+            BoundedString::Ignored
         })
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        let value = if TRIM { value.trim() } else { value };
         Ok(if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
-            BoundedModel::Owned(value.to_string())
+            BoundedString::Owned(value.to_string())
         } else {
-            BoundedModel::Ignored
+            BoundedString::Ignored
         })
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        let value = if TRIM { value.trim() } else { &value };
         if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
-            Ok(BoundedModel::Owned(value))
+            Ok(BoundedString::Owned(value.to_string()))
         } else {
-            Ok(BoundedModel::Ignored)
+            Ok(BoundedString::Ignored)
         }
     }
 
     fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -120,7 +129,7 @@ impl<'de: 'a, 'a> Visitor<'de> for BoundedModelVisitor<'a> {
         A: SeqAccess<'de>,
     {
         while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -128,16 +137,16 @@ impl<'de: 'a, 'a> Visitor<'de> for BoundedModelVisitor<'a> {
         A: MapAccess<'de>,
     {
         while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(BoundedModel::Ignored)
+        Ok(BoundedString::Ignored)
     }
 }
 
-impl<'de: 'a, 'a> Deserialize<'de> for BoundedModel<'a> {
+impl<'de: 'a, 'a, const TRIM: bool> Deserialize<'de> for BoundedString<'a, TRIM> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(BoundedModelVisitor(std::marker::PhantomData))
+        deserializer.deserialize_any(BoundedStringVisitor(std::marker::PhantomData))
     }
 }
 
@@ -431,13 +440,13 @@ impl<'de> Deserialize<'de> for DirectUsageField {
 #[derive(Debug, Deserialize)]
 struct NonStreamEnvelope<'a> {
     #[serde(borrow, default)]
-    object: Option<BoundedModel<'a>>,
+    object: Option<BoundedLiteral<'a>>,
     #[serde(borrow, default)]
-    status: Option<BoundedModel<'a>>,
+    status: Option<BoundedLiteral<'a>>,
     #[serde(borrow, default)]
     model: Option<BoundedModel<'a>>,
     #[serde(borrow, default)]
-    service_tier: Option<BoundedModel<'a>>,
+    service_tier: Option<BoundedLiteral<'a>>,
     #[serde(default)]
     usage: DirectUsageField,
 }
@@ -744,9 +753,10 @@ impl UsageTapState {
     ) {
         match kind {
             ProtocolKind::Responses => {
-                let is_response = envelope.object.as_ref().and_then(BoundedModel::as_str)
+                let is_response = envelope.object.as_ref().and_then(BoundedLiteral::as_str)
                     == Some("response")
-                    || envelope.status.as_ref().and_then(BoundedModel::as_str) == Some("completed");
+                    || envelope.status.as_ref().and_then(BoundedLiteral::as_str)
+                        == Some("completed");
                 if is_response {
                     self.update_non_stream_identity(envelope, now_ms, events);
                     self.emit_completed(
@@ -760,7 +770,7 @@ impl UsageTapState {
                 let has_chat_discriminator = envelope
                     .object
                     .as_ref()
-                    .and_then(BoundedModel::as_str)
+                    .and_then(BoundedLiteral::as_str)
                     .is_some_and(|object| object.starts_with("chat.completion"));
                 let usage = envelope.usage.as_ref().and_then(normalize_chat_usage);
                 if has_chat_discriminator || usage.is_some() {
@@ -777,20 +787,14 @@ impl UsageTapState {
         now_ms: u64,
         events: &mut Vec<TokenCostEvent>,
     ) {
-        if let Some(model) = envelope
-            .model
-            .as_ref()
-            .and_then(BoundedModel::as_str)
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        {
+        if let Some(model) = envelope.model.as_ref().and_then(BoundedModel::as_str) {
             self.model.clear();
             self.model.push_str(model);
         }
         if let Some(service_tier) = envelope
             .service_tier
             .as_ref()
-            .and_then(BoundedModel::as_str)
+            .and_then(BoundedLiteral::as_str)
         {
             self.fast = service_tier == "priority";
         }
@@ -907,8 +911,74 @@ fn bounded_object_string(
     (!value.is_empty() && value.len() <= max_bytes).then(|| value.to_string())
 }
 
-fn parse_non_stream_envelope(body: &[u8]) -> serde_json::Result<NonStreamEnvelope<'_>> {
-    serde_json::from_slice(body)
+fn parse_non_stream_envelope(body: &[u8]) -> Result<NonStreamEnvelope<'_>, ()> {
+    preflight_non_stream_json(body)?;
+    serde_json::from_slice(body).map_err(|_| ())
+}
+
+// serde_json fills scratch buffers for escaped strings and ignored nested values before visitors run.
+fn preflight_non_stream_json(body: &[u8]) -> Result<(), ()> {
+    let mut closers = [0_u8; MAX_NON_STREAM_JSON_DEPTH];
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut string_has_escape = false;
+    let mut string_bytes = 0_usize;
+
+    for &byte in body {
+        if in_string {
+            if escape_next {
+                escape_next = false;
+                string_bytes += 1;
+            } else {
+                match byte {
+                    b'\\' => {
+                        escape_next = true;
+                        string_has_escape = true;
+                        string_bytes += 1;
+                    }
+                    b'"' => {
+                        in_string = false;
+                        continue;
+                    }
+                    0..=0x1f => return Err(()),
+                    _ => string_bytes += 1,
+                }
+            }
+            if string_has_escape && string_bytes > MAX_ESCAPED_JSON_STRING_BYTES {
+                return Err(());
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => {
+                in_string = true;
+                escape_next = false;
+                string_has_escape = false;
+                string_bytes = 0;
+            }
+            b'{' | b'[' => {
+                if depth == MAX_NON_STREAM_JSON_DEPTH {
+                    return Err(());
+                }
+                closers[depth] = if byte == b'{' { b'}' } else { b']' };
+                depth += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 || closers[depth - 1] != byte {
+                    return Err(());
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || depth != 0 {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn normalize_responses_usage(usage: &DirectUsage) -> Option<TokenUsage> {
@@ -1020,7 +1090,14 @@ fn normalize_responses_input(
     has_separate_cache_read: bool,
 ) -> Option<u64> {
     if has_separate_cache_read {
-        return direct_input.checked_add(cached_input);
+        let input_with_cache = direct_input.checked_add(cached_input)?;
+        let Some(total) = total else {
+            return Some(input_with_cache);
+        };
+        let converted_total = input_with_cache
+            .checked_add(cache_write)?
+            .checked_add(output)?;
+        return (converted_total == total).then_some(input_with_cache);
     }
     let Some(total) = total else {
         return Some(direct_input);
@@ -1530,7 +1607,7 @@ mod tests {
             envelope
                 .service_tier
                 .as_ref()
-                .and_then(BoundedModel::as_str),
+                .and_then(BoundedLiteral::as_str),
             Some("priority")
         ));
         assert_eq!(
@@ -1542,6 +1619,77 @@ mod tests {
                 output: 4,
             })
         );
+    }
+
+    #[test]
+    fn non_stream_preflight_accepts_bounded_escaped_strings() {
+        let body = br#"{"object":"respon\u0073e","model":"gpt-5.6-\u0073ol","service_tier":"prior\u0069ty","usage":{"input_tokens":9,"output_tokens":4}}"#;
+        let envelope = parse_non_stream_envelope(body).unwrap();
+
+        assert_eq!(
+            envelope.object.as_ref().and_then(BoundedLiteral::as_str),
+            Some("response")
+        );
+        assert_eq!(
+            envelope.model.as_ref().and_then(BoundedModel::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            envelope
+                .service_tier
+                .as_ref()
+                .and_then(BoundedLiteral::as_str),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn non_stream_preflight_rejects_escaped_known_fields_over_one_mibibyte() {
+        let escaped = format!("\\u0061{}", "a".repeat(1_048_571));
+        assert_eq!(escaped.len(), 1_048_577);
+        let bodies = [
+            format!(
+                "{{\"object\":\"{escaped}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}"
+            ),
+            format!(
+                "{{\"object\":\"response\",\"model\":\"{escaped}\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}"
+            ),
+            format!(
+                "{{\"object\":\"response\",\"usage\":{{\"input_tokens\":\"{escaped}\",\"output_tokens\":1}}}}"
+            ),
+        ];
+
+        for (index, body) in bodies.iter().enumerate() {
+            assert!(parse_non_stream_envelope(body.as_bytes()).is_err());
+            let (mut tap, _) = ResponsesUsageTap::from_request(
+                30 + u64::try_from(index).unwrap(),
+                br#"{"model":"gpt-5.6-sol"}"#,
+                10,
+            );
+            assert!(tap.push_bytes(body.as_bytes(), 20).is_empty());
+            assert!(tap.state.tail.len() <= MAX_SSE_FRAME_BYTES);
+            assert!(tap.state.discarding_oversized_frame);
+            assert!(matches!(
+                tap.finish(30).as_slice(),
+                [TokenCostEvent::TurnFailed { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn non_stream_preflight_allows_depth_64_and_rejects_depth_65() {
+        fn nested_body(array_depth: usize) -> Vec<u8> {
+            let mut body = b"{\"object\":\"response\",\"unknown\":".to_vec();
+            body.extend(std::iter::repeat_n(b'[', array_depth));
+            body.push(b'0');
+            body.extend(std::iter::repeat_n(b']', array_depth));
+            body.extend_from_slice(b",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}");
+            body
+        }
+
+        assert!(parse_non_stream_envelope(&nested_body(63)).is_ok());
+        assert!(parse_non_stream_envelope(&nested_body(64)).is_err());
+        assert!(parse_non_stream_envelope(br#"{"object":"response"]"#).is_err());
     }
 
     #[test]
@@ -1612,6 +1760,47 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_model_trims_before_applying_exact_byte_limit() {
+        let cases = [
+            (
+                format!(
+                    "{{\"object\":\"response\",\"model\":\" {} \",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}",
+                    "m".repeat(128)
+                ),
+                "m".repeat(128),
+            ),
+            (
+                format!(
+                    "{{\"object\":\"response\",\"model\":\" \\u0061{} \",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}",
+                    "m".repeat(127)
+                ),
+                format!("a{}", "m".repeat(127)),
+            ),
+        ];
+
+        for (index, (body, expected_model)) in cases.iter().enumerate() {
+            let (mut tap, _) =
+                ResponsesUsageTap::from_request(50 + u64::try_from(index).unwrap(), b"{}", 10);
+            let events = tap.push_bytes(body.as_bytes(), 20);
+            assert!(matches!(
+                events.first(),
+                Some(TokenCostEvent::TurnStarted { model, .. }) if model == expected_model
+            ));
+        }
+
+        let over_limit = format!(
+            "{{\"object\":\"response\",\"model\":\" {} \",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}",
+            "m".repeat(129)
+        );
+        let (mut tap, _) = ResponsesUsageTap::from_request(52, b"{}", 10);
+        assert!(
+            !tap.push_bytes(over_limit.as_bytes(), 20)
+                .iter()
+                .any(|event| matches!(event, TokenCostEvent::TurnStarted { .. }))
+        );
+    }
+
+    #[test]
     fn chat_direct_cache_fields_normalize_exact_usage_and_cost() {
         let request = br#"{"model":"gpt-5.6-sol"}"#;
         let (mut tap, mut events) = ChatUsageTap::from_request(13, request, 10);
@@ -1653,7 +1842,7 @@ mod tests {
         let request = br#"{"model":"gpt-5.6-sol"}"#;
         let (mut tap, mut events) = ResponsesUsageTap::from_request(14, request, 10);
         let terminal = tap.push_bytes(
-            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_5m_input_tokens\":4,\"cache_creation_1h_input_tokens\":6}}}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":25,\"cache_read_input_tokens\":2,\"cache_creation_5m_input_tokens\":4,\"cache_creation_1h_input_tokens\":6}}}\n\n",
             20,
         );
         assert!(matches!(
@@ -1683,6 +1872,39 @@ mod tests {
         assert_eq!(snapshot.cached_input, 2);
         assert_eq!(snapshot.output, 3);
         assert_eq!(snapshot.cost_nanos, 203_500);
+    }
+
+    #[test]
+    fn responses_direct_cache_total_mismatch_is_rejected_in_sse() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(40, request, 10);
+
+        let terminal = tap.push_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":24,\"cache_read_input_tokens\":2,\"cache_creation_5m_input_tokens\":4,\"cache_creation_1h_input_tokens\":6}}}\n\n",
+            20,
+        );
+
+        assert!(matches!(
+            terminal.as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
+    }
+
+    #[test]
+    fn responses_direct_cache_total_overflow_is_rejected_in_non_stream_body() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(41, request, 10);
+        let body = format!(
+            "{{\"object\":\"response\",\"usage\":{{\"input_tokens\":{},\"output_tokens\":1,\"total_tokens\":0,\"cache_read_input_tokens\":1,\"cache_creation_input_tokens\":1}}}}",
+            u64::MAX - 2
+        );
+
+        let terminal = tap.push_bytes(body.as_bytes(), 20);
+
+        assert!(matches!(
+            terminal.as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
     }
 
     #[test]
