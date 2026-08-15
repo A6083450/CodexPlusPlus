@@ -2344,6 +2344,52 @@ fn responses_tap_finishes_non_stream_json_once() {
 }
 
 #[test]
+fn responses_tap_keeps_native_total_input_when_nested_cache_is_included() {
+    let request = br#"{"model":"gpt-5.6-sol"}"#;
+    let (mut tap, mut events) = ResponsesUsageTap::from_request(16, request, 1);
+    events.extend(tap.push_bytes(
+        b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":7,\"total_tokens\":27,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n",
+        2,
+    ));
+
+    let service = TokenCostService::in_memory();
+    service.bootstrap("native-cache").unwrap();
+    for event in events {
+        service.ingest(event);
+    }
+    let snapshot = service.bootstrap("native-cache").unwrap().snapshot;
+
+    assert_eq!(snapshot.turns, 1);
+    assert_eq!(snapshot.input, 20);
+    assert_eq!(snapshot.cached_input, 5);
+    assert_eq!(snapshot.output, 7);
+    assert_eq!(snapshot.cost_nanos, 287_500);
+}
+
+#[test]
+fn responses_tap_restores_gemini_converted_separate_cached_input() {
+    let request = br#"{"model":"gpt-5.6-sol"}"#;
+    let (mut tap, mut events) = ResponsesUsageTap::from_request(17, request, 1);
+    events.extend(tap.push_bytes(
+        b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":15,\"output_tokens\":7,\"total_tokens\":27,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n",
+        2,
+    ));
+
+    let service = TokenCostService::in_memory();
+    service.bootstrap("gemini-cache").unwrap();
+    for event in events {
+        service.ingest(event);
+    }
+    let snapshot = service.bootstrap("gemini-cache").unwrap().snapshot;
+
+    assert_eq!(snapshot.turns, 1);
+    assert_eq!(snapshot.input, 20);
+    assert_eq!(snapshot.cached_input, 5);
+    assert_eq!(snapshot.output, 7);
+    assert_eq!(snapshot.cost_nanos, 287_500);
+}
+
+#[test]
 fn chat_tap_extracts_direct_content_reasoning_and_usage_fields() {
     let request = br#"{"model":"deepseek-reasoner","service_tier":"priority"}"#;
     let (mut tap, started) = ChatUsageTap::from_request(12, request, 1);

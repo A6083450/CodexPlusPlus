@@ -1,5 +1,9 @@
 use anyhow::ensure;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use std::fmt;
 
 use super::{
     EventMeta, MAX_ID_BYTES, MAX_MODEL_BYTES, MAX_RENDERER_EVENT_BYTES, MAX_SSE_FRAME_BYTES,
@@ -35,6 +39,407 @@ struct UsageTapState {
 enum ProtocolKind {
     Responses,
     Chat,
+}
+
+#[derive(Debug)]
+enum BoundedModel<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+    Ignored,
+}
+
+impl BoundedModel<'_> {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Borrowed(value) => Some(value),
+            Self::Owned(value) => Some(value),
+            Self::Ignored => None,
+        }
+    }
+}
+
+struct BoundedModelVisitor<'a>(std::marker::PhantomData<&'a str>);
+
+impl<'de: 'a, 'a> Visitor<'de> for BoundedModelVisitor<'a> {
+    type Value = BoundedModel<'a>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded model string")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
+            BoundedModel::Borrowed(value)
+        } else {
+            BoundedModel::Ignored
+        })
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
+            BoundedModel::Owned(value.to_string())
+        } else {
+            BoundedModel::Ignored
+        })
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        if !value.is_empty() && value.len() <= MAX_MODEL_BYTES {
+            Ok(BoundedModel::Owned(value))
+        } else {
+            Ok(BoundedModel::Ignored)
+        }
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(BoundedModel::Ignored)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(BoundedModel::Ignored)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for BoundedModel<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BoundedModelVisitor(std::marker::PhantomData))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum DirectNumber {
+    #[default]
+    Missing,
+    Value(u64),
+    Invalid,
+}
+
+impl DirectNumber {
+    fn optional(self) -> Result<Option<u64>, ()> {
+        match self {
+            Self::Missing => Ok(None),
+            Self::Value(value) => Ok(Some(value)),
+            Self::Invalid => Err(()),
+        }
+    }
+}
+
+struct DirectNumberVisitor;
+
+impl<'de> Visitor<'de> for DirectNumberVisitor {
+    type Value = DirectNumber;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an unsigned integer")
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Value(value))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(DirectNumber::Invalid)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(DirectNumber::Invalid)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DirectNumberVisitor)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DirectTokenDetails {
+    #[serde(default)]
+    cached_tokens: DirectNumber,
+}
+
+#[derive(Debug, Default)]
+enum DirectDetailsField {
+    #[default]
+    Missing,
+    Value(DirectTokenDetails),
+    Invalid,
+}
+
+struct DirectDetailsVisitor;
+
+impl<'de> Visitor<'de> for DirectDetailsVisitor {
+    type Value = DirectDetailsField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a direct token details object")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        DirectTokenDetails::deserialize(MapAccessDeserializer::new(map))
+            .map(DirectDetailsField::Value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DirectDetailsField::Invalid)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectDetailsField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DirectDetailsVisitor)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DirectUsage {
+    #[serde(default)]
+    prompt_tokens: DirectNumber,
+    #[serde(default)]
+    input_tokens: DirectNumber,
+    #[serde(default)]
+    completion_tokens: DirectNumber,
+    #[serde(default)]
+    output_tokens: DirectNumber,
+    #[serde(default)]
+    total_tokens: DirectNumber,
+    #[serde(default)]
+    cache_read_input_tokens: DirectNumber,
+    #[serde(default)]
+    cache_creation_input_tokens: DirectNumber,
+    #[serde(default)]
+    cache_creation_5m_input_tokens: DirectNumber,
+    #[serde(default)]
+    cache_creation_1h_input_tokens: DirectNumber,
+    #[serde(default)]
+    prompt_tokens_details: DirectDetailsField,
+    #[serde(default)]
+    input_tokens_details: DirectDetailsField,
+}
+
+#[derive(Debug, Default)]
+enum DirectUsageField {
+    #[default]
+    Missing,
+    Value(DirectUsage),
+    Invalid,
+}
+
+impl DirectUsageField {
+    fn as_ref(&self) -> Option<&DirectUsage> {
+        match self {
+            Self::Value(usage) => Some(usage),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+}
+
+struct DirectUsageVisitor;
+
+impl<'de> Visitor<'de> for DirectUsageVisitor {
+    type Value = DirectUsageField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a direct usage object")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        DirectUsage::deserialize(MapAccessDeserializer::new(map)).map(DirectUsageField::Value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DirectUsageField::Invalid)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirectUsageField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DirectUsageVisitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NonStreamEnvelope<'a> {
+    #[serde(borrow, default)]
+    object: Option<BoundedModel<'a>>,
+    #[serde(borrow, default)]
+    status: Option<BoundedModel<'a>>,
+    #[serde(borrow, default)]
+    model: Option<BoundedModel<'a>>,
+    #[serde(borrow, default)]
+    service_tier: Option<BoundedModel<'a>>,
+    #[serde(default)]
+    usage: DirectUsageField,
 }
 
 impl ResponsesUsageTap {
@@ -133,10 +538,10 @@ impl UsageTapState {
                 .iter()
                 .find(|byte| !byte.is_ascii_whitespace())
                 .is_some_and(|byte| *byte == b'{')
-            && let Ok(value) = serde_json::from_slice::<Value>(bytes)
+            && let Ok(envelope) = parse_non_stream_envelope(bytes)
         {
             let mut events = Vec::new();
-            self.process_non_stream_value(kind, &value, now_ms, &mut events);
+            self.process_non_stream_envelope(kind, &envelope, now_ms, &mut events);
             return events;
         }
         let mut events = Vec::new();
@@ -324,47 +729,72 @@ impl UsageTapState {
         now_ms: u64,
         events: &mut Vec<TokenCostEvent>,
     ) {
-        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        let Ok(envelope) = parse_non_stream_envelope(body) else {
             return;
         };
-        self.process_non_stream_value(kind, &value, now_ms, events);
+        self.process_non_stream_envelope(kind, &envelope, now_ms, events);
     }
 
-    fn process_non_stream_value(
+    fn process_non_stream_envelope(
         &mut self,
         kind: ProtocolKind,
-        value: &Value,
+        envelope: &NonStreamEnvelope<'_>,
         now_ms: u64,
         events: &mut Vec<TokenCostEvent>,
     ) {
-        let Some(object) = value.as_object() else {
-            return;
-        };
         match kind {
             ProtocolKind::Responses => {
-                let is_response = object.get("object").and_then(Value::as_str) == Some("response")
-                    || object.get("status").and_then(Value::as_str) == Some("completed");
+                let is_response = envelope.object.as_ref().and_then(BoundedModel::as_str)
+                    == Some("response")
+                    || envelope.status.as_ref().and_then(BoundedModel::as_str) == Some("completed");
                 if is_response {
-                    self.update_model_and_tier(object, now_ms, events);
+                    self.update_non_stream_identity(envelope, now_ms, events);
                     self.emit_completed(
-                        object.get("usage").and_then(parse_responses_usage),
+                        envelope.usage.as_ref().and_then(normalize_responses_usage),
                         now_ms,
                         events,
                     );
                 }
             }
             ProtocolKind::Chat => {
-                let has_chat_discriminator = object
-                    .get("object")
-                    .and_then(Value::as_str)
+                let has_chat_discriminator = envelope
+                    .object
+                    .as_ref()
+                    .and_then(BoundedModel::as_str)
                     .is_some_and(|object| object.starts_with("chat.completion"));
-                let usage = object.get("usage").and_then(parse_chat_usage);
+                let usage = envelope.usage.as_ref().and_then(normalize_chat_usage);
                 if has_chat_discriminator || usage.is_some() {
-                    self.update_model_and_tier(object, now_ms, events);
+                    self.update_non_stream_identity(envelope, now_ms, events);
                     self.emit_completed(usage, now_ms, events);
                 }
             }
         }
+    }
+
+    fn update_non_stream_identity(
+        &mut self,
+        envelope: &NonStreamEnvelope<'_>,
+        now_ms: u64,
+        events: &mut Vec<TokenCostEvent>,
+    ) {
+        if let Some(model) = envelope
+            .model
+            .as_ref()
+            .and_then(BoundedModel::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            self.model.clear();
+            self.model.push_str(model);
+        }
+        if let Some(service_tier) = envelope
+            .service_tier
+            .as_ref()
+            .and_then(BoundedModel::as_str)
+        {
+            self.fast = service_tier == "priority";
+        }
+        self.emit_turn_started_if_changed(now_ms, events);
     }
 
     fn update_model_and_tier(
@@ -477,23 +907,132 @@ fn bounded_object_string(
     (!value.is_empty() && value.len() <= max_bytes).then(|| value.to_string())
 }
 
-fn parse_responses_usage(value: &Value) -> Option<TokenUsage> {
-    let object = value.as_object()?;
-    let direct_input = direct_u64(object, "input_tokens").ok()??;
-    let output = direct_u64(object, "output_tokens").ok()??;
-    let (cached_input, has_separate_cache_read) = parse_cached_input(object).ok()?;
-    let input = if has_separate_cache_read {
-        direct_input.checked_add(cached_input)?
-    } else {
-        direct_input
-    };
-    let cache_write = parse_cache_write(object).ok()?;
+fn parse_non_stream_envelope(body: &[u8]) -> serde_json::Result<NonStreamEnvelope<'_>> {
+    serde_json::from_slice(body)
+}
+
+fn normalize_responses_usage(usage: &DirectUsage) -> Option<TokenUsage> {
+    let direct_input = usage.input_tokens.optional().ok()??;
+    let output = usage.output_tokens.optional().ok()??;
+    let total = usage.total_tokens.optional().ok()?;
+    let (cached_input, has_separate_cache_read) = direct_cached_input(usage).ok()?;
+    let cache_write = direct_cache_write(usage).ok()?;
+    let input = normalize_responses_input(
+        direct_input,
+        cached_input,
+        cache_write,
+        output,
+        total,
+        has_separate_cache_read,
+    )?;
     (cached_input <= input).then_some(TokenUsage {
         input,
         cached_input,
         cache_write,
         output,
     })
+}
+
+fn normalize_chat_usage(usage: &DirectUsage) -> Option<TokenUsage> {
+    let prompt_tokens = usage.prompt_tokens.optional().ok()?;
+    let input_tokens = usage.input_tokens.optional().ok()?;
+    let completion_tokens = usage.completion_tokens.optional().ok()?;
+    let output_tokens = usage.output_tokens.optional().ok()?;
+    let output = completion_tokens.or(output_tokens)?;
+    let (cached_input, _) = direct_cached_input(usage).ok()?;
+    let input = if let Some(input_tokens) = input_tokens {
+        input_tokens.checked_add(cached_input)?
+    } else {
+        prompt_tokens?
+    };
+    let cache_write = direct_cache_write(usage).ok()?;
+    (cached_input <= input).then_some(TokenUsage {
+        input,
+        cached_input,
+        cache_write,
+        output,
+    })
+}
+
+fn direct_cached_input(usage: &DirectUsage) -> Result<(u64, bool), ()> {
+    let cache_read = usage.cache_read_input_tokens.optional()?;
+    let prompt_cached = direct_details_cached(&usage.prompt_tokens_details)?;
+    let input_cached = direct_details_cached(&usage.input_tokens_details)?;
+    Ok((
+        cache_read.or(prompt_cached).or(input_cached).unwrap_or(0),
+        cache_read.is_some(),
+    ))
+}
+
+fn direct_details_cached(details: &DirectDetailsField) -> Result<Option<u64>, ()> {
+    match details {
+        DirectDetailsField::Missing => Ok(None),
+        DirectDetailsField::Value(details) => details.cached_tokens.optional(),
+        DirectDetailsField::Invalid => Err(()),
+    }
+}
+
+fn direct_cache_write(usage: &DirectUsage) -> Result<u64, ()> {
+    let cache_creation = usage.cache_creation_input_tokens.optional()?;
+    let cache_creation_5m = usage
+        .cache_creation_5m_input_tokens
+        .optional()?
+        .unwrap_or(0);
+    let cache_creation_1h = usage
+        .cache_creation_1h_input_tokens
+        .optional()?
+        .unwrap_or(0);
+    match cache_creation {
+        Some(value) if value > 0 => Ok(value),
+        _ => cache_creation_5m.checked_add(cache_creation_1h).ok_or(()),
+    }
+}
+
+fn parse_responses_usage(value: &Value) -> Option<TokenUsage> {
+    let object = value.as_object()?;
+    let direct_input = direct_u64(object, "input_tokens").ok()??;
+    let output = direct_u64(object, "output_tokens").ok()??;
+    let total = direct_u64(object, "total_tokens").ok()?;
+    let (cached_input, has_separate_cache_read) = parse_cached_input(object).ok()?;
+    let cache_write = parse_cache_write(object).ok()?;
+    let input = normalize_responses_input(
+        direct_input,
+        cached_input,
+        cache_write,
+        output,
+        total,
+        has_separate_cache_read,
+    )?;
+    (cached_input <= input).then_some(TokenUsage {
+        input,
+        cached_input,
+        cache_write,
+        output,
+    })
+}
+
+fn normalize_responses_input(
+    direct_input: u64,
+    cached_input: u64,
+    cache_write: u64,
+    output: u64,
+    total: Option<u64>,
+    has_separate_cache_read: bool,
+) -> Option<u64> {
+    if has_separate_cache_read {
+        return direct_input.checked_add(cached_input);
+    }
+    let Some(total) = total else {
+        return Some(direct_input);
+    };
+    if direct_input.checked_add(output)? == total {
+        return Some(direct_input);
+    }
+    let input_with_cache = direct_input.checked_add(cached_input)?;
+    let converted_total = input_with_cache
+        .checked_add(cache_write)?
+        .checked_add(output)?;
+    (converted_total == total).then_some(input_with_cache)
 }
 
 fn parse_chat_usage(value: &Value) -> Option<TokenUsage> {
@@ -975,6 +1514,104 @@ mod tests {
     }
 
     #[test]
+    fn narrow_non_stream_parser_borrows_identity_and_skips_large_unknown_body() {
+        let padding = "x".repeat(MAX_SSE_FRAME_BYTES * 32);
+        let body = format!(
+            "  {{\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"output\":\"{padding}\",\"usage\":{{\"input_tokens\":9,\"output_tokens\":4}}}}  "
+        );
+
+        let envelope = parse_non_stream_envelope(body.as_bytes()).unwrap();
+
+        assert!(matches!(
+            envelope.model,
+            Some(BoundedModel::Borrowed("gpt-5.6-sol"))
+        ));
+        assert!(matches!(
+            envelope
+                .service_tier
+                .as_ref()
+                .and_then(BoundedModel::as_str),
+            Some("priority")
+        ));
+        assert_eq!(
+            envelope.usage.as_ref().and_then(normalize_responses_usage),
+            Some(TokenUsage {
+                input: 9,
+                cached_input: 0,
+                cache_write: 0,
+                output: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn incomplete_large_object_uses_only_bounded_fallback_state() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(17, request, 10);
+        let mut body = b"{\"object\":\"response\",\"output\":\"".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_SSE_FRAME_BYTES * 2));
+
+        assert!(tap.push_bytes(&body, 20).is_empty());
+        assert!(tap.state.tail.len() <= MAX_SSE_FRAME_BYTES);
+        assert!(tap.state.discarding_oversized_frame);
+        assert!(matches!(
+            tap.finish(30).as_slice(),
+            [TokenCostEvent::TurnFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn invalid_usage_skips_large_body_without_terminalizing_malformed_json() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(18, request, 10);
+        let padding = "x".repeat(MAX_SSE_FRAME_BYTES * 2);
+        let body = format!(
+            "{{\"object\":\"response\",\"output\":\"{padding}\",\"usage\":{{\"input_tokens\":\"bad\",\"output_tokens\":4}}}}"
+        );
+
+        assert!(matches!(
+            tap.push_bytes(body.as_bytes(), 20).as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
+        assert!(tap.state.tail.is_empty());
+        assert!(tap.state.separator.is_empty());
+
+        let (mut malformed_tap, _) = ResponsesUsageTap::from_request(19, request, 10);
+        assert!(
+            malformed_tap
+                .push_bytes(br#"{"object":"response",}"#, 20)
+                .is_empty()
+        );
+        assert!(matches!(
+            malformed_tap.finish(30).as_slice(),
+            [TokenCostEvent::TurnFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn non_stream_discriminator_and_tier_matching_stays_exact() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(20, request, 10);
+        assert!(
+            tap.push_bytes(
+                br#"{"object":" response ","service_tier":" priority ","usage":null}"#,
+                20,
+            )
+            .is_empty()
+        );
+
+        let events = tap.push_bytes(
+            br#"{"object":"response","service_tier":" priority ","usage":{"input_tokens":1,"output_tokens":1}}"#,
+            30,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TokenCostEvent::TurnStarted { fast: true, .. }))
+        );
+    }
+
+    #[test]
     fn chat_direct_cache_fields_normalize_exact_usage_and_cost() {
         let request = br#"{"model":"gpt-5.6-sol"}"#;
         let (mut tap, mut events) = ChatUsageTap::from_request(13, request, 10);
@@ -1112,6 +1749,38 @@ mod tests {
 
         assert!(matches!(
             terminal.as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
+    }
+
+    #[test]
+    fn responses_total_consistency_rejects_checked_add_overflow() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut native_total, _) = ResponsesUsageTap::from_request(18, request, 10);
+        let native_overflow = native_total.push_bytes(
+            format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{},\"output_tokens\":1,\"total_tokens\":0}}}}}}\n\n",
+                u64::MAX
+            )
+            .as_bytes(),
+            20,
+        );
+        assert!(matches!(
+            native_overflow.as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
+
+        let (mut converted_total, _) = ResponsesUsageTap::from_request(19, request, 10);
+        let converted_overflow = converted_total.push_bytes(
+            format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{},\"output_tokens\":0,\"total_tokens\":0,\"input_tokens_details\":{{\"cached_tokens\":1}},\"cache_creation_input_tokens\":1}}}}}}\n\n",
+                u64::MAX - 1
+            )
+            .as_bytes(),
+            20,
+        );
+        assert!(matches!(
+            converted_overflow.as_slice(),
             [TokenCostEvent::TurnCompleted { usage: None, .. }]
         ));
     }
