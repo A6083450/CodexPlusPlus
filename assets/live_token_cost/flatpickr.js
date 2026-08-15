@@ -175,8 +175,19 @@ api.registerModule("flatpickr", (context) => {
         recordedCalendar = calendar;
         context.recordDomWrite();
       }
-      try { candidate.destroy(); } catch {}
-      if (calendarConnected && calendar?.isConnected !== true) context.recordDomWrite();
+      let destroyFailed = false;
+      try { candidate.destroy(); } catch { destroyFailed = true; }
+      if (destroyFailed && Array.isArray(candidate._handlers)) {
+        const ownedHandlers = candidate._handlers.slice(0, LISTENER_COUNT);
+        for (const handler of ownedHandlers) {
+          try { handler?.remove?.(); } catch {}
+        }
+        candidate._handlers.splice(0, ownedHandlers.length);
+      }
+      if (calendarConnected) {
+        if (calendar?.isConnected === true) remove(calendar);
+        else context.recordDomWrite();
+      }
     }
     if (targetNode) {
       try { delete targetNode._flatpickr; } catch {}

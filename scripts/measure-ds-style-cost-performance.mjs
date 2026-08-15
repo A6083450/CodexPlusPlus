@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { finished } from "node:stream/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -682,8 +682,18 @@ export async function publishPreparedOutputs(outputs, operations = {}) {
       published: false,
     };
   });
+  const statFile = operations.lstat || lstat;
   const renameFile = operations.rename || rename;
   const removeFile = operations.unlink || unlink;
+  const warn = operations.warn || ((message) => process.emitWarning(message));
+  for (const state of states) {
+    try {
+      const status = await statFile(state.finalPath);
+      if (!status.isFile()) throw new Error("existing output must be a regular file");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
   try {
     for (const state of states) {
       try {
@@ -714,7 +724,12 @@ export async function publishPreparedOutputs(outputs, operations = {}) {
     throw error;
   }
   for (const state of states) {
-    if (state.hadPrior) await removeTemporary(state.backupPath, removeFile);
+    if (!state.hadPrior) continue;
+    try {
+      await removeTemporary(state.backupPath, removeFile);
+    } catch {
+      try { warn("committed output backup cleanup failed"); } catch {}
+    }
   }
 }
 
@@ -798,6 +813,7 @@ export async function startTrace(client, outputPath, operations = {}) {
   const controller = {
     assertHealthy() {
       if (streamError) throw streamError;
+      if (completionError) throw completionError;
     },
     async abort() {
       if (stopped) return;

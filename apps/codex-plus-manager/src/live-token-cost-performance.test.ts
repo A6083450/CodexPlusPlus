@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { tmpdir } from "node:os";
@@ -384,6 +384,66 @@ describe("DS style cost measurement runner output aggregation", () => {
     }
   }
 
+  const fullRunDependencies = (outputOperations: Record<string, any> = {}) => {
+    const client = new FakeTraceClient() as FakeTraceClient & { close: () => void };
+    client.close = () => {};
+    client.sendEnd = async () => {
+      client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
+      return {};
+    };
+    const originalSend = client.send.bind(client);
+    client.send = async (method: string) => {
+      if (method === "Browser.getVersion") {
+        return {
+          protocolVersion: "1.3",
+          product: "Chrome/140.0.0.0",
+          revision: "@abc123",
+          userAgent: "Codex Test",
+          jsVersion: "14.0",
+        };
+      }
+      return originalSend(method);
+    };
+    return {
+      fetchJson: async () => [{
+        id: "page",
+        type: "page",
+        title: "Codex",
+        url: "app://-/index.html",
+        webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page",
+      }],
+      processList: async () => `
+        101 1 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9339
+        103 101 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+      `,
+      connectCdp: async () => client,
+      pageDiagnostics: async () => null,
+      installLongTaskObserver: async () => {},
+      removeLongTaskObserver: async () => ({ count: 0, totalDurationMs: 0, maxDurationMs: 0 }),
+      delay: async () => {},
+      performanceNow: () => 0,
+      sampleOnce: async () => ({
+        timestamp: "2026-08-16T00:00:01.000Z",
+        rendererPids: [103],
+        processes: [{ pid: 103, cpuPercent: 1, rssKb: 2048 }],
+        aggregate: { cpuPercent: 1, rssKb: 2048 },
+        cdp: {
+          metrics: { TaskDuration: 0.25 },
+          heap: { usedSize: 1024, totalSize: 2048, embedderHeapUsedSize: 128, backingStorageSize: 64 },
+        },
+      }),
+      outputOperations,
+    };
+  };
+
+  const runFullMeasurement = (output: string, traceOutput: string, outputOperations: Record<string, any> = {}) => runMeasurement({
+    debugPort: 9339,
+    durationSeconds: 1,
+    label: "round-three-publication",
+    output,
+    traceOutput,
+  }, fullRunDependencies(outputOperations));
+
   it("latches every tracingComplete received before Tracing.end as fatal", async () => {
     for (const params of [{ dataLossOccurred: false }, { dataLossOccurred: true }, {}]) {
       const output = join(tmpdir(), `codex-ds-early-trace-${randomUUID()}.json`);
@@ -391,6 +451,7 @@ describe("DS style cost measurement runner output aggregation", () => {
       try {
         const trace = await startTrace(client, output);
         client.emit("Tracing.tracingComplete", params);
+        assert.throws(() => trace.assertHealthy(), /before Tracing\.end/);
         await assert.rejects(trace.stop(), /before Tracing\.end/);
         await new Promise((resolve) => setImmediate(resolve));
       } finally {
@@ -596,6 +657,78 @@ describe("DS style cost measurement runner output aggregation", () => {
           await unlink(output).catch(() => {});
         }
       }
+    }
+  });
+
+  it("rejects every non-regular final before changing either full-run output", async () => {
+    for (const unsafeKind of ["directory", "symlink"] as const) {
+      const output = join(tmpdir(), `codex-ds-unsafe-metrics-${randomUUID()}.json`);
+      const traceOutput = join(tmpdir(), `codex-ds-unsafe-trace-${randomUUID()}.json`);
+      const symlinkTarget = join(tmpdir(), `codex-ds-symlink-target-${randomUUID()}.json`);
+      const backupPaths: string[] = [];
+      if (unsafeKind === "directory") {
+        await mkdir(traceOutput);
+        await writeFile(output, "prior metrics", "utf8");
+      } else {
+        await writeFile(symlinkTarget, "symlink target", "utf8");
+        await symlink(symlinkTarget, traceOutput);
+      }
+      try {
+        await assert.rejects(runFullMeasurement(output, traceOutput, {
+          rename: async (from: string, to: string) => {
+            if (to.includes(".backup-")) backupPaths.push(to);
+            await rename(from, to);
+          },
+        }), /regular file/);
+        const traceStat = await lstat(traceOutput);
+        assert.equal(unsafeKind === "directory" ? traceStat.isDirectory() : traceStat.isSymbolicLink(), true);
+        if (unsafeKind === "directory") assert.equal(await readFile(output, "utf8"), "prior metrics");
+        else await assert.rejects(readFile(output), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+        assert.deepEqual(backupPaths, [], "preflight rejection must happen before the first rename");
+      } finally {
+        for (const path of backupPaths) {
+          const stat = await lstat(path).catch(() => null);
+          if (stat?.isDirectory()) await rmdir(path);
+          else await unlink(path).catch(() => {});
+        }
+        const traceStat = await lstat(traceOutput).catch(() => null);
+        if (traceStat?.isDirectory()) await rmdir(traceOutput);
+        else await unlink(traceOutput).catch(() => {});
+        await unlink(output).catch(() => {});
+        await unlink(symlinkTarget).catch(() => {});
+      }
+    }
+  });
+
+  it("keeps the committed new pair authoritative when backup garbage collection fails", async () => {
+    const output = join(tmpdir(), `codex-ds-committed-metrics-${randomUUID()}.json`);
+    const traceOutput = join(tmpdir(), `codex-ds-committed-trace-${randomUUID()}.json`);
+    const retainedBackups: string[] = [];
+    const warnings: string[] = [];
+    await writeFile(output, "prior metrics", "utf8");
+    await writeFile(traceOutput, "prior trace", "utf8");
+    try {
+      const result = await runFullMeasurement(output, traceOutput, {
+        unlink: async (path: string) => {
+          if (path.startsWith(`${traceOutput}.backup-`)) {
+            retainedBackups.push(path);
+            throw new Error("injected backup cleanup failure");
+          }
+          await unlink(path);
+        },
+        warn: (message: string) => warnings.push(message),
+      });
+      assert.equal(result.label, "round-three-publication");
+      assert.equal(JSON.parse(await readFile(output, "utf8")).label, "round-three-publication");
+      assert.deepEqual(JSON.parse(await readFile(traceOutput, "utf8")).traceEvents, []);
+      assert.equal(retainedBackups.length, 1);
+      assert.equal(await readFile(retainedBackups[0], "utf8"), "prior trace");
+      assert.equal(warnings.length, 1);
+      assert.ok(Buffer.byteLength(warnings[0]) <= 128, "post-commit warning must remain bounded");
+    } finally {
+      for (const path of retainedBackups) await unlink(path).catch(() => {});
+      await unlink(traceOutput).catch(() => {});
+      await unlink(output).catch(() => {});
     }
   });
 

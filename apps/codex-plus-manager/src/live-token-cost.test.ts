@@ -479,6 +479,7 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
   const clock = new FakeClock();
   const bridgeCalls: BridgeCall[] = [];
   const bridgePromises: Promise<any>[] = [];
+  const windowListeners = new Map<string, Listener[]>();
   let bridge = initialBridge || ((path: string, payload: any) => {
     if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
     if (path === "/token-cost/action" && payload.action?.type === "query_diagnostics") return nativeDiagnosticsResponse();
@@ -510,8 +511,13 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
     clearInterval() {},
     requestAnimationFrame(callback: () => void) { callback(); return 1; },
     cancelAnimationFrame() {},
-    addEventListener() {},
-    removeEventListener() {},
+    listeners: windowListeners,
+    addEventListener(type: string, listener: Listener) {
+      windowListeners.set(type, [...(windowListeners.get(type) || []), listener]);
+    },
+    removeEventListener(type: string, listener: Listener) {
+      windowListeners.set(type, (windowListeners.get(type) || []).filter((value) => value !== listener));
+    },
     dispatchEvent() { return true; },
     postMessage() {},
     navigator: { userAgent: "CodexPlusPlus test" },
@@ -2849,6 +2855,83 @@ describe("lazy analytics calendar and profile views", () => {
     assert.equal(openDestroyCalls, 1, "the returned instance and target fallback are the same owner");
     assert.equal(openFailure.document.querySelectorAll(".flatpickr-calendar").length, 0);
     assert.equal(Boolean(openFailure.document.getElementById("codex-live-token-cost-flatpickr-style")), false);
+  });
+
+  it("falls back to exact-once owned Flatpickr cleanup when vendor destroy throws immediately", async () => {
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "query_diagnostics") return nativeDiagnosticsResponse();
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+    overlay.querySelector("[data-analytics-preset='custom']")!.click();
+    const target = overlay.querySelector("[data-analytics-date-input]")! as any;
+    const sumListeners = (listeners: Map<string, Listener[]>) => [...listeners.values()]
+      .reduce((total, entries) => total + entries.length, 0);
+    const subtreeListeners = (root: FakeElement | null): number => root
+      ? sumListeners(root.listeners) + root.children.reduce((total, child) => total + subtreeListeners(child), 0)
+      : 0;
+    const realListenerCount = (calendar: FakeElement | null) => sumListeners(harness.document.listeners)
+      + sumListeners(harness.window.listeners)
+      + subtreeListeners(target)
+      + subtreeListeners(calendar);
+    const lazyMutationCount = (from: number) => harness.document.connectedMutationRecords
+      .slice(from)
+      .filter((record) => {
+        if (record.targetClass.split(/\s+/).includes("flatpickr-input") || record.kind.endsWith(":readonly")) return false;
+        const owned = (node?: FakeElement) => Boolean(node && (
+          node.id === "codex-live-token-cost-flatpickr-style"
+          || node.id.startsWith("codex-live-token-cost-")
+          || node.className.split(/\s+/).some((name) => name.startsWith("cltc-") || name.startsWith("flatpickr-"))
+        ));
+        return owned(record.target) || owned(record.node);
+      }).length;
+
+    const diagnosticsBefore = await harness.window.__codexLiveTokenCostV1.diagnostics();
+    const listenersBefore = realListenerCount(null);
+    overlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    harness.runFlatpickr();
+    const instance = target._flatpickr;
+    const calendar = instance.calendarContainer as FakeElement;
+    const diagnosticsMounted = await harness.window.__codexLiveTokenCostV1.diagnostics();
+    const listenersMounted = realListenerCount(calendar);
+    assert.equal(diagnosticsMounted.listenerCount - diagnosticsBefore.listenerCount, listenersMounted - listenersBefore);
+    assert.equal(instance._handlers.length, 12, "fixture must exercise the real bundled listener paths");
+
+    let destroyCalls = 0;
+    instance.destroy = () => {
+      destroyCalls += 1;
+      throw new Error("vendor destroy failed before cleanup");
+    };
+    const mutationStart = harness.document.connectedMutationRecords.length;
+    overlay.querySelector("[data-analytics-preset='today']")!.click();
+    await harness.settle();
+    const diagnosticsAfter = await harness.window.__codexLiveTokenCostV1.diagnostics();
+    assert.equal(destroyCalls, 1);
+    assert.equal(diagnosticsAfter.listenerCount, diagnosticsBefore.listenerCount);
+    assert.equal(realListenerCount(calendar), listenersBefore);
+    assert.equal(instance._handlers.length, 0, "fallback must release each real vendor listener owner");
+    assert.equal(harness.document.querySelectorAll(".flatpickr-calendar").length, 0);
+    assert.equal(harness.document.getElementById("codex-live-token-cost-flatpickr-style"), null);
+    assert.equal(
+      diagnosticsAfter.domWrites - diagnosticsMounted.domWrites,
+      lazyMutationCount(mutationStart),
+      "fallback diagnostics must equal independent connected DOM mutations",
+    );
+
+    overlay.querySelector("[data-analytics-preset='today']")!.click();
+    await harness.settle();
+    const diagnosticsRepeated = await harness.window.__codexLiveTokenCostV1.diagnostics();
+    assert.equal(destroyCalls, 1, "repeated cleanup must not re-enter the failed vendor destroy");
+    assert.equal(diagnosticsRepeated.listenerCount, diagnosticsBefore.listenerCount);
+    assert.equal(realListenerCount(calendar), listenersBefore);
+    assert.equal(harness.document.querySelectorAll(".flatpickr-calendar").length, 0);
   });
 
   it("opens a single local profile only from exact lifecycle and guards save and cleanup ownership", async () => {
