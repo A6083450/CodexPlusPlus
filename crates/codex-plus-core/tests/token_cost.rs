@@ -2160,6 +2160,118 @@ async fn completed_history_and_dedupe_fingerprints_stay_hard_bounded() {
 }
 
 #[tokio::test]
+async fn native_runtime_stays_bounded_under_thirty_minute_equivalent_pressure() {
+    const DELTA_COUNT: u64 = 100_000;
+    const TOOL_EVENT_COUNT: u64 = 2_000;
+    const COMPLETED_TURN_COUNT: usize = 256;
+
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started(
+        "s-pressure",
+        "turn-0",
+        "start-0",
+        "correlation-0",
+        0,
+    ));
+
+    for index in 0..DELTA_COUNT {
+        service.ingest(output_delta(
+            "s-pressure",
+            "turn-0",
+            format!("delta-{index}"),
+            "correlation-0",
+            index + 1,
+            index + 1,
+        ));
+    }
+    for index in 0..(TOOL_EVENT_COUNT / 2) {
+        let call_id = format!("call-{index}");
+        service.ingest(tool_started(
+            "s-pressure",
+            "turn-0",
+            format!("tool-start-{index}"),
+            "correlation-0",
+            DELTA_COUNT + index * 2 + 1,
+            &call_id,
+        ));
+        service.ingest(tool_completed(
+            "s-pressure",
+            "turn-0",
+            format!("tool-complete-{index}"),
+            "correlation-0",
+            DELTA_COUNT + index * 2 + 2,
+            &call_id,
+        ));
+    }
+    let mut occurred_at_ms = DELTA_COUNT + TOOL_EVENT_COUNT + 1;
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-pressure",
+        "turn-0",
+        "complete-0",
+        "correlation-0",
+        occurred_at_ms,
+        None,
+    ));
+
+    for index in 1..COMPLETED_TURN_COUNT {
+        occurred_at_ms += 1;
+        let turn_id = format!("turn-{index}");
+        let correlation_id = format!("correlation-{index}");
+        service.ingest(turn_started(
+            "s-pressure",
+            &turn_id,
+            format!("start-{index}"),
+            correlation_id.clone(),
+            occurred_at_ms,
+        ));
+        occurred_at_ms += 1;
+        service.ingest(turn_completed(
+            UsageSource::Renderer,
+            "s-pressure",
+            &turn_id,
+            format!("complete-{index}"),
+            correlation_id,
+            occurred_at_ms,
+            Some(TokenUsage {
+                input: 1,
+                cached_input: 0,
+                cache_write: 0,
+                output: 1,
+            }),
+        ));
+    }
+
+    let bounded = diagnostics(&service).await;
+    assert_eq!(
+        bounded.events_ingested,
+        1 + DELTA_COUNT + TOOL_EVENT_COUNT + 1 + ((COMPLETED_TURN_COUNT - 1) * 2) as u64
+    );
+    assert_eq!(bounded.events_rejected, 0);
+    assert_eq!(bounded.queue_depth, 0);
+    assert!(bounded.queue_high_water <= EVENT_QUEUE_CAPACITY as u64);
+    assert_eq!(bounded.recent_turns, RECENT_TURN_LIMIT as u64);
+    assert!(bounded.dedupe_fingerprints <= DEDUPE_FINGERPRINT_LIMIT as u64);
+
+    let final_snapshot = snapshot(&service);
+    assert_eq!(final_snapshot.turns, COMPLETED_TURN_COUNT as u32);
+    assert_eq!(final_snapshot.steps, COMPLETED_TURN_COUNT as u32);
+    assert_eq!(final_snapshot.tool_ms, TOOL_EVENT_COUNT / 2);
+    assert_eq!(
+        final_snapshot.output,
+        DELTA_COUNT + (COMPLETED_TURN_COUNT - 1) as u64
+    );
+    let expression =
+        codex_plus_core::token_cost::assets::snapshot_expression(&SnapshotPush::Snapshot {
+            instance_id: "page-1".to_string(),
+            snapshot: final_snapshot,
+        })
+        .expect("the real pressure snapshot should fit the native CDP payload budget");
+    assert!(expression.len() <= MAX_SNAPSHOT_BYTES);
+}
+
+#[tokio::test]
 async fn dedupe_windows_are_removed_after_sequential_sessions_complete() {
     let service = TokenCostService::in_memory();
     service.bootstrap("page-1").unwrap();

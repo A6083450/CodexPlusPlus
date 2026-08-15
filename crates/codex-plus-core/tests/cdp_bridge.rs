@@ -7,8 +7,8 @@ use codex_plus_core::cdp::{
     validate_cdp_websocket_url,
 };
 use codex_plus_core::token_cost::{
-    EventMeta, LazyAsset, TokenCostAction, TokenCostActionResponse, TokenCostEvent,
-    TokenCostService, UsageSource,
+    EventMeta, LazyAsset, MAX_SNAPSHOT_BYTES, TokenCostAction, TokenCostActionResponse,
+    TokenCostEvent, TokenCostService, UsageSource,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -4730,7 +4730,7 @@ async fn token_cost_push_idle_for_650ms_sends_zero_runtime_evaluates() {
 }
 
 #[tokio::test]
-async fn token_cost_push_coalesces_three_updates_to_the_newest_revision() {
+async fn token_cost_push_caps_rate_and_coalesces_to_the_newest_bounded_snapshot() {
     let (prime_seen_tx, prime_seen_rx) = oneshot::channel();
     let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
         complete_bridge_setup(&mut socket).await;
@@ -5081,6 +5081,11 @@ fn assert_token_cost_snapshot_expression(command: &serde_json::Value, revision: 
     assert!(
         expression.contains(&format!("\"revision\":{revision}")),
         "{expression}"
+    );
+    assert!(
+        expression.len() <= MAX_SNAPSHOT_BYTES,
+        "snapshot expression is {} bytes; limit is {MAX_SNAPSHOT_BYTES}",
+        expression.len()
     );
 }
 

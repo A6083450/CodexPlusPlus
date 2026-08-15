@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
+import { performance as nodePerformance } from "node:perf_hooks";
 import vm from "node:vm";
 
 type Listener = (event: FakeEvent) => void;
@@ -386,6 +387,26 @@ function baseConfig(overrides: Record<string, any> = {}) {
   };
 }
 
+function nativeDiagnostics(overrides: Record<string, number> = {}) {
+  return {
+    events_ingested: 100,
+    events_coalesced: 20,
+    events_rejected: 0,
+    queue_depth: 0,
+    queue_high_water: 1,
+    recent_turns: 12,
+    dedupe_fingerprints: 4,
+    snapshots_published: 8,
+    snapshots_sent: 7,
+    lazy_commands_sent: 0,
+    ...overrides,
+  };
+}
+
+function nativeDiagnosticsResponse(overrides: Record<string, number> = {}) {
+  return { status: "ok", response: { type: "diagnostics", diagnostics: nativeDiagnostics(overrides) } };
+}
+
 function successfulBootstrap(instanceId: string, overrides: Record<string, any> = {}) {
   return { status: "ok", instance_id: instanceId, config: baseConfig(), snapshot: baseSnapshot(), ...overrides };
 }
@@ -419,7 +440,11 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
   const clock = new FakeClock();
   const bridgeCalls: BridgeCall[] = [];
   const bridgePromises: Promise<any>[] = [];
-  let bridge = initialBridge || ((_path: string, payload: any) => successfulBootstrap(payload.instance_id));
+  let bridge = initialBridge || ((path: string, payload: any) => {
+    if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+    if (path === "/token-cost/action" && payload.action?.type === "query_diagnostics") return nativeDiagnosticsResponse();
+    return { status: "ok" };
+  });
 
   const header = document.createElement("header");
   const actions = document.createElement("div");
@@ -483,7 +508,7 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
   const context = {
     window: windowObject, self: windowObject, document, localStorage, location: windowObject.location,
     console, URL, Blob, TextEncoder, TextDecoder, CustomEvent: FakeEvent, Event: FakeEvent,
-    Date: ClockDate,
+    Date: ClockDate, performance: nodePerformance,
     navigator: windowObject.navigator,
     HTMLElement: FakeElement, Node: FakeElement, HTMLCollection: Array, NodeList: Array,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
@@ -661,12 +686,20 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.equal(harness.clock.tasks.size, 0);
     assert.equal(harness.document.observerCount, 0);
     assert.equal(harness.document.innerHtmlWrites, 0);
-    const diagnostics = api.diagnostics();
+    const diagnostics = await api.diagnostics();
     assert.equal(diagnostics.captureEnabled, true);
     assert.equal(diagnostics.moduleCount, 0);
     assert.equal(diagnostics.listenerCount, 3);
-    assert.equal(diagnostics.timerCount, 0);
-    assert.equal(Object.values(diagnostics).every((value) => ["string", "number", "boolean"].includes(typeof value)), true);
+    assert.equal(diagnostics.outstandingTimers, 0);
+    assert.equal(diagnostics.observerCount, 0);
+    assert.equal(diagnostics.bridgeCalls, 2);
+    assert.equal(diagnostics.snapshotCount, 1);
+    assert.ok(diagnostics.domWrites > 0);
+    assert.ok(diagnostics.ownedNodeCount > 0);
+    assert.deepEqual(JSON.parse(JSON.stringify(diagnostics.mountedModules)), []);
+    assert.ok(diagnostics.updateDurationsMs.length <= 256);
+    assert.deepEqual(JSON.parse(JSON.stringify(diagnostics.native)), nativeDiagnostics());
+    assert.equal(actionCalls(harness, "query_diagnostics").length, 1);
   });
 
   it("accepts a native-valid empty Profile display name without retrying bootstrap", async () => {
@@ -738,14 +771,15 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.deepEqual(harness.bridgeCalls.map((call) => call.at), [0, 250, 1000]);
     assert.deepEqual(harness.clock.delays, [250, 750]);
     assert.equal(harness.clock.tasks.size, 0);
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().bootstrapAttempts, 3);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).bootstrapAttempts, 3);
     harness.clock.advance(60_000);
     await harness.settle();
-    assert.equal(harness.bridgeCalls.length, 3);
+    assert.equal(harness.bridgeCalls.filter((call) => call.path === "/token-cost/bootstrap").length, 3);
     harness.document.getElementById("codex-live-token-cost-settings")!.click();
     await harness.settle();
-    assert.equal(harness.bridgeCalls.length, 4);
-    assert.equal(harness.bridgeCalls[3].at, 61_000);
+    const bootstrapCalls = harness.bridgeCalls.filter((call) => call.path === "/token-cost/bootstrap");
+    assert.equal(bootstrapCalls.length, 4);
+    assert.equal(bootstrapCalls[3].at, 61_000);
   });
 
   it("resets an exhausted bootstrap cycle from an explicit lifecycle event", async () => {
@@ -756,7 +790,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     await harness.settle();
     harness.clock.advance(750);
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().exhausted, true);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).exhausted, true);
     harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
       detail: { reason: "navigation", route: "/" },
     }));
@@ -812,7 +846,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.equal(api.registerModule("unknown", () => {}), false);
     assert.equal(api.registerModule("settings", null), false);
     assert.equal(executions, 0);
-    assert.equal(api.diagnostics().moduleCount, 4);
+    assert.equal((await api.diagnostics()).moduleCount, 4);
     await api.emitAction({ type: "query_diagnostics", instance_id: "forged" });
     const action = harness.bridgeCalls.at(-1)!;
     assert.equal(action.path, "/token-cost/action");
@@ -1130,7 +1164,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.ok(overlay.querySelector("[data-profile-field='email']"));
     visibility.resolve(updatedResponse(hiddenConfig, 2));
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 2);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).revision, 2);
     assert.equal(overlay.querySelector(".cltc-settings-modal")!.dataset.settingsActive, "general");
     assert.equal(overlay.querySelector("[data-settings-panel='profile']"), null);
     assert.ok(overlay.querySelector("[data-misc-field='profileUnlockEnabled']"), "General body must replace the now-hidden Profile body");
@@ -1189,7 +1223,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     const staleConfig = baseConfig({ profile: { ...baseConfig().profile, email: "stale@example.com" } });
     stale.resolve(updatedResponse(staleConfig, 2));
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 3);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).revision, 3);
 
     overlay.querySelector("[data-settings-panel='general']")!.click();
     overlay.querySelector("[data-settings-panel='profile']")!.click();
@@ -1253,7 +1287,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
 
     stale.resolve(updatedResponse(baseConfig({ price_overrides: { "stale-price": stalePrice } }), 2));
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 3);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).revision, 3);
     assert.equal(overlay.querySelector(".cltc-price-meta")!.textContent, "fresh-price · 自定义");
     assert.equal(overlay.querySelector("[data-price-field='model']")!.value, "fresh-price");
     assert.equal(overlay.querySelector("[data-price-field='input']")!.value, "2");
@@ -1343,7 +1377,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     hub.checked = false;
     hub.dispatchEvent(new FakeEvent("change"));
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 2);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).revision, 2);
     overlay.querySelector("[data-settings-panel='pricing']")!.click();
 
     resolvePrice({ status: "error", error: "price write failed" });
@@ -1401,7 +1435,7 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     resolvePrice(updatedResponse(priceConfig, 2));
     await harness.settleBridgeCalls();
     await harness.settle();
-    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 3);
+    assert.equal((await harness.window.__codexLiveTokenCostV1.diagnostics()).revision, 3);
     assert.equal(overlay.querySelector(".cltc-price-meta")!.textContent, "cross-family-price · 自定义");
     const saved = content.children.find((node) => node.dataset.settingsStatus === "saved");
     assert.equal(saved?.textContent, "已保存模型价格。");
@@ -1457,12 +1491,12 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
         profile_visible: false,
       }),
     }), true);
-    assert.equal(api.diagnostics().revision, 4);
+    assert.equal((await api.diagnostics()).revision, 4);
 
     resolvePrice(updatedResponse(priceConfig, 2));
     await harness.settleBridgeCalls();
     await harness.settle();
-    assert.equal(api.diagnostics().revision, 4);
+    assert.equal((await api.diagnostics()).revision, 4);
     assert.equal(overlay.querySelector(".cltc-price-meta")!.textContent, "snapshot-race-price · 自定义");
     const saved = content.children.find((node) => node.dataset.settingsStatus === "saved");
     assert.equal(saved?.textContent, "已保存模型价格。");
@@ -2901,6 +2935,87 @@ describe("lazy analytics calendar and profile views", () => {
     assert.equal(harness.document.querySelector(".cltc-settings-modal"), null, "late Settings registration cannot steal Profile ownership");
     harness.runProfile();
     assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+  });
+
+  it("keeps the real VM runtime bounded under lifecycle, reinjection, view and snapshot pressure", async () => {
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "query_diagnostics") {
+        return nativeDiagnosticsResponse();
+      }
+      return { status: "ok" };
+    });
+    harness.run();
+    await harness.settle();
+    harness.runSettings();
+    harness.runAnalytics();
+    harness.runProfile();
+    harness.runFlatpickr();
+
+    const api = harness.window.__codexLiveTokenCostV1;
+    const root = harness.document.getElementById("codex-live-token-cost")!;
+    const settingsButton = harness.document.getElementById("codex-live-token-cost-settings")!;
+    const before = await api.diagnostics();
+    assert.equal(actionCalls(harness, "query_diagnostics").length, 1);
+
+    for (let index = 0; index < 1_000; index += 1) {
+      harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+        detail: { reason: "route", profile: false, route: `/pressure/${index}` },
+      }));
+    }
+    for (let index = 0; index < 200; index += 1) harness.run();
+    assert.equal(harness.window.__codexLiveTokenCostV1, api);
+    assert.equal(harness.document.getElementById("codex-live-token-cost"), root);
+    assert.equal(actionCalls(harness, "query_diagnostics").length, 1, "ordinary paths never poll diagnostics");
+
+    for (let index = 0; index < 100; index += 1) {
+      settingsButton.click();
+      const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+      overlay.querySelector("[data-settings-panel='usage']")!.click();
+      await harness.settle();
+      overlay.querySelector("[data-analytics-preset='custom']")!.click();
+      overlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+      assert.equal(harness.document.querySelectorAll(".flatpickr-calendar").length, 1);
+      overlay.querySelector("[data-analytics-preset='today']")!.click();
+      await harness.settle();
+      assert.equal(harness.document.querySelector(".flatpickr-calendar"), null);
+      overlay.querySelector("[data-action='close-price']")!.click();
+
+      harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+        detail: { reason: "profile_entry", profile: true },
+      }));
+      assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+      harness.document.querySelector("[data-profile-action='close']")!.click();
+    }
+
+    const writesBeforeSnapshots = (await api.diagnostics()).domWrites;
+    for (let index = 0; index < 300; index += 1) {
+      assert.equal(api.acceptNativePush({
+        type: "snapshot",
+        instance_id: api.instanceId,
+        snapshot: baseSnapshot(index + 2, { turns: index + 100 }),
+      }), true);
+    }
+    const after = await api.diagnostics();
+    const sortedDurations = [...after.updateDurationsMs].sort((left, right) => left - right);
+    const p95 = sortedDurations[Math.ceil(sortedDurations.length * 0.95) - 1];
+
+    assert.equal(after.domWrites - writesBeforeSnapshots, 300, "changed-only HUD snapshots write one owned field each");
+    assert.equal(after.updateDurationsMs.length, 256);
+    assert.ok(p95 <= 4, `HUD update p95 ${p95}ms exceeds 4ms`);
+    assert.ok(Math.max(...sortedDurations) < 16, "every HUD update stays under one 16ms frame");
+    assert.equal(after.ownedNodeCount, before.ownedNodeCount);
+    assert.equal(harness.document.getElementById("codex-live-token-cost"), root);
+    assert.equal(listenerCount(harness.document, "click"), 1);
+    assert.equal(listenerCount(harness.document, "change"), 1);
+    assert.equal(listenerCount(harness.document, "codex-plus:token-cost-lifecycle"), 1);
+    assert.equal(harness.document.observerCount, 0);
+    assert.equal(harness.clock.tasks.size, 0);
+    assert.equal(actionCalls(harness, "query_diagnostics").length, 3);
   });
 
   it("keeps lazy view sources inert, bounded and visually tied to the frozen contract", async () => {

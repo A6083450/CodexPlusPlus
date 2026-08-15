@@ -17,6 +17,7 @@
   const PROFILE_MARKER = "data-codex-plus-token-cost-profile-entry";
   const LIFECYCLE_EVENT = "codex-plus:token-cost-lifecycle";
   const MODULE_NAMES = ["settings", "analytics", "profile", "flatpickr"];
+  const MAX_UPDATE_DURATION_SAMPLES = 256;
   const ACTION_NAMES = [
     "set_visibility", "save_price", "delete_price", "reset_price", "save_profile",
     "query_analytics", "sync_cc_switch", "query_diagnostics", "dispose_instance",
@@ -34,6 +35,12 @@
 
   const instanceId = `token-cost-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const modules = { settings: null, analytics: null, profile: null, flatpickr: null };
+  const counters = {
+    bridgeCalls: 0,
+    domWrites: 0,
+    snapshotCount: 0,
+    updateDurationsMs: [],
+  };
   const state = {
     alive: true,
     activated: false,
@@ -67,6 +74,24 @@
 
   function safeCount(value) {
     return Number.isSafeInteger(value) && value >= 0;
+  }
+
+  function incrementCounter(name, amount = 1) {
+    counters[name] = Math.min(Number.MAX_SAFE_INTEGER, counters[name] + amount);
+  }
+
+  function recordDomWrite(amount = 1) {
+    incrementCounter("domWrites", amount);
+  }
+
+  function monotonicNow() {
+    return typeof performance === "object" && typeof performance.now === "function" ? performance.now() : Date.now();
+  }
+
+  function recordUpdateDuration(startedAt) {
+    const duration = Math.max(0, monotonicNow() - startedAt);
+    if (counters.updateDurationsMs.length >= MAX_UPDATE_DURATION_SAMPLES) counters.updateDurationsMs.shift();
+    counters.updateDurationsMs.push(duration);
   }
 
   function validAvatar(value) {
@@ -116,6 +141,7 @@
   }
 
   function postJson(path, payload) {
+    incrementCounter("bridgeCalls");
     const bridge = window.__codexPlusPostJson;
     if (typeof bridge !== "function") return Promise.reject(new Error("Codex++ bridge unavailable"));
     try { return Promise.resolve(bridge(path, payload)); } catch (error) { return Promise.reject(error); }
@@ -134,14 +160,21 @@
 
   function makeElement(tag, className, text) {
     const node = document.createElement(tag);
-    if (className) node.className = className;
-    if (text != null) node.textContent = text;
+    if (className) {
+      node.className = className;
+      recordDomWrite();
+    }
+    if (text != null) {
+      node.textContent = text;
+      recordDomWrite();
+    }
     return node;
   }
 
   function valueNode(key) {
     const node = makeElement("span", "cltc-value", "--");
     node.setAttribute("data-cltc-value-key", key);
+    recordDomWrite();
     return node;
   }
 
@@ -149,6 +182,7 @@
     for (const part of parts) {
       if (typeof part === "string") parent.appendChild(makeElement("span", "", part));
       else parent.appendChild(part);
+      recordDomWrite();
     }
   }
 
@@ -157,6 +191,7 @@
     const flow = makeElement("span", "cltc-current-flow");
     appendParts(flow, [valueNode("session-turns"), "轮 · ", valueNode("session-steps"), "步"]);
     first.appendChild(flow);
+    recordDomWrite();
 
     const second = makeElement("span", "cltc-pill");
     appendParts(second, ["LLM ", valueNode("session-llm-duration"), " · 工具调用 ", valueNode("session-tool-duration")]);
@@ -167,6 +202,7 @@
     rate.setAttribute("data-cltc-output-rate", "session");
     appendParts(rate, [" · ", valueNode("session-output-rate"), " tok/s"]);
     third.appendChild(rate);
+    recordDomWrite();
 
     const fourth = makeElement("span", "cltc-pill");
     appendParts(fourth, ["缓存命中 ", valueNode("session-cache-percent")]);
@@ -174,6 +210,7 @@
     const fifth = makeElement("span", "cltc-pill");
     appendParts(fifth, ["输入 ", valueNode("session-input"), " tok · 输出 ", valueNode("session-output"), " tok"]);
     root.append(first, second, third, fourth, fifth);
+    recordDomWrite(5);
   }
 
   function ensureStyle() {
@@ -303,7 +340,9 @@
         }
       }
     `;
+    recordDomWrite(2);
     document.head && document.head.appendChild(style);
+    if (document.head) recordDomWrite();
     state.style = style;
     return style;
   }
@@ -324,11 +363,13 @@
       root.dataset.cltcVersion = VERSION;
       root.dataset.cltcOutputRateVisible = "true";
       root.dataset.running = "false";
+      recordDomWrite(4);
       buildSkeleton(root);
       state.root = root;
     }
     if (state.root.parentElement !== composer.parentElement || state.root.nextElementSibling !== composer) {
       composer.parentElement.insertBefore(state.root, composer);
+      recordDomWrite();
     }
     removeDuplicateId(ROOT_ID, state.root);
     return state.root;
@@ -354,10 +395,12 @@
       button.title = "Codex Token Cost 设置";
       button.setAttribute("aria-label", "打开 Codex Token Cost 设置");
       button.dataset.floating = "false";
+      recordDomWrite(5);
       state.settingsButton = button;
     }
     if (state.settingsButton.parentElement !== menu.parentElement || state.settingsButton.nextElementSibling !== menu) {
       menu.parentElement.insertBefore(state.settingsButton, menu);
+      recordDomWrite();
     }
     removeDuplicateId(SETTINGS_BUTTON_ID, state.settingsButton);
     return state.settingsButton;
@@ -395,7 +438,10 @@
   function setText(key, value) {
     const node = state.root?.querySelector(`[data-cltc-value-key='${key}']`);
     const text = String(value);
-    if (node && node.textContent !== text) node.textContent = text;
+    if (node && node.textContent !== text) {
+      node.textContent = text;
+      recordDomWrite();
+    }
   }
 
   function renderSnapshot(snapshot) {
@@ -405,12 +451,12 @@
       const outputRateVisible = String(snapshot.output_rate_visible);
       const hidden = !snapshot.hub_visible;
       const ariaHidden = String(hidden);
-      if (root.dataset.running !== running) root.dataset.running = running;
-      if (root.dataset.cltcOutputRateVisible !== outputRateVisible) root.dataset.cltcOutputRateVisible = outputRateVisible;
-      if (root.hidden !== hidden) root.hidden = hidden;
-      if (root.getAttribute("aria-hidden") !== ariaHidden) root.setAttribute("aria-hidden", ariaHidden);
+      if (root.dataset.running !== running) { root.dataset.running = running; recordDomWrite(); }
+      if (root.dataset.cltcOutputRateVisible !== outputRateVisible) { root.dataset.cltcOutputRateVisible = outputRateVisible; recordDomWrite(); }
+      if (root.hidden !== hidden) { root.hidden = hidden; recordDomWrite(); }
+      if (root.getAttribute("aria-hidden") !== ariaHidden) { root.setAttribute("aria-hidden", ariaHidden); recordDomWrite(); }
       const rate = root.querySelector("[data-cltc-output-rate='session']");
-      if (rate && rate.hidden !== !snapshot.output_rate_visible) rate.hidden = !snapshot.output_rate_visible;
+      if (rate && rate.hidden !== !snapshot.output_rate_visible) { rate.hidden = !snapshot.output_rate_visible; recordDomWrite(); }
       setText("session-turns", formatCount(snapshot.turns));
       setText("session-steps", formatCount(snapshot.steps));
       setText("session-llm-duration", formatDuration(snapshot.llm_ms));
@@ -424,22 +470,25 @@
     if (state.settingsButton) {
       const totalTokens = Math.min(Number.MAX_SAFE_INTEGER, snapshot.input + snapshot.output);
       const label = `今日 ${formatCount(totalTokens)}`;
-      if (state.settingsButton.textContent !== label) state.settingsButton.textContent = label;
+      if (state.settingsButton.textContent !== label) { state.settingsButton.textContent = label; recordDomWrite(); }
       const title = `${label} · Codex Token Cost 设置`;
       const ariaLabel = `${label}，打开 Codex Token Cost 设置`;
-      if (state.settingsButton.title !== title) state.settingsButton.title = title;
-      if (state.settingsButton.getAttribute("aria-label") !== ariaLabel) state.settingsButton.setAttribute("aria-label", ariaLabel);
+      if (state.settingsButton.title !== title) { state.settingsButton.title = title; recordDomWrite(); }
+      if (state.settingsButton.getAttribute("aria-label") !== ariaLabel) { state.settingsButton.setAttribute("aria-label", ariaLabel); recordDomWrite(); }
     }
     if (!snapshot.profile_visible) restoreConnectedProfiles();
   }
 
   function applySnapshot(snapshot) {
     if (!state.alive || !validSnapshot(snapshot) || snapshot.revision <= state.revision) return false;
+    const startedAt = monotonicNow();
     state.revision = snapshot.revision;
     state.snapshot = snapshot;
     syncConfigVisibility(snapshot);
     if (!snapshot.profile_visible) closeProfileOwner();
     renderSnapshot(snapshot);
+    incrementCounter("snapshotCount");
+    recordUpdateDuration(startedAt);
     return true;
   }
 
@@ -970,7 +1019,39 @@
     });
   }
 
-  function diagnostics() {
+  function mountedModules() {
+    const mounted = [];
+    let current = state.activeModule;
+    while (current && mounted.length < MODULE_NAMES.length) {
+      if (MODULE_NAMES.includes(current.name)) mounted.push(current.name);
+      current = current.child;
+    }
+    return mounted;
+  }
+
+  function ownedNodeCount() {
+    const roots = [state.root, state.settingsButton, state.style];
+    for (const selector of [".cltc-settings-overlay", ".cltc-profile-page", ".flatpickr-" + "calendar"]) {
+      const root = document.querySelector(selector);
+      if (root) roots.push(root);
+    }
+    const unique = new Set();
+    let count = 0;
+    for (const root of roots) {
+      if (!root || !root.isConnected || unique.has(root)) continue;
+      unique.add(root);
+      count = Math.min(Number.MAX_SAFE_INTEGER, count + 1 + root.querySelectorAll("*").length);
+    }
+    return count;
+  }
+
+  async function diagnostics() {
+    let native = null;
+    try {
+      const result = await emitAction({ type: "query_diagnostics" });
+      if (result?.status === "ok" && result.response?.type === "diagnostics") native = result.response.diagnostics;
+    } catch {}
+    const mounted = mountedModules();
     return {
       instanceId,
       revision: state.revision,
@@ -980,7 +1061,15 @@
       exhausted: !state.activated && state.bootstrapAttempts >= 3 && !state.bootstrapInFlight && !state.retryTimer,
       moduleCount: MODULE_NAMES.reduce((count, name) => count + (typeof modules[name] === "function" ? 1 : 0), 0),
       listenerCount: state.alive ? 3 : 0,
-      timerCount: state.retryTimer ? 1 : 0,
+      outstandingTimers: state.retryTimer ? 1 : 0,
+      observerCount: 0,
+      bridgeCalls: counters.bridgeCalls,
+      snapshotCount: counters.snapshotCount,
+      domWrites: counters.domWrites,
+      updateDurationsMs: counters.updateDurationsMs.slice(),
+      mountedModules: mounted,
+      ownedNodeCount: ownedNodeCount(),
+      native,
     };
   }
 
