@@ -4,9 +4,12 @@ use codex_plus_core::paths::{
     TOKEN_COST_UI_FILE, default_codex_plus_config_dir, token_cost_ui_path,
 };
 use codex_plus_core::token_cost::{
-    EventMeta, MAX_EMAIL_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES,
-    ModelPrice, ProfileConfig, TokenCostEvent, TokenUsage, UiConfig, UiConfigStore, UsageSource,
-    default_model_price, fast_multiplier_millis, usage_cost_nanos,
+    BoundedEventQueue, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, EventMeta, IngestOutcome,
+    MAX_EMAIL_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES, ModelPrice,
+    ProfileConfig, QueueAdmission, RECENT_TURN_LIMIT, RuntimeState, TokenCostAction,
+    TokenCostActionResponse, TokenCostEvent, TokenCostService, TokenCostSnapshot, TokenUsage,
+    UiConfig, UiConfigStore, UsageSource, default_model_price, fast_multiplier_millis,
+    usage_cost_nanos,
 };
 use serde_json::json;
 
@@ -18,6 +21,173 @@ fn meta(source: UsageSource) -> EventMeta {
         event_id: "event-1".to_string(),
         correlation_id: "correlation-1".to_string(),
         occurred_at_ms: 42,
+    }
+}
+
+fn runtime_meta(
+    source: UsageSource,
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+) -> EventMeta {
+    EventMeta {
+        source,
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        event_id: event_id.into(),
+        correlation_id: correlation_id.into(),
+        occurred_at_ms,
+    }
+}
+
+fn turn_started(
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+) -> TokenCostEvent {
+    TokenCostEvent::TurnStarted {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        model: "gpt-5.6-sol".to_string(),
+        fast: false,
+    }
+}
+
+fn output_delta(
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+    estimated_output_tokens: u64,
+) -> TokenCostEvent {
+    TokenCostEvent::OutputDelta {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        estimated_output_tokens,
+    }
+}
+
+fn exact_usage(
+    source: UsageSource,
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+    usage: TokenUsage,
+) -> TokenCostEvent {
+    TokenCostEvent::Usage {
+        meta: runtime_meta(
+            source,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        usage,
+        exact: true,
+    }
+}
+
+fn turn_completed(
+    source: UsageSource,
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+    usage: Option<TokenUsage>,
+) -> TokenCostEvent {
+    TokenCostEvent::TurnCompleted {
+        meta: runtime_meta(
+            source,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        usage,
+    }
+}
+
+fn tool_started(
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+    call_id: &str,
+) -> TokenCostEvent {
+    TokenCostEvent::ToolStarted {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        call_id: call_id.to_string(),
+        name: "shell".to_string(),
+    }
+}
+
+fn tool_completed(
+    session_id: &str,
+    turn_id: &str,
+    event_id: impl Into<String>,
+    correlation_id: impl Into<String>,
+    occurred_at_ms: u64,
+    call_id: &str,
+) -> TokenCostEvent {
+    TokenCostEvent::ToolCompleted {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            session_id,
+            turn_id,
+            event_id,
+            correlation_id,
+            occurred_at_ms,
+        ),
+        call_id: call_id.to_string(),
+    }
+}
+
+fn snapshot(service: &TokenCostService) -> TokenCostSnapshot {
+    service.bootstrap("page-1").unwrap().snapshot
+}
+
+async fn diagnostics(
+    service: &TokenCostService,
+) -> codex_plus_core::token_cost::TokenCostDiagnostics {
+    match service
+        .apply_action(TokenCostAction::QueryDiagnostics {
+            instance_id: "page-1".to_string(),
+        })
+        .await
+        .unwrap()
+    {
+        TokenCostActionResponse::Diagnostics { diagnostics } => diagnostics,
+        response => panic!("unexpected diagnostics response: {response:?}"),
     }
 }
 
@@ -724,4 +894,726 @@ fn ui_config_store_atomically_replaces_without_a_leftover_temp_file() {
         replacement
     );
     assert!(!temp.path().join("token-cost-ui.json.tmp").exists());
+}
+
+#[tokio::test]
+async fn capture_requires_bootstrap_and_only_the_current_instance_can_dispose() {
+    let service = TokenCostService::in_memory();
+    let _receiver = service.subscribe();
+    assert!(!service.capture_enabled());
+    assert_eq!(
+        service.ingest(turn_started("s-disabled", "t-disabled", "start", "c-1", 0)),
+        IngestOutcome::Rejected {
+            reason: "capture_disabled",
+        }
+    );
+
+    let bootstrap = service.bootstrap("page-1").unwrap();
+    assert_eq!(bootstrap.instance_id, "page-1");
+    assert_eq!(bootstrap.config, UiConfig::default());
+    assert_eq!(bootstrap.snapshot.revision, 0);
+    assert!(service.capture_enabled());
+
+    let stale = service
+        .apply_action(TokenCostAction::DisposeInstance {
+            instance_id: "stale-page".to_string(),
+        })
+        .await;
+    assert!(stale.is_err());
+    assert!(service.capture_enabled());
+    assert_eq!(snapshot(&service).revision, 0);
+
+    assert_eq!(
+        service
+            .apply_action(TokenCostAction::DisposeInstance {
+                instance_id: "page-1".to_string(),
+            })
+            .await
+            .unwrap(),
+        TokenCostActionResponse::Disposed
+    );
+    assert!(!service.capture_enabled());
+}
+
+#[test]
+fn explicit_and_lazy_turn_starts_count_once_and_duplicate_ids_preserve_revision() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    assert_eq!(
+        service.ingest(turn_started("s-explicit", "t-1", "start-1", "c-1", 100)),
+        IngestOutcome::Applied { revision: 1 }
+    );
+    let started = snapshot(&service);
+    assert!(started.running);
+    assert_eq!(started.turns, 1);
+    assert_eq!(started.steps, 1);
+
+    let first_delta = output_delta("s-explicit", "t-1", "delta-1", "c-1", 150, 8);
+    assert_eq!(
+        service.ingest(first_delta.clone()),
+        IngestOutcome::Applied { revision: 2 }
+    );
+    assert_eq!(
+        service.ingest(first_delta),
+        IngestOutcome::NoChange { revision: 2 }
+    );
+    assert_eq!(snapshot(&service).turns, 1);
+    assert_eq!(snapshot(&service).output, 8);
+    assert_eq!(
+        service.ingest(output_delta(
+            "s-explicit",
+            "t-1",
+            "lower-delta",
+            "c-1",
+            200,
+            7,
+        )),
+        IngestOutcome::NoChange { revision: 2 }
+    );
+
+    let lazy = TokenCostService::in_memory();
+    lazy.bootstrap("page-1").unwrap();
+    assert_eq!(
+        lazy.ingest(output_delta("s-lazy", "t-2", "delta-2", "c-2", 500, 3)),
+        IngestOutcome::Applied { revision: 1 }
+    );
+    let lazy_snapshot = snapshot(&lazy);
+    assert!(lazy_snapshot.running);
+    assert_eq!(lazy_snapshot.turns, 1);
+    assert_eq!(lazy_snapshot.steps, 1);
+    assert_eq!(lazy_snapshot.first_token_average_ms, Some(0));
+
+    let lazy_usage = TokenCostService::in_memory();
+    lazy_usage.bootstrap("page-1").unwrap();
+    assert_eq!(
+        lazy_usage.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-lazy-usage",
+            "t-lazy-usage",
+            "usage",
+            "c-usage",
+            700,
+            TokenUsage {
+                input: 5,
+                cached_input: 1,
+                cache_write: 0,
+                output: 2,
+            },
+        )),
+        IngestOutcome::Applied { revision: 1 }
+    );
+    let lazy_usage_snapshot = snapshot(&lazy_usage);
+    assert!(lazy_usage_snapshot.running);
+    assert_eq!(lazy_usage_snapshot.turns, 1);
+    assert_eq!(lazy_usage_snapshot.steps, 1);
+    assert_eq!(lazy_usage_snapshot.input, 5);
+    assert_eq!(lazy_usage_snapshot.output, 2);
+}
+
+#[test]
+fn first_token_steps_and_overlapping_tool_time_use_only_event_timestamps() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    service.ingest(turn_started("s-time", "t-time", "start", "c-1", 1_000));
+    service.ingest(output_delta(
+        "s-time", "t-time", "delta-1", "c-1", 1_300, 10,
+    ));
+    service.ingest(tool_started(
+        "s-time",
+        "t-time",
+        "tool-a-start",
+        "c-1",
+        1_400,
+        "call-a",
+    ));
+    service.ingest(tool_started(
+        "s-time",
+        "t-time",
+        "tool-b-start",
+        "c-1",
+        1_500,
+        "call-b",
+    ));
+    service.ingest(tool_completed(
+        "s-time",
+        "t-time",
+        "tool-a-end",
+        "c-1",
+        1_800,
+        "call-a",
+    ));
+    service.ingest(tool_completed(
+        "s-time",
+        "t-time",
+        "tool-b-end",
+        "c-1",
+        2_000,
+        "call-b",
+    ));
+    service.ingest(output_delta(
+        "s-time", "t-time", "delta-2", "c-2", 2_200, 20,
+    ));
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-time",
+        "t-time",
+        "complete",
+        "c-2",
+        2_400,
+        None,
+    ));
+
+    let result = snapshot(&service);
+    assert!(!result.running);
+    assert_eq!(result.turns, 1);
+    assert_eq!(result.steps, 2);
+    assert_eq!(result.first_token_average_ms, Some(250));
+    assert_eq!(result.tool_ms, 600);
+    assert_eq!(result.llm_ms, 800);
+    assert_eq!(result.output, 20);
+}
+
+#[test]
+fn output_rate_uses_exact_output_over_measured_generation_time() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    service.ingest(turn_started("s-rate", "t-rate", "start", "c-1", 1_000));
+    service.ingest(output_delta(
+        "s-rate", "t-rate", "delta-1", "c-1", 1_100, 10,
+    ));
+    service.ingest(output_delta(
+        "s-rate", "t-rate", "delta-2", "c-1", 2_100, 40,
+    ));
+    service.ingest(exact_usage(
+        UsageSource::ProtocolProxy,
+        "s-rate",
+        "t-rate",
+        "usage",
+        "c-1",
+        2_150,
+        TokenUsage {
+            input: 20,
+            cached_input: 0,
+            cache_write: 0,
+            output: 30,
+        },
+    ));
+    service.ingest(turn_completed(
+        UsageSource::ProtocolProxy,
+        "s-rate",
+        "t-rate",
+        "complete",
+        "c-1",
+        2_200,
+        None,
+    ));
+
+    let result = snapshot(&service);
+    assert_eq!(result.output, 30);
+    assert_eq!(result.output_rate_milli_tokens_per_second, 30_000);
+}
+
+#[test]
+fn exact_usage_replaces_estimates_and_protocol_exact_outranks_renderer_exact() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started("s-usage", "t-usage", "start", "c-1", 0));
+    service.ingest(output_delta("s-usage", "t-usage", "delta", "c-1", 100, 40));
+
+    let renderer_usage = TokenUsage {
+        input: 100,
+        cached_input: 10,
+        cache_write: 0,
+        output: 30,
+    };
+    service.ingest(exact_usage(
+        UsageSource::Renderer,
+        "s-usage",
+        "t-usage",
+        "renderer-usage",
+        "c-1",
+        200,
+        renderer_usage,
+    ));
+    assert_eq!(snapshot(&service).output, 30);
+
+    let revision_before_precedence = snapshot(&service).revision;
+    assert_eq!(
+        service.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-usage",
+            "t-usage",
+            "protocol-same",
+            "c-1",
+            250,
+            renderer_usage,
+        )),
+        IngestOutcome::NoChange {
+            revision: revision_before_precedence,
+        }
+    );
+    assert_eq!(
+        service.ingest(exact_usage(
+            UsageSource::Renderer,
+            "s-usage",
+            "t-usage",
+            "renderer-late",
+            "c-1",
+            300,
+            TokenUsage {
+                output: 99,
+                ..renderer_usage
+            },
+        )),
+        IngestOutcome::NoChange {
+            revision: revision_before_precedence,
+        }
+    );
+
+    assert!(matches!(
+        service.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-usage",
+            "t-usage",
+            "protocol-replacement",
+            "c-1",
+            350,
+            TokenUsage {
+                input: 120,
+                cached_input: 10,
+                cache_write: 0,
+                output: 35,
+            },
+        )),
+        IngestOutcome::Applied { .. }
+    ));
+    let replaced = snapshot(&service);
+    assert_eq!(replaced.input, 120);
+    assert_eq!(replaced.cached_input, 10);
+    assert_eq!(replaced.output, 35);
+    assert_eq!(replaced.cost_nanos, 1_605_000);
+}
+
+#[test]
+fn exact_usage_establishes_only_missing_steps() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started("s-step", "t-step", "start", "c-1", 0));
+    service.ingest(exact_usage(
+        UsageSource::ProtocolProxy,
+        "s-step",
+        "t-step",
+        "usage-1",
+        "c-1",
+        10,
+        TokenUsage {
+            output: 1,
+            ..TokenUsage::default()
+        },
+    ));
+    assert_eq!(snapshot(&service).steps, 1);
+
+    service.ingest(exact_usage(
+        UsageSource::ProtocolProxy,
+        "s-step",
+        "t-step",
+        "usage-2",
+        "c-2",
+        20,
+        TokenUsage {
+            output: 2,
+            ..TokenUsage::default()
+        },
+    ));
+    assert_eq!(snapshot(&service).steps, 2);
+    service.ingest(output_delta("s-step", "t-step", "delta-2", "c-2", 30, 3));
+    assert_eq!(snapshot(&service).steps, 2);
+
+    let observed = TokenCostService::in_memory();
+    observed.bootstrap("page-1").unwrap();
+    observed.ingest(turn_started("s-seen", "t-seen", "start", "c-1", 100));
+    observed.ingest(tool_started(
+        "s-seen",
+        "t-seen",
+        "tool-start",
+        "c-1",
+        110,
+        "call",
+    ));
+    observed.ingest(tool_completed(
+        "s-seen", "t-seen", "tool-end", "c-1", 120, "call",
+    ));
+    observed.ingest(output_delta("s-seen", "t-seen", "delta", "c-2", 130, 2));
+    observed.ingest(exact_usage(
+        UsageSource::Renderer,
+        "s-seen",
+        "t-seen",
+        "usage",
+        "c-2",
+        140,
+        TokenUsage {
+            output: 2,
+            ..TokenUsage::default()
+        },
+    ));
+    assert_eq!(snapshot(&observed).steps, 2);
+}
+
+#[test]
+fn completion_before_usage_and_repeated_final_usage_never_double_count() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started("s-late", "t-late", "start", "c-1", 1_000));
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-late",
+        "t-late",
+        "complete",
+        "c-1",
+        1_100,
+        None,
+    ));
+    assert_eq!(snapshot(&service).output, 0);
+
+    let usage = TokenUsage {
+        input: 10,
+        cached_input: 2,
+        cache_write: 1,
+        output: 4,
+    };
+    assert!(matches!(
+        service.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-late",
+            "t-late",
+            "late-usage",
+            "c-1",
+            1_200,
+            usage,
+        )),
+        IngestOutcome::Applied { .. }
+    ));
+    let after_late = snapshot(&service);
+    assert_eq!(after_late.input, 10);
+    assert_eq!(after_late.cached_input, 2);
+    assert_eq!(after_late.output, 4);
+
+    assert_eq!(
+        service.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-late",
+            "t-late",
+            "late-usage-repeat",
+            "c-1",
+            1_300,
+            usage,
+        )),
+        IngestOutcome::NoChange {
+            revision: after_late.revision,
+        }
+    );
+    assert_eq!(snapshot(&service).input, 10);
+    assert_eq!(snapshot(&service).output, 4);
+
+    let completed_with_usage = TokenCostService::in_memory();
+    completed_with_usage.bootstrap("page-1").unwrap();
+    completed_with_usage.ingest(turn_started("s-final", "t-final", "start", "c-1", 0));
+    completed_with_usage.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-final",
+        "t-final",
+        "complete",
+        "c-1",
+        100,
+        Some(usage),
+    ));
+    completed_with_usage.ingest(exact_usage(
+        UsageSource::ProtocolProxy,
+        "s-final",
+        "t-final",
+        "protocol-final",
+        "c-1",
+        110,
+        usage,
+    ));
+    assert_eq!(snapshot(&completed_with_usage).input, 10);
+    assert_eq!(snapshot(&completed_with_usage).output, 4);
+}
+
+#[test]
+fn failed_turn_closes_without_inventing_usage() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started("s-fail", "t-fail", "start", "c-1", 5_000));
+    service.ingest(TokenCostEvent::TurnFailed {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            "s-fail",
+            "t-fail",
+            "failed",
+            "c-1",
+            5_100,
+        ),
+    });
+
+    let failed = snapshot(&service);
+    assert!(!failed.running);
+    assert_eq!(failed.turns, 1);
+    assert_eq!(failed.steps, 1);
+    assert_eq!(failed.llm_ms, 100);
+    assert_eq!(failed.input, 0);
+    assert_eq!(failed.cached_input, 0);
+    assert_eq!(failed.output, 0);
+    assert_eq!(failed.cost_nanos, 0);
+}
+
+#[tokio::test]
+async fn completed_history_and_dedupe_fingerprints_stay_hard_bounded() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    for index in 0..(RECENT_TURN_LIMIT + 1) {
+        let turn_id = format!("turn-{index}");
+        let correlation_id = format!("correlation-{index}");
+        service.ingest(turn_started(
+            "s-bounds",
+            &turn_id,
+            format!("start-{index}"),
+            correlation_id.clone(),
+            index as u64 * 10,
+        ));
+        service.ingest(turn_completed(
+            UsageSource::ProtocolProxy,
+            "s-bounds",
+            &turn_id,
+            format!("complete-{index}"),
+            correlation_id,
+            index as u64 * 10 + 5,
+            Some(TokenUsage {
+                input: 1,
+                cached_input: 0,
+                cache_write: 0,
+                output: 1,
+            }),
+        ));
+    }
+
+    let bounded = diagnostics(&service).await;
+    assert_eq!(bounded.recent_turns, RECENT_TURN_LIMIT as u64);
+    assert!(bounded.dedupe_fingerprints <= DEDUPE_FINGERPRINT_LIMIT as u64);
+    assert!(bounded.queue_depth <= EVENT_QUEUE_CAPACITY as u64);
+    assert!(bounded.queue_high_water <= EVENT_QUEUE_CAPACITY as u64);
+    let totals = snapshot(&service);
+    assert_eq!(totals.turns, (RECENT_TURN_LIMIT + 1) as u32);
+    assert_eq!(totals.input, (RECENT_TURN_LIMIT + 1) as u64);
+    assert_eq!(totals.output, (RECENT_TURN_LIMIT + 1) as u64);
+}
+
+#[test]
+fn bounded_queue_coalesces_cumulative_events_under_ten_thousand_delta_pressure() {
+    let mut queue = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    for index in 0..10_000_u64 {
+        let admission = queue.push(output_delta(
+            "s-pressure",
+            "t-pressure",
+            format!("delta-{index}"),
+            "c-1",
+            index,
+            index,
+        ));
+        assert_eq!(
+            admission,
+            if index == 0 {
+                QueueAdmission::Enqueued
+            } else {
+                QueueAdmission::Coalesced
+            }
+        );
+        assert!(queue.len() <= EVENT_QUEUE_CAPACITY);
+        assert!(queue.high_water() <= EVENT_QUEUE_CAPACITY);
+    }
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.high_water(), 1);
+    assert!(matches!(
+        queue.pop_front(),
+        Some(TokenCostEvent::OutputDelta {
+            estimated_output_tokens: 9_999,
+            ..
+        })
+    ));
+
+    let mut estimated_usage = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    assert_eq!(
+        estimated_usage.push(TokenCostEvent::Usage {
+            meta: runtime_meta(
+                UsageSource::Renderer,
+                "s-estimate",
+                "t-estimate",
+                "estimate-1",
+                "c-1",
+                1,
+            ),
+            usage: TokenUsage {
+                input: 10,
+                cached_input: 2,
+                cache_write: 1,
+                output: 4,
+            },
+            exact: false,
+        }),
+        QueueAdmission::Enqueued
+    );
+    assert_eq!(
+        estimated_usage.push(TokenCostEvent::Usage {
+            meta: runtime_meta(
+                UsageSource::Renderer,
+                "s-estimate",
+                "t-estimate",
+                "estimate-2",
+                "c-1",
+                2,
+            ),
+            usage: TokenUsage {
+                input: 20,
+                cached_input: 4,
+                cache_write: 3,
+                output: 8,
+            },
+            exact: false,
+        }),
+        QueueAdmission::Coalesced
+    );
+    assert!(matches!(
+        estimated_usage.pop_front(),
+        Some(TokenCostEvent::Usage {
+            usage: TokenUsage {
+                input: 20,
+                cached_input: 4,
+                cache_write: 3,
+                output: 8,
+            },
+            exact: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn bounded_queue_never_allows_ordinary_events_to_displace_critical_events() {
+    let mut queue = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    for index in 0..EVENT_QUEUE_CAPACITY {
+        assert_eq!(
+            queue.push(turn_started(
+                "s-critical",
+                &format!("turn-{index}"),
+                format!("start-{index}"),
+                format!("correlation-{index}"),
+                index as u64,
+            )),
+            QueueAdmission::Enqueued
+        );
+    }
+    assert_eq!(queue.len(), EVENT_QUEUE_CAPACITY);
+    assert_eq!(queue.high_water(), EVENT_QUEUE_CAPACITY);
+    assert_eq!(
+        queue.push(output_delta(
+            "s-critical",
+            "ordinary",
+            "ordinary-delta",
+            "ordinary-correlation",
+            1_000,
+            1,
+        )),
+        QueueAdmission::Rejected
+    );
+    assert_eq!(queue.len(), EVENT_QUEUE_CAPACITY);
+
+    let next_critical = turn_completed(
+        UsageSource::Renderer,
+        "s-critical",
+        "turn-0",
+        "complete-0",
+        "correlation-0",
+        2_000,
+        None,
+    );
+    assert_eq!(
+        queue.push(next_critical.clone()),
+        QueueAdmission::RequiresDrain
+    );
+    let oldest = queue.pop_front().unwrap();
+    let mut state = RuntimeState::new();
+    assert!(state.apply(oldest, &UiConfig::default()));
+    assert_eq!(state.snapshot(&UiConfig::default()).turns, 1);
+    assert_eq!(queue.push(next_critical), QueueAdmission::Enqueued);
+    assert_eq!(queue.len(), EVENT_QUEUE_CAPACITY);
+}
+
+#[test]
+fn critical_events_evict_only_coalescible_entries_and_exact_usage_never_coalesces() {
+    let mut queue = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    queue.push(output_delta("s-mixed", "t-delta", "delta", "c-delta", 0, 1));
+    for index in 0..(EVENT_QUEUE_CAPACITY - 1) {
+        queue.push(turn_started(
+            "s-mixed",
+            &format!("turn-{index}"),
+            format!("start-{index}"),
+            format!("correlation-{index}"),
+            index as u64 + 1,
+        ));
+    }
+    assert_eq!(queue.len(), EVENT_QUEUE_CAPACITY);
+    assert_eq!(
+        queue.push(turn_completed(
+            UsageSource::Renderer,
+            "s-mixed",
+            "turn-0",
+            "complete",
+            "correlation-0",
+            10_000,
+            None,
+        )),
+        QueueAdmission::Enqueued
+    );
+    let mut deltas = 0;
+    while let Some(event) = queue.pop_front() {
+        if matches!(event, TokenCostEvent::OutputDelta { .. }) {
+            deltas += 1;
+        }
+    }
+    assert_eq!(deltas, 0);
+
+    let mut exact = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    let usage = TokenUsage {
+        output: 1,
+        ..TokenUsage::default()
+    };
+    assert_eq!(
+        exact.push(exact_usage(
+            UsageSource::Renderer,
+            "s-exact",
+            "t-exact",
+            "exact-1",
+            "c-1",
+            1,
+            usage,
+        )),
+        QueueAdmission::Enqueued
+    );
+    assert_eq!(
+        exact.push(exact_usage(
+            UsageSource::Renderer,
+            "s-exact",
+            "t-exact",
+            "exact-2",
+            "c-1",
+            2,
+            usage,
+        )),
+        QueueAdmission::Enqueued
+    );
+    assert_eq!(exact.len(), 2);
 }
