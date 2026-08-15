@@ -479,7 +479,8 @@ impl LaunchHooks for LauncherHooks {
             self.runtime.clone(),
             self.data.clone(),
             app_dir.to_path_buf(),
-        );
+        )
+        .with_token_cost(self.core.token_cost_service());
         *self
             .bridge_context
             .lock()
@@ -493,7 +494,14 @@ impl LaunchHooks for LauncherHooks {
         helper_port: u16,
         ctx: BridgeContext,
     ) -> anyhow::Result<()> {
-        inject_with_context(debug_port, helper_port, ctx, self.runtime.clone()).await
+        inject_with_context(
+            debug_port,
+            helper_port,
+            ctx,
+            self.runtime.clone(),
+            self.core.token_cost_service(),
+        )
+        .await
     }
 
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
@@ -503,12 +511,14 @@ impl LaunchHooks for LauncherHooks {
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         let ctx = self.watchdog_bridge_context()?;
         let runtime = self.runtime.clone();
+        let token_cost = self.core.token_cost_service();
         let reinjector: BridgeReinjector = Arc::new(move || {
             let ctx = ctx.clone();
             let runtime = runtime.clone();
-            Box::pin(
-                async move { inject_with_context(debug_port, helper_port, ctx, runtime).await },
-            )
+            let token_cost = Arc::clone(&token_cost);
+            Box::pin(async move {
+                inject_with_context(debug_port, helper_port, ctx, runtime, token_cost).await
+            })
         });
         self.core.set_bridge_reinjector(reinjector).await;
         self.core
@@ -986,10 +996,19 @@ async fn inject_with_context(
     helper_port: u16,
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
+    token_cost: Arc<codex_plus_core::token_cost::TokenCostService>,
 ) -> anyhow::Result<()> {
     let mut last_error = None;
     for _ in 0..20 {
-        match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
+        match try_inject_with_context(
+            debug_port,
+            helper_port,
+            ctx.clone(),
+            runtime.clone(),
+            Arc::clone(&token_cost),
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -1005,6 +1024,7 @@ async fn try_inject_with_context(
     helper_port: u16,
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
+    token_cost: Arc<codex_plus_core::token_cost::TokenCostService>,
 ) -> anyhow::Result<()> {
     let targets = codex_plus_core::cdp::list_targets(debug_port).await?;
     let target = codex_plus_core::cdp::pick_injectable_codex_page_target(&targets)?;
@@ -1026,7 +1046,7 @@ async fn try_inject_with_context(
     } else {
         vec![script, user_bundle]
     };
-    codex_plus_core::bridge::install_bridge(
+    codex_plus_core::bridge::install_bridge_with_pushes(
         websocket_url,
         codex_plus_core::bridge::BRIDGE_BINDING_NAME,
         Arc::new(move |path, payload| {
@@ -1036,6 +1056,7 @@ async fn try_inject_with_context(
             })
         }),
         &new_document_scripts,
+        Some(token_cost.subscribe()),
     )
     .await
 }
@@ -1208,7 +1229,14 @@ mod tests {
         assert!(source.contains("async fn start_bridge_watchdog"));
         assert!(source.contains("self.watchdog_bridge_context()?"));
         assert!(source.contains("set_bridge_reinjector(reinjector)"));
-        assert!(source.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
+        assert!(
+            source
+                .contains("inject_with_context(debug_port, helper_port, ctx, runtime, token_cost)")
+        );
+        let subscription_call = ["Some(token_cost.", "subscribe())"].concat();
+        let reconstructed_service = ["TokenCostService::", "in_memory"].concat();
+        assert_eq!(source.matches(&subscription_call).count(), 1);
+        assert!(!source.contains(&reconstructed_service));
         assert!(source.contains("async fn ensure_computer_use_config"));
         assert!(source.contains("self.core.ensure_computer_use_config(settings).await"));
         assert!(source.contains("async fn ensure_plugin_marketplace_config"));
@@ -1254,6 +1282,63 @@ mod tests {
             result["message"],
             "Move workspace service is not wired in core launcher hooks"
         );
+    }
+
+    #[tokio::test]
+    async fn token_cost_packaged_context_and_watchdog_share_the_core_service() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "codex-plus-launcher-token-cost-test-{}",
+            std::process::id()
+        ));
+        let core = Arc::new(DefaultLaunchHooks::default());
+        let service = core.token_cost_service();
+        let hooks = LauncherHooks {
+            core,
+            data: Arc::new(LauncherDataService {
+                db_path: test_dir.join("state.sqlite"),
+                backup_dir: test_dir.join("backups"),
+            }),
+            runtime: Arc::new(LauncherRuntimeService::new(
+                9229,
+                UserScriptManager::new(
+                    test_dir.join("builtin"),
+                    test_dir.join("user"),
+                    test_dir.join("settings.json"),
+                ),
+            )),
+            bridge_context: Arc::new(Mutex::new(None)),
+        };
+
+        let initial = hooks
+            .bridge_context(9229, &test_dir)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = codex_plus_core::routes::handle_bridge_request(
+            initial,
+            "/token-cost/bootstrap",
+            json!({"instance_id": "packaged-initial"}),
+        )
+        .await;
+        assert_eq!(response["status"], "ok");
+        assert!(service.capture_enabled());
+
+        let watchdog = hooks.watchdog_bridge_context().unwrap();
+        let response = codex_plus_core::routes::handle_bridge_request(
+            watchdog,
+            "/token-cost/bootstrap",
+            json!({"instance_id": "packaged-watchdog"}),
+        )
+        .await;
+        assert_eq!(response["status"], "ok");
+        let diagnostics = service
+            .apply_action(
+                codex_plus_core::token_cost::TokenCostAction::QueryDiagnostics {
+                    instance_id: "packaged-watchdog".to_string(),
+                },
+            )
+            .await;
+        assert!(diagnostics.is_ok());
     }
 }
 

@@ -26,6 +26,17 @@ use codex_plus_core::settings::{
 use codex_plus_core::status::StatusStore;
 
 #[test]
+fn token_cost_default_hooks_share_one_service_but_separate_hooks_are_isolated() {
+    let first = DefaultLaunchHooks::default();
+    let second = DefaultLaunchHooks::default();
+
+    let first_service = first.token_cost_service();
+
+    assert!(Arc::ptr_eq(&first_service, &first.token_cost_service()));
+    assert!(!Arc::ptr_eq(&first_service, &second.token_cost_service()));
+}
+
+#[test]
 fn browser_identity_change_requires_two_distinct_observations() {
     assert!(!browser_identity_changed(None, "browser-a"));
     assert!(!browser_identity_changed(Some("browser-a"), "browser-a"));

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,7 @@ const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 
 const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
+static TOKEN_COST_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Throttles bridge health checks and reinjections.
 ///
@@ -296,7 +297,6 @@ pub trait LaunchHooks: Send + Sync {
     async fn terminate_codex(&self, launch: &CodexLaunch);
 }
 
-#[derive(Default)]
 pub struct DefaultLaunchHooks {
     child: Mutex<Option<Child>>,
     helper: Mutex<Option<HelperRuntime>>,
@@ -304,6 +304,23 @@ pub struct DefaultLaunchHooks {
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
     computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
     computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
+    token_cost: Arc<crate::token_cost::TokenCostService>,
+}
+
+impl Default for DefaultLaunchHooks {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            helper: Mutex::new(None),
+            bridge_watchdog: Mutex::new(None),
+            bridge_reinjector: Mutex::new(None),
+            computer_use_guard_watchdog: Mutex::new(None),
+            computer_use_guard_artifacts: Mutex::new(None),
+            token_cost: crate::token_cost::TokenCostService::with_store(
+                crate::token_cost::UiConfigStore::new(crate::paths::token_cost_ui_path()),
+            ),
+        }
+    }
 }
 
 struct HelperRuntime {
@@ -585,6 +602,10 @@ impl DefaultLaunchHooks {
     pub async fn set_bridge_reinjector(&self, reinjector: BridgeReinjector) {
         *self.bridge_reinjector.lock().await = Some(reinjector);
     }
+
+    pub fn token_cost_service(&self) -> Arc<crate::token_cost::TokenCostService> {
+        Arc::clone(&self.token_cost)
+    }
 }
 
 fn helper_bind_host() -> String {
@@ -753,14 +774,16 @@ impl LaunchHooks for DefaultLaunchHooks {
             }),
         );
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let token_cost = self.token_cost_service();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         if let Ok((stream, addr)) = accepted {
+                            let token_cost = Arc::clone(&token_cost);
                             tokio::spawn(async move {
-                                let _ = handle_helper_connection(stream, Some(addr)).await;
+                                let _ = handle_helper_connection(stream, Some(addr), token_cost).await;
                             });
                         }
                     }
@@ -896,10 +919,22 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
-        retry_injection(debug_port, helper_port).await
+        retry_injection_with_service(debug_port, helper_port, self.token_cost_service()).await
     }
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
-        let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
+        let bridge_reinjector = match self.bridge_reinjector.lock().await.clone() {
+            Some(reinjector) => Some(reinjector),
+            None => {
+                let token_cost = self.token_cost_service();
+                let reinjector: BridgeReinjector = Arc::new(move || {
+                    let token_cost = Arc::clone(&token_cost);
+                    Box::pin(async move {
+                        retry_injection_with_service(debug_port, helper_port, token_cost).await
+                    })
+                });
+                Some(reinjector)
+            }
+        };
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             #[cfg(windows)]
@@ -1100,9 +1135,90 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 }
 
+enum ProtocolUsageTap {
+    Responses(crate::token_cost::ResponsesUsageTap),
+    Chat(crate::token_cost::ChatUsageTap),
+}
+
+struct TokenCostCapture {
+    service: Arc<crate::token_cost::TokenCostService>,
+    tap: Option<ProtocolUsageTap>,
+}
+
+impl TokenCostCapture {
+    fn responses(
+        capture_enabled: bool,
+        service: &Arc<crate::token_cost::TokenCostService>,
+        request_body: &[u8],
+    ) -> Option<Self> {
+        if !capture_enabled {
+            return None;
+        }
+        let request_id = TOKEN_COST_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let (tap, events) =
+            crate::token_cost::ResponsesUsageTap::from_request(request_id, request_body, now_ms());
+        let capture = Self {
+            service: Arc::clone(service),
+            tap: Some(ProtocolUsageTap::Responses(tap)),
+        };
+        capture.ingest(events);
+        Some(capture)
+    }
+
+    fn chat(
+        capture_enabled: bool,
+        service: &Arc<crate::token_cost::TokenCostService>,
+        request_body: &[u8],
+    ) -> Option<Self> {
+        if !capture_enabled {
+            return None;
+        }
+        let request_id = TOKEN_COST_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let (tap, events) =
+            crate::token_cost::ChatUsageTap::from_request(request_id, request_body, now_ms());
+        let capture = Self {
+            service: Arc::clone(service),
+            tap: Some(ProtocolUsageTap::Chat(tap)),
+        };
+        capture.ingest(events);
+        Some(capture)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        let events = match self.tap.as_mut() {
+            Some(ProtocolUsageTap::Responses(tap)) => tap.push_bytes(bytes, now_ms()),
+            Some(ProtocolUsageTap::Chat(tap)) => tap.push_bytes(bytes, now_ms()),
+            None => return,
+        };
+        self.ingest(events);
+    }
+
+    fn finish(&mut self) {
+        let events = match self.tap.take() {
+            Some(ProtocolUsageTap::Responses(mut tap)) => tap.finish(now_ms()),
+            Some(ProtocolUsageTap::Chat(mut tap)) => tap.finish(now_ms()),
+            None => return,
+        };
+        self.ingest(events);
+    }
+
+    fn ingest(&self, events: Vec<crate::token_cost::TokenCostEvent>) {
+        if !events.is_empty() {
+            self.service.ingest_batch(events);
+        }
+    }
+}
+
+impl Drop for TokenCostCapture {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 async fn handle_helper_connection(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
+    token_cost: Arc<crate::token_cost::TokenCostService>,
 ) -> anyhow::Result<()> {
     let request = match read_http_request(&mut stream).await {
         Ok(request) => request,
@@ -1122,6 +1238,7 @@ async fn handle_helper_connection(
             return Ok(());
         }
     };
+    let token_cost_capture_enabled = token_cost.capture_enabled();
     let request_headers = String::from_utf8_lossy(&request.headers);
     let request_line = request_headers.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
@@ -1214,6 +1331,8 @@ async fn handle_helper_connection(
             method,
             path,
             remote_addr_text,
+            token_cost_capture_enabled,
+            &token_cost,
         )
         .await;
     }
@@ -1226,6 +1345,8 @@ async fn handle_helper_connection(
             method,
             path,
             remote_addr_text,
+            token_cost_capture_enabled,
+            &token_cost,
         )
         .await;
     }
@@ -1553,7 +1674,11 @@ async fn handle_protocol_proxy_connection(
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
+    capture_enabled: bool,
+    token_cost: &Arc<crate::token_cost::TokenCostService>,
 ) -> anyhow::Result<()> {
+    let mut capture =
+        TokenCostCapture::responses(capture_enabled, token_cost, request_body.as_bytes());
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
     let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path(
         request_body,
@@ -1612,10 +1737,16 @@ async fn handle_protocol_proxy_connection(
             let mut bytes_stream = upstream.response.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 if let Ok(bytes) = chunk {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.push_bytes(&bytes);
+                    }
                     stream.write_all(&bytes).await?;
                 } else {
                     break;
                 }
+            }
+            if let Some(capture) = capture.as_mut() {
+                capture.finish();
             }
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
@@ -1638,6 +1769,9 @@ async fn handle_protocol_proxy_connection(
                 Ok(bytes) => {
                     let converted = converter.push_bytes(&bytes);
                     if !converted.is_empty() {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.push_bytes(&converted);
+                        }
                         stream.write_all(&converted).await?;
                     }
                 }
@@ -1647,6 +1781,9 @@ async fn handle_protocol_proxy_connection(
                         Some("stream_error".to_string()),
                     );
                     if !failed.is_empty() {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.push_bytes(&failed);
+                        }
                         stream.write_all(&failed).await?;
                     }
                     stream_failed = true;
@@ -1657,8 +1794,14 @@ async fn handle_protocol_proxy_connection(
         if !stream_failed {
             let tail = converter.finish();
             if !tail.is_empty() {
+                if let Some(capture) = capture.as_mut() {
+                    capture.push_bytes(&tail);
+                }
                 stream.write_all(&tail).await?;
             }
+        }
+        if let Some(capture) = capture.as_mut() {
+            capture.finish();
         }
         log_helper_response(
             "helper.protocol_proxy_stream_ok",
@@ -1672,6 +1815,10 @@ async fn handle_protocol_proxy_connection(
     }
     let upstream_body = upstream.response.bytes().await?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        if let Some(capture) = capture.as_mut() {
+            capture.push_bytes(&upstream_body);
+            capture.finish();
+        }
         write_http_response(
             stream,
             "200 OK",
@@ -1700,6 +1847,10 @@ async fn handle_protocol_proxy_connection(
         crate::protocol_proxy::chat_completion_to_response(chat_json)?
     };
     let body = serde_json::to_vec(&response_json)?;
+    if let Some(capture) = capture.as_mut() {
+        capture.push_bytes(&body);
+        capture.finish();
+    }
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
         "helper.protocol_proxy_ok",
@@ -1782,7 +1933,10 @@ async fn handle_chat_completions_proxy_connection(
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
+    capture_enabled: bool,
+    token_cost: &Arc<crate::token_cost::TokenCostService>,
 ) -> anyhow::Result<()> {
+    let mut capture = TokenCostCapture::chat(capture_enabled, token_cost, request_body.as_bytes());
     let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request(
         request_body,
         request_user_agent,
@@ -1823,7 +1977,14 @@ async fn handle_chat_completions_proxy_connection(
         write_http_stream_headers(stream, &status, &content_type).await?;
         let mut bytes_stream = upstream.response.bytes_stream();
         while let Some(chunk) = bytes_stream.next().await {
-            stream.write_all(&chunk?).await?;
+            let chunk = chunk?;
+            if let Some(capture) = capture.as_mut() {
+                capture.push_bytes(&chunk);
+            }
+            stream.write_all(&chunk).await?;
+        }
+        if let Some(capture) = capture.as_mut() {
+            capture.finish();
         }
         log_helper_response(
             "helper.chat_completions_proxy_stream_ok",
@@ -1836,6 +1997,10 @@ async fn handle_chat_completions_proxy_connection(
         return Ok(());
     }
     let body = upstream.response.bytes().await?.to_vec();
+    if is_success && let Some(capture) = capture.as_mut() {
+        capture.push_bytes(&body);
+        capture.finish();
+    }
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(
         if is_success {
@@ -2439,9 +2604,22 @@ const INJECT_ATTEMPT_DELAYS: [Duration; 3] = [
 ];
 
 async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+    retry_injection_with_service(
+        debug_port,
+        helper_port,
+        crate::token_cost::TokenCostService::in_memory(),
+    )
+    .await
+}
+
+async fn retry_injection_with_service(
+    debug_port: u16,
+    helper_port: u16,
+    token_cost: Arc<crate::token_cost::TokenCostService>,
+) -> anyhow::Result<()> {
     let mut last_error = None;
     for (attempt, delay) in INJECT_ATTEMPT_DELAYS.iter().enumerate() {
-        match try_inject(debug_port, helper_port).await {
+        match try_inject(debug_port, helper_port, Arc::clone(&token_cost)).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -2588,7 +2766,11 @@ fn runtime_evaluate_result_is_true(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+async fn try_inject(
+    debug_port: u16,
+    helper_port: u16,
+    token_cost: Arc<crate::token_cost::TokenCostService>,
+) -> anyhow::Result<()> {
     let targets = crate::cdp::list_targets(debug_port).await?;
     let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
     let websocket_url = target
@@ -2600,8 +2782,9 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     let ctx = crate::routes::BridgeContext::core(Arc::new(crate::routes::CoreRuntimeService::new(
         debug_port,
         StatusStore::default(),
-    )));
-    crate::bridge::install_bridge(
+    )))
+    .with_token_cost(Arc::clone(&token_cost));
+    crate::bridge::install_bridge_with_pushes(
         websocket_url,
         crate::bridge::BRIDGE_BINDING_NAME,
         Arc::new(move |path, payload| {
@@ -2611,6 +2794,7 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
             )
         }),
         &[script],
+        Some(token_cost.subscribe()),
     )
     .await
 }
@@ -3231,6 +3415,370 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[derive(Clone, Copy)]
+    enum TestProtocol {
+        Responses,
+        Chat,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestResponseMode {
+        Fixed,
+        Chunked,
+        TruncatedChunked,
+    }
+
+    impl TestProtocol {
+        fn settings_value(self) -> &'static str {
+            match self {
+                Self::Responses => "responses",
+                Self::Chat => "chatCompletions",
+            }
+        }
+    }
+
+    async fn read_test_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_len = None;
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "request ended before its body was complete");
+            request.extend_from_slice(&buffer[..read]);
+            if expected_len.is_none()
+                && let Some(header_end) = find_header_end(&request)
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header_value_from_headers(&headers, "content-length")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                expected_len = Some(header_end + 4 + content_length);
+            }
+            if expected_len.is_some_and(|length| request.len() >= length) {
+                return;
+            }
+        }
+    }
+
+    async fn run_token_cost_proxy_case(
+        settings_path: &Path,
+        helper_addr: SocketAddr,
+        protocol: TestProtocol,
+        request_path: &str,
+        request_body: &str,
+        content_type: &str,
+        response_parts: &[&[u8]],
+        response_mode: TestResponseMode,
+    ) -> Vec<u8> {
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "token-cost-test",
+                "name": "Token cost test",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-test",
+                "protocol": protocol.settings_value(),
+                "relayMode": "mixedApi"
+            }],
+            "activeRelayId": "token-cost-test"
+        });
+        std::fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let owned_parts = response_parts
+            .iter()
+            .map(|part| part.to_vec())
+            .collect::<Vec<_>>();
+        let content_type = content_type.to_string();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            read_test_http_request(&mut stream).await;
+            match response_mode {
+                TestResponseMode::Chunked => {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    for part in owned_parts {
+                        stream
+                            .write_all(format!("{:X}\r\n", part.len()).as_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(&part).await.unwrap();
+                        stream.write_all(b"\r\n").await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                    stream.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                TestResponseMode::TruncatedChunked => {
+                    let body = owned_parts.concat();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+                        body.len() + 8
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                }
+                TestResponseMode::Fixed => {
+                    let body = owned_parts.concat();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                }
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let request = format!(
+            "POST {request_path} HTTP/1.1\r\nHost: {helper_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request_body}",
+            request_body.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        upstream.await.unwrap();
+        response
+    }
+
+    async fn start_token_cost_test_helper(hooks: &DefaultLaunchHooks) -> (u16, SocketAddr) {
+        let bind_host = helper_bind_host();
+        let probe = tokio::net::TcpListener::bind((bind_host.as_str(), 0))
+            .await
+            .unwrap();
+        let helper_addr = probe.local_addr().unwrap();
+        let helper_port = helper_addr.port();
+        drop(probe);
+        hooks.start_helper(helper_port).await.unwrap();
+        (helper_port, helper_addr)
+    }
+
+    fn test_http_body(response: &[u8]) -> &[u8] {
+        let header_end = find_header_end(response).unwrap();
+        &response[header_end + 4..]
+    }
+
+    async fn token_cost_diagnostics(
+        service: &crate::token_cost::TokenCostService,
+        instance_id: &str,
+    ) -> crate::token_cost::TokenCostDiagnostics {
+        match service
+            .apply_action(crate::token_cost::TokenCostAction::QueryDiagnostics {
+                instance_id: instance_id.to_string(),
+            })
+            .await
+            .unwrap()
+        {
+            crate::token_cost::TokenCostActionResponse::Diagnostics { diagnostics } => diagnostics,
+            response => panic!("unexpected token cost response: {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_cost_helper_uses_one_shared_service_for_all_protocol_paths() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous = crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let hooks = DefaultLaunchHooks::default();
+        let service = hooks.token_cost_service();
+        assert!(Arc::ptr_eq(&service, &hooks.token_cost_service()));
+        service.bootstrap("helper-capture").unwrap();
+        let (helper_port, helper_addr) = start_token_cost_test_helper(&hooks).await;
+        let request = r#"{"model":"gpt-5.6-sol","input":"SECRET_PROMPT_SENTINEL","stream":true}"#;
+
+        let responses_stream = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\ndata: [DONE]\n\n";
+        let split = responses_stream.len() / 2;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Responses,
+            "/v1/responses",
+            request,
+            "text/event-stream",
+            &[&responses_stream[..split], &responses_stream[split..]],
+            TestResponseMode::Chunked,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), responses_stream);
+
+        let responses_json = br#"{"id":"resp-2","object":"response","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":3,"output_tokens":4}}"#;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Responses,
+            "/v1/responses",
+            &request.replace("true", "false"),
+            "application/json",
+            &[responses_json],
+            TestResponseMode::Fixed,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), responses_json);
+
+        let chat_stream = b"data: {\"id\":\"chatcmpl-3\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}\n\ndata: [DONE]\n\n";
+        let split = chat_stream.len() / 2;
+        let converted = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Chat,
+            "/v1/responses",
+            request,
+            "text/event-stream",
+            &[&chat_stream[..split], &chat_stream[split..]],
+            TestResponseMode::Chunked,
+        )
+        .await;
+        assert!(String::from_utf8_lossy(test_http_body(&converted)).contains("response.completed"));
+
+        let chat_json = br#"{"id":"chatcmpl-4","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":7,"completion_tokens":8,"total_tokens":15}}"#;
+        let converted = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Chat,
+            "/v1/responses",
+            &request.replace("true", "false"),
+            "application/json",
+            &[chat_json],
+            TestResponseMode::Fixed,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(test_http_body(&converted)).unwrap()["usage"]
+                ["input_tokens"],
+            7
+        );
+
+        let direct_chat_stream = b"data: {\"id\":\"chatcmpl-5\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":10,\"total_tokens\":19}}\n\ndata: [DONE]\n\n";
+        let split = direct_chat_stream.len() / 2;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Chat,
+            "/v1/chat/completions",
+            request,
+            "text/event-stream",
+            &[&direct_chat_stream[..split], &direct_chat_stream[split..]],
+            TestResponseMode::Chunked,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), direct_chat_stream);
+
+        let direct_chat_json = br#"{"id":"chatcmpl-6","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":11,"completion_tokens":12,"total_tokens":23}}"#;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Chat,
+            "/v1/chat/completions",
+            &request.replace("true", "false"),
+            "application/json",
+            &[direct_chat_json],
+            TestResponseMode::Fixed,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), direct_chat_json);
+
+        let snapshot = service.bootstrap("helper-capture").unwrap().snapshot;
+        assert_eq!(snapshot.turns, 6);
+        assert_eq!(snapshot.input, 36);
+        assert_eq!(snapshot.output, 42);
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("SECRET_PROMPT_SENTINEL")
+        );
+        let diagnostics = token_cost_diagnostics(&service, "helper-capture").await;
+        assert_eq!(diagnostics.recent_turns, 6);
+
+        let aborted = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Chat,
+            "/v1/chat/completions",
+            request,
+            "text/event-stream",
+            &[b"data: {\"choices\":[{\"delta\":{\"content\":\"partial"],
+            TestResponseMode::TruncatedChunked,
+        )
+        .await;
+        assert!(aborted.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let snapshot = service.bootstrap("helper-capture").unwrap().snapshot;
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.turns, 7);
+        assert_eq!(snapshot.input, 36);
+        assert_eq!(snapshot.output, 42);
+        let diagnostics = token_cost_diagnostics(&service, "helper-capture").await;
+        assert_eq!(diagnostics.recent_turns, 7);
+
+        hooks.shutdown_helper(helper_port).await;
+        crate::paths::set_settings_path_for_tests(previous);
+    }
+
+    #[tokio::test]
+    async fn token_cost_capture_disabled_preserves_bytes_and_state() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous = crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let hooks = DefaultLaunchHooks::default();
+        let service = hooks.token_cost_service();
+        service.bootstrap("before-disabled").unwrap();
+        let before_snapshot = service.bootstrap("before-disabled").unwrap().snapshot;
+        let before_diagnostics = token_cost_diagnostics(&service, "before-disabled").await;
+        service
+            .apply_action(crate::token_cost::TokenCostAction::DisposeInstance {
+                instance_id: "before-disabled".to_string(),
+            })
+            .await
+            .unwrap();
+        let (helper_port, helper_addr) = start_token_cost_test_helper(&hooks).await;
+
+        let request = r#"{"model":"gpt-5.6-sol","input":"DISABLED_SECRET","stream":true}"#;
+        let stream_body = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":19,\"output_tokens\":23}}}\n\ndata: [DONE]\n\n";
+        let split = stream_body.len() / 2;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Responses,
+            "/v1/responses",
+            request,
+            "text/event-stream",
+            &[&stream_body[..split], &stream_body[split..]],
+            TestResponseMode::Chunked,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), stream_body);
+
+        let json_body = br#"{"id":"resp-disabled","object":"response","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":29,"output_tokens":31}}"#;
+        let response = run_token_cost_proxy_case(
+            &settings_path,
+            helper_addr,
+            TestProtocol::Responses,
+            "/v1/responses",
+            &request.replace("true", "false"),
+            "application/json",
+            &[json_body],
+            TestResponseMode::Fixed,
+        )
+        .await;
+        assert_eq!(test_http_body(&response), json_body);
+
+        let after_snapshot = service.bootstrap("after-disabled").unwrap().snapshot;
+        let after_diagnostics = token_cost_diagnostics(&service, "after-disabled").await;
+        assert_eq!(after_snapshot, before_snapshot);
+        assert_eq!(after_diagnostics, before_diagnostics);
+
+        hooks.shutdown_helper(helper_port).await;
+        crate::paths::set_settings_path_for_tests(previous);
+    }
+
     fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
         Arc::new(move || {
             let calls = calls.clone();
@@ -3552,9 +4100,13 @@ mod tests {
         let helper_addr = helper_listener.local_addr().unwrap();
         let helper = tokio::spawn(async move {
             let (stream, remote_addr) = helper_listener.accept().await.unwrap();
-            handle_helper_connection(stream, Some(remote_addr))
-                .await
-                .unwrap();
+            handle_helper_connection(
+                stream,
+                Some(remote_addr),
+                crate::token_cost::TokenCostService::in_memory(),
+            )
+            .await
+            .unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
         let headers = format!(
@@ -3588,9 +4140,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let helper = tokio::spawn(async move {
             let (stream, remote_addr) = listener.accept().await.unwrap();
-            handle_helper_connection(stream, Some(remote_addr))
-                .await
-                .unwrap();
+            handle_helper_connection(
+                stream,
+                Some(remote_addr),
+                crate::token_cost::TokenCostService::in_memory(),
+            )
+            .await
+            .unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         client.write_all(request).await.unwrap();
@@ -3674,9 +4230,13 @@ mod tests {
         let helper_addr = helper_listener.local_addr().unwrap();
         let helper = tokio::spawn(async move {
             let (stream, remote_addr) = helper_listener.accept().await.unwrap();
-            handle_helper_connection(stream, Some(remote_addr))
-                .await
-                .unwrap();
+            handle_helper_connection(
+                stream,
+                Some(remote_addr),
+                crate::token_cost::TokenCostService::in_memory(),
+            )
+            .await
+            .unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
         let headers = format!(
