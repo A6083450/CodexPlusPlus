@@ -4,12 +4,13 @@ use codex_plus_core::paths::{
     TOKEN_COST_UI_FILE, default_codex_plus_config_dir, token_cost_ui_path,
 };
 use codex_plus_core::token_cost::{
-    BoundedEventQueue, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, EventMeta, IngestOutcome,
-    MAX_EMAIL_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES, ModelPrice,
-    ProfileConfig, QueueAdmission, RECENT_TURN_LIMIT, RuntimeState, TokenCostAction,
-    TokenCostActionResponse, TokenCostEvent, TokenCostService, TokenCostSnapshot, TokenUsage,
-    UiConfig, UiConfigStore, UsageSource, default_model_price, fast_multiplier_millis,
-    usage_cost_nanos,
+    BoundedEventQueue, ChatUsageTap, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, EventMeta,
+    IngestOutcome, MAX_EMAIL_BYTES, MAX_ID_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES,
+    MAX_PROFILE_TEXT_BYTES, MAX_RENDERER_EVENT_BYTES, MAX_SSE_FRAME_BYTES, MAX_TOOL_NAME_BYTES,
+    ModelPrice, ProfileConfig, QueueAdmission, RECENT_TURN_LIMIT, ResponsesUsageTap, RuntimeState,
+    TokenCostAction, TokenCostActionResponse, TokenCostEvent, TokenCostService, TokenCostSnapshot,
+    TokenUsage, UiConfig, UiConfigStore, UsageSource, default_model_price, fast_multiplier_millis,
+    usage_cost_nanos, validate_renderer_event,
 };
 use serde_json::json;
 
@@ -2022,4 +2023,603 @@ fn critical_events_evict_only_coalescible_entries_and_exact_usage_never_coalesce
         QueueAdmission::Enqueued
     );
     assert_eq!(exact.len(), 2);
+}
+
+fn event_meta_ref(event: &TokenCostEvent) -> &EventMeta {
+    match event {
+        TokenCostEvent::TurnStarted { meta, .. }
+        | TokenCostEvent::OutputDelta { meta, .. }
+        | TokenCostEvent::ToolStarted { meta, .. }
+        | TokenCostEvent::ToolCompleted { meta, .. }
+        | TokenCostEvent::Usage { meta, .. }
+        | TokenCostEvent::TurnCompleted { meta, .. }
+        | TokenCostEvent::TurnFailed { meta } => meta,
+    }
+}
+
+fn event_meta_mut(event: &mut TokenCostEvent) -> &mut EventMeta {
+    match event {
+        TokenCostEvent::TurnStarted { meta, .. }
+        | TokenCostEvent::OutputDelta { meta, .. }
+        | TokenCostEvent::ToolStarted { meta, .. }
+        | TokenCostEvent::ToolCompleted { meta, .. }
+        | TokenCostEvent::Usage { meta, .. }
+        | TokenCostEvent::TurnCompleted { meta, .. }
+        | TokenCostEvent::TurnFailed { meta } => meta,
+    }
+}
+
+fn renderer_validation_events() -> Vec<TokenCostEvent> {
+    let usage = TokenUsage {
+        input: 10,
+        cached_input: 2,
+        cache_write: 1,
+        output: 4,
+    };
+    vec![
+        TokenCostEvent::TurnStarted {
+            meta: meta(UsageSource::Renderer),
+            model: "gpt-5.6-sol".to_string(),
+            fast: true,
+        },
+        TokenCostEvent::OutputDelta {
+            meta: meta(UsageSource::Renderer),
+            estimated_output_tokens: u64::MAX,
+        },
+        TokenCostEvent::ToolStarted {
+            meta: meta(UsageSource::Renderer),
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+        },
+        TokenCostEvent::ToolCompleted {
+            meta: meta(UsageSource::Renderer),
+            call_id: "call-1".to_string(),
+        },
+        TokenCostEvent::Usage {
+            meta: meta(UsageSource::Renderer),
+            usage,
+            exact: false,
+        },
+        TokenCostEvent::TurnCompleted {
+            meta: meta(UsageSource::Renderer),
+            usage: Some(usage),
+        },
+        TokenCostEvent::TurnCompleted {
+            meta: meta(UsageSource::Renderer),
+            usage: None,
+        },
+        TokenCostEvent::TurnFailed {
+            meta: meta(UsageSource::Renderer),
+        },
+    ]
+}
+
+fn serialized_turn_started_of_size(target: usize) -> TokenCostEvent {
+    let mut event = TokenCostEvent::TurnStarted {
+        meta: meta(UsageSource::Renderer),
+        model: String::new(),
+        fast: false,
+    };
+    let baseline = serde_json::to_vec(&event).unwrap().len();
+    let TokenCostEvent::TurnStarted { model, .. } = &mut event else {
+        unreachable!();
+    };
+    *model = "m".repeat(target - baseline);
+    assert_eq!(serde_json::to_vec(&event).unwrap().len(), target);
+    event
+}
+
+#[test]
+fn responses_tap_handles_every_split_boundary_and_utf8_delta_bytes() {
+    let request = br#"{
+        "model":"gpt-5.6-sol",
+        "service_tier":"priority",
+        "metadata":{"thread_id":"thread-1","turn_id":"turn-1"},
+        "correlation_id":"correlation-1"
+    }"#;
+    let frame =
+        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ab\xe4\xbd\xa0\"}\r\n\r\n";
+
+    for split in 0..=frame.len() {
+        let (mut tap, started) = ResponsesUsageTap::from_request(41, request, 10);
+        assert!(matches!(
+            started.as_slice(),
+            [TokenCostEvent::TurnStarted {
+                model,
+                fast: true,
+                ..
+            }] if model == "gpt-5.6-sol"
+        ));
+        let started_meta = event_meta_ref(&started[0]);
+        assert_eq!(started_meta.session_id, "thread-1");
+        assert_eq!(started_meta.turn_id, "turn-1");
+        assert_eq!(started_meta.correlation_id, "correlation-1");
+        assert_eq!(started_meta.event_id, "proxy-41-0");
+
+        let mut events = tap.push_bytes(&frame[..split], 11);
+        events.extend(tap.push_bytes(&frame[split..], 12));
+        assert!(matches!(
+            events.as_slice(),
+            [TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 2,
+                ..
+            }]
+        ));
+        assert_eq!(event_meta_ref(&events[0]).event_id, "proxy-41-1");
+    }
+}
+
+#[test]
+fn request_identity_priority_fallback_and_fast_are_direct_only() {
+    let cases = [
+        (
+            json!({
+                "model": "gpt-5.6-sol",
+                "service_tier": "priority",
+                "metadata": {"thread_id": "thread", "turn_id": "turn"},
+                "correlation_id": "correlation",
+                "prompt_cache_key": "cache",
+                "conversation": "conversation"
+            }),
+            ("thread", "turn", "correlation", true),
+        ),
+        (
+            json!({"model": "gpt-5.6-sol", "correlation_id": "correlation"}),
+            ("correlation", "correlation", "correlation", false),
+        ),
+        (
+            json!({
+                "model": "gpt-5.6-sol",
+                "prompt_cache_key": "cache",
+                "conversation": "conversation"
+            }),
+            ("cache", "cache", "cache", false),
+        ),
+        (
+            json!({"model": "gpt-5.6-sol", "conversation": "conversation"}),
+            ("conversation", "conversation", "conversation", false),
+        ),
+        (
+            json!({
+                "model": "gpt-5.6-sol",
+                "nested": {
+                    "service_tier": "priority",
+                    "metadata": {"thread_id": "nested-thread", "turn_id": "nested-turn"},
+                    "correlation_id": "nested-correlation"
+                }
+            }),
+            ("proxy-45", "proxy-45", "proxy-45", false),
+        ),
+    ];
+
+    for (index, (body, expected)) in cases.into_iter().enumerate() {
+        let request_id = 41 + index as u64;
+        let (_, events) =
+            ResponsesUsageTap::from_request(request_id, &body.to_string().into_bytes(), 1);
+        let [TokenCostEvent::TurnStarted { meta, fast, .. }] = events.as_slice() else {
+            panic!("expected one turn start: {events:?}");
+        };
+        assert_eq!(
+            (
+                &*meta.session_id,
+                &*meta.turn_id,
+                &*meta.correlation_id,
+                *fast
+            ),
+            expected
+        );
+    }
+
+    let oversized = "x".repeat(MAX_ID_BYTES + 1);
+    let body = json!({
+        "model": "gpt-5.6-sol",
+        "metadata": {"thread_id": oversized, "turn_id": ""},
+        "correlation_id": {"nested": "not-a-string"},
+        "prompt_cache_key": ""
+    });
+    let (_, events) = ResponsesUsageTap::from_request(99, &body.to_string().into_bytes(), 1);
+    let [TokenCostEvent::TurnStarted { meta, fast, .. }] = events.as_slice() else {
+        panic!("expected one fallback turn start: {events:?}");
+    };
+    assert_eq!(meta.session_id, "proxy-99");
+    assert_eq!(meta.turn_id, "proxy-99");
+    assert_eq!(meta.correlation_id, "proxy-99");
+    assert!(!fast);
+}
+
+#[test]
+fn responses_tap_parses_lf_crlf_deltas_terminal_usage_and_done_once() {
+    let request = br#"{"model":"gpt-5.6-sol"}"#;
+    let (mut tap, started) = ResponsesUsageTap::from_request(7, request, 100);
+    assert_eq!(event_meta_ref(&started[0]).event_id, "proxy-7-0");
+    let bytes = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"你\"}\r\n\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"cache_creation_input_tokens\":2,\"output_tokens\":5}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let events = tap.push_bytes(bytes.as_bytes(), 200);
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 1,
+                ..
+            },
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 2,
+                ..
+            },
+            TokenCostEvent::Usage {
+                usage: TokenUsage {
+                    input: 10,
+                    cached_input: 3,
+                    cache_write: 2,
+                    output: 5
+                },
+                exact: true,
+                ..
+            },
+            TokenCostEvent::TurnCompleted { usage: None, .. }
+        ]
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event_meta_ref(event).event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["proxy-7-1", "proxy-7-2", "proxy-7-3", "proxy-7-4"]
+    );
+    assert!(tap.push_bytes(bytes.as_bytes(), 300).is_empty());
+    assert!(tap.finish(400).is_empty());
+}
+
+#[test]
+fn responses_tap_ignores_nested_lookalikes_malformed_frames_and_impossible_usage() {
+    let request = br#"{"model":"gpt-5.6-sol"}"#;
+    let (mut malformed, _) = ResponsesUsageTap::from_request(8, request, 1);
+    let bytes = concat!(
+        "event: response.output_text.delta\n\n",
+        "data: not-json\n\n",
+        ": keep-alive\n\n",
+        "data: {\"wrapper\":{\"type\":\"response.output_text.delta\",\"delta\":\"nested\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+    );
+    assert!(malformed.push_bytes(bytes.as_bytes(), 2).is_empty());
+
+    let (mut nested, _) = ResponsesUsageTap::from_request(9, request, 1);
+    let nested_terminal = b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}]}}\n\n";
+    let events = nested.push_bytes(nested_terminal, 2);
+    assert!(matches!(
+        events.as_slice(),
+        [TokenCostEvent::TurnCompleted { usage: None, .. }]
+    ));
+
+    let (mut impossible, _) = ResponsesUsageTap::from_request(10, request, 1);
+    let impossible_usage = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":1}}}\n\n";
+    let events = impossible.push_bytes(impossible_usage, 2);
+    assert!(matches!(
+        events.as_slice(),
+        [TokenCostEvent::TurnCompleted { usage: None, .. }]
+    ));
+}
+
+#[test]
+fn responses_tap_finishes_non_stream_json_once() {
+    let request = br#"{"model":"gpt-5.6-sol"}"#;
+    let (mut tap, _) = ResponsesUsageTap::from_request(11, request, 1);
+    let body = br#"{"id":"resp-1","object":"response","status":"completed","model":"gpt-5.6-sol","usage":{"input_tokens":7,"input_tokens_details":{"cached_tokens":2},"output_tokens":3}}"#;
+
+    assert!(tap.push_bytes(body, 2).is_empty());
+    let events = tap.finish(3);
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            TokenCostEvent::Usage {
+                usage: TokenUsage {
+                    input: 7,
+                    cached_input: 2,
+                    cache_write: 0,
+                    output: 3
+                },
+                exact: true,
+                ..
+            },
+            TokenCostEvent::TurnCompleted { usage: None, .. }
+        ]
+    ));
+    assert!(tap.finish(4).is_empty());
+}
+
+#[test]
+fn chat_tap_extracts_direct_content_reasoning_and_usage_fields() {
+    let request = br#"{"model":"deepseek-reasoner","service_tier":"priority"}"#;
+    let (mut tap, started) = ChatUsageTap::from_request(12, request, 1);
+    assert!(matches!(
+        started.as_slice(),
+        [TokenCostEvent::TurnStarted { fast: true, .. }]
+    ));
+    let bytes = concat!(
+        "data: {\"model\":\"deepseek-reasoner\",\"choices\":[{\"delta\":{\"content\":\"ab\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"你\"}}]}\r\n\r\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"wxyz\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":3},\"cache_creation_input_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let events = tap.push_bytes(bytes.as_bytes(), 2);
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 1,
+                ..
+            },
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 2,
+                ..
+            },
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 3,
+                ..
+            },
+            TokenCostEvent::Usage {
+                usage: TokenUsage {
+                    input: 10,
+                    cached_input: 3,
+                    cache_write: 2,
+                    output: 5
+                },
+                exact: true,
+                ..
+            },
+            TokenCostEvent::TurnCompleted { usage: None, .. }
+        ]
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event_meta_ref(event).event_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "proxy-12-1",
+            "proxy-12-2",
+            "proxy-12-3",
+            "proxy-12-4",
+            "proxy-12-5"
+        ]
+    );
+    assert!(tap.finish(3).is_empty());
+}
+
+#[test]
+fn chat_tap_supports_non_stream_direct_responses_style_usage() {
+    let request = br#"{"model":"gpt-5.4"}"#;
+    let (mut tap, _) = ChatUsageTap::from_request(13, request, 1);
+    let body = br#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5.4","choices":[{"message":{"content":"not retained"},"finish_reason":"stop"}],"usage":{"input_tokens":7,"output_tokens":3,"input_tokens_details":{"cached_tokens":2},"cache_read_input_tokens":1,"cache_creation_input_tokens":4}}"#;
+
+    assert!(tap.push_bytes(body, 2).is_empty());
+    let events = tap.finish(3);
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            TokenCostEvent::Usage {
+                usage: TokenUsage {
+                    input: 7,
+                    cached_input: 1,
+                    cache_write: 4,
+                    output: 3
+                },
+                exact: true,
+                ..
+            },
+            TokenCostEvent::TurnCompleted { usage: None, .. }
+        ]
+    ));
+    assert!(tap.finish(4).is_empty());
+}
+
+#[test]
+fn chat_tap_ignores_nested_usage_and_non_string_reasoning_shapes() {
+    let request = br#"{"model":"gpt-5.4"}"#;
+    let (mut tap, _) = ChatUsageTap::from_request(14, request, 1);
+    let bytes = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"reasoning\":{\"text\":\"nested\"},\"reasoning_details\":[{\"text\":\"nested\"}],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let events = tap.push_bytes(bytes.as_bytes(), 2);
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            TokenCostEvent::OutputDelta {
+                estimated_output_tokens: 1,
+                ..
+            },
+            TokenCostEvent::TurnCompleted { usage: None, .. }
+        ]
+    ));
+}
+
+#[test]
+fn unfinished_stream_finish_emits_one_failure_without_usage() {
+    let request = br#"{"model":"gpt-5.4"}"#;
+    let (mut tap, _) = ChatUsageTap::from_request(15, request, 1);
+    assert!(
+        tap.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            2
+        )
+        .iter()
+        .all(|event| !matches!(event, TokenCostEvent::Usage { .. }))
+    );
+
+    assert!(matches!(
+        tap.finish(3).as_slice(),
+        [TokenCostEvent::TurnFailed { .. }]
+    ));
+    assert!(tap.finish(4).is_empty());
+}
+
+#[test]
+fn renderer_validator_accepts_every_variant_unchanged_and_rejects_protocol_source() {
+    for event in renderer_validation_events() {
+        assert_eq!(validate_renderer_event(event.clone()).unwrap(), event);
+
+        let mut protocol = event;
+        event_meta_mut(&mut protocol).source = UsageSource::ProtocolProxy;
+        assert!(validate_renderer_event(protocol).is_err());
+    }
+}
+
+#[test]
+fn renderer_validator_enforces_required_ids_and_utf8_byte_limits() {
+    let exact_id = format!("{}a", "界".repeat(53));
+    assert_eq!(exact_id.len(), MAX_ID_BYTES);
+    let exact_model = format!("{}ab", "界".repeat(42));
+    assert_eq!(exact_model.len(), MAX_MODEL_BYTES);
+    let exact_tool = format!("{}ab", "界".repeat(42));
+    assert_eq!(exact_tool.len(), MAX_TOOL_NAME_BYTES);
+
+    let mut exact = TokenCostEvent::TurnStarted {
+        meta: EventMeta {
+            source: UsageSource::Renderer,
+            session_id: exact_id.clone(),
+            turn_id: exact_id.clone(),
+            event_id: exact_id.clone(),
+            correlation_id: exact_id.clone(),
+            occurred_at_ms: 1,
+        },
+        model: exact_model,
+        fast: false,
+    };
+    assert_eq!(validate_renderer_event(exact.clone()).unwrap(), exact);
+
+    for field in 0..4 {
+        let meta = event_meta_mut(&mut exact);
+        let target = match field {
+            0 => &mut meta.session_id,
+            1 => &mut meta.turn_id,
+            2 => &mut meta.event_id,
+            _ => &mut meta.correlation_id,
+        };
+        let saved = std::mem::take(target);
+        assert!(validate_renderer_event(exact.clone()).is_err());
+        let meta = event_meta_mut(&mut exact);
+        *match field {
+            0 => &mut meta.session_id,
+            1 => &mut meta.turn_id,
+            2 => &mut meta.event_id,
+            _ => &mut meta.correlation_id,
+        } = saved;
+    }
+
+    for field in 0..4 {
+        let mut over = exact.clone();
+        let meta = event_meta_mut(&mut over);
+        *match field {
+            0 => &mut meta.session_id,
+            1 => &mut meta.turn_id,
+            2 => &mut meta.event_id,
+            _ => &mut meta.correlation_id,
+        } = "界".repeat(54);
+        assert!(validate_renderer_event(over).is_err());
+    }
+
+    let mut over_model = exact;
+    let TokenCostEvent::TurnStarted { model, .. } = &mut over_model else {
+        unreachable!();
+    };
+    *model = format!("{}abc", "界".repeat(42));
+    assert_eq!(model.len(), MAX_MODEL_BYTES + 1);
+    assert!(validate_renderer_event(over_model).is_err());
+
+    for event in [
+        TokenCostEvent::ToolStarted {
+            meta: meta(UsageSource::Renderer),
+            call_id: exact_id.clone(),
+            name: exact_tool.clone(),
+        },
+        TokenCostEvent::ToolCompleted {
+            meta: meta(UsageSource::Renderer),
+            call_id: exact_id,
+        },
+    ] {
+        assert_eq!(validate_renderer_event(event.clone()).unwrap(), event);
+    }
+
+    let over_call = TokenCostEvent::ToolCompleted {
+        meta: meta(UsageSource::Renderer),
+        call_id: "界".repeat(54),
+    };
+    assert!(validate_renderer_event(over_call).is_err());
+    let over_name = TokenCostEvent::ToolStarted {
+        meta: meta(UsageSource::Renderer),
+        call_id: "call".to_string(),
+        name: format!("{}abc", "界".repeat(42)),
+    };
+    assert!(validate_renderer_event(over_name).is_err());
+}
+
+#[test]
+fn renderer_validator_rejects_zero_delta_and_impossible_usage_without_token_ceiling() {
+    let zero = TokenCostEvent::OutputDelta {
+        meta: meta(UsageSource::Renderer),
+        estimated_output_tokens: 0,
+    };
+    assert!(validate_renderer_event(zero).is_err());
+
+    let max = TokenCostEvent::OutputDelta {
+        meta: meta(UsageSource::Renderer),
+        estimated_output_tokens: u64::MAX,
+    };
+    assert_eq!(validate_renderer_event(max.clone()).unwrap(), max);
+
+    for event in [
+        TokenCostEvent::Usage {
+            meta: meta(UsageSource::Renderer),
+            usage: TokenUsage {
+                input: 1,
+                cached_input: 2,
+                cache_write: 0,
+                output: 3,
+            },
+            exact: true,
+        },
+        TokenCostEvent::TurnCompleted {
+            meta: meta(UsageSource::Renderer),
+            usage: Some(TokenUsage {
+                input: 1,
+                cached_input: 2,
+                cache_write: 0,
+                output: 3,
+            }),
+        },
+    ] {
+        assert!(validate_renderer_event(event).is_err());
+    }
+}
+
+#[test]
+fn renderer_validator_checks_serialized_size_before_field_echo() {
+    assert_eq!(MAX_SSE_FRAME_BYTES, 64 * 1024);
+    assert_eq!(MAX_RENDERER_EVENT_BYTES, 4 * 1024);
+
+    let exact = serialized_turn_started_of_size(MAX_RENDERER_EVENT_BYTES);
+    assert!(validate_renderer_event(exact).is_err());
+
+    let marker = "sensitive-payload-marker";
+    let mut over = serialized_turn_started_of_size(MAX_RENDERER_EVENT_BYTES + 1);
+    let TokenCostEvent::TurnStarted { model, .. } = &mut over else {
+        unreachable!();
+    };
+    model.replace_range(..marker.len(), marker);
+    let error = validate_renderer_event(over).unwrap_err().to_string();
+    assert!(error.contains("event"));
+    assert!(!error.contains(marker));
+    assert!(error.len() < 100);
 }

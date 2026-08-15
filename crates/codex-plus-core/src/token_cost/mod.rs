@@ -4,12 +4,14 @@ use anyhow::{bail, ensure};
 use tokio::sync::{broadcast, watch};
 
 pub mod config;
+pub mod input;
 pub mod model;
 pub mod pricing;
 pub mod push;
 pub mod state;
 
 pub use config::{ProfileConfig, UiConfig, UiConfigStore};
+pub use input::{ChatUsageTap, ResponsesUsageTap, validate_renderer_event};
 pub use model::{
     AnalyticsDay, AnalyticsModel, AnalyticsRange, AnalyticsSnapshot, AnalyticsTotals, EventMeta,
     IngestOutcome, LazyAsset, LazyAssetPush, MAX_EMAIL_BYTES, MAX_ID_BYTES, MAX_MODEL_BYTES,
@@ -27,6 +29,9 @@ pub use state::{
 use push::{ActiveInstance, PushMetrics};
 
 const LAZY_PUSH_CAPACITY: usize = 8;
+
+pub const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_RENDERER_EVENT_BYTES: usize = 4 * 1024;
 
 pub struct TokenCostService {
     inner: Mutex<ServiceInner>,
