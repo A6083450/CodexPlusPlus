@@ -395,6 +395,7 @@ function baseAppServerParams(overrides: Record<string, unknown> = {}) {
     eventId: "host-event-1",
     correlationId: "correlation-1",
     occurredAtMs: 1_000,
+    itemId: "item-1",
     model: "gpt-5.6-sol",
     serviceTier: "priority",
     ...overrides,
@@ -495,6 +496,8 @@ describe("renderer token-cost AppServer allowlist", () => {
     }));
     const second = runtime.api.eventFromAppServer("item/reasoning/summary_text_delta", baseAppServerParams({
       eventId: undefined,
+      itemId: undefined,
+      item: { id: "reasoning-1" },
       delta: "bc",
     }));
     assert.equal(first.type, "output_delta");
@@ -560,6 +563,14 @@ describe("renderer token-cost AppServer allowlist", () => {
     });
     assert.equal(snake.meta.session_id, "thread-snake");
     assert.equal(snake.fast, false);
+    assert.equal(runtime.api.eventFromAppServer("item/reasoning/summary_text_delta", {
+      thread_id: "thread-snake",
+      turn_id: "turn-snake",
+      correlation_id: "correlation-snake",
+      occurred_at_ms: 2_001,
+      item_id: "reasoning-snake",
+      delta: "snake",
+    })?.type, "output_delta");
 
     const types = ["toolCall", "commandExecution", "fileChange", "webSearch", "computer", "imageGeneration"];
     for (const [index, type] of types.entries()) {
@@ -609,6 +620,7 @@ describe("renderer token-cost AppServer allowlist", () => {
 
   it("rejects unknown, nested, unsafe, missing, and oversized values", async () => {
     const runtime = await createTokenCostRuntime();
+    runtime.api.eventFromAppServer("turn/started", baseAppServerParams());
     const invalid = [
       ["unknown/method", baseAppServerParams()],
       ["turn/started", { payload: baseAppServerParams() }],
@@ -618,6 +630,10 @@ describe("renderer token-cost AppServer allowlist", () => {
       ["turn/started", baseAppServerParams({ model: "界".repeat(43) })],
       ["turn/started", baseAppServerParams({ occurredAtMs: -1 })],
       ["item/agentMessage/delta", baseAppServerParams({ delta: { text: "hidden" } })],
+      ["item/agentMessage/delta", baseAppServerParams({ itemId: undefined, delta: "missing-item" })],
+      ["item/agentMessage/delta", baseAppServerParams({ itemId: undefined, payload: { itemId: "nested" }, delta: "nested-item" })],
+      ["item/reasoning/summary_text_delta", baseAppServerParams({ itemId: "x".repeat(161), delta: "oversized-item" })],
+      ["item/reasoning/summary_text_delta", baseAppServerParams({ itemId: undefined, item: { id: "x".repeat(161) }, delta: "oversized-item" })],
       ["item/started", baseAppServerParams({ item: { id: "call", type: "unknown", name: "tool" } })],
       ["item/started", baseAppServerParams({ item: { id: "call", type: "toolCall" } })],
       ["item/started", baseAppServerParams({ item: { id: "x".repeat(161), type: "toolCall", name: "tool" } })],
@@ -635,14 +651,15 @@ describe("renderer token-cost AppServer allowlist", () => {
       assert.equal(runtime.api.eventFromAppServer(method, params), null, `${method}: ${JSON.stringify(params)}`);
     }
 
-    runtime.api.eventFromAppServer("turn/started", baseAppServerParams({ turnId: "still-active" }));
-    assert.equal(runtime.api.state().turns, 1);
-    assert.equal(runtime.api.eventFromAppServer("turn/completed", baseAppServerParams({
+    const completionRuntime = await createTokenCostRuntime();
+    completionRuntime.api.eventFromAppServer("turn/started", baseAppServerParams({ turnId: "still-active" }));
+    assert.equal(completionRuntime.api.state().turns, 1);
+    assert.equal(completionRuntime.api.eventFromAppServer("turn/completed", baseAppServerParams({
       turnId: "still-active",
       status: "completed",
       usage: { input: 1, cachedInput: 2, output: 1 },
     })), null);
-    assert.equal(runtime.api.state().turns, 1, "an invalid completion must not mutate active-turn state");
+    assert.equal(completionRuntime.api.state().turns, 1, "an invalid completion must not mutate active-turn state");
 
     activate(runtime);
     const throwingParams = Object.defineProperty({}, "threadId", {
@@ -694,7 +711,86 @@ describe("renderer token-cost AppServer allowlist", () => {
     assert.match(maxFirst.meta.event_id, /^od:1:/);
     assert.match(maxSecond.meta.event_id, /^od:2:/);
     assert.ok(new TextEncoder().encode(maxSecond.meta.event_id).byteLength <= 160);
+
+    const identityA = await createTokenCostRuntime();
+    const identityB = await createTokenCostRuntime();
+    identityA.api.eventFromAppServer("turn/started", baseAppServerParams());
+    identityB.api.eventFromAppServer("turn/started", baseAppServerParams());
+    const identityDeltaA = identityA.api.eventFromAppServer("item/agentMessage/delta", baseAppServerParams({
+      eventId: undefined, itemId: "message-a", delta: "same",
+    }));
+    const identityDeltaB = identityB.api.eventFromAppServer("item/agentMessage/delta", baseAppServerParams({
+      eventId: undefined, itemId: "message-b", delta: "same",
+    }));
+    assert.notEqual(identityDeltaA.meta.event_id, identityDeltaB.meta.event_id);
   });
+
+  for (const [label, installThrowingCapture] of [
+    ["capture global", (runtime: TokenCostRuntime) => {
+      Object.defineProperty(runtime.window, "__codexLiveTokenCostCaptureV1", {
+        configurable: true,
+        get() {
+          throw new Error("capture global getter");
+        },
+      });
+    }],
+    ["capture enabled", (runtime: TokenCostRuntime) => {
+      runtime.window.__codexLiveTokenCostCaptureV1 = Object.defineProperty({}, "enabled", {
+        get() {
+          throw new Error("capture enabled getter");
+        },
+      });
+    }],
+    ["capture instanceId", (runtime: TokenCostRuntime) => {
+      runtime.window.__codexLiveTokenCostCaptureV1 = Object.defineProperty({ enabled: true }, "instanceId", {
+        get() {
+          throw new Error("capture instance getter");
+        },
+      });
+    }],
+  ] as const) {
+    it(`treats a throwing ${label} getter as disabled without changing dispatcher semantics`, async () => {
+      const runtime = await createTokenCostRuntime();
+      installThrowingCapture(runtime);
+      const payload = { untouched: true };
+      const originalCalls: unknown[][] = [];
+      const dispatcher = {
+        __codexServiceTierOriginalDispatchMessage(...args: unknown[]) {
+          originalCalls.push(args);
+          return "original-result";
+        },
+      };
+      assert.equal(runtime.api.dispatchMessage(dispatcher, "unknown/method", payload), "original-result");
+      assert.deepEqual(originalCalls, [["unknown/method", payload]]);
+
+      const expectedError = new Error("original dispatcher failure");
+      let errorCalls = 0;
+      const errorArgs: unknown[][] = [];
+      let caught: unknown;
+      try {
+        runtime.api.dispatchMessage({
+          __codexServiceTierOriginalDispatchMessage(...args: unknown[]) {
+            errorCalls += 1;
+            errorArgs.push(args);
+            throw expectedError;
+          },
+        }, "unknown/method", payload);
+      } catch (error) {
+        caught = error;
+      }
+      assert.equal(caught, expectedError);
+      assert.equal(errorCalls, 1);
+      assert.deepEqual(errorArgs, [["unknown/method", payload]]);
+      assert.equal(runtime.bridgeCalls.length, 0);
+      assert.deepEqual(lifecycleDetails(runtime), []);
+      assert.deepEqual(structuredClone(runtime.api.state()), {
+        active: false,
+        turns: 0,
+        accountListeners: 0,
+        pendingFrame: 0,
+      });
+    });
+  }
 
   it("forwards once without blocking or changing original dispatcher output", async () => {
     const runtime = await createTokenCostRuntime();
@@ -918,6 +1014,19 @@ describe("renderer token-cost lifecycle and account boundary", () => {
     const block = tokenCostBlock(renderer);
     const navigation = sourceFunction(renderer, "captureThreadScrollNavigation", "editableThreadScrollTarget");
     assert.match(navigation, /tokenCostEmitNavigationLifecycle\(\)/);
+    let lifecycleCalls = 0;
+    const captureNavigation = new Function(
+      "tokenCostEmitNavigationLifecycle",
+      "codexPlusSettings",
+      `${navigation}\nreturn captureThreadScrollNavigation;`,
+    )(
+      () => {
+        lifecycleCalls += 1;
+      },
+      () => ({ threadScrollRestore: false }),
+    ) as (targetSessionId: string) => void;
+    captureNavigation("thread-navigation");
+    assert.equal(lifecycleCalls, 1);
     for (const forbidden of [
       "MutationObserver",
       "setInterval",

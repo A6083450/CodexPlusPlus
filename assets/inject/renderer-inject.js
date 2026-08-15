@@ -6484,6 +6484,15 @@
     return method.startsWith("item/reasoning/") && method.endsWith("delta") && method.length > "item/reasoning/delta".length;
   }
 
+  function tokenCostDeltaItemId(params) {
+    const direct = params.itemId ?? params.item_id;
+    if (direct !== undefined) return tokenCostBoundedString(direct, tokenCostMaxIdBytes);
+    const item = params.item;
+    return item && typeof item === "object" && !Array.isArray(item)
+      ? tokenCostBoundedString(item.id, tokenCostMaxIdBytes)
+      : "";
+  }
+
   function tokenCostEventFromAppServer(method, params) {
     if (typeof method !== "string"
         || tokenCostUtf8Length(method) > tokenCostMaxIdBytes
@@ -6509,8 +6518,9 @@
     }
 
     if (method === "item/agentMessage/delta" || tokenCostIsReasoningDelta(method)) {
-      if (typeof params.delta !== "string" || params.delta.length === 0) return null;
-      const baseMeta = tokenCostMeta(method, params, "od");
+      const itemId = tokenCostDeltaItemId(params);
+      if (!itemId || typeof params.delta !== "string" || params.delta.length === 0) return null;
+      const baseMeta = tokenCostMeta(method, params, "od", 0, itemId);
       if (!baseMeta) return null;
       const turn = tokenCostTurns.get(tokenCostTurnKey(baseMeta));
       if (!turn || turn.sequence >= Number.MAX_SAFE_INTEGER) return null;
@@ -6522,7 +6532,7 @@
       if (explicit.present && !explicit.value) return null;
       baseMeta.event_id = tokenCostEventId(
         "od",
-        `${baseMeta.session_id}\u0000${baseMeta.turn_id}\u0000${method}`,
+        `${baseMeta.session_id}\u0000${baseMeta.turn_id}\u0000${method}\u0000${itemId}`,
         turn.sequence,
         explicit,
       );
@@ -6588,9 +6598,13 @@
   }
 
   function tokenCostCaptureInstance() {
-    const capture = window.__codexLiveTokenCostCaptureV1;
-    if (!capture || capture.enabled !== true) return "";
-    return tokenCostBoundedString(capture.instanceId, tokenCostMaxIdBytes);
+    try {
+      const capture = window.__codexLiveTokenCostCaptureV1;
+      if (!capture || capture.enabled !== true) return "";
+      return tokenCostBoundedString(capture.instanceId, tokenCostMaxIdBytes);
+    } catch (_) {
+      return "";
+    }
   }
 
   function tokenCostCaptureMatches(instanceId) {
@@ -6725,8 +6739,8 @@
     tokenCostLastRoute = "";
   }
 
-  function tokenCostForwardAppServerEventIfEnabled(method, params) {
-    const instanceId = tokenCostCaptureInstance();
+  function tokenCostForwardAppServerEventIfEnabled(method, params, capturedInstanceId = "") {
+    const instanceId = capturedInstanceId || tokenCostCaptureInstance();
     if (!instanceId || instanceId !== tokenCostActiveInstanceId) return null;
     let event = null;
     try {
@@ -6770,9 +6784,8 @@
   // TOKEN_COST_END
 
   function dispatchCodexPlusMessage(dispatcher, type, payload) {
-    if (window.__codexLiveTokenCostCaptureV1?.enabled === true) {
-      tokenCostForwardAppServerEventIfEnabled(type, payload);
-    }
+    const tokenCostInstanceId = tokenCostCaptureInstance();
+    if (tokenCostInstanceId) tokenCostForwardAppServerEventIfEnabled(type, payload, tokenCostInstanceId);
     const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
     const nextType = message?.type || type;
     const { type: _type, ...nextPayload } = message || {};
