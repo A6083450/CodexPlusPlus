@@ -351,6 +351,39 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_batch_applies_every_distinct_ordinary_event_at_capacity() {
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+
+        let outcome = service.ingest_batch((0..=EVENT_QUEUE_CAPACITY).map(|index| {
+            TokenCostEvent::OutputDelta {
+                meta: meta(
+                    format!("ordinary-turn-{index}"),
+                    format!("ordinary-delta-{index}"),
+                    index as u64,
+                ),
+                estimated_output_tokens: 1,
+            }
+        }));
+
+        assert_eq!(outcome, IngestOutcome::Applied { revision: 1 });
+        let inner = service
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let diagnostics = service.diagnostics_locked(&inner);
+        let snapshot = inner.state.snapshot(&inner.config);
+        assert_eq!(snapshot.turns, 257);
+        assert_eq!(snapshot.output, 257);
+        assert_eq!(diagnostics.events_ingested, 257);
+        assert_eq!(diagnostics.events_rejected, 0);
+        assert_eq!(diagnostics.events_coalesced, 0);
+        assert_eq!(diagnostics.queue_high_water, EVENT_QUEUE_CAPACITY as u64);
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(diagnostics.snapshots_published, 1);
+    }
+
+    #[test]
     fn retired_turn_support_window_stays_hard_bounded() {
         let service = TokenCostService::in_memory();
         service.bootstrap("page-1").unwrap();

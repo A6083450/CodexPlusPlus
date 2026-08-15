@@ -1920,6 +1920,45 @@ fn bounded_queue_never_allows_ordinary_events_to_displace_critical_events() {
 }
 
 #[test]
+fn full_ordinary_queue_requires_drain_without_removing_an_event() {
+    let mut queue = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
+    for index in 0..EVENT_QUEUE_CAPACITY {
+        assert_eq!(
+            queue.push(output_delta(
+                "s-ordinary",
+                &format!("turn-{index}"),
+                format!("delta-{index}"),
+                format!("correlation-{index}"),
+                index as u64,
+                1,
+            )),
+            QueueAdmission::Enqueued
+        );
+    }
+
+    assert_eq!(
+        queue.push(output_delta(
+            "s-ordinary",
+            "turn-256",
+            "delta-256",
+            "correlation-256",
+            256,
+            1,
+        )),
+        QueueAdmission::RequiresDrain
+    );
+    assert_eq!(queue.len(), EVENT_QUEUE_CAPACITY);
+
+    let mut turn_ids = Vec::new();
+    while let Some(TokenCostEvent::OutputDelta { meta, .. }) = queue.pop_front() {
+        turn_ids.push(meta.turn_id);
+    }
+    assert_eq!(turn_ids.len(), EVENT_QUEUE_CAPACITY);
+    assert!(turn_ids.iter().any(|turn_id| turn_id == "turn-0"));
+    assert!(!turn_ids.iter().any(|turn_id| turn_id == "turn-256"));
+}
+
+#[test]
 fn critical_events_evict_only_coalescible_entries_and_exact_usage_never_coalesces() {
     let mut queue = BoundedEventQueue::new(EVENT_QUEUE_CAPACITY);
     queue.push(output_delta("s-mixed", "t-delta", "delta", "c-delta", 0, 1));

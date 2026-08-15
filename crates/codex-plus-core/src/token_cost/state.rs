@@ -53,10 +53,12 @@ impl BoundedEventQueue {
                 QueueAdmission::Rejected
             };
         };
-        if is_critical(&event) || is_coalescible(&event) {
+        if is_critical(&event) {
             self.events.remove(coalescible);
             self.events.push_back(event);
             QueueAdmission::Enqueued
+        } else if is_coalescible(&event) {
+            QueueAdmission::RequiresDrain
         } else {
             QueueAdmission::Rejected
         }
