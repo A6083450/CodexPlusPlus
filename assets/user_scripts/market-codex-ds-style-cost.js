@@ -438,6 +438,7 @@
     state.revision = snapshot.revision;
     state.snapshot = snapshot;
     syncConfigVisibility(snapshot);
+    if (!snapshot.profile_visible) closeProfileOwner();
     renderSnapshot(snapshot);
     return true;
   }
@@ -685,25 +686,94 @@
 
   function rootChange() {}
 
+  function closeProfileOwner() {
+    if (state.pendingOpen?.name === "profile") state.pendingOpen = null;
+    if (state.activeModule?.name === "profile") closeActiveModule();
+  }
+
   function lifecycle(event) {
     if (!state.alive) return;
     mountOnce();
     resetBootstrapIfExhausted();
     const detail = event?.detail;
-    if (detail?.reason === "profile_menu") projectProfile(detail.profileMenuId);
+    if (detail?.profile === false) {
+      closeProfileOwner();
+      if (detail.reason === "profile_menu") projectProfile(detail.profileMenuId);
+      return;
+    }
+    if (detail?.reason === "profile_menu") {
+      projectProfile(detail.profileMenuId);
+      return;
+    }
+    if (detail?.reason !== "profile_entry" || detail.profile !== true || !state.activated || !state.config?.profile_visible) return;
+    const mountTarget = document.querySelector("main");
+    if (!mountTarget) return;
+    if (state.pendingOpen && state.pendingOpen.name !== "profile") state.pendingOpen = null;
+    if (state.activeModule && state.activeModule.name !== "profile") closeActiveModule();
+    requestModuleOpen("profile", mountTarget);
   }
 
   function registerModule(name, factory) {
     if (!state.alive || !MODULE_NAMES.includes(name)) return false;
     if (typeof factory !== "function") {
-      clearPendingOpen(name);
+      const error = new Error("invalid lazy module factory");
+      if (!clearPendingOpen(name)) {
+        const active = state.activeModule;
+        if (!clearPendingChild(active, name, error)) clearPendingChild(active?.child, name, error);
+      }
       return false;
     }
     modules[name] = factory;
     const pending = state.pendingOpen;
     if (pending && pending.name === name && pending.generation === state.generation) {
       state.pendingOpen = null;
-      openModule(name);
+      const opened = openModule(name, pending.mountTarget);
+      if (!opened) delete modules[name];
+      return opened;
+    }
+    const active = state.activeModule;
+    const childPending = active?.pendingChild;
+    if (childPending && childPending.name === name && childPending.generation === state.generation) {
+      active.pendingChild = null;
+      const opened = openChildModule(active, name, childPending.mountTarget, childPending.onError, childPending.onApply);
+      if (!opened) delete modules[name];
+      return opened;
+    }
+    const nestedPending = active?.child?.pendingChild;
+    if (nestedPending && nestedPending.name === name && nestedPending.generation === state.generation) {
+      active.child.pendingChild = null;
+      const opened = openChildModule(active.child, name, nestedPending.mountTarget, nestedPending.onError, nestedPending.onApply);
+      if (!opened) delete modules[name];
+      return opened;
+    }
+    return true;
+  }
+
+  function liveModule(record) {
+    return Boolean(record && (state.activeModule === record || state.activeModule?.child === record));
+  }
+
+  function closeChildModule(parent, owner) {
+    if (!liveModule(parent)) return false;
+    const child = parent.child;
+    if (!child || (owner && child.owner !== owner)) return false;
+    parent.child = null;
+    child.pendingChild = null;
+    if (child.child) {
+      const nested = child.child;
+      child.child = null;
+      try { nested.instance.unmount(); } catch {}
+    }
+    try { child.instance.unmount(); } catch {}
+    return true;
+  }
+
+  function clearPendingChild(parent, name, error) {
+    const pending = parent?.pendingChild;
+    if (!pending || (name && pending.name !== name)) return false;
+    parent.pendingChild = null;
+    if (error && state.alive && liveModule(parent) && pending.generation === state.generation) {
+      try { pending.onError?.(error); } catch {}
     }
     return true;
   }
@@ -712,26 +782,56 @@
     const active = state.activeModule;
     if (!active || (owner && active.owner !== owner)) return false;
     state.activeModule = null;
+    active.pendingChild = null;
+    if (active.child) {
+      const child = active.child;
+      active.child = null;
+      child.pendingChild = null;
+      if (child.child) {
+        const nested = child.child;
+        child.child = null;
+        try { nested.instance.unmount(); } catch {}
+      }
+      try { child.instance.unmount(); } catch {}
+    }
     try { active.instance.unmount(); } catch {}
-    if (state.alive && state.settingsButton?.isConnected) state.settingsButton.focus?.();
+    if (state.alive && active.name === "settings" && state.settingsButton?.isConnected) state.settingsButton.focus?.();
     return true;
   }
 
-  function openModule(name) {
+  function defineChildContext(context, parent, name) {
+    if (name === "settings") {
+      Object.defineProperties(context, {
+        requestAnalytics: { value: (target, onError) => requestChildModule(parent, "analytics", target, onError), enumerable: true },
+        closeAnalytics: { value: () => closeRequestedChild(parent, "analytics"), enumerable: true },
+      });
+    } else if (name === "analytics") {
+      Object.defineProperties(context, {
+        requestFlatpickr: { value: (target, onApply, onError) => requestChildModule(parent, "flatpickr", target, onError, onApply), enumerable: true },
+        closeFlatpickr: { value: () => closeRequestedChild(parent, "flatpickr"), enumerable: true },
+      });
+    }
+  }
+
+  function openModule(name, mountTarget) {
     if (!state.alive || state.activeModule || typeof modules[name] !== "function") return false;
     const owner = {};
+    const parent = { name, instance: null, owner, child: null, pendingChild: null };
     const context = {};
     Object.defineProperties(context, {
       config: { get: () => state.config, enumerable: true },
       snapshot: { get: () => state.snapshot, enumerable: true },
       emitAction: { value: emitAction, enumerable: true },
       close: { value: () => closeActiveModule(owner), enumerable: true },
+      mountTarget: { value: mountTarget || null, enumerable: true },
     });
+    defineChildContext(context, parent, name);
     Object.freeze(context);
     let instance;
     try { instance = modules[name](context); } catch { return false; }
     if (!instance || typeof instance.mount !== "function" || typeof instance.unmount !== "function") return false;
-    state.activeModule = { name, instance, owner };
+    parent.instance = instance;
+    state.activeModule = parent;
     try {
       instance.mount();
       return true;
@@ -742,18 +842,99 @@
     }
   }
 
+  function openChildModule(parent, name, mountTarget, onError, onApply) {
+    if (!state.alive || !liveModule(parent) || parent.child || typeof modules[name] !== "function") return false;
+    const owner = {};
+    const child = { name, instance: null, owner, child: null, pendingChild: null };
+    const context = {};
+    Object.defineProperties(context, {
+      config: { get: () => state.config, enumerable: true },
+      snapshot: { get: () => state.snapshot, enumerable: true },
+      emitAction: { value: emitAction, enumerable: true },
+      close: { value: () => closeChildModule(parent, owner), enumerable: true },
+      mountTarget: { value: mountTarget || null, enumerable: true },
+      onApply: { value: typeof onApply === "function" ? onApply : null, enumerable: true },
+    });
+    defineChildContext(context, child, name);
+    Object.freeze(context);
+    let instance;
+    try { instance = modules[name](context); } catch (error) {
+      try { onError?.(error); } catch {}
+      return false;
+    }
+    if (!instance || typeof instance.mount !== "function" || typeof instance.unmount !== "function") {
+      try { onError?.(new Error("invalid lazy module instance")); } catch {}
+      return false;
+    }
+    child.instance = instance;
+    parent.child = child;
+    try {
+      instance.mount();
+      return true;
+    } catch (error) {
+      parent.child = null;
+      try { instance.unmount(); } catch {}
+      try { onError?.(error); } catch {}
+      return false;
+    }
+  }
+
+  function childEdge(parent, name) {
+    return parent?.name === "settings" && name === "analytics"
+      || parent?.name === "analytics" && name === "flatpickr";
+  }
+
+  function closeRequestedChild(parent, name) {
+    if (!childEdge(parent, name) || !liveModule(parent)) return false;
+    clearPendingChild(parent, name);
+    return parent.child?.name === name ? closeChildModule(parent) : true;
+  }
+
+  function requestChildModule(parent, name, mountTarget, onError, onApply) {
+    if (!state.alive || !state.activated || !liveModule(parent) || !childEdge(parent, name) || !mountTarget?.isConnected) return false;
+    if (parent.child) {
+      if (parent.child.name !== name) return false;
+      if (name === "flatpickr" && typeof parent.child.instance.reopen === "function") {
+        try { return parent.child.instance.reopen() !== false; } catch (error) {
+          try { onError?.(error); } catch {}
+          return false;
+        }
+      }
+      return true;
+    }
+    if (typeof modules[name] === "function") {
+      const opened = openChildModule(parent, name, mountTarget, onError, onApply);
+      if (!opened) delete modules[name];
+      return opened;
+    }
+    if (parent.pendingChild) return parent.pendingChild.name === name;
+    const pending = { name, generation: state.generation, mountTarget, onError, onApply };
+    parent.pendingChild = pending;
+    postJson("/token-cost/lazy-asset", { instance_id: instanceId, asset: name }).then((response) => {
+      if (!state.alive || !liveModule(parent) || parent.pendingChild !== pending) return;
+      if (!response || response.status !== "ok") clearPendingChild(parent, name, new Error("lazy asset rejected"));
+    }, (error) => {
+      if (state.alive && liveModule(parent) && parent.pendingChild === pending) clearPendingChild(parent, name, error);
+    });
+    return true;
+  }
+
   function clearPendingOpen(name) {
     if (!state.pendingOpen || (name && state.pendingOpen.name !== name)) return false;
     state.pendingOpen = null;
     return true;
   }
 
-  function requestModuleOpen(name) {
-    if (!state.alive || !state.activated || !MODULE_NAMES.includes(name)) return false;
+  function requestModuleOpen(name, mountTarget) {
+    if (!state.alive || !state.activated || !["settings", "profile"].includes(name)) return false;
     if (state.activeModule) return state.activeModule.name === name;
-    if (typeof modules[name] === "function") return openModule(name);
+    if (typeof modules[name] === "function") {
+      const opened = openModule(name, mountTarget);
+      if (!opened) delete modules[name];
+      return opened;
+    }
     if (state.pendingOpen) return state.pendingOpen.name === name;
-    const pending = { name, generation: state.generation };
+    const pending = { name, generation: state.generation, mountTarget: mountTarget || null };
     state.pendingOpen = pending;
     postJson("/token-cost/lazy-asset", { instance_id: instanceId, asset: name }).then((response) => {
       if (!state.alive || state.pendingOpen !== pending) return;
@@ -766,7 +947,10 @@
 
   function acceptLazyError(error) {
     if (!state.alive || !error || !MODULE_NAMES.includes(error.asset)) return false;
-    return clearPendingOpen(error.asset);
+    if (clearPendingOpen(error.asset)) return true;
+    const active = state.activeModule;
+    if (active && clearPendingChild(active, error.asset, error)) return true;
+    return Boolean(active?.child && clearPendingChild(active.child, error.asset, error));
   }
 
   function emitAction(action) {

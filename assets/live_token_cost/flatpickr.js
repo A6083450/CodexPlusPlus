@@ -1,10 +1,24 @@
 "use strict";
 
-api.registerModule("flatpickr", () => {
-  const style = document.getElementById("codex-live-token-cost-flatpickr-style") || document.createElement("style");
-  style.id = "codex-live-token-cost-flatpickr-style";
-  style.textContent = css;
-  if (!style.isConnected) document.head?.appendChild(style);
+((flatpickrCss) => {
+let cachedFlatpickrFactory = null;
+function restore(owner, name, descriptor) {
+  if (descriptor) Object.defineProperty(owner, name, descriptor);
+  else delete owner[name];
+}
+api.registerModule("flatpickr", (context) => {
+  let flatpickrFactory = cachedFlatpickrFactory;
+  if (!flatpickrFactory) {
+    const globalRoot = globalThis;
+    const windowFlatpickr = Object.getOwnPropertyDescriptor(window, "flatpickr");
+    const globalFlatpickr = globalRoot === window ? windowFlatpickr : Object.getOwnPropertyDescriptor(globalRoot, "flatpickr");
+    const globalZh = Object.getOwnPropertyDescriptor(globalRoot, "zh");
+    const dateIncrement = Object.getOwnPropertyDescriptor(Date.prototype, "fp_incr");
+    const elementFlatpickr = typeof HTMLElement === "undefined" ? null : Object.getOwnPropertyDescriptor(HTMLElement.prototype, "flatpickr");
+    const collectionFlatpickr = typeof HTMLCollection === "undefined" ? null : Object.getOwnPropertyDescriptor(HTMLCollection.prototype, "flatpickr");
+    const nodeListFlatpickr = typeof NodeList === "undefined" ? null : Object.getOwnPropertyDescriptor(NodeList.prototype, "flatpickr");
+    const jqueryFlatpickr = typeof jQuery === "undefined" || !jQuery.fn ? null : Object.getOwnPropertyDescriptor(jQuery.fn, "flatpickr");
+    try {
   const exports = undefined;
   const module = undefined;
   const define = undefined;
@@ -100,5 +114,95 @@ api.registerModule("flatpickr", () => {
   Object.defineProperty(exports, '__esModule', { value: true });
 
 })));
-  return window.flatpickr;
+    flatpickrFactory = window.flatpickr;
+    } finally {
+    restore(window, "flatpickr", windowFlatpickr);
+    if (globalRoot !== window) restore(globalRoot, "flatpickr", globalFlatpickr);
+    restore(globalRoot, "zh", globalZh);
+    restore(Date.prototype, "fp_incr", dateIncrement);
+    if (typeof HTMLElement !== "undefined") restore(HTMLElement.prototype, "flatpickr", elementFlatpickr);
+    if (typeof HTMLCollection !== "undefined") restore(HTMLCollection.prototype, "flatpickr", collectionFlatpickr);
+    if (typeof NodeList !== "undefined") restore(NodeList.prototype, "flatpickr", nodeListFlatpickr);
+    if (typeof jQuery !== "undefined" && jQuery.fn) restore(jQuery.fn, "flatpickr", jqueryFlatpickr);
+    }
+    if (typeof flatpickrFactory !== "function") throw new Error("flatpickr factory unavailable");
+    cachedFlatpickrFactory = flatpickrFactory;
+  }
+
+  let instance = null;
+  let style = null;
+  let targetNode = null;
+  let stopped = false;
+
+  function dayValue(date) {
+    const part = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())}`;
+  }
+
+  function destroyOwnedInstances(primary) {
+    let fallback = null;
+    try { fallback = targetNode?._flatpickr; } catch {}
+    const candidates = primary === fallback ? [primary] : [primary, fallback];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate.destroy !== "function") continue;
+      try { candidate.destroy(); } catch {}
+    }
+    if (targetNode) {
+      try { delete targetNode._flatpickr; } catch {}
+    }
+  }
+
+  function mount() {
+    const target = context.mountTarget;
+    if (stopped || instance || !target?.isConnected || typeof flatpickrFactory !== "function") return;
+    targetNode = target;
+    document.getElementById("codex-live-token-cost-flatpickr-style")?.remove();
+    style = document.createElement("style");
+    style.id = "codex-live-token-cost-flatpickr-style";
+    style.textContent = flatpickrCss;
+    document.head?.appendChild(style);
+    let created = null;
+    try {
+      created = flatpickrFactory(target, {
+        mode: "range",
+        locale: flatpickrFactory.l10ns.zh,
+        dateFormat: "Y-m-d",
+        showMonths: 2,
+        animate: false,
+        onChange(selectedDates) {
+          if (!stopped && selectedDates.length === 2 && typeof context.onApply === "function") {
+            context.onApply(dayValue(selectedDates[0]), dayValue(selectedDates[1]));
+          }
+        },
+      });
+      instance = created;
+      if (!instance || typeof instance.destroy !== "function") throw new Error("flatpickr instance unavailable");
+      instance.open();
+    } catch (error) {
+      destroyOwnedInstances(created);
+      style?.remove();
+      instance = null;
+      style = null;
+      throw error;
+    }
+  }
+
+  function unmount() {
+    if (stopped) return;
+    stopped = true;
+    destroyOwnedInstances(instance);
+    style?.remove();
+    instance = null;
+    style = null;
+    targetNode = null;
+  }
+
+  function reopen() {
+    if (stopped || !instance || typeof instance.open !== "function") return false;
+    instance.open();
+    return true;
+  }
+
+  return Object.freeze({ mount, reopen, unmount });
 });
+})(css);

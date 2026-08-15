@@ -438,6 +438,41 @@ fn settings_lazy_asset_packages_the_frozen_shell_and_typed_actions() {
 }
 
 #[test]
+fn remaining_lazy_views_package_bounded_explicit_workflows_without_startup_bytes() {
+    let startup = include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js");
+    let analytics = codex_plus_core::token_cost::assets::lazy_asset_source(LazyAsset::Analytics);
+    let profile = codex_plus_core::token_cost::assets::lazy_asset_source(LazyAsset::Profile);
+    let flatpickr = codex_plus_core::token_cost::assets::lazy_asset_source(LazyAsset::Flatpickr);
+    let flatpickr_css = include_str!("../../../assets/live_token_cost/flatpickr.css");
+
+    assert!(analytics.contains("query_analytics"));
+    assert!(analytics.contains("sync_cc_switch"));
+    assert!(analytics.contains("MAX_ANALYTICS_DAYS"));
+    assert!(analytics.contains("MAX_ANALYTICS_MODELS"));
+    assert!(analytics.contains("使用统计"));
+    assert!(profile.contains("save_profile"));
+    assert!(profile.contains("codex-live-token-cost-profile-page"));
+    assert!(profile.contains("电子邮箱"));
+    assert!(profile.contains("订阅计划"));
+    assert!(flatpickr.contains("Flatpickr 4.6.13 + zh locale"));
+    assert!(flatpickr.contains("destroy"));
+    assert!(flatpickr.contains("rangeSeparator: \" 至 \""));
+    assert!(!flatpickr_css.to_ascii_lowercase().contains("infinite"));
+
+    for lazy_only in [
+        "cltc-analytics-metrics",
+        "codex-live-token-cost-profile-page",
+        "flatpickr v4.6.13",
+        "flatpickr-calendar",
+    ] {
+        assert!(
+            !startup.contains(lazy_only),
+            "startup unexpectedly contains lazy implementation marker {lazy_only}"
+        );
+    }
+}
+
+#[test]
 fn lazy_expression_uses_an_exact_send_time_instance_guard() {
     let expression = codex_plus_core::token_cost::assets::lazy_asset_expression(&LazyAssetPush {
         instance_id: "page-exact".to_string(),

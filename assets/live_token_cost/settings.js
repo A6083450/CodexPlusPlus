@@ -351,7 +351,10 @@ api.registerModule("settings", (context) => {
   }
 
   function renderUsage() {
-    return section("使用统计", "运行期统计将在首次显式打开后按需加载。");
+    const host = make("div", "cltc-analytics-host");
+    host.dataset.analyticsHost = "true";
+    host.appendChild(section("使用统计", "运行期统计将在首次显式打开后按需加载。"));
+    return host;
   }
 
   function renderNavigation() {
@@ -371,9 +374,8 @@ api.registerModule("settings", (context) => {
 
   function refreshVisibilityUi() {
     if (!config.profile_visible && activePanel === "profile") {
-      activePanel = "general";
-      renderNavigation();
       renderPanel("general");
+      renderNavigation();
       return;
     }
     renderNavigation();
@@ -381,6 +383,8 @@ api.registerModule("settings", (context) => {
 
   function renderPanel(name) {
     if (!content || !["profile", "general", "usage", "pricing"].includes(name)) return;
+    if (name === activePanel && content.firstElementChild) return;
+    if (activePanel === "usage") context.closeAnalytics();
     activePanel = name;
     modal.dataset.settingsActive = name;
     for (const item of overlay.querySelectorAll("[data-settings-panel]")) {
@@ -391,6 +395,16 @@ api.registerModule("settings", (context) => {
       : name === "general" ? renderGeneral()
         : name === "pricing" ? renderPricing() : renderUsage();
     content.appendChild(panel);
+    if (name === "usage") {
+      context.requestAnalytics(panel, () => {
+        if (!stopped && activePanel === "usage" && panel.isConnected) {
+          clear(panel);
+          const fallback = section("使用统计", "统计模块加载失败，请重新打开后重试。");
+          fallback.classList.add("cltc-settings-error");
+          panel.appendChild(fallback);
+        }
+      });
+    }
   }
 
   function priceField(name) {
@@ -662,6 +676,7 @@ api.registerModule("settings", (context) => {
   function unmount() {
     if (stopped) return;
     stopped = true;
+    context.closeAnalytics();
     if (overlay) {
       overlay.removeEventListener("click", onClick);
       overlay.removeEventListener("change", onChange);

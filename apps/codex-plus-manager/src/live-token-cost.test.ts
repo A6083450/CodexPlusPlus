@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import vm from "node:vm";
@@ -7,8 +8,8 @@ type Listener = (event: FakeEvent) => void;
 type BridgeCall = { at: number; path: string; payload: any };
 
 class FakeEvent {
-  readonly type: string;
-  readonly bubbles: boolean;
+  type: string;
+  bubbles: boolean;
   readonly detail: any;
   target: FakeElement | FakeDocument | null;
   currentTarget: FakeElement | FakeDocument | null = null;
@@ -26,6 +27,7 @@ class FakeEvent {
 
   preventDefault() { this.defaultPrevented = true; }
   stopPropagation() { this.propagationStopped = true; }
+  initEvent(type: string, bubbles: boolean) { this.type = type; this.bubbles = bubbles; }
 }
 
 function dataAttribute(name: string) {
@@ -68,6 +70,7 @@ class FakeStyle {
 class FakeElement {
   readonly ownerDocument: FakeDocument;
   readonly tagName: string;
+  readonly namespaceURI: string;
   readonly attributes = new Map<string, string>();
   readonly children: FakeElement[] = [];
   readonly listeners = new Map<string, Listener[]>();
@@ -91,9 +94,10 @@ class FakeElement {
   private titleValue = "";
   private ownText = "";
 
-  constructor(ownerDocument: FakeDocument, tagName: string) {
+  constructor(ownerDocument: FakeDocument, tagName: string, namespaceURI = "http://www.w3.org/1999/xhtml") {
     this.ownerDocument = ownerDocument;
     this.tagName = tagName.toUpperCase();
+    this.namespaceURI = namespaceURI;
     this.dataset = new Proxy({}, {
       get: (_target, key) => typeof key === "string" ? this.getAttribute(dataAttribute(key)) ?? undefined : undefined,
       set: (_target, key, value) => {
@@ -123,6 +127,13 @@ class FakeElement {
   }
 
   get childNodes() { return this.children; }
+  get firstChild(): FakeElement | null { return this.children[0] || null; }
+  get lastChild(): FakeElement | null { return this.children.at(-1) || null; }
+  get parentNode() { return this.parentElement; }
+  get nodeName() { return this.tagName; }
+  get nodeType() { return 1; }
+  get offsetWidth() { return 280; }
+  get offsetHeight() { return 36; }
   get disabled() { return this.disabledValue; }
   set disabled(value: boolean) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; this.disabledValue = Boolean(value); }
   get hidden() { return this.hiddenValue; }
@@ -197,6 +208,10 @@ class FakeElement {
   }
   append(...nodes: FakeElement[]) { nodes.forEach((node) => this.appendChild(node)); }
   appendChild<T extends FakeElement>(node: T): T {
+    if (node.tagName === "#DOCUMENT-FRAGMENT") {
+      for (const child of [...node.children]) this.appendChild(child);
+      return node;
+    }
     node.remove();
     this.ownText = "";
     this.children.push(node);
@@ -221,6 +236,10 @@ class FakeElement {
     this.parentElement = null;
     this.ownerDocument.domOperations += 1;
   }
+  removeChild<T extends FakeElement>(node: T): T { node.remove(); return node; }
+  getRootNode() { return this.ownerDocument; }
+  getBoundingClientRect() { return { top: 80, right: 280, bottom: 116, left: 20, width: 260, height: 36, x: 20, y: 80 }; }
+  getElementsByTagName(tagName: string) { return this.querySelectorAll(tagName); }
   matches(selector: string) { return selector.split(",").some((part) => matchesSimple(this, part)); }
   closest(selector: string): FakeElement | null {
     let current: FakeElement | null = this;
@@ -292,6 +311,9 @@ class FakeDocument {
     this.documentElement.append(this.head, this.body);
   }
   createElement(tagName: string) { this.domOperations += 1; return new FakeElement(this, tagName); }
+  createElementNS(namespaceURI: string, tagName: string) { this.domOperations += 1; return new FakeElement(this, tagName, namespaceURI); }
+  createDocumentFragment() { this.domOperations += 1; return new FakeElement(this, "#document-fragment"); }
+  createEvent(type: string) { return new FakeEvent(type); }
   getElementById(id: string) {
     if (this.documentElement.id === id) return this.documentElement;
     return this.documentElement.querySelector(`#${id}`);
@@ -375,14 +397,24 @@ type Harness = {
   window: Record<string, any>;
   run: () => void;
   runSettings: () => void;
+  runAnalytics: () => void;
+  runProfile: () => void;
+  runFlatpickr: () => void;
+  evaluate: (source: string) => any;
   settle: () => Promise<void>;
   settleBridgeCalls: () => Promise<void>;
   setBridge: (handler: (path: string, payload: any) => any) => void;
 };
 
 async function createHarness(initialBridge?: (path: string, payload: any) => any): Promise<Harness> {
-  const source = await readFile(new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url), "utf8");
-  const settingsSource = await readFile(new URL("../../../assets/live_token_cost/settings.js", import.meta.url), "utf8");
+  const [source, settingsSource, analyticsSource, profileSource, flatpickrSource, flatpickrCss] = await Promise.all([
+    readFile(new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url), "utf8"),
+    readFile(new URL("../../../assets/live_token_cost/settings.js", import.meta.url), "utf8"),
+    readFile(new URL("../../../assets/live_token_cost/analytics.js", import.meta.url), "utf8"),
+    readFile(new URL("../../../assets/live_token_cost/profile.js", import.meta.url), "utf8"),
+    readFile(new URL("../../../assets/live_token_cost/flatpickr.js", import.meta.url), "utf8"),
+    readFile(new URL("../../../assets/live_token_cost/flatpickr.css", import.meta.url), "utf8"),
+  ]);
   const document = new FakeDocument();
   const clock = new FakeClock();
   const bridgeCalls: BridgeCall[] = [];
@@ -418,6 +450,18 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
     removeEventListener() {},
     dispatchEvent() { return true; },
     postMessage() {},
+    navigator: { userAgent: "CodexPlusPlus test" },
+    innerWidth: 1280,
+    innerHeight: 800,
+    pageXOffset: 0,
+    pageYOffset: 0,
+    fetch: function hostFetch() {},
+    XMLHttpRequest: class HostXMLHttpRequest {},
+    WebSocket: class HostWebSocket {},
+    electronBridge: Object.freeze({ invoke() {} }),
+    __hostReactContext: Object.freeze({ name: "react-context" }),
+    __hostStatsig: Object.freeze({ name: "statsig" }),
+    __hostAuth: Object.freeze({ name: "auth" }),
     __codexPlusPostJson(path: string, payload: any) {
       bridgeCalls.push({ at: clock.now, path, payload: structuredClone(payload) });
       const promise = Promise.resolve().then(() => bridge(path, payload));
@@ -440,19 +484,41 @@ async function createHarness(initialBridge?: (path: string, payload: any) => any
     window: windowObject, self: windowObject, document, localStorage, location: windowObject.location,
     console, URL, Blob, TextEncoder, TextDecoder, CustomEvent: FakeEvent, Event: FakeEvent,
     Date: ClockDate,
+    navigator: windowObject.navigator,
+    HTMLElement: FakeElement, Node: FakeElement, HTMLCollection: Array, NodeList: Array,
     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
     setInterval: windowObject.setInterval, clearInterval: windowObject.clearInterval,
     MutationObserver: class { constructor() { document.observerCount += 1; } },
+    fetch: windowObject.fetch, XMLHttpRequest: windowObject.XMLHttpRequest, WebSocket: windowObject.WebSocket,
+    electronBridge: windowObject.electronBridge,
   };
   const settle = async () => { for (let index = 0; index < 8; index += 1) await Promise.resolve(); };
   return {
     clock, document, bridgeCalls, window: windowObject,
     run: () => vm.runInNewContext(source, context), settle,
+    evaluate: (snippet) => vm.runInNewContext(snippet, context),
     settleBridgeCalls: async () => { await Promise.allSettled(bridgePromises); },
     runSettings: () => {
       (context as Record<string, any>).api = windowObject.__codexLiveTokenCostV1;
       vm.runInNewContext(settingsSource, context);
       delete (context as Record<string, any>).api;
+    },
+    runAnalytics: () => {
+      (context as Record<string, any>).api = windowObject.__codexLiveTokenCostV1;
+      vm.runInNewContext(analyticsSource, context);
+      delete (context as Record<string, any>).api;
+    },
+    runProfile: () => {
+      (context as Record<string, any>).api = windowObject.__codexLiveTokenCostV1;
+      vm.runInNewContext(profileSource, context);
+      delete (context as Record<string, any>).api;
+    },
+    runFlatpickr: () => {
+      (context as Record<string, any>).api = windowObject.__codexLiveTokenCostV1;
+      (context as Record<string, any>).css = flatpickrCss;
+      vm.runInNewContext(flatpickrSource, context);
+      delete (context as Record<string, any>).api;
+      delete (context as Record<string, any>).css;
     },
     setBridge(handler) { bridge = handler; },
   };
@@ -545,6 +611,32 @@ function updatedResponse(config: Record<string, any>, revision: number) {
       }),
     },
   };
+}
+
+function analyticsTotals(overrides: Record<string, number> = {}) {
+  return {
+    turns: 0, steps: 0, input: 0, cached_input: 0, cache_write: 0, output: 0,
+    cost_nanos: 0, llm_ms: 0, tool_ms: 0, first_token_total_ms: 0,
+    first_token_samples: 0, generation_ms: 0, generation_output_tokens: 0,
+    ...overrides,
+  };
+}
+
+function analyticsSnapshot(overrides: Record<string, any> = {}) {
+  return {
+    from_day: "2026-08-15", to_day: "2026-08-15",
+    totals: analyticsTotals({ turns: 12, steps: 34, input: 128_000, cached_input: 92_160, output: 18_000, cost_nanos: 123_000_000 }),
+    days: [{ day: "2026-08-15", totals: analyticsTotals({ turns: 12, input: 128_000, output: 18_000 }) }],
+    models: [{ model: "gpt-5.6-sol", totals: analyticsTotals({ turns: 12, steps: 34, input: 128_000, output: 18_000, cost_nanos: 123_000_000 }) }],
+    ...overrides,
+  };
+}
+
+function deferred<T = any>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: any) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
@@ -1014,6 +1106,35 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
       hiddenModal.querySelectorAll("[data-settings-panel]").map((node) => node.textContent),
       ["数据与显示", "使用统计", "模型价格"],
     );
+  });
+
+  it("repaints General when a delayed visibility save hides the currently selected Profile panel", async () => {
+    const visibility = deferred<any>();
+    const hiddenConfig = baseConfig({ profile_visible: false });
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/action" && payload.action.type === "set_visibility") return visibility.promise;
+      return { status: "ok" };
+    });
+    harness.run();
+    await harness.settle();
+    harness.runSettings();
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+    overlay.querySelector("[data-settings-panel='general']")!.click();
+    const profileToggle = overlay.querySelector("[data-misc-field='profileUnlockEnabled']")!;
+    profileToggle.checked = false;
+    profileToggle.dispatchEvent(new FakeEvent("change"));
+    assert.equal(actionCalls(harness, "set_visibility").length, 1);
+    overlay.querySelector("[data-settings-panel='profile']")!.click();
+    assert.ok(overlay.querySelector("[data-profile-field='email']"));
+    visibility.resolve(updatedResponse(hiddenConfig, 2));
+    await harness.settle();
+    assert.equal(harness.window.__codexLiveTokenCostV1.diagnostics().revision, 2);
+    assert.equal(overlay.querySelector(".cltc-settings-modal")!.dataset.settingsActive, "general");
+    assert.equal(overlay.querySelector("[data-settings-panel='profile']"), null);
+    assert.ok(overlay.querySelector("[data-misc-field='profileUnlockEnabled']"), "General body must replace the now-hidden Profile body");
+    assert.equal(overlay.querySelector("[data-profile-field='email']"), null);
   });
 
   it("settings focuses the accessible close control and handles Escape from the real active element", async () => {
@@ -2067,5 +2188,767 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     });
     assert.equal(profile.identityItem.getAttribute("data-codex-plus-token-cost-profile-entry"), null);
     assert.equal(api.acceptNativePush({ type: "snapshot", instance_id: api.instanceId, snapshot: baseSnapshot(9) }), false);
+  });
+});
+
+describe("lazy analytics calendar and profile views", () => {
+  async function openAnalytics(harness: Harness) {
+    harness.run();
+    await harness.settle();
+    harness.runSettings();
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+    overlay.querySelector("[data-settings-panel='usage']")!.click();
+    return overlay;
+  }
+
+  it("loads analytics only from Usage and renders bounded native results with monotonic queries", async () => {
+    const seven = deferred<any>();
+    const thirty = deferred<any>();
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        if (payload.action.range.type === "last_seven_days") return seven.promise;
+        if (payload.action.range.type === "last_thirty_days") return thirty.promise;
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    });
+
+    harness.run();
+    await harness.settle();
+    harness.runSettings();
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+    for (const panel of ["general", "profile", "pricing"]) overlay.querySelector(`[data-settings-panel='${panel}']`)!.click();
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "analytics").length, 0);
+    assert.equal(actionCalls(harness, "query_analytics").length, 0);
+
+    overlay.querySelector("[data-settings-panel='usage']")!.click();
+    overlay.querySelector("[data-settings-panel='usage']")!.click();
+    assert.deepEqual(lazyCalls(harness).map((call) => call.payload.asset), ["analytics"]);
+    harness.runAnalytics();
+    await harness.settle();
+    assert.deepEqual(actionCalls(harness, "query_analytics").map((call) => call.payload.action.range), [{ type: "today" }]);
+    const analytics = overlay.querySelector(".cltc-analytics")!;
+    assert.ok(analytics);
+    assert.equal(analytics.classList.contains("cltc-settings-section"), true);
+    assert.equal(analytics.querySelector("h2")!.textContent, "使用统计");
+    assert.equal(analytics.querySelector(".cltc-settings-section-heading")!.querySelector("p")!.textContent, "基于 HUD、Profile 与 CC Switch 相同的本地去重口径。");
+    assert.deepEqual(analytics.querySelectorAll(".cltc-analytics-metric").map((node) => node.children[0].textContent), ["总 Token", "总花费", "模型调用", "缓存命中率"]);
+    assert.equal(analytics.querySelectorAll(".cltc-analytics-section").length, 3);
+    assert.ok(analytics.querySelector(".cltc-composition-bar"));
+    const chart = analytics.querySelector("[data-analytics-chart]")!;
+    assert.equal(chart.tagName, "SVG");
+    assert.equal(chart.namespaceURI, "http://www.w3.org/2000/svg");
+    assert.equal(chart.querySelector("rect")!.namespaceURI, "http://www.w3.org/2000/svg");
+    assert.deepEqual(analytics.querySelector(".cltc-analytics-model-head")!.children.map((node) => node.textContent), ["模型", "Token", "模型调用", "花费", "占比"]);
+    assert.match(analytics.textContent, /146K/);
+    assert.match(analytics.textContent, /\$0\.12/);
+    assert.match(analytics.textContent, /72%/);
+
+    const hostileDays = Array.from({ length: 40 }, (_, index) => ({
+      day: `2026-07-${String((index % 31) + 1).padStart(2, "0")}`,
+      totals: analyticsTotals({ turns: 1, input: index + 1 }),
+    }));
+    const hostileModels = Array.from({ length: 30 }, (_, index) => ({
+      model: `model-${String(index).padStart(2, "0")}`,
+      totals: analyticsTotals({ turns: 1, input: 100 - index, cost_nanos: index + 1 }),
+    }));
+    overlay.querySelector("[data-analytics-preset='7d']")!.click();
+    overlay.querySelector("[data-analytics-preset='30d']")!.click();
+    assert.deepEqual(actionCalls(harness, "query_analytics").slice(-2).map((call) => call.payload.action.range), [
+      { type: "last_seven_days" }, { type: "last_thirty_days" },
+    ]);
+    thirty.resolve({ status: "ok", response: { type: "analytics", analytics: analyticsSnapshot({ from_day: "2026-07-17", to_day: "2026-08-15", days: hostileDays, models: hostileModels }) } });
+    await harness.settle();
+    assert.equal(overlay.querySelectorAll("[data-chart-index]").length, 31);
+    assert.equal(overlay.querySelectorAll(".cltc-analytics-model-row").length, 20);
+    assert.equal(overlay.querySelectorAll(".cltc-analytics-model-row[data-hidden='true']").length, 10);
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-08-15");
+    seven.resolve({ status: "ok", response: { type: "analytics", analytics: analyticsSnapshot({ to_day: "2026-01-01" }) } });
+    await harness.settle();
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-08-15", "late analytics response must be inert");
+
+    overlay.querySelector(".cltc-analytics-model-row")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "query_analytics").at(-1)!.payload.action.model, "model-00");
+    const filter = overlay.querySelector("[data-action='clear-analytics-model']")!;
+    assert.match(filter.textContent, /model-00.*×/);
+    overlay.querySelector("[data-analytics-preset='today']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "query_analytics").at(-1)!.payload.action.model, "model-00", "range changes preserve the explicit model filter");
+    overlay.querySelector("[data-action='clear-analytics-model']")!.click();
+    await harness.settle();
+    assert.equal(Object.hasOwn(actionCalls(harness, "query_analytics").at(-1)!.payload.action, "model"), false);
+    overlay.querySelector("[data-settings-panel='general']")!.click();
+    assert.equal(overlay.querySelector(".cltc-analytics"), null);
+    assert.equal(harness.document.getElementById("codex-live-token-cost-analytics-style"), null);
+    const lazyCount = lazyCalls(harness).length;
+    overlay.querySelector("[data-settings-panel='usage']")!.click();
+    await harness.settle();
+    assert.equal(lazyCalls(harness).length, lazyCount, "warm analytics reuses its cached factory");
+    overlay.querySelector("[data-action='close-price']")!.click();
+    assert.equal(harness.document.querySelector(".cltc-analytics"), null);
+  });
+
+  it("keeps analytics empty and manual CC Switch paths bounded and explicit", async () => {
+    let syncMode: "success" | "error" = "success";
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot({ totals: analyticsTotals(), days: [], models: [] }) } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "sync_cc_switch") {
+        if (syncMode === "error") throw new Error("offline");
+        return { status: "ok", response: { type: "synced", imported_turns: 3, analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+    assert.equal(overlay.querySelectorAll(".cltc-analytics-empty").length, 1);
+    assert.equal(harness.clock.tasks.size, 0);
+
+    overlay.querySelector("[data-action='sync-analytics-cc-switch']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "sync_cc_switch").length, 1);
+    assert.match(overlay.querySelector("[data-analytics-status='sync']")!.textContent, /已同步 3 条/);
+    assert.equal(harness.clock.tasks.size, 0);
+    syncMode = "error";
+    overlay.querySelector("[data-action='sync-analytics-cc-switch']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "sync_cc_switch").length, 2);
+    assert.equal(overlay.querySelectorAll(".cltc-analytics-error").length, 1);
+    assert.equal(harness.clock.tasks.size, 0);
+    assert.equal(actionCalls(harness).some((call) => ["set_visibility", "save_price", "save_profile"].includes(call.payload.action.type)), false);
+  });
+
+  it("coalesces repeated CC Switch sync clicks until the owner request settles", async () => {
+    const pendingSync = deferred<any>();
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "sync_cc_switch") return pendingSync.promise;
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+    const sync = overlay.querySelector("[data-action='sync-analytics-cc-switch']")!;
+
+    sync.click();
+    sync.click();
+    assert.equal(actionCalls(harness, "sync_cc_switch").length, 1);
+    assert.equal(sync.disabled, true);
+    assert.equal(harness.clock.tasks.size, 0);
+
+    pendingSync.resolve({
+      status: "ok",
+      response: {
+        type: "synced",
+        imported_turns: 6,
+        analytics: analyticsSnapshot({ from_day: "2026-06-01", to_day: "2026-06-30" }),
+      },
+    });
+    await harness.settle();
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-06-30");
+    assert.match(overlay.querySelector("[data-analytics-status='sync']")!.textContent, /已同步 6 条/);
+    assert.equal(sync.disabled, false);
+    assert.equal(actionCalls(harness, "sync_cc_switch").length, 1);
+    assert.equal(harness.clock.tasks.size, 0);
+  });
+
+  it("aligns filters and range controls to the authoritative CC Switch snapshot", async () => {
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "sync_cc_switch") {
+        return {
+          status: "ok",
+          response: {
+            type: "synced",
+            imported_turns: 4,
+            analytics: analyticsSnapshot({ from_day: "2026-06-01", to_day: "2026-06-30" }),
+          },
+        };
+      }
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+
+    overlay.querySelector("[data-analytics-preset='7d']")!.click();
+    await harness.settle();
+    overlay.querySelector(".cltc-analytics-model-row")!.click();
+    await harness.settle();
+    assert.equal(overlay.querySelector("[data-analytics-preset='7d']")!.dataset.active, "true");
+    assert.equal(overlay.querySelector("[data-action='clear-analytics-model']")!.hidden, false);
+
+    overlay.querySelector("[data-action='sync-analytics-cc-switch']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "sync_cc_switch").length, 1);
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-06-30");
+    assert.equal(overlay.querySelector("[data-analytics-preset='custom']")!.dataset.active, "true");
+    assert.equal(overlay.querySelector("[data-analytics-preset='7d']")!.dataset.active, "false");
+    assert.equal(overlay.querySelector("[data-action='open-analytics-calendar']")!.hidden, false);
+    assert.equal(overlay.querySelector("[data-action='open-analytics-calendar']")!.textContent, "2026-06-01 – 2026-06-30");
+    assert.equal(overlay.querySelector("[data-action='clear-analytics-model']")!.hidden, true);
+
+    overlay.querySelector("[data-analytics-preset='today']")!.click();
+    await harness.settle();
+    assert.equal(Object.hasOwn(actionCalls(harness, "query_analytics").at(-1)!.payload.action, "model"), false);
+  });
+
+  it("keeps the latest explicit Analytics action authoritative across sync and range queries", async () => {
+    const pendingSync = deferred<any>();
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "sync_cc_switch") return pendingSync.promise;
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        const toDay = payload.action.range.type === "last_seven_days" ? "2026-08-20" : "2026-08-15";
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot({ to_day: toDay }) } };
+      }
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+    overlay.querySelector("[data-action='sync-analytics-cc-switch']")!.click();
+    overlay.querySelector("[data-analytics-preset='7d']")!.click();
+    await harness.settle();
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-08-20");
+    pendingSync.resolve({
+      status: "ok",
+      response: { type: "synced", imported_turns: 9, analytics: analyticsSnapshot({ to_day: "2026-01-01" }) },
+    });
+    await harness.settle();
+    assert.equal(overlay.querySelector("[data-analytics-result]")!.dataset.toDay, "2026-08-20", "late sync must not replace a newer range query");
+    assert.equal(overlay.querySelector("[data-analytics-status='sync']"), null);
+  });
+
+  it("loads calendar only from the custom trigger with one explicit retry and cached cleanup", async () => {
+    const bridge = (path: string, payload: any) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    };
+    const failed = await createHarness(bridge);
+    const failedOverlay = await openAnalytics(failed);
+    failed.runAnalytics();
+    await failed.settle();
+    assert.equal(lazyCalls(failed).some((call) => call.payload.asset === "flatpickr"), false);
+    assert.equal(failed.window.flatpickr, undefined);
+    failedOverlay.querySelector("[data-analytics-preset='7d']")!.click();
+    await failed.settle();
+    assert.equal(lazyCalls(failed).some((call) => call.payload.asset === "flatpickr"), false);
+    failedOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    assert.equal(lazyCalls(failed).some((call) => call.payload.asset === "flatpickr"), false);
+    const trigger = failedOverlay.querySelector("[data-action='open-analytics-calendar']")!;
+    trigger.click();
+    trigger.click();
+    assert.equal(lazyCalls(failed).filter((call) => call.payload.asset === "flatpickr").length, 1);
+    assert.equal(failed.window.__codexLiveTokenCostV1.registerModule("flatpickr", null), false);
+    assert.equal(failedOverlay.querySelectorAll(".cltc-analytics-error").length, 1);
+    trigger.click();
+    assert.equal(lazyCalls(failed).filter((call) => call.payload.asset === "flatpickr").length, 2);
+    failed.window.__codexLiveTokenCostV1.acceptLazyError({ asset: "flatpickr" });
+    trigger.click();
+    assert.equal(lazyCalls(failed).filter((call) => call.payload.asset === "flatpickr").length, 2, "second owner failure exhausts retries");
+    assert.equal(failed.clock.tasks.size, 0);
+
+    const invalidInstance = await createHarness(bridge);
+    const invalidOverlay = await openAnalytics(invalidInstance);
+    invalidInstance.runAnalytics();
+    await invalidInstance.settle();
+    invalidOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    invalidOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    assert.equal(invalidInstance.window.__codexLiveTokenCostV1.registerModule("flatpickr", () => ({ mount() {} })), false);
+    assert.equal(invalidOverlay.querySelectorAll(".cltc-analytics-error").length, 1);
+    invalidOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    assert.equal(lazyCalls(invalidInstance).filter((call) => call.payload.asset === "flatpickr").length, 2, "invalid instances are not retained as cached factories");
+
+    const failedInitialization = await createHarness(bridge);
+    const failedInitializationOverlay = await openAnalytics(failedInitialization);
+    failedInitialization.runAnalytics();
+    await failedInitialization.settle();
+    failedInitialization.evaluate("window.__hostDateIncrement = function hostDateIncrement() {}; Object.defineProperty(Date.prototype, 'fp_incr', { configurable: true, enumerable: false, writable: false, value: window.__hostDateIncrement }); delete HTMLElement.prototype.flatpickr;");
+    const failedDatePrototypeBefore = failedInitialization.evaluate("Date.prototype.fp_incr");
+    failedInitializationOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    failedInitializationOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    failedInitialization.runFlatpickr();
+    assert.equal(failedInitialization.evaluate("Date.prototype.fp_incr"), failedDatePrototypeBefore);
+    assert.equal(failedInitialization.evaluate("HTMLElement.prototype.flatpickr"), undefined, "partial library initialization restores host prototypes");
+    assert.equal(failedInitializationOverlay.querySelectorAll(".cltc-analytics-error").length, 1);
+
+    const success = await createHarness(bridge);
+    const successOverlay = await openAnalytics(success);
+    success.runAnalytics();
+    await success.settle();
+    success.evaluate("window.__flatpickrLibraryWrites = 0; window.__hostDateIncrement = function hostDateIncrement() {}; Object.defineProperty(Date.prototype, 'fp_incr', { configurable: true, get() { return window.__hostDateIncrement; }, set() { window.__flatpickrLibraryWrites += 1; } }); HTMLElement.prototype.flatpickr = function hostElementFlatpickr() {};");
+    const datePrototypeBefore = success.evaluate("Date.prototype.fp_incr");
+    const elementPrototypeBefore = success.evaluate("HTMLElement.prototype.flatpickr");
+    successOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    successOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    success.runFlatpickr();
+    const libraryWritesAfterColdOpen = success.evaluate("window.__flatpickrLibraryWrites");
+    assert.equal(success.document.querySelectorAll(".flatpickr-calendar").length, 1);
+    assert.equal(success.document.querySelectorAll("#codex-live-token-cost-flatpickr-style").length, 1);
+    assert.equal(success.window.flatpickr, undefined, "library globals are restored after instance creation");
+    assert.equal(success.evaluate("Date.prototype.fp_incr"), datePrototypeBefore);
+    assert.equal(success.evaluate("HTMLElement.prototype.flatpickr"), elementPrototypeBefore);
+    const firstDay = success.document.querySelectorAll(".flatpickr-day").find((node) => !node.classList.contains("flatpickr-disabled"))!;
+    const firstTime = (firstDay as any).dateObj.getTime();
+    firstDay.click();
+    const secondDay = success.document.querySelectorAll(".flatpickr-day").find((node) => !node.classList.contains("flatpickr-disabled") && (node as any).dateObj.getTime() > firstTime)!;
+    secondDay.click();
+    await success.settle();
+    const customAction = actionCalls(success, "query_analytics").at(-1)!.payload.action;
+    assert.equal(customAction.range.type, "custom");
+    assert.match(customAction.range.from_day, /^\d{4}-\d{2}-\d{2}$/);
+    assert.match(customAction.range.to_day, /^\d{4}-\d{2}-\d{2}$/);
+    assert.ok(customAction.range.from_day <= customAction.range.to_day);
+    assert.equal(success.document.querySelector(".flatpickr-calendar"), null, "range apply destroys the owned instance");
+    assert.equal(success.document.getElementById("codex-live-token-cost-flatpickr-style"), null);
+    successOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    successOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    assert.equal(success.document.querySelectorAll(".flatpickr-calendar").length, 1);
+    assert.equal(success.evaluate("window.__flatpickrLibraryWrites"), libraryWritesAfterColdOpen, "warm open reuses the initialized Flatpickr factory");
+    successOverlay.querySelector("[data-analytics-preset='today']")!.click();
+    await success.settle();
+    assert.equal(success.document.querySelector(".flatpickr-calendar"), null);
+    assert.equal(success.document.getElementById("codex-live-token-cost-flatpickr-style"), null);
+    const calls = lazyCalls(success).filter((call) => call.payload.asset === "flatpickr").length;
+    successOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    successOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    assert.equal(lazyCalls(success).filter((call) => call.payload.asset === "flatpickr").length, calls);
+    assert.equal(success.document.querySelectorAll(".flatpickr-calendar").length, 1);
+    successOverlay.querySelector("[data-settings-panel='general']")!.click();
+    assert.equal(success.document.querySelector(".flatpickr-calendar"), null);
+    assert.equal(success.document.getElementById("codex-live-token-cost-flatpickr-style"), null);
+  });
+
+  it("reopens the existing Flatpickr child after a natural calendar close", async () => {
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(harness);
+    harness.runAnalytics();
+    await harness.settle();
+    overlay.querySelector("[data-analytics-preset='custom']")!.click();
+    const trigger = overlay.querySelector("[data-action='open-analytics-calendar']")!;
+    trigger.click();
+    harness.runFlatpickr();
+
+    const target = overlay.querySelector("[data-analytics-date-input]")! as any;
+    const instance = target._flatpickr;
+    assert.ok(instance);
+    let reopenCalls = 0;
+    const open = instance.open.bind(instance);
+    instance.open = () => { reopenCalls += 1; return open(); };
+    instance.close();
+    assert.equal(instance.isOpen, false);
+    const lazyCount = lazyCalls(harness).filter((call) => call.payload.asset === "flatpickr").length;
+
+    trigger.click();
+    assert.equal(reopenCalls, 1, "the live child must reopen instead of treating the click as a no-op");
+    assert.equal(target._flatpickr, instance);
+    assert.equal(harness.document.querySelectorAll(".flatpickr-calendar").length, 1);
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "flatpickr").length, lazyCount);
+  });
+
+  it("destroys real partial Flatpickr instances exactly once when mounting fails", async () => {
+    const bridge = (path: string, payload: any) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    };
+
+    const lateAssignment = await createHarness(bridge);
+    const lateOverlay = await openAnalytics(lateAssignment);
+    lateAssignment.runAnalytics();
+    await lateAssignment.settle();
+    lateOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    lateOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    const lateTarget = lateOverlay.querySelector("[data-analytics-date-input]")! as any;
+    const lateListeners = [...lateAssignment.document.listeners.values()].reduce((total, listeners) => total + listeners.length, 0);
+    const lateDatePrototype = lateAssignment.evaluate("Date.prototype.fp_incr");
+    let lateInstance: any;
+    let lateDestroyCalls = 0;
+    Object.defineProperty(lateTarget, "_flatpickr", {
+      configurable: true,
+      get: () => lateInstance,
+      set: (value) => {
+        lateInstance = value;
+        const destroy = value.destroy.bind(value);
+        value.destroy = () => { lateDestroyCalls += 1; return destroy(); };
+        throw new Error("late target assignment failure");
+      },
+    });
+    lateAssignment.runFlatpickr();
+    assert.equal(lateDestroyCalls, 1);
+    assert.equal(lateAssignment.document.querySelectorAll(".flatpickr-calendar").length, 0);
+    assert.equal(Boolean(lateAssignment.document.getElementById("codex-live-token-cost-flatpickr-style")), false);
+    assert.equal([...lateAssignment.document.listeners.values()].reduce((total, listeners) => total + listeners.length, 0), lateListeners);
+    assert.equal(lateAssignment.window.flatpickr, undefined);
+    assert.equal(lateAssignment.evaluate("Date.prototype.fp_incr"), lateDatePrototype);
+
+    const openFailure = await createHarness(bridge);
+    const openOverlay = await openAnalytics(openFailure);
+    openFailure.runAnalytics();
+    await openFailure.settle();
+    openOverlay.querySelector("[data-analytics-preset='custom']")!.click();
+    openOverlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    const openTarget = openOverlay.querySelector("[data-analytics-date-input]")! as any;
+    let openInstance: any;
+    let openDestroyCalls = 0;
+    Object.defineProperty(openTarget, "_flatpickr", {
+      configurable: true,
+      get: () => openInstance,
+      set: (value) => {
+        openInstance = value;
+        const destroy = value.destroy.bind(value);
+        value.destroy = () => { openDestroyCalls += 1; return destroy(); };
+        value.open = () => { throw new Error("late open failure"); };
+      },
+    });
+    openFailure.runFlatpickr();
+    assert.equal(openDestroyCalls, 1, "the returned instance and target fallback are the same owner");
+    assert.equal(openFailure.document.querySelectorAll(".flatpickr-calendar").length, 0);
+    assert.equal(Boolean(openFailure.document.getElementById("codex-live-token-cost-flatpickr-style")), false);
+  });
+
+  it("opens a single local profile only from exact lifecycle and guards save and cleanup ownership", async () => {
+    let revision = 1;
+    let config = baseConfig({
+      profile: { ...baseConfig().profile, display_name: "Local Usage", username: "local-usage", email: "local@example.com", plan_label: "Pro 20x" },
+    });
+    let saveMode: "success" | "error" | "pending" = "success";
+    let pendingSave = deferred<any>();
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id, { config: structuredClone(config) });
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "save_profile") {
+        if (saveMode === "error") throw new Error("save failed");
+        if (saveMode === "pending") return pendingSave.promise;
+        config = { ...config, profile: structuredClone(payload.action.profile) };
+        return updatedResponse(config, ++revision);
+      }
+      return { status: "ok" };
+    });
+    const menu = installProfileMenu(harness.document);
+    const before = harness.evaluate("({filter:Array.prototype.filter,test:RegExp.prototype.test,fetch,XMLHttpRequest,WebSocket,electronBridge,react:window.__hostReactContext,statsig:window.__hostStatsig,auth:window.__hostAuth})");
+    harness.run();
+    await harness.settle();
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_menu", profile: true, profileMenuId: menu.menu.id } }));
+    for (const detail of [null, {}, { reason: "profile_entry" }, { reason: "profile_entry", profile: false }, { reason: "other", profile: true }]) {
+      harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail }));
+    }
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "profile").length, 0);
+    harness.runSettings();
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    assert.ok(harness.document.querySelector(".cltc-settings-modal"));
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "profile").length, 1);
+    assert.equal(harness.document.querySelector(".cltc-settings-modal"), null, "Profile replaces the prior top-level owner");
+    harness.runProfile();
+    const page = harness.document.getElementById("codex-live-token-cost-profile-page")!;
+    assert.ok(page);
+    assert.equal(page.parentElement!.tagName, "MAIN");
+    assert.equal(page.querySelector(".cltc-profile-head"), null, "frozen Profile page has no injected duplicate heading");
+    assert.equal(harness.document.querySelectorAll("#codex-live-token-cost-profile-page").length, 1);
+    assert.deepEqual(page.querySelectorAll("[data-profile-tab]").map((tab) => tab.textContent), ["个人资料", "通知", "数据控制"]);
+    assert.match(page.textContent, /Local Usage/);
+    assert.match(page.textContent, /@local-usage/);
+    assert.match(page.textContent, /local@example\.com/);
+    assert.match(page.textContent, /Codex Pro 20x/);
+    assert.match(page.textContent, /12/);
+    assert.match(page.textContent, /146K/);
+    assert.ok(page.querySelector(".profile-card"));
+    const activity = page.querySelector(".cltc-profile-activity")!;
+    assert.equal(activity.hidden, true, "the frozen default Profile viewport remains empty below the card");
+    page.querySelector("[data-profile-tab='数据控制']")!.click();
+    assert.equal(activity.hidden, false, "bounded runtime activity is available from the explicit data tab");
+    assert.equal(page.querySelector(".profile-card")!.hidden, true);
+    page.querySelector("[data-profile-tab='个人资料']")!.click();
+    assert.equal(activity.hidden, true);
+    assert.equal(page.querySelector(".profile-card")!.hidden, false);
+    const profileStyle = harness.document.getElementById("codex-live-token-cost-profile-style")!.textContent;
+    assert.match(profileStyle, /main:has\(> #codex-live-token-cost-profile-page\)\{position:relative/);
+    assert.match(profileStyle, /width:min\(940px,calc\(100% - 64px\)\)/);
+    assert.match(profileStyle, /width:64px;height:64px/);
+
+    page.querySelector("[data-profile-action='edit']")!.click();
+    page.querySelector("[data-profile-field='display_name']")!.value = "Updated Local";
+    page.querySelector("[data-profile-field='username']")!.value = "updated-local";
+    page.querySelector("[data-profile-action='save']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "save_profile").length, 1);
+    assert.deepEqual(actionCalls(harness, "save_profile")[0].payload.action.profile, {
+      ...baseConfig().profile,
+      display_name: "Updated Local", username: "updated-local", email: "local@example.com", plan_label: "Pro 20x",
+    });
+    assert.match(page.textContent, /Updated Local/);
+    assert.equal(menu.label.textContent, "Updated Local");
+
+    page.querySelector("[data-profile-action='edit']")!.click();
+    page.querySelector("[data-profile-field='email']")!.value = "";
+    page.querySelector("[data-profile-field='avatar_data_url']")!.value = "data:image/png;base64,AAAA";
+    page.querySelector("[data-profile-action='save']")!.click();
+    assert.equal(actionCalls(harness, "save_profile").length, 1, "mismatched avatar MIME/header stays local");
+    assert.equal(page.querySelectorAll(".cltc-profile-error").length, 1);
+    page.querySelector("[data-profile-field='avatar_data_url']")!.value = "data:image/png;base64,iVBORw0KGgo=";
+    page.querySelector("[data-profile-action='save']")!.click();
+    await harness.settle();
+    assert.equal(actionCalls(harness, "save_profile").length, 2, "native permits an empty bounded email");
+    assert.equal(actionCalls(harness, "save_profile").at(-1)!.payload.action.profile.email, "");
+
+    saveMode = "error";
+    page.querySelector("[data-profile-action='edit']")!.click();
+    const retained = page.querySelector("[data-profile-field='display_name']")!;
+    retained.value = "Retain Me";
+    page.querySelector("[data-profile-action='save']")!.click();
+    await harness.settle();
+    assert.equal(retained.value, "Retain Me");
+    assert.equal(page.querySelectorAll(".cltc-profile-error").length, 1);
+    assert.equal(harness.clock.tasks.size, 0);
+
+    saveMode = "pending";
+    pendingSave = deferred<any>();
+    page.querySelector("[data-profile-action='save']")!.click();
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "route", profile: false } }));
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-page")), false);
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-style")), false);
+    pendingSave.resolve(updatedResponse(config, ++revision));
+    await harness.settle();
+    assert.equal(harness.document.getElementById("codex-live-token-cost-profile-page"), null, "late save cannot revive a disposed owner");
+
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "profile").length, 1, "warm profile uses cached factory");
+    assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+    harness.document.querySelector("[data-profile-action='close']")!.click();
+    assert.equal(harness.document.getElementById("codex-live-token-cost-profile-page"), null);
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+    harness.window.__codexLiveTokenCostV1.destroy();
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-page")), false);
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-style")), false);
+    const after = harness.evaluate("({filter:Array.prototype.filter,test:RegExp.prototype.test,fetch,XMLHttpRequest,WebSocket,electronBridge,react:window.__hostReactContext,statsig:window.__hostStatsig,auth:window.__hostAuth})");
+    for (const key of Object.keys(before)) assert.equal(after[key], before[key], `${key} reference`);
+  });
+
+  it("keeps Profile plan type and label aligned for known and custom edits", async () => {
+    let revision = 1;
+    let config = baseConfig();
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id, { config: structuredClone(config) });
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "save_profile") {
+        config = { ...config, profile: structuredClone(payload.action.profile) };
+        return updatedResponse(config, ++revision);
+      }
+      return { status: "ok" };
+    });
+    harness.run();
+    await harness.settle();
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    harness.runProfile();
+    const page = harness.document.getElementById("codex-live-token-cost-profile-page")!;
+
+    page.querySelector("[data-profile-action='edit']")!.click();
+    page.querySelector("[data-profile-field='plan_label']")!.value = "Plus";
+    page.querySelector("[data-profile-action='save']")!.click();
+    await harness.settle();
+    const known = actionCalls(harness, "save_profile").at(-1)!.payload.action.profile;
+    assert.deepEqual({ plan_type: known.plan_type, plan_label: known.plan_label }, {
+      plan_type: "plus", plan_label: "Plus",
+    });
+
+    page.querySelector("[data-profile-action='edit']")!.click();
+    page.querySelector("[data-profile-field='plan_label']")!.value = "  Team Enterprise  ";
+    page.querySelector("[data-profile-action='save']")!.click();
+    await harness.settle();
+    const custom = actionCalls(harness, "save_profile").at(-1)!.payload.action.profile;
+    assert.deepEqual({ plan_type: custom.plan_type, plan_label: custom.plan_label }, {
+      plan_type: "Team Enterprise", plan_label: "Team Enterprise",
+    });
+  });
+
+  it("closes an active Profile before projecting a profile_menu false lifecycle", async () => {
+    const harness = await createHarness();
+    const menu = installProfileMenu(harness.document);
+    harness.run();
+    await harness.settle();
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    harness.runProfile();
+    assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_menu", profile: false, profileMenuId: menu.menu.id },
+    }));
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-page")), false);
+    assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-style")), false);
+    assert.equal(menu.identityItem.getAttribute("data-codex-plus-token-cost-profile-entry"), "true");
+    assert.equal(menu.identityItem.className, menu.settings.className);
+  });
+
+  it("closes only Profile ownership when a native snapshot hides it", async () => {
+    const active = await createHarness();
+    active.run();
+    await active.settle();
+    active.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    active.runProfile();
+    const activeApi = active.window.__codexLiveTokenCostV1;
+    assert.equal(activeApi.acceptNativePush({
+      type: "snapshot", instance_id: activeApi.instanceId, snapshot: baseSnapshot(2, { profile_visible: false }),
+    }), true);
+    assert.equal(Boolean(active.document.getElementById("codex-live-token-cost-profile-page")), false);
+
+    const pending = await createHarness();
+    pending.run();
+    await pending.settle();
+    pending.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    assert.equal(lazyCalls(pending).filter((call) => call.payload.asset === "profile").length, 1);
+    const pendingApi = pending.window.__codexLiveTokenCostV1;
+    assert.equal(pendingApi.acceptNativePush({
+      type: "snapshot", instance_id: pendingApi.instanceId, snapshot: baseSnapshot(2, { profile_visible: false }),
+    }), true);
+    pending.runProfile();
+    assert.equal(Boolean(pending.document.getElementById("codex-live-token-cost-profile-page")), false, "late registration cannot consume a hidden Profile intent");
+
+    const settings = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      return { status: "ok" };
+    });
+    const overlay = await openAnalytics(settings);
+    settings.runAnalytics();
+    await settings.settle();
+    const settingsApi = settings.window.__codexLiveTokenCostV1;
+    assert.equal(settingsApi.acceptNativePush({
+      type: "snapshot", instance_id: settingsApi.instanceId, snapshot: baseSnapshot(2, { profile_visible: false }),
+    }), true);
+    assert.ok(overlay.isConnected);
+    assert.ok(overlay.querySelector(".cltc-analytics"), "Profile visibility must not close Settings or Analytics");
+  });
+
+  it("does not retain a profile intent when the fixed local mount anchor is absent", async () => {
+    const harness = await createHarness();
+    harness.document.querySelector("main")!.remove();
+    harness.run();
+    await harness.settle();
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    assert.equal(lazyCalls(harness).filter((call) => call.payload.asset === "profile").length, 0);
+    harness.runProfile();
+    assert.equal(harness.document.getElementById("codex-live-token-cost-profile-page"), null);
+
+    const disabled = await createHarness((path, payload) => path === "/token-cost/bootstrap"
+      ? successfulBootstrap(payload.instance_id, { config: baseConfig({ profile_visible: false }), snapshot: baseSnapshot(1, { profile_visible: false }) })
+      : { status: "ok" });
+    disabled.run();
+    await disabled.settle();
+    disabled.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", { detail: { reason: "profile_entry", profile: true } }));
+    assert.equal(lazyCalls(disabled).filter((call) => call.payload.asset === "profile").length, 0);
+  });
+
+  it("lets an exact Profile lifecycle replace a pending Settings top-level intent", async () => {
+    const harness = await createHarness((path, payload) => path === "/token-cost/bootstrap"
+      ? successfulBootstrap(payload.instance_id)
+      : { status: "ok" });
+    harness.run();
+    await harness.settle();
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    assert.deepEqual(lazyCalls(harness).map((call) => call.payload.asset), ["settings"]);
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    assert.deepEqual(lazyCalls(harness).map((call) => call.payload.asset), ["settings", "profile"]);
+    harness.runSettings();
+    assert.equal(harness.document.querySelector(".cltc-settings-modal"), null, "late Settings registration cannot steal Profile ownership");
+    harness.runProfile();
+    assert.ok(harness.document.getElementById("codex-live-token-cost-profile-page"));
+  });
+
+  it("keeps lazy view sources inert, bounded and visually tied to the frozen contract", async () => {
+    const [startup, settings, analytics, profile, flatpickr, flatpickrCss] = await Promise.all([
+      readFile(new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/live_token_cost/settings.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/live_token_cost/analytics.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/live_token_cost/profile.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/live_token_cost/flatpickr.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/live_token_cost/flatpickr.css", import.meta.url), "utf8"),
+    ]);
+    assert.ok(Buffer.byteLength(startup) <= 61_440);
+    for (const lazySentinel of ["cltc-analytics-metrics", "profile-card", "flatpickr v4.6.13", "flatpickr-calendar"]) assert.equal(startup.includes(lazySentinel), false, lazySentinel);
+    for (const source of [analytics, profile]) {
+      assert.equal((source.match(/registerModule\(/g) || []).length, 1);
+      for (const forbidden of ["localStorage", "sessionStorage", "indexedDB", "MutationObserver", "ResizeObserver", "setInterval", "requestAnimationFrame", "offsetWidth", "getBoundingClientRect", "fetch(", "XMLHttpRequest", "WebSocket", "__reactFiber", "eval(", "new Function", ".innerHTML"]) {
+        assert.equal(source.includes(forbidden), false, forbidden);
+      }
+    }
+    assert.match(analytics, /使用统计[\s\S]*基于 HUD、Profile 与 CC Switch 相同的本地去重口径/);
+    assert.match(analytics, /cltc-segmented[\s\S]*Token 构成[\s\S]*cltc-analytics-model-head/);
+    assert.match(analytics, /gap:26px/);
+    assert.match(analytics, /border-top:1px solid var\(--cltc-border-subtle\);border-bottom:1px solid var\(--cltc-border-subtle\)/);
+    assert.doesNotMatch(analytics, /\.cltc-analytics-metric\{[^}]*border:/);
+    assert.equal((analytics.match(/\.cltc-analytics \[data-tone=/g) || []).length, 4, "composition tones stay scoped to the owned analytics root");
+    assert.match(profile, /个人资料[\s\S]*通知[\s\S]*数据控制[\s\S]*电子邮箱[\s\S]*订阅计划/);
+    assert.doesNotMatch(profile, /[},]\.cltc-profile-/, "profile CSS selectors stay scoped to the owned root");
+    assert.match(flatpickr, /Flatpickr 4\.6\.13 \+ zh locale/);
+    assert.match(flatpickr, /@license MIT/);
+    assert.match(flatpickr, /rangeSeparator: " 至 "/);
+    assert.doesNotMatch(flatpickr, /eval\(|new Function/);
+    assert.doesNotMatch(flatpickrCss, /animation\s*:[^;]*infinite/i);
+    assert.match(flatpickrCss, /\.flatpickr-calendar\{[^}]*animation:none/);
+    assert.match(settings, /data-settings-panel/);
+
+    const expectedHashes: Record<string, string> = {
+      "hud-idle.png": "bf36885a7b502f3555dd653861c5997ce79cdbdd790328ef40dd850fb28840fc",
+      "hud-running.png": "bf36885a7b502f3555dd653861c5997ce79cdbdd790328ef40dd850fb28840fc",
+      "profile-page.png": "507ca262fc7066a5b9b3f48ced95fb020cd9d46acef9ec1dba33d8436bba3a98",
+      "settings-calendar.png": "fb387ae20493f566c64946f0862ec12fe514c8f612d1a66f421e3de9e50704cf",
+      "settings-general.png": "1fb762abf9cae06a28b9dab3c8bc9b1d1382f62a499cb2bab67e05cd17fad941",
+      "settings-pricing.png": "2d828c09fdf0e72d588b945e90534629694de4672d10ac1ad6c8516edd3726ec",
+      "settings-profile.png": "54232737ae184c358d57eed24106066a1294463b22c7bee012e055f4ae55bb1e",
+      "settings-usage.png": "f25f88e353e17257784e1440c61bdc64f9f7548654a2c088acaccef6db79569a",
+    };
+    for (const [name, expected] of Object.entries(expectedHashes)) {
+      const bytes = await readFile(new URL(`../../../docs/superpowers/evidence/ds-style-cost-baseline/${name}`, import.meta.url));
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, name);
+    }
   });
 });
