@@ -38,6 +38,7 @@
   const counters = {
     bridgeCalls: 0,
     domWrites: 0,
+    lazyListeners: 0,
     snapshotCount: 0,
     updateDurationsMs: [],
   };
@@ -81,7 +82,13 @@
   }
 
   function recordDomWrite(amount = 1) {
+    if (!Number.isSafeInteger(amount) || amount < 1) return;
     incrementCounter("domWrites", amount);
+  }
+
+  function recordListenerDelta(amount) {
+    if (!Number.isSafeInteger(amount) || amount === 0) return;
+    counters.lazyListeners = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, counters.lazyListeners + amount));
   }
 
   function monotonicNow() {
@@ -873,6 +880,8 @@
       emitAction: { value: emitAction, enumerable: true },
       close: { value: () => closeActiveModule(owner), enumerable: true },
       mountTarget: { value: mountTarget || null, enumerable: true },
+      recordDomWrite: { value: recordDomWrite, enumerable: true },
+      recordListenerDelta: { value: recordListenerDelta, enumerable: true },
     });
     defineChildContext(context, parent, name);
     Object.freeze(context);
@@ -903,6 +912,8 @@
       close: { value: () => closeChildModule(parent, owner), enumerable: true },
       mountTarget: { value: mountTarget || null, enumerable: true },
       onApply: { value: typeof onApply === "function" ? onApply : null, enumerable: true },
+      recordDomWrite: { value: recordDomWrite, enumerable: true },
+      recordListenerDelta: { value: recordListenerDelta, enumerable: true },
     });
     defineChildContext(context, child, name);
     Object.freeze(context);
@@ -1060,7 +1071,7 @@
       bootstrapInFlight: state.bootstrapInFlight,
       exhausted: !state.activated && state.bootstrapAttempts >= 3 && !state.bootstrapInFlight && !state.retryTimer,
       moduleCount: MODULE_NAMES.reduce((count, name) => count + (typeof modules[name] === "function" ? 1 : 0), 0),
-      listenerCount: state.alive ? 3 : 0,
+      listenerCount: state.alive ? Math.min(Number.MAX_SAFE_INTEGER, 3 + counters.lazyListeners) : 0,
       outstandingTimers: state.retryTimer ? 1 : 0,
       observerCount: 0,
       bridgeCalls: counters.bridgeCalls,

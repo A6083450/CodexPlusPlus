@@ -1,53 +1,58 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFile, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import { tmpdir } from "node:os";
 const runnerUrl = new URL("../../../scripts/measure-ds-style-cost-performance.mjs", import.meta.url);
 const {
   CdpClient,
   buildCostDiagnostics,
   discoverCodexProcesses,
   parseArgs,
+  parseBrowserVersion,
   parseCdpSample,
   parseProcessList,
   parseProcessStat,
   readBoundedResponseText,
+  rediscoverRenderers,
   selectPrimaryPage,
   summarizeSamples,
+  startTrace,
+  validateTraceCompletion,
+  writeJsonAtomically,
 } = await import(runnerUrl.href);
 
 const SOURCE_URL = new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url);
 const RENDERER_SOURCE_URL = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
 const MAX_STARTUP_BYTES = 61_440;
-const FORBIDDEN = [
-  "localStorage",
-  "sessionStorage",
-  "indexedDB",
-  "MutationObserver",
-  "ResizeObserver",
-  "setInterval",
-  ".clone(",
-  "offsetWidth",
-  "offsetHeight",
-  "clientWidth",
-  "clientHeight",
-  "scrollWidth",
-  "scrollHeight",
-  "getBoundingClientRect(",
-  "getComputedStyle(",
-  "Array.prototype",
-  "Promise.prototype",
-  "RegExp.prototype",
-  "window.fetch =",
-  "globalThis.fetch =",
-  "XMLHttpRequest",
-  "WebSocket",
-  "electronBridge =",
-  "Statsig",
-  "__react",
-  "__reactFiber",
-  "eval(",
-  "new Function",
+const FORBIDDEN: Array<[string, RegExp]> = [
+  ["localStorage", /\blocalStorage\b/],
+  ["sessionStorage", /\bsessionStorage\b/],
+  ["indexedDB", /\bindexedDB\b/],
+  ["MutationObserver", /\bMutationObserver\b/],
+  ["ResizeObserver", /\bResizeObserver\b/],
+  ["setInterval", /\bsetInterval\s*\(/],
+  ["clone", /(?:\.\s*clone|\[\s*["']clone["']\s*\])\s*\(/],
+  ["layout dimension read", /\b(?:offsetWidth|offsetHeight|clientWidth|clientHeight|scrollWidth|scrollHeight)\b/],
+  ["getBoundingClientRect", /\bgetBoundingClientRect\s*\(/],
+  ["getComputedStyle", /\bgetComputedStyle\s*\(/],
+  ["Array.prototype", /\bArray\s*(?:\.\s*prototype|\[\s*["']prototype["']\s*\])/],
+  ["Promise.prototype", /\bPromise\s*(?:\.\s*prototype|\[\s*["']prototype["']\s*\])/],
+  ["RegExp.prototype", /\bRegExp\s*(?:\.\s*prototype|\[\s*["']prototype["']\s*\])/],
+  ["fetch replacement", /\b(?:window|globalThis)\s*(?:\.\s*fetch|\[\s*["']fetch["']\s*\])\s*=/],
+  ["XMLHttpRequest", /\bXMLHttpRequest\b/],
+  ["WebSocket", /\bWebSocket\b/],
+  ["electronBridge replacement", /\belectronBridge\s*=/],
+  ["Statsig", /\bStatsig\b/],
+  ["__react", /\b__react\w*\b/],
+  ["eval", /\beval\s*\(/],
+  ["new Function", /\bnew\s+Function\b/],
 ];
+
+function forbiddenMechanisms(source: string) {
+  return FORBIDDEN.filter(([, pattern]) => pattern.test(source)).map(([label]) => label);
+}
 
 function extractTokenCostBlock(source: string) {
   const begin = "// TOKEN_COST_BEGIN";
@@ -107,24 +112,53 @@ function functionBody(source: string, openBrace: number) {
 }
 
 function recursiveArbitraryEnumerators(source: string) {
-  const suspects: string[] = [];
-  const declarations = /\bfunction\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g;
-  for (const match of source.matchAll(declarations)) {
-    const name = match[1];
-    const openBrace = match.index + match[0].lastIndexOf("{");
-    const body = functionBody(source, openBrace);
-    const enumerates = /\bObject\.(?:keys|values|entries)\s*\(/.test(body)
-      || /\bfor\s*\(\s*(?:const|let|var)\s+[A-Za-z_$][\w$]*\s+in\s+/.test(body);
-    const recurses = new RegExp(`\\b${name.replace(/[$]/g, "\\$")}\\s*\\(`).test(body);
-    if (enumerates && recurses) suspects.push(name);
+  const suspects = new Set<string>();
+  const enumerates = (body: string) => /\bObject\s*\.\s*(?:keys|values|entries)\s*\(/.test(body)
+    || /\bfor\s*\(\s*(?:const|let|var)\s+[A-Za-z_$][\w$]*\s+in\s+/.test(body);
+  const inspect = (reportedName: string, recursiveNames: string[], body: string) => {
+    const recurses = recursiveNames.some((name) => new RegExp(`\\b${name.replace(/[$]/g, "\\$")}\\s*\\(`).test(body));
+    if (enumerates(body) && recurses) suspects.add(reportedName);
+  };
+  const blocks: Array<[RegExp, (match: RegExpMatchArray) => [string, string[]]]> = [
+    [/\bfunction\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g, (match) => [match[1], [match[1]]]],
+    [/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function(?:\s+([A-Za-z_$][\w$]*))?\s*\([^)]*\)\s*\{/g,
+      (match) => [match[1], [match[1], match[2]].filter(Boolean)]],
+    [/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{/g,
+      (match) => [match[1], [match[1]]]],
+  ];
+  for (const [pattern, names] of blocks) {
+    for (const match of source.matchAll(pattern)) {
+      const openBrace = match.index + match[0].lastIndexOf("{");
+      const [reportedName, recursiveNames] = names(match);
+      inspect(reportedName, recursiveNames, functionBody(source, openBrace));
+    }
   }
-  return suspects;
+  const expressionArrows = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(?!\{)([^;\n]+)/g;
+  for (const match of source.matchAll(expressionArrows)) inspect(match[1], [match[1]], match[2]);
+  return [...suspects];
 }
 
 describe("Codex Live Token Cost startup performance policy", () => {
   it("keeps the full startup below 60 KiB", async () => {
     const source = await readFile(SOURCE_URL);
     assert.ok(source.byteLength <= MAX_STARTUP_BYTES, `startup is ${source.byteLength} bytes; limit is ${MAX_STARTUP_BYTES}`);
+  });
+
+  it("rejects whitespace-obscured properties and recursive function expressions or arrows", () => {
+    for (const fixture of [
+      "node . getBoundingClientRect ( )",
+      "Array . prototype . map",
+      "window . fetch = replacement",
+      "setInterval (work, 1000)",
+      "new   Function ('return 1')",
+    ]) {
+      assert.ok(forbiddenMechanisms(fixture).length > 0, `missed forbidden fixture: ${fixture}`);
+    }
+    assert.deepEqual(recursiveArbitraryEnumerators(`
+      const walk = (value) => { for (const key in value) walk(value[key]); };
+      const visit = function (value) { Object . entries (value); visit(value); };
+      const mapTree = value => Object . keys (value).map((key) => mapTree(value[key]));
+    `).sort(), ["mapTree", "visit", "walk"]);
   });
 
   it("scans only the full startup and exactly one marked renderer block for forbidden mechanisms", async () => {
@@ -134,7 +168,7 @@ describe("Codex Live Token Cost startup performance policy", () => {
     ]);
     const tokenCostBlock = extractTokenCostBlock(renderer);
     for (const [label, source] of [["startup", startup], ["renderer token-cost block", tokenCostBlock]]) {
-      const found = FORBIDDEN.filter((token) => source.includes(token));
+      const found = forbiddenMechanisms(source);
       assert.deepEqual(found, [], `${label} contains forbidden APIs`);
       assert.deepEqual(recursiveArbitraryEnumerators(source), [], `${label} recursively enumerates arbitrary objects`);
     }
@@ -207,6 +241,26 @@ describe("DS style cost measurement runner process discovery", () => {
       103 102 Codex Helper --type=renderer
     `, 9339), /cycle/);
   });
+
+  it("rediscovers renderer additions and exits without sampling a reused PID", () => {
+    assert.deepEqual(rediscoverRenderers(PROCESS_LIST, 9339, 101), [103, 104]);
+    assert.deepEqual(rediscoverRenderers(`${PROCESS_LIST}
+      106 102 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+    `, 9339, 101), [103, 104, 106]);
+    assert.deepEqual(rediscoverRenderers(`
+      101 1 Codex --remote-debugging-port=9339
+      104 101 Codex Helper --type=renderer
+    `, 9339, 101), [104]);
+    assert.deepEqual(rediscoverRenderers(`
+      101 1 Codex --remote-debugging-port=9339
+      103 1 /usr/bin/reused-unrelated --type=worker
+      104 101 Codex Helper --type=renderer
+    `, 9339, 101), [104]);
+    assert.throws(() => rediscoverRenderers(`
+      201 1 Codex --remote-debugging-port=9339
+      204 201 Codex Helper --type=renderer
+    `, 9339, 101), /browser identity changed/);
+  });
 });
 
 describe("DS style cost measurement runner sample parsing", () => {
@@ -278,6 +332,103 @@ describe("DS style cost measurement runner sample parsing", () => {
 });
 
 describe("DS style cost measurement runner output aggregation", () => {
+  it("rejects trace data loss and completes only after an ordered lossless event", async () => {
+    assert.throws(() => validateTraceCompletion({ dataLossOccurred: true }), /data loss/);
+    assert.throws(() => validateTraceCompletion({}), /dataLossOccurred/);
+    assert.doesNotThrow(() => validateTraceCompletion({ dataLossOccurred: false }));
+
+    class FakeTraceClient {
+      listeners = new Map<string, Set<(params: any) => void>>();
+      sent: string[] = [];
+
+      on(method: string, listener: (params: any) => void) {
+        const bucket = this.listeners.get(method) || new Set();
+        bucket.add(listener);
+        this.listeners.set(method, bucket);
+        return () => bucket.delete(listener);
+      }
+
+      async send(method: string) {
+        this.sent.push(method);
+        return {};
+      }
+
+      emit(method: string, params: any) {
+        for (const listener of this.listeners.get(method) || []) listener(params);
+      }
+    }
+
+    const output = join(tmpdir(), `codex-ds-trace-${randomUUID()}.json`);
+    const client = new FakeTraceClient();
+    try {
+      const trace = await startTrace(client, output);
+      client.emit("Tracing.dataCollected", { value: [{ name: "first" }, { name: "second" }] });
+      let stopped = false;
+      const stopping = trace.stop().then(() => { stopped = true; });
+      await Promise.resolve();
+      assert.equal(stopped, false);
+      assert.deepEqual(client.sent, ["Tracing.start", "Tracing.end"]);
+      client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
+      await stopping;
+      assert.deepEqual(JSON.parse(await readFile(output, "utf8")).traceEvents, [
+        { name: "first" },
+        { name: "second" },
+      ]);
+    } finally {
+      await unlink(output).catch(() => {});
+    }
+  });
+
+  it("publishes trace and metrics only after their temporary files finish successfully", async () => {
+    const priorTrace = join(tmpdir(), `codex-ds-prior-trace-${randomUUID()}.json`);
+    const newTrace = join(tmpdir(), `codex-ds-new-trace-${randomUUID()}.json`);
+    const priorMetrics = join(tmpdir(), `codex-ds-prior-metrics-${randomUUID()}.json`);
+    const newMetrics = join(tmpdir(), `codex-ds-new-metrics-${randomUUID()}.json`);
+    const failingClient = {
+      on() { return () => {}; },
+      async send(method: string) {
+        if (method === "Tracing.start") throw new Error("injected CDP failure");
+      },
+    };
+    const assertMissing = async (path: string) => {
+      await assert.rejects(readFile(path), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    };
+    await writeFile(priorTrace, "prior trace", "utf8");
+    await writeFile(priorMetrics, "prior metrics", "utf8");
+    try {
+      await assert.rejects(startTrace(failingClient, priorTrace), /injected CDP failure/);
+      await assert.rejects(startTrace(failingClient, newTrace), /injected CDP failure/);
+      assert.equal(await readFile(priorTrace, "utf8"), "prior trace");
+      await assertMissing(newTrace);
+
+      await assert.rejects(startTrace({
+        on() { return () => {}; },
+        async send() {},
+      }, newTrace, {
+        createStream() { throw new Error("injected stream failure"); },
+      }), /injected stream failure/);
+      await assertMissing(newTrace);
+
+      for (const path of [priorTrace, newTrace]) {
+        const aborting = await startTrace({
+          on() { return () => {}; },
+          async send() {},
+        }, path);
+        await aborting.abort();
+      }
+      assert.equal(await readFile(priorTrace, "utf8"), "prior trace");
+      await assertMissing(newTrace);
+
+      const failingWrite = { async writeFile() { throw new Error("injected write failure"); } };
+      await assert.rejects(writeJsonAtomically(priorMetrics, { valid: true }, failingWrite), /injected write failure/);
+      await assert.rejects(writeJsonAtomically(newMetrics, { valid: true }, failingWrite), /injected write failure/);
+      assert.equal(await readFile(priorMetrics, "utf8"), "prior metrics");
+      await assertMissing(newMetrics);
+    } finally {
+      for (const path of [priorTrace, newTrace, priorMetrics, newMetrics]) await unlink(path).catch(() => {});
+    }
+  });
+
   it("keeps before and after diagnostics outside the observer and trace window", async () => {
     const source = await readFile(runnerUrl, "utf8");
     const before = source.indexOf("const diagnosticsBefore = await pageDiagnostics(client)");
@@ -295,8 +446,21 @@ describe("DS style cost measurement runner output aggregation", () => {
   it("selects one primary Codex page and summarizes every retained sample", () => {
     assert.deepEqual(selectPrimaryPage([
       { id: "worker", type: "worker", url: "app://-/worker.js", webSocketDebuggerUrl: "ws://worker" },
-      { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://page" },
-    ]), { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://page" });
+      { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page" },
+    ], 9339), { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page" });
+    assert.deepEqual(parseBrowserVersion({
+      protocolVersion: "1.3",
+      product: "Chrome/140.0.0.0",
+      revision: "@abc123",
+      userAgent: "Codex Test",
+      jsVersion: "14.0.0",
+    }), {
+      protocolVersion: "1.3",
+      product: "Chrome/140.0.0.0",
+      revision: "@abc123",
+      userAgent: "Codex Test",
+      jsVersion: "14.0.0",
+    });
     assert.deepEqual(summarizeSamples([
       { aggregate: { cpuPercent: 3, rssKb: 100 }, cdp: { heap: { usedSize: 20 } } },
       { aggregate: { cpuPercent: 1, rssKb: 150 }, cdp: { heap: { usedSize: 40 } } },
@@ -309,11 +473,24 @@ describe("DS style cost measurement runner output aggregation", () => {
   });
 
   it("rejects ambiguous pages and produces explicit bounded diagnostic deltas", () => {
-    assert.throws(() => selectPrimaryPage([]), /exactly one primary page/);
+    assert.throws(() => selectPrimaryPage([], 9339), /exactly one primary page/);
     assert.throws(() => selectPrimaryPage([
-      { id: "one", type: "page", url: "app://-/one", webSocketDebuggerUrl: "ws://one" },
-      { id: "two", type: "page", url: "app://-/two", webSocketDebuggerUrl: "ws://two" },
-    ]), /exactly one primary page/);
+      { id: "one", type: "page", title: "One", url: "app://-/one", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/one" },
+      { id: "two", type: "page", title: "Two", url: "app://-/two", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/two" },
+    ], 9339), /exactly one primary page/);
+    for (const target of [
+      { id: "page", type: "page", title: "Codex", url: "https://example.com", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page" },
+      { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://localhost:9339/devtools/page/page" },
+      { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9340/devtools/page/page" },
+      { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/other" },
+    ]) {
+      assert.throws(() => selectPrimaryPage([target], 9339), /exactly one primary page/);
+    }
+    const validVersion = {
+      protocolVersion: "1.3", product: "Chrome/140", revision: "@abc", userAgent: "Codex", jsVersion: "14",
+    };
+    assert.throws(() => parseBrowserVersion({ ...validVersion, revision: undefined }), /Browser.getVersion/);
+    assert.throws(() => parseBrowserVersion({ ...validVersion, product: "x".repeat(257) }), /Browser.getVersion/);
     const before = {
       instanceId: "cost-instance-1",
       domWrites: 10,

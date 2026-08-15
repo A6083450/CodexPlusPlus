@@ -7,6 +7,7 @@ function restore(owner, name, descriptor) {
   else delete owner[name];
 }
 api.registerModule("flatpickr", (context) => {
+  const LISTENER_COUNT = 12;
   let flatpickrFactory = cachedFlatpickrFactory;
   if (!flatpickrFactory) {
     const globalRoot = globalThis;
@@ -133,6 +134,7 @@ api.registerModule("flatpickr", (context) => {
   let style = null;
   let targetNode = null;
   let stopped = false;
+  let diagnosticsMounted = false;
 
   function dayValue(date) {
     const part = (value) => String(value).padStart(2, "0");
@@ -178,6 +180,9 @@ api.registerModule("flatpickr", (context) => {
       instance = created;
       if (!instance || typeof instance.destroy !== "function") throw new Error("flatpickr instance unavailable");
       instance.open();
+      context.recordDomWrite(2);
+      context.recordListenerDelta(LISTENER_COUNT);
+      diagnosticsMounted = true;
     } catch (error) {
       destroyOwnedInstances(created);
       style?.remove();
@@ -192,6 +197,11 @@ api.registerModule("flatpickr", (context) => {
     stopped = true;
     destroyOwnedInstances(instance);
     style?.remove();
+    if (diagnosticsMounted) {
+      context.recordDomWrite(2);
+      context.recordListenerDelta(-LISTENER_COUNT);
+      diagnosticsMounted = false;
+    }
     instance = null;
     style = null;
     targetNode = null;

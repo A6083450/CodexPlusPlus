@@ -2,6 +2,7 @@
 
 api.registerModule("settings", (context) => {
   const STYLE_ID = "codex-live-token-cost-settings-style";
+  const LISTENER_COUNT = 4;
   const MAX_SAFE_NANOS = BigInt(Number.MAX_SAFE_INTEGER);
   const PROFILE_PLAN_OPTIONS = Object.freeze([
     ["free", "Free"], ["go", "Go"], ["plus", "Plus"], ["pro_5x", "Pro 5x"], ["pro_20x", "Pro 20x"],
@@ -27,6 +28,7 @@ api.registerModule("settings", (context) => {
   let style = null;
   let activePanel = config.profile_visible ? "profile" : "general";
   let stopped = false;
+  let diagnosticsMounted = false;
   const mutationSequences = { pricing: 0, profile: 0, visibility: 0 };
 
   function make(tag, className, text) {
@@ -39,6 +41,7 @@ api.registerModule("settings", (context) => {
   function clear(node) {
     while (node.firstElementChild) node.firstElementChild.remove();
     node.textContent = "";
+    context.recordDomWrite();
   }
 
   function button(text, action, variant) {
@@ -671,6 +674,9 @@ api.registerModule("settings", (context) => {
     document.body.appendChild(overlay);
     renderPanel(activePanel);
     close.focus();
+    context.recordDomWrite(2);
+    context.recordListenerDelta(LISTENER_COUNT);
+    diagnosticsMounted = true;
   }
 
   function unmount() {
@@ -685,6 +691,11 @@ api.registerModule("settings", (context) => {
       overlay.remove();
     }
     if (style) style.remove();
+    if (diagnosticsMounted) {
+      context.recordDomWrite(2);
+      context.recordListenerDelta(-LISTENER_COUNT);
+      diagnosticsMounted = false;
+    }
     overlay = null;
     modal = null;
     content = null;

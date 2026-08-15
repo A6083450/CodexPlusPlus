@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { finished } from "node:stream/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,6 +153,12 @@ export function discoverCodexProcesses(source, debugPort) {
   return { browserPid: browsers[0].pid, rendererPids };
 }
 
+export function rediscoverRenderers(source, debugPort, expectedBrowserPid) {
+  const { browserPid, rendererPids } = discoverCodexProcesses(source, debugPort);
+  if (browserPid !== expectedBrowserPid) throw new Error("Codex browser identity changed during measurement");
+  return rendererPids;
+}
+
 export function parseProcessStat(source, pid) {
   const fields = String(source).trim().split(/\s+/);
   if (
@@ -205,7 +212,7 @@ export function parseCdpSample(performanceResult, heapResult) {
   return { metrics, heap };
 }
 
-export function selectPrimaryPage(targets) {
+export function selectPrimaryPage(targets, debugPort) {
   if (!Array.isArray(targets) || targets.length > 128) throw new Error("expected exactly one primary page");
   const pages = targets.filter((target) => (
     target
@@ -217,14 +224,34 @@ export function selectPrimaryPage(targets) {
     && Buffer.byteLength(target.title) <= 1_024
     && typeof target.url === "string"
     && Buffer.byteLength(target.url) <= 4_096
+    && target.url.startsWith("app://-/")
     && typeof target.webSocketDebuggerUrl === "string"
-    && target.webSocketDebuggerUrl.length > 0
     && Buffer.byteLength(target.webSocketDebuggerUrl) <= 4_096
+    && target.webSocketDebuggerUrl === `ws://127.0.0.1:${debugPort}/devtools/page/${target.id}`
   ));
-  const codexPages = pages.filter((target) => target.url.startsWith("app://-/"));
-  const candidates = codexPages.length > 0 ? codexPages : pages;
-  if (candidates.length !== 1) throw new Error(`expected exactly one primary page; found ${candidates.length}`);
-  return candidates[0];
+  if (pages.length !== 1) throw new Error(`expected exactly one primary page; found ${pages.length}`);
+  return pages[0];
+}
+
+export function parseBrowserVersion(value) {
+  const fields = {
+    protocolVersion: 64,
+    product: 256,
+    revision: 256,
+    userAgent: 1_024,
+    jsVersion: 128,
+  };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid Browser.getVersion response");
+  }
+  const identity = {};
+  for (const [name, maxBytes] of Object.entries(fields)) {
+    if (typeof value[name] !== "string" || value[name].length === 0 || Buffer.byteLength(value[name]) > maxBytes) {
+      throw new Error(`invalid Browser.getVersion field: ${name}`);
+    }
+    identity[name] = value[name];
+  }
+  return identity;
 }
 
 function finiteNumber(value, label) {
@@ -523,7 +550,8 @@ function aggregateProcesses(processes) {
   };
 }
 
-async function sampleOnce(client, rendererPids) {
+async function sampleOnce(client, debugPort, browserPid) {
+  const rendererPids = rediscoverRenderers(await processList(), debugPort, browserPid);
   const [performanceResult, heapResult, processes] = await Promise.all([
     client.send("Performance.getMetrics"),
     client.send("Runtime.getHeapUsage"),
@@ -531,15 +559,66 @@ async function sampleOnce(client, rendererPids) {
   ]);
   return {
     timestamp: new Date().toISOString(),
+    rendererPids,
     processes,
     aggregate: aggregateProcesses(processes),
     cdp: parseCdpSample(performanceResult, heapResult),
   };
 }
 
-async function startTrace(client, outputPath) {
-  await mkdir(dirname(resolve(outputPath)), { recursive: true });
-  const stream = createWriteStream(outputPath, { encoding: "utf8" });
+export function validateTraceCompletion(params) {
+  if (!params || typeof params !== "object" || !Object.hasOwn(params, "dataLossOccurred")) {
+    throw new Error("Tracing.tracingComplete is missing dataLossOccurred");
+  }
+  if (params.dataLossOccurred !== false) {
+    if (params.dataLossOccurred === true) throw new Error("CDP trace reported data loss");
+    throw new Error("Tracing.tracingComplete has invalid dataLossOccurred");
+  }
+}
+
+function temporarySibling(outputPath) {
+  return `${resolve(outputPath)}.tmp-${process.pid}-${randomUUID()}`;
+}
+
+async function removeTemporary(path, removeFile) {
+  try { await removeFile(path); } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+export async function writeJsonAtomically(outputPath, value, operations = {}) {
+  const write = operations.writeFile || writeFile;
+  const renameFile = operations.rename || rename;
+  const removeFile = operations.unlink || unlink;
+  const serialized = JSON.stringify(value, null, 2);
+  if (typeof serialized !== "string") throw new Error("metrics output is not serializable");
+  JSON.parse(serialized);
+  const finalPath = resolve(outputPath);
+  const temporaryPath = temporarySibling(finalPath);
+  await mkdir(dirname(finalPath), { recursive: true });
+  try {
+    await write(temporaryPath, `${serialized}\n`, "utf8");
+    await renameFile(temporaryPath, finalPath);
+  } catch (error) {
+    await removeTemporary(temporaryPath, removeFile);
+    throw error;
+  }
+}
+
+export async function startTrace(client, outputPath, operations = {}) {
+  const createStream = operations.createStream || createWriteStream;
+  const renameFile = operations.rename || rename;
+  const removeFile = operations.unlink || unlink;
+  const finalPath = resolve(outputPath);
+  const temporaryPath = temporarySibling(finalPath);
+  await mkdir(dirname(finalPath), { recursive: true });
+  let stream;
+  try {
+    stream = createStream(temporaryPath, { encoding: "utf8" });
+  } catch (error) {
+    await removeTemporary(temporaryPath, removeFile);
+    throw error;
+  }
   let first = true;
   let streamError = null;
   stream.on("error", (error) => { streamError = error; });
@@ -570,8 +649,19 @@ async function startTrace(client, outputPath) {
     }
   });
   let completeTrace;
-  const completed = new Promise((resolveComplete) => { completeTrace = resolveComplete; });
-  const removeComplete = client.on("Tracing.tracingComplete", completeTrace);
+  let rejectTrace;
+  const completed = new Promise((resolveComplete, rejectComplete) => {
+    completeTrace = resolveComplete;
+    rejectTrace = rejectComplete;
+  });
+  const removeComplete = client.on("Tracing.tracingComplete", (params) => {
+    try {
+      validateTraceCompletion(params);
+      completeTrace();
+    } catch (error) {
+      rejectTrace(error);
+    }
+  });
   try {
     await client.send("Tracing.start", { categories: TRACE_CATEGORIES, transferMode: "ReportEvents" });
   } catch (error) {
@@ -579,12 +669,23 @@ async function startTrace(client, outputPath) {
     removeComplete();
     stream.destroy();
     try { await finished(stream); } catch {}
+    await removeTemporary(temporaryPath, removeFile);
     throw error;
   }
   let stopped = false;
   return {
     assertHealthy() {
       if (streamError) throw streamError;
+    },
+    async abort() {
+      if (stopped) return;
+      stopped = true;
+      removeData();
+      removeComplete();
+      try { await client.send("Tracing.end"); } catch {}
+      if (!stream.destroyed) stream.destroy();
+      try { await finished(stream); } catch {}
+      await removeTemporary(temporaryPath, removeFile);
     },
     async stop() {
       if (stopped) return;
@@ -613,8 +714,18 @@ async function startTrace(client, outputPath) {
       } catch (error) {
         stopError ||= error;
       }
-      if (streamError) throw streamError;
-      if (stopError) throw stopError;
+      stopError ||= streamError;
+      if (!stopError) {
+        try {
+          await renameFile(temporaryPath, finalPath);
+        } catch (error) {
+          stopError = error;
+        }
+      }
+      if (stopError) {
+        await removeTemporary(temporaryPath, removeFile);
+        throw stopError;
+      }
     },
   };
 }
@@ -622,13 +733,13 @@ async function startTrace(client, outputPath) {
 async function runMeasurement(options) {
   const endpoint = `http://127.0.0.1:${options.debugPort}/json/list`;
   const [targets, psOutput] = await Promise.all([fetchJson(endpoint), processList()]);
-  const page = selectPrimaryPage(targets);
+  const page = selectPrimaryPage(targets, options.debugPort);
   const { browserPid, rendererPids } = discoverCodexProcesses(psOutput, options.debugPort);
   const client = await CdpClient.connect(page.webSocketDebuggerUrl);
   let trace = null;
   let observerInstalled = false;
   try {
-    const browserVersion = await client.send("Browser.getVersion");
+    const browserVersion = parseBrowserVersion(await client.send("Browser.getVersion"));
     await client.send("Performance.enable");
     const diagnosticsBefore = await pageDiagnostics(client);
     await installLongTaskObserver(client);
@@ -643,7 +754,7 @@ async function runMeasurement(options) {
       const lateness = performance.now() - deadline;
       if (lateness > 900) throw new Error(`missed 1 Hz sample deadline by ${lateness.toFixed(1)}ms`);
       trace?.assertHealthy();
-      samples.push(await sampleOnce(client, rendererPids));
+      samples.push(await sampleOnce(client, options.debugPort, browserPid));
       trace?.assertHealthy();
     }
     if (samples.length !== options.durationSeconds) throw new Error("sample collection is incomplete");
@@ -671,15 +782,14 @@ async function runMeasurement(options) {
       longTasks,
       costDiagnostics: buildCostDiagnostics(diagnosticsBefore, diagnosticsAfter),
     };
-    await mkdir(dirname(resolve(options.output)), { recursive: true });
-    await writeFile(options.output, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    await writeJsonAtomically(options.output, result);
     return result;
   } finally {
     if (observerInstalled) {
       try { await removeLongTaskObserver(client); } catch {}
     }
     if (trace) {
-      try { await trace.stop(); } catch {}
+      try { await trace.abort(); } catch {}
     }
     client.close();
   }

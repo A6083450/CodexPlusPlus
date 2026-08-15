@@ -4738,7 +4738,13 @@ async fn token_cost_push_caps_rate_and_coalesces_to_the_newest_bounded_snapshot(
         assert_token_cost_snapshot_expression(&prime, 1);
         let _ = prime_seen_tx.send(());
 
-        let newest = tokio::time::timeout(Duration::from_millis(700), recv_json(&mut socket))
+        assert!(
+            tokio::time::timeout(Duration::from_millis(450), socket.next())
+                .await
+                .is_err(),
+            "the coalesced snapshot must not send before the 500ms rate limit"
+        );
+        let newest = tokio::time::timeout(Duration::from_millis(250), recv_json(&mut socket))
             .await
             .expect("the coalesced snapshot should send at its fixed deadline");
         assert_token_cost_snapshot_expression(&newest, 4);

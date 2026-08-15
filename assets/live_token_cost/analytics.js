@@ -2,6 +2,7 @@
 
 api.registerModule("analytics", (context) => {
   const STYLE_ID = "codex-live-token-cost-analytics-style";
+  const LISTENER_COUNT = 1;
   const SVG_NS = "http://www.w3.org/2000/svg";
   const MAX_ANALYTICS_DAYS = 31;
   const MAX_ANALYTICS_MODELS = 20;
@@ -11,6 +12,7 @@ api.registerModule("analytics", (context) => {
   let statusRoot = null;
   let style = null;
   let stopped = false;
+  let diagnosticsMounted = false;
   let querySequence = 0;
   let currentPreset = "today";
   let currentModel = null;
@@ -38,6 +40,7 @@ api.registerModule("analytics", (context) => {
   function clear(node) {
     while (node.firstElementChild) node.firstElementChild.remove();
     node.textContent = "";
+    context.recordDomWrite();
   }
 
   function button(text, attribute, value) {
@@ -452,6 +455,9 @@ api.registerModule("analytics", (context) => {
     root.appendChild(syncRow);
     root.addEventListener("click", onClick);
     host.appendChild(root);
+    context.recordDomWrite(2);
+    context.recordListenerDelta(LISTENER_COUNT);
+    diagnosticsMounted = true;
     queryAnalytics();
   }
 
@@ -464,6 +470,11 @@ api.registerModule("analytics", (context) => {
     root?.removeEventListener("click", onClick);
     root?.remove();
     style?.remove();
+    if (diagnosticsMounted) {
+      context.recordDomWrite(2);
+      context.recordListenerDelta(-LISTENER_COUNT);
+      diagnosticsMounted = false;
+    }
     root = null;
     resultRoot = null;
     statusRoot = null;

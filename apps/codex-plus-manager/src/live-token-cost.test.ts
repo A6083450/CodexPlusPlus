@@ -162,12 +162,14 @@ class FakeElement {
     this.ownerDocument.textWrites += 1;
     this.ownerDocument.domOperations += 1;
     this.textWrites += 1;
+    if (this.children.length > 0) this.ownerDocument.structuralMutations += 1;
     this.children.splice(0).forEach((child) => { child.parentElement = null; });
     this.ownText = text;
   }
   get innerHTML() { return this.textContent; }
   set innerHTML(value: string) {
     this.ownerDocument.innerHtmlWrites += 1;
+    this.ownerDocument.structuralMutations += 1;
     this.textContent = String(value);
   }
 
@@ -218,6 +220,7 @@ class FakeElement {
     this.children.push(node);
     node.parentElement = this;
     this.ownerDocument.domOperations += 1;
+    this.ownerDocument.structuralMutations += 1;
     return node;
   }
   insertBefore<T extends FakeElement>(node: T, before: FakeElement | null): T {
@@ -228,6 +231,7 @@ class FakeElement {
     else this.children.splice(index, 0, node);
     node.parentElement = this;
     this.ownerDocument.domOperations += 1;
+    this.ownerDocument.structuralMutations += 1;
     return node;
   }
   remove() {
@@ -236,8 +240,14 @@ class FakeElement {
     if (index >= 0) this.parentElement.children.splice(index, 1);
     this.parentElement = null;
     this.ownerDocument.domOperations += 1;
+    this.ownerDocument.structuralMutations += 1;
   }
   removeChild<T extends FakeElement>(node: T): T { node.remove(); return node; }
+  replaceChildren(...nodes: FakeElement[]) {
+    for (const child of [...this.children]) child.remove();
+    this.ownText = "";
+    for (const node of nodes) this.appendChild(node);
+  }
   getRootNode() { return this.ownerDocument; }
   getBoundingClientRect() { return { top: 80, right: 280, bottom: 116, left: 20, width: 260, height: 36, x: 20, y: 80 }; }
   getElementsByTagName(tagName: string) { return this.querySelectorAll(tagName); }
@@ -301,6 +311,7 @@ class FakeDocument {
   propertyWrites = 0;
   textWrites = 0;
   domOperations = 0;
+  structuralMutations = 0;
   observerCount = 0;
   activeElement: FakeElement;
 
@@ -2236,6 +2247,67 @@ describe("lazy analytics calendar and profile views", () => {
     return overlay;
   }
 
+  it("reports fixed lazy listener and owned DOM write lifecycles through explicit diagnostics", async () => {
+    const harness = await createHarness((path, payload) => {
+      if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
+      if (path === "/token-cost/lazy-asset") return { status: "ok" };
+      if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
+        return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
+      }
+      if (path === "/token-cost/action" && payload.action.type === "query_diagnostics") return nativeDiagnosticsResponse();
+      return { status: "ok" };
+    });
+    harness.run();
+    await harness.settle();
+    harness.runSettings();
+    harness.runAnalytics();
+    harness.runProfile();
+    harness.runFlatpickr();
+    const api = harness.window.__codexLiveTokenCostV1;
+    const baseline = await api.diagnostics();
+    assert.equal(baseline.listenerCount, 3);
+
+    harness.document.getElementById("codex-live-token-cost-settings")!.click();
+    const settings = await api.diagnostics();
+    assert.deepEqual(Array.from(settings.mountedModules), ["settings"]);
+    assert.equal(settings.listenerCount, 7);
+    assert.ok(settings.domWrites > baseline.domWrites);
+
+    const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+    overlay.querySelector("[data-settings-panel='usage']")!.click();
+    await harness.settle();
+    const analytics = await api.diagnostics();
+    assert.deepEqual(Array.from(analytics.mountedModules), ["settings", "analytics"]);
+    assert.equal(analytics.listenerCount, 8);
+    assert.ok(analytics.domWrites > settings.domWrites);
+
+    overlay.querySelector("[data-analytics-preset='custom']")!.click();
+    overlay.querySelector("[data-action='open-analytics-calendar']")!.click();
+    const calendar = await api.diagnostics();
+    assert.deepEqual(Array.from(calendar.mountedModules), ["settings", "analytics", "flatpickr"]);
+    assert.equal(calendar.listenerCount, 20);
+    assert.ok(calendar.domWrites > analytics.domWrites);
+    overlay.querySelector("[data-analytics-preset='today']")!.click();
+    await harness.settle();
+    overlay.querySelector("[data-action='close-price']")!.click();
+    const settingsClosed = await api.diagnostics();
+    assert.deepEqual(Array.from(settingsClosed.mountedModules), []);
+    assert.equal(settingsClosed.listenerCount, 3);
+    assert.ok(settingsClosed.domWrites > calendar.domWrites);
+
+    harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+      detail: { reason: "profile_entry", profile: true },
+    }));
+    const profile = await api.diagnostics();
+    assert.deepEqual(Array.from(profile.mountedModules), ["profile"]);
+    assert.equal(profile.listenerCount, 4);
+    harness.document.querySelector("[data-profile-action='close']")!.click();
+    const cleaned = await api.diagnostics();
+    assert.deepEqual(Array.from(cleaned.mountedModules), []);
+    assert.equal(cleaned.listenerCount, 3);
+    assert.ok(cleaned.domWrites > profile.domWrites);
+  });
+
   it("loads analytics only from Usage and renders bounded native results with monotonic queries", async () => {
     const seven = deferred<any>();
     const thirty = deferred<any>();
@@ -2959,6 +3031,10 @@ describe("lazy analytics calendar and profile views", () => {
     const api = harness.window.__codexLiveTokenCostV1;
     const root = harness.document.getElementById("codex-live-token-cost")!;
     const settingsButton = harness.document.getElementById("codex-live-token-cost-settings")!;
+    const representativeChildren = ["session-turns", "session-output", "session-input"].map((key) => (
+      root.querySelector(`[data-cltc-value-key='${key}']`)!
+    ));
+    assert.ok(representativeChildren.every(Boolean));
     const before = await api.diagnostics();
     assert.equal(actionCalls(harness, "query_diagnostics").length, 1);
 
@@ -2992,6 +3068,11 @@ describe("lazy analytics calendar and profile views", () => {
       harness.document.querySelector("[data-profile-action='close']")!.click();
     }
 
+    for (const [index, key] of ["session-turns", "session-output", "session-input"].entries()) {
+      assert.equal(root.querySelector(`[data-cltc-value-key='${key}']`), representativeChildren[index]);
+    }
+    assert.ok(Number.isSafeInteger(harness.document.structuralMutations));
+    const structuralMutationsBeforeSnapshots = harness.document.structuralMutations;
     const writesBeforeSnapshots = (await api.diagnostics()).domWrites;
     for (let index = 0; index < 300; index += 1) {
       assert.equal(api.acceptNativePush({
@@ -3005,6 +3086,10 @@ describe("lazy analytics calendar and profile views", () => {
     const p95 = sortedDurations[Math.ceil(sortedDurations.length * 0.95) - 1];
 
     assert.equal(after.domWrites - writesBeforeSnapshots, 300, "changed-only HUD snapshots write one owned field each");
+    assert.equal(harness.document.structuralMutations, structuralMutationsBeforeSnapshots, "snapshot updates never reconstruct HUD children");
+    for (const [index, key] of ["session-turns", "session-output", "session-input"].entries()) {
+      assert.equal(root.querySelector(`[data-cltc-value-key='${key}']`), representativeChildren[index]);
+    }
     assert.equal(after.updateDurationsMs.length, 256);
     assert.ok(p95 <= 4, `HUD update p95 ${p95}ms exceeds 4ms`);
     assert.ok(Math.max(...sortedDurations) < 16, "every HUD update stays under one 16ms frame");

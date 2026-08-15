@@ -3,6 +3,7 @@
 api.registerModule("profile", (context) => {
   const ROOT_ID = "codex-live-token-cost-profile-page";
   const STYLE_ID = "codex-live-token-cost-profile-style";
+  const LISTENER_COUNT = 1;
   const PROFILE_PLAN_OPTIONS = Object.freeze([
     ["free", "Free"], ["go", "Go"], ["plus", "Plus"], ["pro_5x", "Pro 5x"], ["pro_20x", "Pro 20x"],
     ["business", "Business"], ["enterprise", "Enterprise"], ["edu", "Edu"], ["staff", "Staff"], ["founder", "Founder"],
@@ -16,6 +17,7 @@ api.registerModule("profile", (context) => {
   let identityPlanRow = null;
   let editor = null;
   let stopped = false;
+  let diagnosticsMounted = false;
   let saveSequence = 0;
 
   function make(tag, className, text) {
@@ -308,6 +310,9 @@ api.registerModule("profile", (context) => {
     target.appendChild(root);
     applyIdentity(profile);
     close.focus();
+    context.recordDomWrite(2);
+    context.recordListenerDelta(LISTENER_COUNT);
+    diagnosticsMounted = true;
   }
 
   function unmount() {
@@ -317,6 +322,11 @@ api.registerModule("profile", (context) => {
     root?.removeEventListener("click", onClick);
     root?.remove();
     style?.remove();
+    if (diagnosticsMounted) {
+      context.recordDomWrite(2);
+      context.recordListenerDelta(-LISTENER_COUNT);
+      diagnosticsMounted = false;
+    }
     root = null;
     style = null;
     editor = null;
