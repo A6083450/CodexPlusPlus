@@ -6,6 +6,10 @@ use codex_plus_core::cdp::{
     is_quick_chat_page_target, list_targets, pick_injectable_codex_page_target, pick_page_target,
     validate_cdp_websocket_url,
 };
+use codex_plus_core::token_cost::{
+    EventMeta, LazyAsset, TokenCostAction, TokenCostActionResponse, TokenCostEvent,
+    TokenCostService, UsageSource,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -4640,6 +4644,442 @@ async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
     request_rx
         .await
         .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn token_cost_push_keeps_binding_resolution_live_without_evaluate_ack() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+
+        let snapshot = recv_json(&mut socket).await;
+        assert_token_cost_snapshot_expression(&snapshot, 1);
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "during-push",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let resolve = tokio::time::timeout(Duration::from_millis(500), recv_json(&mut socket))
+            .await
+            .expect("binding resolution must not wait for the snapshot evaluate ack");
+        assert_expression_contains_request(&resolve, "during-push");
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-push-live").unwrap();
+    let pushes = service.subscribe();
+
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(pushes),
+    )
+    .await
+    .unwrap();
+    service.ingest(token_cost_turn_started("turn-live", "start-live"));
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    let diagnostics = token_cost_diagnostics(&service, "page-push-live").await;
+    assert_eq!(diagnostics.snapshots_sent, 1);
+}
+
+#[tokio::test]
+async fn token_cost_push_idle_for_650ms_sends_zero_runtime_evaluates() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        let idle_message = tokio::time::timeout(Duration::from_millis(650), socket.next()).await;
+        assert!(
+            idle_message.is_err(),
+            "an idle token cost receiver must not issue Runtime.evaluate"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-idle").unwrap();
+
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(service.subscribe()),
+    )
+    .await
+    .unwrap();
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    let diagnostics = token_cost_diagnostics(&service, "page-idle").await;
+    assert_eq!(diagnostics.snapshots_sent, 0);
+    assert_eq!(diagnostics.lazy_commands_sent, 0);
+}
+
+#[tokio::test]
+async fn token_cost_push_coalesces_three_updates_to_the_newest_revision() {
+    let (prime_seen_tx, prime_seen_rx) = oneshot::channel();
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        let prime = recv_json(&mut socket).await;
+        assert_token_cost_snapshot_expression(&prime, 1);
+        let _ = prime_seen_tx.send(());
+
+        let newest = tokio::time::timeout(Duration::from_millis(700), recv_json(&mut socket))
+            .await
+            .expect("the coalesced snapshot should send at its fixed deadline");
+        assert_token_cost_snapshot_expression(&newest, 4);
+        let expression = newest["params"]["expression"].as_str().unwrap();
+        assert!(!expression.contains("\"revision\":2"), "{expression}");
+        assert!(!expression.contains("\"revision\":3"), "{expression}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), socket.next())
+                .await
+                .is_err(),
+            "coalescing must not leave extra snapshot evaluates"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-coalesce").unwrap();
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(service.subscribe()),
+    )
+    .await
+    .unwrap();
+
+    service.ingest(token_cost_turn_started("turn-coalesce", "start"));
+    prime_seen_rx.await.unwrap();
+    for revision in 2..=4 {
+        service.ingest(token_cost_output_delta(
+            "turn-coalesce",
+            &format!("delta-{revision}"),
+            revision,
+        ));
+    }
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert_eq!(
+        token_cost_diagnostics(&service, "page-coalesce")
+            .await
+            .snapshots_sent,
+        2
+    );
+}
+
+#[tokio::test]
+async fn token_cost_push_none_clears_an_armed_pending_snapshot() {
+    let (prime_seen_tx, prime_seen_rx) = oneshot::channel();
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        assert_token_cost_snapshot_expression(&recv_json(&mut socket).await, 1);
+        let _ = prime_seen_tx.send(());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(650), socket.next())
+                .await
+                .is_err(),
+            "dispose/watch None must disarm a pending snapshot deadline"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-dispose").unwrap();
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(service.subscribe()),
+    )
+    .await
+    .unwrap();
+    service.ingest(token_cost_turn_started("turn-dispose", "start"));
+    prime_seen_rx.await.unwrap();
+    service.ingest(token_cost_output_delta("turn-dispose", "delta", 2));
+    assert_eq!(
+        service
+            .apply_action(TokenCostAction::DisposeInstance {
+                instance_id: "page-dispose".to_string(),
+            })
+            .await
+            .unwrap(),
+        TokenCostActionResponse::Disposed
+    );
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn token_cost_push_drops_stale_snapshot_and_lazy_commands_without_metrics() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(650), socket.next())
+                .await
+                .is_err(),
+            "stale queued pushes must not evaluate"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-stale").unwrap();
+    let pushes = service.subscribe();
+    service.ingest(token_cost_turn_started("turn-stale", "start"));
+    service
+        .request_lazy_asset("page-stale", LazyAsset::Settings)
+        .unwrap();
+    service.bootstrap("page-current").unwrap();
+
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(pushes),
+    )
+    .await
+    .unwrap();
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    let diagnostics = token_cost_diagnostics(&service, "page-current").await;
+    assert_eq!(diagnostics.snapshots_sent, 0);
+    assert_eq!(diagnostics.lazy_commands_sent, 0);
+}
+
+#[tokio::test]
+async fn token_cost_push_replacement_closes_old_pump_and_uses_new_receiver() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = websocket_url(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (first_stream, _) = listener.accept().await.unwrap();
+        let mut first = accept_async(first_stream).await.unwrap();
+        complete_bridge_setup(&mut first).await;
+
+        let (second_stream, _) = listener.accept().await.unwrap();
+        let mut second = accept_async(second_stream).await.unwrap();
+        for expected_id in 1..=3 {
+            let command = recv_json(&mut second).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut second, json!({ "id": expected_id, "result": {} })).await;
+        }
+        let bridge_eval = recv_json(&mut second).await;
+        assert_eq!(bridge_eval["id"], 5);
+        send_json(&mut second, json!({ "id": 5, "result": {} })).await;
+
+        let first_closed = tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("the replaced push pump should close promptly");
+        assert!(matches!(first_closed, None | Some(Ok(Message::Close(_)))));
+        assert_token_cost_snapshot_expression(&recv_json(&mut second).await, 1);
+        close_socket(&mut second).await;
+    });
+    let first_service = TokenCostService::in_memory();
+    first_service.bootstrap("page-first").unwrap();
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(first_service.subscribe()),
+    )
+    .await
+    .unwrap();
+    let second_service = TokenCostService::in_memory();
+    second_service.bootstrap("page-second").unwrap();
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(second_service.subscribe()),
+    )
+    .await
+    .unwrap();
+    second_service.ingest(token_cost_turn_started("turn-second", "start"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn token_cost_push_lazy_broadcast_lag_reports_once_without_retry() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        let lag_error = tokio::time::timeout(Duration::from_millis(500), recv_json(&mut socket))
+            .await
+            .expect("broadcast lag should report one bounded visible error");
+        let expression = lag_error["params"]["expression"].as_str().unwrap();
+        assert!(expression.contains("acceptLazyError"), "{expression}");
+        assert!(expression.contains("settings"), "{expression}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), socket.next())
+                .await
+                .is_err(),
+            "broadcast lag must not retry or drain the stale backlog"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-lag").unwrap();
+    let pushes = service.subscribe();
+    for _ in 0..9 {
+        service
+            .request_lazy_asset("page-lag", LazyAsset::Settings)
+            .unwrap();
+    }
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(pushes),
+    )
+    .await
+    .unwrap();
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert_eq!(
+        token_cost_diagnostics(&service, "page-lag")
+            .await
+            .lazy_commands_sent,
+        0
+    );
+}
+
+#[tokio::test]
+async fn token_cost_push_sends_one_static_lazy_module_and_counts_after_scheduling() {
+    let instance_id = "page-lazy-\"\\";
+    let quoted_instance = serde_json::to_string(instance_id).unwrap();
+    let (url, request_rx) = spawn_cdp_server(move |mut socket| async move {
+        complete_bridge_setup(&mut socket).await;
+        let lazy = tokio::time::timeout(Duration::from_millis(500), recv_json(&mut socket))
+            .await
+            .expect("an explicitly requested lazy module should evaluate once");
+        let expression = lazy["params"]["expression"].as_str().unwrap();
+        assert!(expression.contains("window.__codexLiveTokenCostV1"));
+        assert!(expression.contains("api.instanceId !=="));
+        assert!(expression.contains(&quoted_instance));
+        assert!(expression.contains(r#"registerModule(\"analytics\""#));
+        assert!(!expression.contains("flatpickr v4.6.13"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), socket.next())
+                .await
+                .is_err(),
+            "one request must not start retries or background evaluates"
+        );
+        close_socket(&mut socket).await;
+    })
+    .await;
+    let service = TokenCostService::in_memory();
+    service.bootstrap(instance_id).unwrap();
+    bridge::install_bridge_with_pushes(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &[],
+        Some(service.subscribe()),
+    )
+    .await
+    .unwrap();
+    service
+        .request_lazy_asset(instance_id, LazyAsset::Analytics)
+        .unwrap();
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert_eq!(
+        token_cost_diagnostics(&service, instance_id)
+            .await
+            .lazy_commands_sent,
+        1
+    );
+}
+
+async fn complete_bridge_setup(socket: &mut TestSocket) {
+    for expected_id in 1..=5 {
+        let command = recv_json(socket).await;
+        assert_eq!(command["id"], expected_id);
+        send_json(socket, json!({ "id": expected_id, "result": {} })).await;
+    }
+}
+
+fn token_cost_meta(turn_id: &str, event_id: &str) -> EventMeta {
+    EventMeta {
+        source: UsageSource::Renderer,
+        session_id: "session-push".to_string(),
+        turn_id: turn_id.to_string(),
+        event_id: event_id.to_string(),
+        correlation_id: "correlation-push".to_string(),
+        occurred_at_ms: 1,
+    }
+}
+
+fn token_cost_turn_started(turn_id: &str, event_id: &str) -> TokenCostEvent {
+    TokenCostEvent::TurnStarted {
+        meta: token_cost_meta(turn_id, event_id),
+        model: "gpt-5.6-sol".to_string(),
+        fast: false,
+    }
+}
+
+fn token_cost_output_delta(turn_id: &str, event_id: &str, output: u64) -> TokenCostEvent {
+    TokenCostEvent::OutputDelta {
+        meta: token_cost_meta(turn_id, event_id),
+        estimated_output_tokens: output,
+    }
+}
+
+async fn token_cost_diagnostics(
+    service: &TokenCostService,
+    instance_id: &str,
+) -> codex_plus_core::token_cost::TokenCostDiagnostics {
+    match service
+        .apply_action(TokenCostAction::QueryDiagnostics {
+            instance_id: instance_id.to_string(),
+        })
+        .await
+        .unwrap()
+    {
+        TokenCostActionResponse::Diagnostics { diagnostics } => diagnostics,
+        response => panic!("unexpected token cost response: {response:?}"),
+    }
+}
+
+fn assert_token_cost_snapshot_expression(command: &serde_json::Value, revision: u64) {
+    assert_eq!(command["method"], "Runtime.evaluate");
+    let expression = command["params"]["expression"].as_str().unwrap();
+    assert!(
+        expression.contains("window.__codexLiveTokenCostV1?.acceptNativePush("),
+        "{expression}"
+    );
+    assert!(
+        expression.contains(&format!("\"revision\":{revision}")),
+        "{expression}"
+    );
 }
 
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;

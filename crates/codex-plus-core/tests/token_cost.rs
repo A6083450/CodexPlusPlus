@@ -1,16 +1,19 @@
 use std::collections::BTreeMap;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use codex_plus_core::paths::{
     TOKEN_COST_UI_FILE, default_codex_plus_config_dir, token_cost_ui_path,
 };
 use codex_plus_core::token_cost::{
     BoundedEventQueue, ChatUsageTap, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, EventMeta,
-    IngestOutcome, MAX_EMAIL_BYTES, MAX_ID_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES,
-    MAX_PROFILE_TEXT_BYTES, MAX_RENDERER_EVENT_BYTES, MAX_SSE_FRAME_BYTES, MAX_TOOL_NAME_BYTES,
-    ModelPrice, ProfileConfig, QueueAdmission, RECENT_TURN_LIMIT, ResponsesUsageTap, RuntimeState,
-    TokenCostAction, TokenCostActionResponse, TokenCostEvent, TokenCostService, TokenCostSnapshot,
-    TokenUsage, UiConfig, UiConfigStore, UsageSource, default_model_price, fast_multiplier_millis,
-    usage_cost_nanos, validate_renderer_event,
+    IngestOutcome, LazyAsset, LazyAssetPush, MAX_EMAIL_BYTES, MAX_ID_BYTES, MAX_MODEL_BYTES,
+    MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES, MAX_RENDERER_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
+    MAX_SSE_FRAME_BYTES, MAX_TOOL_NAME_BYTES, ModelPrice, ProfileConfig, QueueAdmission,
+    RECENT_TURN_LIMIT, ResponsesUsageTap, RuntimeState, SNAPSHOT_MIN_INTERVAL, SnapshotCoalescer,
+    SnapshotOffer, SnapshotPush, TokenCostAction, TokenCostActionResponse, TokenCostEvent,
+    TokenCostService, TokenCostSnapshot, TokenUsage, UiConfig, UiConfigStore, UsageSource,
+    default_model_price, fast_multiplier_millis, usage_cost_nanos, validate_renderer_event,
 };
 use serde_json::json;
 
@@ -197,6 +200,190 @@ fn config_with_profile(profile: ProfileConfig) -> UiConfig {
         profile,
         ..UiConfig::default()
     }
+}
+
+fn snapshot_push(revision: u64, running: bool, model: impl Into<String>) -> SnapshotPush {
+    SnapshotPush::Snapshot {
+        instance_id: "page-1".to_string(),
+        snapshot: TokenCostSnapshot {
+            revision,
+            running,
+            model: model.into(),
+            fast: false,
+            turns: revision as u32,
+            steps: revision as u32,
+            llm_ms: 0,
+            tool_ms: 0,
+            first_token_average_ms: None,
+            output_rate_milli_tokens_per_second: 0,
+            input: 0,
+            cached_input: 0,
+            output: 0,
+            cost_nanos: 0,
+            hub_visible: true,
+            output_rate_visible: true,
+            profile_visible: true,
+        },
+    }
+}
+
+#[test]
+fn snapshot_coalescer_sends_first_immediately_and_only_newest_at_fixed_deadline() {
+    let started_at = Instant::now();
+    let mut coalescer = SnapshotCoalescer::default();
+    let first = snapshot_push(1, true, "gpt-5.6-sol");
+    assert_eq!(
+        coalescer.offer(started_at, first.clone()),
+        SnapshotOffer::SendNow(first)
+    );
+    assert_eq!(coalescer.deadline(), None);
+
+    let deadline = started_at + SNAPSHOT_MIN_INTERVAL;
+    assert_eq!(
+        coalescer.offer(
+            started_at + Duration::from_millis(100),
+            snapshot_push(2, true, "m")
+        ),
+        SnapshotOffer::ArmAt(deadline)
+    );
+    assert_eq!(
+        coalescer.offer(
+            started_at + Duration::from_millis(300),
+            snapshot_push(3, true, "m")
+        ),
+        SnapshotOffer::ReplacedPending
+    );
+    assert_eq!(coalescer.deadline(), Some(deadline));
+    assert_eq!(coalescer.take_due(deadline - Duration::from_nanos(1)), None);
+    assert_eq!(
+        coalescer.take_due(deadline),
+        Some(snapshot_push(3, true, "m"))
+    );
+    assert_eq!(coalescer.deadline(), None);
+}
+
+#[test]
+fn snapshot_coalescer_final_snapshot_obeys_gate_and_clear_removes_pending_only() {
+    let started_at = Instant::now();
+    let mut coalescer = SnapshotCoalescer::default();
+    assert!(matches!(
+        coalescer.offer(started_at, snapshot_push(1, true, "m")),
+        SnapshotOffer::SendNow(_)
+    ));
+    let deadline = started_at + SNAPSHOT_MIN_INTERVAL;
+    assert_eq!(
+        coalescer.offer(
+            started_at + Duration::from_millis(1),
+            snapshot_push(2, false, "m")
+        ),
+        SnapshotOffer::ArmAt(deadline)
+    );
+    assert_eq!(coalescer.deadline(), Some(deadline));
+    coalescer.clear();
+    assert_eq!(coalescer.deadline(), None);
+    assert_eq!(coalescer.take_due(deadline), None);
+
+    assert_eq!(
+        coalescer.offer(deadline, snapshot_push(3, false, "m")),
+        SnapshotOffer::SendNow(snapshot_push(3, false, "m"))
+    );
+}
+
+#[test]
+fn snapshot_expression_accepts_exact_8_kib_and_rejects_one_byte_more() {
+    const TARGET_PREFIX: &str = "window.__codexLiveTokenCostV1?.acceptNativePush(";
+    let base = snapshot_push(1, true, "");
+    let base_json = serde_json::to_string(&base).unwrap();
+    let fixed_bytes = TARGET_PREFIX.len() + base_json.len() + 1;
+    let exact = snapshot_push(1, true, "x".repeat(MAX_SNAPSHOT_BYTES - fixed_bytes));
+    let exact_expression = codex_plus_core::token_cost::assets::snapshot_expression(&exact)
+        .expect("an exact 8 KiB expression should be accepted");
+    assert_eq!(exact_expression.len(), MAX_SNAPSHOT_BYTES);
+    assert!(exact_expression.starts_with(TARGET_PREFIX));
+
+    let oversized = snapshot_push(1, true, "x".repeat(MAX_SNAPSHOT_BYTES - fixed_bytes + 1));
+    let error = codex_plus_core::token_cost::assets::snapshot_expression(&oversized)
+        .expect_err("an 8 KiB + 1 expression should be rejected");
+    assert_eq!(error.to_string(), "snapshot expression exceeds 8192 bytes");
+}
+
+#[test]
+fn lazy_asset_expressions_are_static_inert_and_json_quote_instance_ids() {
+    let quoted_instance = "page-\"\\\n";
+    for (asset, module_name) in [
+        (LazyAsset::Settings, "settings"),
+        (LazyAsset::Analytics, "analytics"),
+        (LazyAsset::Profile, "profile"),
+        (LazyAsset::Flatpickr, "flatpickr"),
+    ] {
+        let expression =
+            codex_plus_core::token_cost::assets::lazy_asset_expression(&LazyAssetPush {
+                instance_id: quoted_instance.to_string(),
+                asset,
+            })
+            .unwrap();
+        assert!(expression.contains("window.__codexLiveTokenCostV1"));
+        assert!(expression.contains("api.instanceId !=="));
+        assert!(expression.contains(&serde_json::to_string(quoted_instance).unwrap()));
+        let source = codex_plus_core::token_cost::assets::lazy_asset_source(asset);
+        assert!(source.contains(&format!("registerModule(\"{module_name}\"")));
+        assert!(expression.contains(&serde_json::to_string(source).unwrap()));
+        assert!(!expression.contains("__codexSessionDeleteBridge"));
+    }
+
+    let snapshot_expression = codex_plus_core::token_cost::assets::snapshot_expression(
+        &snapshot_push(1, true, "flatpickr sentinel"),
+    )
+    .unwrap();
+    assert!(!snapshot_expression.contains("flatpickr v4.6.13"));
+    assert!(!bridge_startup_source().contains("flatpickr v4.6.13"));
+}
+
+#[test]
+fn lazy_module_sources_register_without_dom_or_mount_side_effects() {
+    for (asset, module_name) in [
+        (LazyAsset::Settings, "settings"),
+        (LazyAsset::Analytics, "analytics"),
+        (LazyAsset::Profile, "profile"),
+        (LazyAsset::Flatpickr, "flatpickr"),
+    ] {
+        let source = codex_plus_core::token_cost::assets::lazy_asset_source(asset);
+        let harness = format!(
+            r#"
+globalThis.window = globalThis;
+const registrations = [];
+const api = {{
+  registerModule(name, factory) {{
+    if (typeof factory !== "function") throw new Error("factory required");
+    registrations.push(name);
+  }},
+}};
+const css = "";
+const source = {};
+new Function("api", "css", source)(api, css);
+process.stdout.write(JSON.stringify({{ registrations, flatpickr: typeof window.flatpickr }}));
+"#,
+            serde_json::to_string(source).unwrap()
+        );
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{module_name} registration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            json!({ "registrations": [module_name], "flatpickr": "undefined" })
+        );
+    }
+}
+
+fn bridge_startup_source() -> String {
+    codex_plus_core::bridge::build_bridge_script(codex_plus_core::bridge::BRIDGE_BINDING_NAME)
 }
 
 fn meta_json(source: &str) -> serde_json::Value {

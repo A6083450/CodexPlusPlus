@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, watch};
 
+pub mod assets;
 pub mod config;
 pub mod input;
 pub mod model;
@@ -29,7 +30,7 @@ pub use model::{
     TokenCostDiagnostics, TokenCostEvent, TokenCostSnapshot, TokenUsage, UsageSource,
 };
 pub use pricing::{default_model_price, fast_multiplier_millis, usage_cost_nanos};
-pub use push::TokenCostPushReceiver;
+pub use push::{SnapshotCoalescer, SnapshotOffer, TokenCostPushReceiver};
 pub use state::{
     BoundedEventQueue, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, QueueAdmission,
     RECENT_TURN_LIMIT, RuntimeState,
@@ -46,6 +47,8 @@ const CC_SWITCH_URL: &str = "http://127.0.0.1:17888/cc-switch/turns?refresh=1";
 
 pub const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_RENDERER_EVENT_BYTES: usize = 4 * 1024;
+pub const MAX_SNAPSHOT_BYTES: usize = 8 * 1024;
+pub const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct TokenCostService {
     inner: Mutex<ServiceInner>,
