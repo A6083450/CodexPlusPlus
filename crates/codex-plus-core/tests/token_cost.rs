@@ -28,6 +28,17 @@ fn config_with_profile(profile: ProfileConfig) -> UiConfig {
     }
 }
 
+fn meta_json(source: &str) -> serde_json::Value {
+    json!({
+        "source": source,
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "event_id": "event-1",
+        "correlation_id": "correlation-1",
+        "occurred_at_ms": 42
+    })
+}
+
 #[test]
 fn event_models_use_the_exact_wire_tags() {
     assert_eq!(
@@ -39,27 +50,136 @@ fn event_models_use_the_exact_wire_tags() {
         json!("renderer")
     );
 
-    let event = TokenCostEvent::ToolStarted {
-        meta: meta(UsageSource::Renderer),
-        call_id: "call-1".to_string(),
-        name: "shell".to_string(),
+    let usage = TokenUsage {
+        input: 10,
+        cached_input: 2,
+        cache_write: 3,
+        output: 4,
     };
-    assert_eq!(
-        serde_json::to_value(event).unwrap(),
-        json!({
-            "type": "tool_started",
-            "meta": {
-                "source": "renderer",
-                "session_id": "session-1",
-                "turn_id": "turn-1",
-                "event_id": "event-1",
-                "correlation_id": "correlation-1",
-                "occurred_at_ms": 42
+    let cases = vec![
+        (
+            TokenCostEvent::TurnStarted {
+                meta: meta(UsageSource::ProtocolProxy),
+                model: "gpt-5.6-sol".to_string(),
+                fast: true,
             },
-            "call_id": "call-1",
-            "name": "shell"
-        })
-    );
+            json!({
+                "type": "turn_started",
+                "meta": meta_json("protocol_proxy"),
+                "model": "gpt-5.6-sol",
+                "fast": true
+            }),
+            &["meta", "model", "fast"][..],
+        ),
+        (
+            TokenCostEvent::OutputDelta {
+                meta: meta(UsageSource::Renderer),
+                estimated_output_tokens: 7,
+            },
+            json!({
+                "type": "output_delta",
+                "meta": meta_json("renderer"),
+                "estimated_output_tokens": 7
+            }),
+            &["meta", "estimated_output_tokens"],
+        ),
+        (
+            TokenCostEvent::ToolStarted {
+                meta: meta(UsageSource::Renderer),
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+            },
+            json!({
+                "type": "tool_started",
+                "meta": meta_json("renderer"),
+                "call_id": "call-1",
+                "name": "shell"
+            }),
+            &["meta", "call_id", "name"],
+        ),
+        (
+            TokenCostEvent::ToolCompleted {
+                meta: meta(UsageSource::ProtocolProxy),
+                call_id: "call-1".to_string(),
+            },
+            json!({
+                "type": "tool_completed",
+                "meta": meta_json("protocol_proxy"),
+                "call_id": "call-1"
+            }),
+            &["meta", "call_id"],
+        ),
+        (
+            TokenCostEvent::Usage {
+                meta: meta(UsageSource::ProtocolProxy),
+                usage,
+                exact: true,
+            },
+            json!({
+                "type": "usage",
+                "meta": meta_json("protocol_proxy"),
+                "usage": {
+                    "input": 10,
+                    "cached_input": 2,
+                    "cache_write": 3,
+                    "output": 4
+                },
+                "exact": true
+            }),
+            &["meta", "usage", "exact"],
+        ),
+        (
+            TokenCostEvent::TurnCompleted {
+                meta: meta(UsageSource::Renderer),
+                usage: Some(usage),
+            },
+            json!({
+                "type": "turn_completed",
+                "meta": meta_json("renderer"),
+                "usage": {
+                    "input": 10,
+                    "cached_input": 2,
+                    "cache_write": 3,
+                    "output": 4
+                }
+            }),
+            &["meta"],
+        ),
+        (
+            TokenCostEvent::TurnFailed {
+                meta: meta(UsageSource::ProtocolProxy),
+            },
+            json!({
+                "type": "turn_failed",
+                "meta": meta_json("protocol_proxy")
+            }),
+            &["meta"],
+        ),
+    ];
+
+    for (event, expected, required_fields) in cases {
+        assert_eq!(serde_json::to_value(&event).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<TokenCostEvent>(expected.clone()).unwrap(),
+            event
+        );
+
+        let mut with_unknown = expected.clone();
+        with_unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<TokenCostEvent>(with_unknown).is_err());
+
+        for required_field in required_fields {
+            let mut missing_required = expected.clone();
+            missing_required
+                .as_object_mut()
+                .unwrap()
+                .remove(*required_field);
+            assert!(
+                serde_json::from_value::<TokenCostEvent>(missing_required).is_err(),
+                "{required_field} must be required in {expected}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -171,11 +291,58 @@ fn ui_config_store_rejects_oversized_profile_text_fields() {
 }
 
 #[test]
+fn ui_config_store_counts_utf8_limits_in_bytes() {
+    let mut profile = ProfileConfig::default();
+    profile.display_name = "用".repeat(MAX_PROFILE_TEXT_BYTES / 3 + 1);
+    assert!(
+        UiConfigStore::in_memory()
+            .save(&config_with_profile(profile))
+            .unwrap_err()
+            .to_string()
+            .contains("display_name")
+    );
+
+    let mut config = UiConfig::default();
+    config
+        .price_overrides
+        .insert("模".repeat(MAX_MODEL_BYTES / 3 + 1), ModelPrice::default());
+    assert!(
+        UiConfigStore::in_memory()
+            .save(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("model")
+    );
+}
+
+#[test]
+fn ui_config_store_accepts_exact_string_and_username_boundaries() {
+    for username in ["abc".to_string(), "x".repeat(20)] {
+        let profile = ProfileConfig {
+            display_name: "d".repeat(MAX_PROFILE_TEXT_BYTES),
+            username,
+            email: "e".repeat(MAX_EMAIL_BYTES),
+            plan_type: "t".repeat(MAX_PROFILE_TEXT_BYTES),
+            plan_label: "l".repeat(MAX_PROFILE_TEXT_BYTES),
+            workspace_name: "w".repeat(MAX_PROFILE_TEXT_BYTES),
+            avatar_data_url: None,
+        };
+        let mut config = config_with_profile(profile);
+        config
+            .price_overrides
+            .insert("m".repeat(MAX_MODEL_BYTES), ModelPrice::default());
+        UiConfigStore::in_memory().save(&config).unwrap();
+    }
+}
+
+#[test]
 fn ui_config_store_rejects_invalid_usernames() {
     for username in [
         "ab".to_string(),
         "x".repeat(21),
         "not allowed".to_string(),
+        "not/allowed".to_string(),
+        "not:allowed".to_string(),
         "codex-\u{7528}\u{6237}".to_string(),
     ] {
         let mut profile = ProfileConfig::default();
@@ -213,15 +380,48 @@ fn ui_config_store_rejects_oversized_email_and_model_names() {
             .to_string()
             .contains("model")
     );
+
+    let mut config = UiConfig::default();
+    config
+        .price_overrides
+        .insert(String::new(), ModelPrice::default());
+    assert!(
+        UiConfigStore::in_memory()
+            .save(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("model")
+    );
 }
 
 #[test]
 fn ui_config_store_validates_avatar_data_urls_and_size() {
     for avatar in [
+        "data:image/png;base64,iVBORw0KGgo=",
+        "data:image/jpeg;base64,/9j/4A==",
+        "data:image/webp;base64,UklGRgQAAABXRUJQ",
+    ] {
+        let mut profile = ProfileConfig::default();
+        profile.avatar_data_url = Some(avatar.to_string());
+        UiConfigStore::in_memory()
+            .save(&config_with_profile(profile))
+            .unwrap();
+    }
+
+    for avatar in [
         "https://example.com/avatar.png".to_string(),
         "data:image/gif;base64,AAAA".to_string(),
         "data:image/png;base64,".to_string(),
         "data:image/png;base64,not valid".to_string(),
+        "data:image/png;base64,/9j/4A==".to_string(),
+        "data:image/jpeg;base64,iVBORw0KGgo=".to_string(),
+        "data:image/webp;base64,iVBORw0KGgo=".to_string(),
+        "data:image/png;base64,AAAA".to_string(),
+        "data:image/png;base64,====".to_string(),
+        "data:image/png;base64,iVBORw0KGgo===".to_string(),
+        "data:image/png;base64,AAAAA".to_string(),
+        "data:image/png;base64,iVBORw0KGgo*".to_string(),
+        "data:image/jpeg;base64,/9j/4B==".to_string(),
     ] {
         let mut profile = ProfileConfig::default();
         profile.avatar_data_url = Some(avatar);
@@ -233,16 +433,19 @@ fn ui_config_store_validates_avatar_data_urls_and_size() {
     }
 
     let prefix = "data:image/webp;base64,";
+    let payload = format!(
+        "UklGRgQAAABXRUJQ{}",
+        "AAAA".repeat((MAX_PROFILE_AVATAR_BYTES - prefix.len() - 16) / 4)
+    );
+    assert_eq!(prefix.len() + payload.len(), MAX_PROFILE_AVATAR_BYTES - 1);
+    assert!(prefix.len() + payload.len() + 4 > MAX_PROFILE_AVATAR_BYTES);
     let mut profile = ProfileConfig::default();
-    profile.avatar_data_url = Some(format!(
-        "{prefix}{}",
-        "A".repeat(MAX_PROFILE_AVATAR_BYTES - prefix.len())
-    ));
+    profile.avatar_data_url = Some(format!("{prefix}{payload}"));
     UiConfigStore::in_memory()
         .save(&config_with_profile(profile.clone()))
         .unwrap();
 
-    profile.avatar_data_url.as_mut().unwrap().push('A');
+    profile.avatar_data_url.as_mut().unwrap().push_str("AAAA");
     assert!(
         UiConfigStore::in_memory()
             .save(&config_with_profile(profile))
@@ -445,18 +648,56 @@ fn ui_config_store_loads_only_its_exact_path_and_in_memory_stays_ephemeral() {
 }
 
 #[test]
-fn malformed_config_falls_back_and_emits_only_one_diagnostic() {
+fn invalid_configs_fall_back_and_emit_only_one_diagnostic() {
     let temp = tempfile::tempdir().unwrap();
-    let config_path = temp.path().join("ui.json");
     let diagnostic_path = temp.path().join("diagnostic.log");
-    std::fs::write(&config_path, b"{malformed").unwrap();
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(
         diagnostic_path.clone(),
     ));
 
-    let store = UiConfigStore::new(config_path);
-    assert_eq!(store.load(), UiConfig::default());
-    assert_eq!(store.load(), UiConfig::default());
+    let malformed_path = temp.path().join("malformed.json");
+    std::fs::write(&malformed_path, b"{malformed").unwrap();
+    assert_eq!(
+        UiConfigStore::new(malformed_path).load(),
+        UiConfig::default()
+    );
+
+    let unreadable_path = temp.path().join("unreadable.json");
+    std::fs::create_dir(&unreadable_path).unwrap();
+    assert_eq!(
+        UiConfigStore::new(unreadable_path).load(),
+        UiConfig::default()
+    );
+
+    let wrong_schema_path = temp.path().join("wrong-schema.json");
+    std::fs::write(
+        &wrong_schema_path,
+        serde_json::to_vec(&UiConfig {
+            schema_version: 2,
+            ..UiConfig::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        UiConfigStore::new(wrong_schema_path).load(),
+        UiConfig::default()
+    );
+
+    let invalid_value_path = temp.path().join("invalid-value.json");
+    let mut invalid_value = UiConfig::default();
+    invalid_value
+        .price_overrides
+        .insert(String::new(), ModelPrice::default());
+    std::fs::write(
+        &invalid_value_path,
+        serde_json::to_vec(&invalid_value).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        UiConfigStore::new(invalid_value_path).load(),
+        UiConfig::default()
+    );
 
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     let diagnostics = std::fs::read_to_string(diagnostic_path).unwrap();
