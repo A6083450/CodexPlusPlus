@@ -5934,6 +5934,7 @@
   }
 
   function captureThreadScrollNavigation(targetSessionId) {
+    tokenCostEmitNavigationLifecycle();
     if (!codexPlusSettings().threadScrollRestore) return;
     const runtime = threadScrollRuntime();
     const targetKey = validThreadScrollSessionKey(targetSessionId);
@@ -6264,7 +6265,514 @@
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
 
+  // TOKEN_COST_BEGIN
+  const tokenCostMaxIdBytes = 160;
+  const tokenCostMaxModelBytes = 128;
+  const tokenCostMaxToolNameBytes = 128;
+  const tokenCostTurnLimit = 256;
+  const tokenCostAccountTargetSelector =
+    "[data-codex-plus-token-cost-profile-entry], button[aria-label='打开个人资料菜单'], button[aria-label='Open profile menu'], button[aria-label='Open profile menu and settings']";
+  const tokenCostAccountLabels = new Set([
+    "打开个人资料菜单",
+    "Open profile menu",
+    "Open profile menu and settings",
+  ]);
+  const tokenCostToolTypes = new Set([
+    "toolcall",
+    "commandexecution",
+    "filechange",
+    "websearch",
+    "computer",
+    "imagegeneration",
+  ]);
+  const tokenCostEncoder = new TextEncoder();
+  const tokenCostTurns = new Map();
+  let tokenCostActiveInstanceId = "";
+  let tokenCostLastLifecycle = null;
+  let tokenCostLastRoute = "";
+  let tokenCostAccountListenersInstalled = false;
+  let tokenCostPendingAccountFrame = false;
+  let tokenCostPendingAccountFrameId = 0;
+
+  function tokenCostUtf8Length(value) {
+    return tokenCostEncoder.encode(value).byteLength;
+  }
+
+  function tokenCostBoundedString(value, maxBytes) {
+    if (typeof value !== "string") return "";
+    const normalized = value.trim();
+    return normalized && tokenCostUtf8Length(normalized) <= maxBytes ? normalized : "";
+  }
+
+  function tokenCostTruncate(value, maxBytes) {
+    const text = String(value || "");
+    if (tokenCostUtf8Length(text) <= maxBytes) return text;
+    let result = "";
+    let bytes = 0;
+    for (const character of text) {
+      const size = tokenCostUtf8Length(character);
+      if (bytes + size > maxBytes) break;
+      result += character;
+      bytes += size;
+    }
+    return result;
+  }
+
+  function tokenCostDirectId(params, camelName, snakeName) {
+    const raw = params[camelName] ?? params[snakeName];
+    return tokenCostBoundedString(raw, tokenCostMaxIdBytes);
+  }
+
+  function tokenCostOptionalId(params, camelName, snakeName) {
+    const raw = params[camelName] ?? params[snakeName];
+    if (raw === undefined) return { present: false, value: "" };
+    const value = tokenCostBoundedString(raw, tokenCostMaxIdBytes);
+    return { present: true, value };
+  }
+
+  function tokenCostFingerprint(value) {
+    const bytes = tokenCostEncoder.encode(value);
+    let left = 0x811c9dc5;
+    let right = 0x9e3779b9;
+    for (const byte of bytes) {
+      left = Math.imul(left ^ byte, 0x01000193) >>> 0;
+      right = Math.imul(right ^ byte, 0x85ebca6b) >>> 0;
+    }
+    return `${left.toString(16).padStart(8, "0")}${right.toString(16).padStart(8, "0")}`;
+  }
+
+  function tokenCostEventId(tag, identity, sequence, explicit) {
+    if (explicit.present) return explicit.value;
+    const suffix = sequence > 0 ? `:${sequence}` : "";
+    return `${tag}${suffix}:${tokenCostFingerprint(identity)}`;
+  }
+
+  function tokenCostCorrelationId(params, sessionId, turnId) {
+    const explicit = tokenCostOptionalId(params, "correlationId", "correlation_id");
+    if (explicit.present) return explicit.value;
+    return tokenCostTruncate(`renderer:${sessionId}:${turnId}`, tokenCostMaxIdBytes);
+  }
+
+  function tokenCostTimestamp(params, method) {
+    let value = params.occurredAtMs ?? params.occurred_at_ms;
+    if (value === undefined && method === "turn/started") value = params.startedAtMs ?? params.started_at_ms;
+    if (value === undefined && (method === "turn/completed" || method === "item/completed")) {
+      value = params.completedAtMs ?? params.completed_at_ms;
+    }
+    if (value === undefined && method === "item/started") value = params.startedAtMs ?? params.started_at_ms;
+    if (value === undefined) value = Date.now();
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+
+  function tokenCostMeta(method, params, tag, sequence = 0, identity = "") {
+    const sessionId = tokenCostDirectId(params, "threadId", "thread_id");
+    const turnId = tokenCostDirectId(params, "turnId", "turn_id");
+    const explicitEventId = tokenCostOptionalId(params, "eventId", "event_id");
+    const correlationId = tokenCostCorrelationId(params, sessionId, turnId);
+    const occurredAtMs = tokenCostTimestamp(params, method);
+    if (!sessionId || !turnId || (explicitEventId.present && !explicitEventId.value) || !correlationId || occurredAtMs === null) return null;
+    const eventId = tokenCostEventId(
+      tag,
+      `${sessionId}\u0000${turnId}\u0000${method}\u0000${identity}`,
+      sequence,
+      explicitEventId,
+    );
+    if (!eventId) return null;
+    return {
+      source: "renderer",
+      session_id: sessionId,
+      turn_id: turnId,
+      event_id: eventId,
+      correlation_id: correlationId,
+      occurred_at_ms: occurredAtMs,
+    };
+  }
+
+  function tokenCostTurnKey(meta) {
+    return `${meta.session_id}\u0000${meta.turn_id}`;
+  }
+
+  function tokenCostRememberTurn(meta) {
+    const key = tokenCostTurnKey(meta);
+    if (tokenCostTurns.has(key)) return tokenCostTurns.get(key);
+    tokenCostTurns.set(key, { bytes: 0, sequence: 0 });
+    while (tokenCostTurns.size > tokenCostTurnLimit) {
+      const oldest = tokenCostTurns.keys().next().value;
+      if (oldest === undefined) break;
+      tokenCostTurns.delete(oldest);
+    }
+    return tokenCostTurns.get(key);
+  }
+
+  function tokenCostDirectNumber(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+
+  function tokenCostNumberField(value, camelNames, snakeNames) {
+    for (let index = 0; index < camelNames.length; index += 1) {
+      const camelValue = value[camelNames[index]];
+      if (camelValue !== undefined) return { present: true, value: tokenCostDirectNumber(camelValue) };
+      const snakeValue = value[snakeNames[index]];
+      if (snakeValue !== undefined) return { present: true, value: tokenCostDirectNumber(snakeValue) };
+    }
+    return { present: false, value: 0 };
+  }
+
+  function tokenCostUsageFromValue(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { present: true, usage: null };
+    const input = tokenCostNumberField(value, ["input", "inputTokens"], ["input", "input_tokens"]);
+    const cached = tokenCostNumberField(
+      value,
+      ["cached", "cachedInput", "cachedInputTokens"],
+      ["cached", "cached_input", "cached_input_tokens"],
+    );
+    const cacheWrite = tokenCostNumberField(
+      value,
+      ["cacheWrite", "cacheWriteTokens"],
+      ["cache_write", "cache_write_tokens"],
+    );
+    const output = tokenCostNumberField(value, ["output", "outputTokens"], ["output", "output_tokens"]);
+    if (!input.present && !cached.present && !cacheWrite.present && !output.present) return { present: false, usage: null };
+    if (input.value === null || cached.value === null || cacheWrite.value === null || output.value === null) {
+      return { present: true, usage: null };
+    }
+    const inputValue = input.value || 0;
+    const cachedValue = cached.value || 0;
+    const cacheWriteValue = cacheWrite.value || 0;
+    const outputValue = output.value || 0;
+    if (cachedValue > inputValue) return { present: true, usage: null };
+    if (inputValue > Number.MAX_SAFE_INTEGER - cacheWriteValue) return { present: true, usage: null };
+    const inputAndWrite = inputValue + cacheWriteValue;
+    if (inputAndWrite > Number.MAX_SAFE_INTEGER - outputValue) return { present: true, usage: null };
+    return {
+      present: true,
+      usage: {
+        input: inputValue,
+        cached_input: cachedValue,
+        cache_write: cacheWriteValue,
+        output: outputValue,
+      },
+    };
+  }
+
+  function tokenCostUsageFromParams(params) {
+    if (params.usage !== undefined) return tokenCostUsageFromValue(params.usage);
+    if (params.tokenUsage !== undefined) return tokenCostUsageFromValue(params.tokenUsage);
+    if (params.token_usage !== undefined) return tokenCostUsageFromValue(params.token_usage);
+    return tokenCostUsageFromValue(params);
+  }
+
+  function tokenCostFastMode(params) {
+    const booleanValue = params.fastMode ?? params.fast_mode;
+    if (booleanValue !== undefined) return typeof booleanValue === "boolean" ? booleanValue : null;
+    const tier = params.serviceTier ?? params.service_tier;
+    if (tier === undefined || tier === null || tier === "") return false;
+    if (typeof tier !== "string") return null;
+    const normalized = tier.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (["fast", "fast_mode", "priority"].includes(normalized)) return true;
+    if (["standard", "normal", "regular", "default"].includes(normalized)) return false;
+    return null;
+  }
+
+  function tokenCostToolType(value) {
+    if (typeof value !== "string" || tokenCostUtf8Length(value) > tokenCostMaxToolNameBytes) return "";
+    const normalized = value.replace(/[-_]/g, "").toLowerCase();
+    return tokenCostToolTypes.has(normalized) ? normalized : "";
+  }
+
+  function tokenCostIsReasoningDelta(method) {
+    return method.startsWith("item/reasoning/") && method.endsWith("delta") && method.length > "item/reasoning/delta".length;
+  }
+
+  function tokenCostEventFromAppServer(method, params) {
+    if (typeof method !== "string"
+        || tokenCostUtf8Length(method) > tokenCostMaxIdBytes
+        || !params
+        || typeof params !== "object"
+        || Array.isArray(params)) return null;
+    const allowed = method === "turn/started"
+      || method === "item/agentMessage/delta"
+      || tokenCostIsReasoningDelta(method)
+      || method === "item/started"
+      || method === "item/completed"
+      || method === "thread/tokenUsage/updated"
+      || method === "turn/completed";
+    if (!allowed) return null;
+
+    if (method === "turn/started") {
+      const meta = tokenCostMeta(method, params, "ts");
+      const model = tokenCostBoundedString(params.model, tokenCostMaxModelBytes);
+      const fast = tokenCostFastMode(params);
+      if (!meta || !model || fast === null) return null;
+      tokenCostRememberTurn(meta);
+      return { type: "turn_started", meta, model, fast };
+    }
+
+    if (method === "item/agentMessage/delta" || tokenCostIsReasoningDelta(method)) {
+      if (typeof params.delta !== "string" || params.delta.length === 0) return null;
+      const baseMeta = tokenCostMeta(method, params, "od");
+      if (!baseMeta) return null;
+      const turn = tokenCostTurns.get(tokenCostTurnKey(baseMeta));
+      if (!turn || turn.sequence >= Number.MAX_SAFE_INTEGER) return null;
+      const deltaBytes = tokenCostUtf8Length(params.delta);
+      if (!deltaBytes || turn.bytes > Number.MAX_SAFE_INTEGER - deltaBytes) return null;
+      turn.bytes += deltaBytes;
+      turn.sequence += 1;
+      const explicit = tokenCostOptionalId(params, "eventId", "event_id");
+      if (explicit.present && !explicit.value) return null;
+      baseMeta.event_id = tokenCostEventId(
+        "od",
+        `${baseMeta.session_id}\u0000${baseMeta.turn_id}\u0000${method}`,
+        turn.sequence,
+        explicit,
+      );
+      return {
+        type: "output_delta",
+        meta: baseMeta,
+        estimated_output_tokens: Math.max(1, Math.ceil(turn.bytes / 4)),
+      };
+    }
+
+    if (method === "item/started" || method === "item/completed") {
+      const item = params.item;
+      if (!item || typeof item !== "object" || Array.isArray(item) || !tokenCostToolType(item.type)) return null;
+      const callId = tokenCostBoundedString(item.id ?? params.itemId ?? params.item_id, tokenCostMaxIdBytes);
+      if (!callId) return null;
+      const meta = tokenCostMeta(
+        method,
+        params,
+        method === "item/started" ? "tool-start" : "tool-complete",
+        0,
+        callId,
+      );
+      if (!meta) return null;
+      if (method === "item/completed") return { type: "tool_completed", meta, call_id: callId };
+      const name = tokenCostBoundedString(item.name, tokenCostMaxToolNameBytes);
+      return name ? { type: "tool_started", meta, call_id: callId, name } : null;
+    }
+
+    if (method === "thread/tokenUsage/updated") {
+      const parsed = tokenCostUsageFromParams(params);
+      if (!parsed.present || !parsed.usage) return null;
+      const usage = parsed.usage;
+      const meta = tokenCostMeta(
+        method,
+        params,
+        "usage",
+        0,
+        `${usage.input}:${usage.cached_input}:${usage.cache_write}:${usage.output}`,
+      );
+      return meta && parsed.present && parsed.usage
+        ? { type: "usage", meta, usage: parsed.usage, exact: true }
+        : null;
+    }
+
+    const rawStatus = params.status;
+    if (rawStatus !== undefined && typeof rawStatus !== "string") return null;
+    const status = typeof rawStatus === "string" ? rawStatus.trim().toLowerCase().replace(/[\s-]+/g, "_") : "completed";
+    const failed = ["failed", "failure", "cancelled", "canceled", "cancel", "aborted", "abort"].includes(status);
+    if (!failed && !["completed", "complete", "succeeded", "success"].includes(status)) return null;
+    const parsed = failed ? { present: false, usage: null } : tokenCostUsageFromParams(params);
+    if (!failed && parsed.present && !parsed.usage) return null;
+    const identity = parsed.usage
+      ? `${status}:${parsed.usage.input}:${parsed.usage.cached_input}:${parsed.usage.cache_write}:${parsed.usage.output}`
+      : status;
+    const meta = tokenCostMeta(method, params, "turn-complete", 0, identity);
+    if (!meta) return null;
+    if (failed) {
+      tokenCostTurns.delete(tokenCostTurnKey(meta));
+      return { type: "turn_failed", meta };
+    }
+    tokenCostTurns.delete(tokenCostTurnKey(meta));
+    return { type: "turn_completed", meta, usage: parsed.usage };
+  }
+
+  function tokenCostCaptureInstance() {
+    const capture = window.__codexLiveTokenCostCaptureV1;
+    if (!capture || capture.enabled !== true) return "";
+    return tokenCostBoundedString(capture.instanceId, tokenCostMaxIdBytes);
+  }
+
+  function tokenCostCaptureMatches(instanceId) {
+    return !!instanceId && tokenCostActiveInstanceId === instanceId && tokenCostCaptureInstance() === instanceId;
+  }
+
+  function tokenCostCurrentRoute() {
+    return tokenCostTruncate(`${location.pathname || "/"}${location.search || ""}${location.hash || ""}`, tokenCostMaxIdBytes) || "/";
+  }
+
+  function tokenCostEmitLifecycle(reason, profile = false, profileMenuId = "") {
+    if (!tokenCostCaptureMatches(tokenCostActiveInstanceId)) return false;
+    const route = tokenCostCurrentRoute();
+    const boundedMenuId = profileMenuId ? tokenCostBoundedString(profileMenuId, tokenCostMaxIdBytes) : "";
+    if (profileMenuId && !boundedMenuId) return false;
+    const detail = { route, reason, profile: profile === true, profileMenuId: boundedMenuId };
+    if (tokenCostLastLifecycle
+        && tokenCostLastLifecycle.route === detail.route
+        && tokenCostLastLifecycle.reason === detail.reason
+        && tokenCostLastLifecycle.profile === detail.profile
+        && tokenCostLastLifecycle.profileMenuId === detail.profileMenuId) return false;
+    tokenCostLastLifecycle = detail;
+    document.dispatchEvent(new CustomEvent("codex-plus:token-cost-lifecycle", { detail }));
+    return true;
+  }
+
+  function tokenCostEmitNavigationLifecycle() {
+    if (!tokenCostCaptureMatches(tokenCostActiveInstanceId)) return false;
+    const route = tokenCostCurrentRoute();
+    if (route === tokenCostLastRoute) return false;
+    tokenCostLastRoute = route;
+    return tokenCostEmitLifecycle("navigation", false, "");
+  }
+
+  function tokenCostValidMenu(button, menu) {
+    if (!menu || menu.getAttribute?.("role") !== "menu" || menu.getAttribute?.("aria-labelledby") !== button.id) return false;
+    const items = menu.querySelectorAll?.("[role='menuitem']") || [];
+    let identity = null;
+    let identityCount = 0;
+    let settingsCount = 0;
+    for (const item of items) {
+      const disabled = item.getAttribute?.("aria-disabled") === "true" || item.hasAttribute?.("data-disabled");
+      if (disabled) {
+        identity = item;
+        identityCount += 1;
+        continue;
+      }
+      const label = typeof item.textContent === "string" ? item.textContent.trim().toLowerCase() : "";
+      if (label === "设置" || label === "settings") settingsCount += 1;
+    }
+    return identityCount === 1
+      && settingsCount === 1
+      && identity?.getAttribute?.("aria-disabled") === "true"
+      && identity?.hasAttribute?.("data-disabled");
+  }
+
+  function tokenCostScheduleAccountMenu(button, event) {
+    const buttonId = tokenCostBoundedString(button.id, tokenCostMaxIdBytes);
+    const menuId = tokenCostBoundedString(button.getAttribute?.("aria-controls"), tokenCostMaxIdBytes);
+    if (!buttonId || !menuId) return false;
+    if (event.type === "keydown" && event.key === " ") event.preventDefault();
+    if (tokenCostPendingAccountFrame) return true;
+    const instanceId = tokenCostActiveInstanceId;
+    tokenCostPendingAccountFrame = true;
+    tokenCostPendingAccountFrameId = requestAnimationFrame(() => {
+      tokenCostPendingAccountFrame = false;
+      tokenCostPendingAccountFrameId = 0;
+      if (!tokenCostCaptureMatches(instanceId)) return;
+      const menu = document.getElementById(menuId);
+      if (!tokenCostValidMenu(button, menu)) return;
+      tokenCostEmitLifecycle("profile_menu", false, menuId);
+    });
+    return true;
+  }
+
+  function tokenCostAccountEvent(event) {
+    if (!tokenCostCaptureMatches(tokenCostActiveInstanceId)) return;
+    if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
+    const target = event.target?.closest?.(tokenCostAccountTargetSelector);
+    if (!target) return;
+    if (target.hasAttribute?.("data-codex-plus-token-cost-profile-entry")) {
+      if (target.getAttribute?.("role") !== "menuitem"
+          || target.getAttribute?.("aria-disabled") === "true"
+          || target.hasAttribute?.("data-disabled")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      tokenCostEmitLifecycle("profile_entry", true, "");
+      return;
+    }
+    if (!tokenCostAccountLabels.has(target.getAttribute?.("aria-label"))) return;
+    tokenCostScheduleAccountMenu(target, event);
+  }
+
+  function tokenCostInstallAccountListeners() {
+    if (tokenCostAccountListenersInstalled) return;
+    document.addEventListener("click", tokenCostAccountEvent, true);
+    document.addEventListener("keydown", tokenCostAccountEvent, true);
+    tokenCostAccountListenersInstalled = true;
+  }
+
+  function tokenCostRemoveAccountListeners() {
+    if (tokenCostAccountListenersInstalled) {
+      document.removeEventListener("click", tokenCostAccountEvent, true);
+      document.removeEventListener("keydown", tokenCostAccountEvent, true);
+      tokenCostAccountListenersInstalled = false;
+    }
+    if (tokenCostPendingAccountFrame) cancelAnimationFrame(tokenCostPendingAccountFrameId);
+    tokenCostPendingAccountFrame = false;
+    tokenCostPendingAccountFrameId = 0;
+  }
+
+  function tokenCostActivate(event) {
+    const instanceId = tokenCostCaptureInstance();
+    if (!instanceId || tokenCostBoundedString(event?.detail?.instanceId, tokenCostMaxIdBytes) !== instanceId) return;
+    if (tokenCostActiveInstanceId === instanceId) return;
+    tokenCostRemoveAccountListeners();
+    tokenCostTurns.clear();
+    tokenCostActiveInstanceId = instanceId;
+    tokenCostLastLifecycle = null;
+    tokenCostLastRoute = tokenCostCurrentRoute();
+    tokenCostInstallAccountListeners();
+    tokenCostEmitLifecycle("activate", false, "");
+  }
+
+  function tokenCostDeactivate(event) {
+    const instanceId = tokenCostBoundedString(event?.detail?.instanceId, tokenCostMaxIdBytes);
+    if (!instanceId || instanceId !== tokenCostActiveInstanceId) return;
+    tokenCostRemoveAccountListeners();
+    tokenCostTurns.clear();
+    tokenCostActiveInstanceId = "";
+    tokenCostLastLifecycle = null;
+    tokenCostLastRoute = "";
+  }
+
+  function tokenCostForwardAppServerEventIfEnabled(method, params) {
+    const instanceId = tokenCostCaptureInstance();
+    if (!instanceId || instanceId !== tokenCostActiveInstanceId) return null;
+    let event = null;
+    try {
+      event = tokenCostEventFromAppServer(method, params);
+    } catch (_) {
+      return null;
+    }
+    if (!event) return null;
+    try {
+      const request = postJson("/token-cost/event", { instance_id: instanceId, event });
+      if (request && typeof request.catch === "function") request.catch(() => {});
+    } catch (_) {}
+    if (event.type === "turn_started") tokenCostEmitLifecycle("turn_started", false, "");
+    if (event.type === "turn_completed" || event.type === "turn_failed") tokenCostEmitLifecycle("turn_completed", false, "");
+    return event;
+  }
+
+  function tokenCostTestState() {
+    return {
+      active: !!tokenCostActiveInstanceId,
+      turns: tokenCostTurns.size,
+      accountListeners: tokenCostAccountListenersInstalled ? 2 : 0,
+      pendingFrame: tokenCostPendingAccountFrame ? 1 : 0,
+    };
+  }
+
+  try {
+    window.__codexPlusTokenCostRendererCleanup?.();
+  } catch (_) {}
+  const tokenCostActivateHandler = (event) => tokenCostActivate(event);
+  const tokenCostDeactivateHandler = (event) => tokenCostDeactivate(event);
+  document.addEventListener("codex-plus:token-cost-activate", tokenCostActivateHandler);
+  document.addEventListener("codex-plus:token-cost-deactivate", tokenCostDeactivateHandler);
+  window.__codexPlusTokenCostRendererCleanup = () => {
+    document.removeEventListener("codex-plus:token-cost-activate", tokenCostActivateHandler);
+    document.removeEventListener("codex-plus:token-cost-deactivate", tokenCostDeactivateHandler);
+    tokenCostRemoveAccountListeners();
+    tokenCostTurns.clear();
+    tokenCostActiveInstanceId = "";
+  };
+  // TOKEN_COST_END
+
   function dispatchCodexPlusMessage(dispatcher, type, payload) {
+    if (window.__codexLiveTokenCostCaptureV1?.enabled === true) {
+      tokenCostForwardAppServerEventIfEnabled(type, payload);
+    }
     const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
     const nextType = message?.type || type;
     const { type: _type, ...nextPayload } = message || {};
@@ -6298,6 +6806,9 @@
       installRemoteSessionRecoveryListener: () => installCodexRemoteSessionRecoveryListener(),
       installRemoteSessionDispatcherSubscription: (dispatcher, assetPrefix = "test") => installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix),
       dispatchMessage: (dispatcher, type, payload) => dispatchCodexPlusMessage(dispatcher, type, payload),
+      tokenCostEventFromAppServer: (method, params) => tokenCostEventFromAppServer(method, params),
+      tokenCostForwardAppServerEventIfEnabled: (method, params) => tokenCostForwardAppServerEventIfEnabled(method, params),
+      tokenCostState: () => tokenCostTestState(),
       requestOverride: (message) => codexServiceTierRequestOverride(message),
       diagnostics: () => [...(window.__codexPlusServiceTierTestDiagnostics || [])],
       statusSummary: (state = {}) => {
