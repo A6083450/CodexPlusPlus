@@ -6,14 +6,15 @@ use codex_plus_core::paths::{
     TOKEN_COST_UI_FILE, default_codex_plus_config_dir, token_cost_ui_path,
 };
 use codex_plus_core::token_cost::{
-    BoundedEventQueue, ChatUsageTap, DEDUPE_FINGERPRINT_LIMIT, EVENT_QUEUE_CAPACITY, EventMeta,
-    IngestOutcome, LazyAsset, LazyAssetPush, MAX_EMAIL_BYTES, MAX_ID_BYTES, MAX_MODEL_BYTES,
-    MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES, MAX_RENDERER_EVENT_BYTES, MAX_SNAPSHOT_BYTES,
-    MAX_SSE_FRAME_BYTES, MAX_TOOL_NAME_BYTES, ModelPrice, ProfileConfig, QueueAdmission,
-    RECENT_TURN_LIMIT, ResponsesUsageTap, RuntimeState, SNAPSHOT_MIN_INTERVAL, SnapshotCoalescer,
-    SnapshotOffer, SnapshotPush, TokenCostAction, TokenCostActionResponse, TokenCostEvent,
-    TokenCostService, TokenCostSnapshot, TokenUsage, UiConfig, UiConfigStore, UsageSource,
-    default_model_price, fast_multiplier_millis, usage_cost_nanos, validate_renderer_event,
+    AnalyticsRange, BoundedEventQueue, ChatUsageTap, DEDUPE_FINGERPRINT_LIMIT,
+    EVENT_QUEUE_CAPACITY, EventMeta, IngestOutcome, LazyAsset, LazyAssetPush, MAX_EMAIL_BYTES,
+    MAX_ID_BYTES, MAX_MODEL_BYTES, MAX_PROFILE_AVATAR_BYTES, MAX_PROFILE_TEXT_BYTES,
+    MAX_RENDERER_EVENT_BYTES, MAX_SNAPSHOT_BYTES, MAX_SSE_FRAME_BYTES, MAX_TOOL_NAME_BYTES,
+    ModelPrice, ProfileConfig, QueueAdmission, RECENT_TURN_LIMIT, ResponsesUsageTap, RuntimeState,
+    SNAPSHOT_MIN_INTERVAL, SnapshotCoalescer, SnapshotOffer, SnapshotPush, TokenCostAction,
+    TokenCostActionResponse, TokenCostEvent, TokenCostService, TokenCostSnapshot, TokenUsage,
+    UiConfig, UiConfigStore, UsageSource, default_model_price, fast_multiplier_millis,
+    usage_cost_nanos, validate_renderer_event,
 };
 use serde_json::json;
 
@@ -200,6 +201,20 @@ fn config_with_profile(profile: ProfileConfig) -> UiConfig {
         profile,
         ..UiConfig::default()
     }
+}
+
+fn config_with_price_overrides(count: usize) -> UiConfig {
+    let mut config = UiConfig::default();
+    for index in 0..count {
+        config.price_overrides.insert(
+            format!("custom-model-{index:02}"),
+            ModelPrice {
+                input_nanos_per_million: index as u64,
+                ..ModelPrice::default()
+            },
+        );
+    }
+    config
 }
 
 fn snapshot_push(revision: u64, running: bool, model: impl Into<String>) -> SnapshotPush {
@@ -405,6 +420,21 @@ process.stdout.write(JSON.stringify({{ registrations, flatpickr: typeof window.f
             json!({ "registrations": [module_name], "flatpickr": "undefined" })
         );
     }
+}
+
+#[test]
+fn settings_lazy_asset_packages_the_frozen_shell_and_typed_actions() {
+    let source = codex_plus_core::token_cost::assets::lazy_asset_source(LazyAsset::Settings);
+    assert!(source.contains("Codex Token Cost"));
+    assert!(source.contains("个人资料"));
+    assert!(source.contains("数据与显示"));
+    assert!(source.contains("使用统计"));
+    assert!(source.contains("模型价格"));
+    assert!(source.contains("set_visibility"));
+    assert!(source.contains("save_profile"));
+    assert!(source.contains("save_price"));
+    assert!(source.contains("delete_price"));
+    assert!(source.contains("reset_price"));
 }
 
 #[test]
@@ -753,6 +783,20 @@ fn ui_config_store_accepts_exact_string_and_username_boundaries() {
             .insert("m".repeat(MAX_MODEL_BYTES), ModelPrice::default());
         UiConfigStore::in_memory().save(&config).unwrap();
     }
+}
+
+#[test]
+fn ui_config_store_accepts_64_price_overrides_and_rejects_65() {
+    UiConfigStore::in_memory()
+        .save(&config_with_price_overrides(64))
+        .unwrap();
+    let error = UiConfigStore::in_memory()
+        .save(&config_with_price_overrides(65))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("price_overrides"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -1125,6 +1169,47 @@ fn invalid_configs_fall_back_and_emit_only_one_diagnostic() {
     assert!(diagnostics.contains("token_cost.ui_config_load_failed"));
 }
 
+#[tokio::test]
+async fn oversized_price_overrides_fall_back_and_failed_update_preserves_committed_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let oversized_path = temp.path().join("oversized-token-cost-ui.json");
+    std::fs::write(
+        &oversized_path,
+        serde_json::to_vec(&config_with_price_overrides(65)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        UiConfigStore::new(oversized_path).load(),
+        UiConfig::default()
+    );
+
+    let committed_path = temp.path().join("committed").join("token-cost-ui.json");
+    let committed = config_with_price_overrides(64);
+    UiConfigStore::new(committed_path.clone())
+        .save(&committed)
+        .unwrap();
+    let service = TokenCostService::with_store(UiConfigStore::new(committed_path.clone()));
+    let before = service.bootstrap("page-override-limit").unwrap();
+    assert_eq!(before.config, committed);
+
+    let error = service
+        .apply_action(TokenCostAction::SavePrice {
+            instance_id: "page-override-limit".to_string(),
+            model: "sixty-fifth-model".to_string(),
+            price: ModelPrice::default(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("price_overrides"),
+        "unexpected error: {error}"
+    );
+    let after = service.bootstrap("page-override-limit").unwrap();
+    assert_eq!(after.config, before.config);
+    assert_eq!(after.snapshot.revision, before.snapshot.revision);
+    assert_eq!(UiConfigStore::new(committed_path).load(), committed);
+}
+
 #[test]
 fn ui_config_store_atomically_replaces_without_a_leftover_temp_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -1144,6 +1229,202 @@ fn ui_config_store_atomically_replaces_without_a_leftover_temp_file() {
         replacement
     );
     assert!(!temp.path().join("token-cost-ui.json.tmp").exists());
+}
+
+#[tokio::test]
+async fn typed_config_actions_commit_once_no_ops_and_queries_do_not_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_parent = temp.path().join("config");
+    let path = config_parent.join("token-cost-ui.json");
+    let service = TokenCostService::with_store(UiConfigStore::new(path.clone()));
+    service.bootstrap("page-settings").unwrap();
+
+    let changed = service
+        .apply_action(TokenCostAction::SetVisibility {
+            instance_id: "page-settings".to_string(),
+            hub_visible: false,
+            output_rate_visible: true,
+            profile_visible: true,
+        })
+        .await
+        .unwrap();
+    let (committed, revision) = match changed {
+        TokenCostActionResponse::Updated { config, snapshot } => (config, snapshot.revision),
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(revision, 1);
+    assert_eq!(UiConfigStore::new(path.clone()).load(), committed);
+    let first_bytes = std::fs::read(&path).unwrap();
+    let loaded_parent = temp.path().join("loaded-config");
+    std::fs::rename(&config_parent, &loaded_parent).unwrap();
+    std::fs::write(&config_parent, b"any attempted config write must fail").unwrap();
+
+    let no_op = service
+        .apply_action(TokenCostAction::SetVisibility {
+            instance_id: "page-settings".to_string(),
+            hub_visible: false,
+            output_rate_visible: true,
+            profile_visible: true,
+        })
+        .await
+        .unwrap();
+    match no_op {
+        TokenCostActionResponse::Updated { snapshot, .. } => {
+            assert_eq!(snapshot.revision, revision)
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+    let _ = service
+        .apply_action(TokenCostAction::QueryDiagnostics {
+            instance_id: "page-settings".to_string(),
+        })
+        .await
+        .unwrap();
+    let _ = service
+        .apply_action(TokenCostAction::QueryAnalytics {
+            instance_id: "page-settings".to_string(),
+            range: AnalyticsRange::Today,
+            model: None,
+        })
+        .await
+        .unwrap();
+    std::fs::rename(&config_parent, temp.path().join("write-blocker")).unwrap();
+    std::fs::rename(&loaded_parent, &config_parent).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), first_bytes);
+
+    let price = ModelPrice {
+        input_nanos_per_million: 1_250_000_000,
+        cached_input_nanos_per_million: None,
+        cache_write_nanos_per_million: Some(1),
+        output_nanos_per_million: 12_345_678_901,
+    };
+    let saved = service
+        .apply_action(TokenCostAction::SavePrice {
+            instance_id: "page-settings".to_string(),
+            model: "gpt-5.6-sol-custom".to_string(),
+            price,
+        })
+        .await
+        .unwrap();
+    let saved_revision = match saved {
+        TokenCostActionResponse::Updated { config, snapshot } => {
+            assert_eq!(
+                config.price_overrides.get("gpt-5.6-sol-custom"),
+                Some(&price)
+            );
+            assert_eq!(UiConfigStore::new(path.clone()).load(), config);
+            snapshot.revision
+        }
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(saved_revision, revision + 1);
+
+    let saved_no_op = service
+        .apply_action(TokenCostAction::SavePrice {
+            instance_id: "page-settings".to_string(),
+            model: "gpt-5.6-sol-custom".to_string(),
+            price,
+        })
+        .await
+        .unwrap();
+    match saved_no_op {
+        TokenCostActionResponse::Updated { snapshot, .. } => {
+            assert_eq!(snapshot.revision, saved_revision)
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    let mut profile = ProfileConfig::default();
+    profile.display_name = "Local Pro".to_string();
+    let profile_saved = service
+        .apply_action(TokenCostAction::SaveProfile {
+            instance_id: "page-settings".to_string(),
+            profile: profile.clone(),
+        })
+        .await
+        .unwrap();
+    let profile_revision = match profile_saved {
+        TokenCostActionResponse::Updated { config, snapshot } => {
+            assert_eq!(config.profile, profile);
+            snapshot.revision
+        }
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(profile_revision, saved_revision + 1);
+
+    let deleted = service
+        .apply_action(TokenCostAction::DeletePrice {
+            instance_id: "page-settings".to_string(),
+            model: "gpt-5.6-sol-custom".to_string(),
+        })
+        .await
+        .unwrap();
+    match deleted {
+        TokenCostActionResponse::Updated { config, snapshot } => {
+            assert!(!config.price_overrides.contains_key("gpt-5.6-sol-custom"));
+            assert_eq!(snapshot.revision, profile_revision + 1);
+            assert_eq!(UiConfigStore::new(path.clone()).load(), config);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    let restored = service
+        .apply_action(TokenCostAction::SavePrice {
+            instance_id: "page-settings".to_string(),
+            model: "gpt-5.6-sol-custom".to_string(),
+            price,
+        })
+        .await
+        .unwrap();
+    let restored_revision = match restored {
+        TokenCostActionResponse::Updated { snapshot, .. } => snapshot.revision,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    assert_eq!(restored_revision, profile_revision + 2);
+    let reset = service
+        .apply_action(TokenCostAction::ResetPrice {
+            instance_id: "page-settings".to_string(),
+            model: "gpt-5.6-sol-custom".to_string(),
+        })
+        .await
+        .unwrap();
+    match reset {
+        TokenCostActionResponse::Updated { config, snapshot } => {
+            assert!(!config.price_overrides.contains_key("gpt-5.6-sol-custom"));
+            assert_eq!(snapshot.revision, restored_revision + 1);
+            assert_eq!(UiConfigStore::new(path).load(), config);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_config_write_keeps_the_committed_config_and_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_parent = temp.path().join("config-parent");
+    let config_path = config_parent.join("token-cost-ui.json");
+    let initial = UiConfig::default();
+    UiConfigStore::new(config_path.clone())
+        .save(&initial)
+        .unwrap();
+    let service = TokenCostService::with_store(UiConfigStore::new(config_path));
+    let before = service.bootstrap("page-settings-failure").unwrap();
+    std::fs::rename(&config_parent, temp.path().join("loaded-config-parent")).unwrap();
+    std::fs::write(&config_parent, b"block child creation").unwrap();
+
+    let error = service
+        .apply_action(TokenCostAction::SetVisibility {
+            instance_id: "page-settings-failure".to_string(),
+            hub_visible: false,
+            output_rate_visible: false,
+            profile_visible: false,
+        })
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().is_empty());
+    let after = service.bootstrap("page-settings-failure").unwrap();
+    assert_eq!(after.config, before.config);
+    assert_eq!(after.snapshot.revision, before.snapshot.revision);
 }
 
 #[tokio::test]

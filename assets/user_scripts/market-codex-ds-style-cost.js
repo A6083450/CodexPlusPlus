@@ -37,11 +37,14 @@
   const state = {
     alive: true,
     activated: false,
+    activeModule: null,
     bootstrapAttempts: 0,
     bootstrapCycleStartedAt: 0,
     bootstrapInFlight: false,
     config: null,
+    configRevision: -1,
     generation: 1,
+    pendingOpen: null,
     retryTimer: 0,
     revision: -1,
     root: null,
@@ -434,7 +437,32 @@
     if (!state.alive || !validSnapshot(snapshot) || snapshot.revision <= state.revision) return false;
     state.revision = snapshot.revision;
     state.snapshot = snapshot;
+    syncConfigVisibility(snapshot);
     renderSnapshot(snapshot);
+    return true;
+  }
+
+  function syncConfigVisibility(snapshot) {
+    const config = state.config;
+    if (!config || (
+      config.hub_visible === snapshot.hub_visible
+      && config.output_rate_visible === snapshot.output_rate_visible
+      && config.profile_visible === snapshot.profile_visible
+    )) return false;
+    state.config = {
+      ...config,
+      hub_visible: snapshot.hub_visible,
+      output_rate_visible: snapshot.output_rate_visible,
+      profile_visible: snapshot.profile_visible,
+    };
+    return true;
+  }
+
+  function applyUpdatedConfig(config, revision) {
+    if (!validConfig(config) || !Number.isSafeInteger(revision) || revision < 0 || revision <= state.configRevision) return false;
+    state.config = config;
+    state.configRevision = revision;
+    if (state.snapshot && state.snapshot.revision > revision) syncConfigVisibility(state.snapshot);
     return true;
   }
 
@@ -623,6 +651,7 @@
       }
       state.bootstrapInFlight = false;
       state.config = response.config;
+      state.configRevision = response.snapshot.revision;
       if (!applySnapshot(response.snapshot)) {
         bootstrapFailed(generation);
         return;
@@ -650,6 +679,7 @@
       event.stopPropagation?.();
       mountOnce();
       resetBootstrapIfExhausted();
+      if (state.activated) requestModuleOpen("settings");
     }
   }
 
@@ -664,9 +694,79 @@
   }
 
   function registerModule(name, factory) {
-    if (!state.alive || !MODULE_NAMES.includes(name) || typeof factory !== "function") return false;
+    if (!state.alive || !MODULE_NAMES.includes(name)) return false;
+    if (typeof factory !== "function") {
+      clearPendingOpen(name);
+      return false;
+    }
     modules[name] = factory;
+    const pending = state.pendingOpen;
+    if (pending && pending.name === name && pending.generation === state.generation) {
+      state.pendingOpen = null;
+      openModule(name);
+    }
     return true;
+  }
+
+  function closeActiveModule(owner) {
+    const active = state.activeModule;
+    if (!active || (owner && active.owner !== owner)) return false;
+    state.activeModule = null;
+    try { active.instance.unmount(); } catch {}
+    if (state.alive && state.settingsButton?.isConnected) state.settingsButton.focus?.();
+    return true;
+  }
+
+  function openModule(name) {
+    if (!state.alive || state.activeModule || typeof modules[name] !== "function") return false;
+    const owner = {};
+    const context = {};
+    Object.defineProperties(context, {
+      config: { get: () => state.config, enumerable: true },
+      snapshot: { get: () => state.snapshot, enumerable: true },
+      emitAction: { value: emitAction, enumerable: true },
+      close: { value: () => closeActiveModule(owner), enumerable: true },
+    });
+    Object.freeze(context);
+    let instance;
+    try { instance = modules[name](context); } catch { return false; }
+    if (!instance || typeof instance.mount !== "function" || typeof instance.unmount !== "function") return false;
+    state.activeModule = { name, instance, owner };
+    try {
+      instance.mount();
+      return true;
+    } catch {
+      state.activeModule = null;
+      try { instance.unmount(); } catch {}
+      return false;
+    }
+  }
+
+  function clearPendingOpen(name) {
+    if (!state.pendingOpen || (name && state.pendingOpen.name !== name)) return false;
+    state.pendingOpen = null;
+    return true;
+  }
+
+  function requestModuleOpen(name) {
+    if (!state.alive || !state.activated || !MODULE_NAMES.includes(name)) return false;
+    if (state.activeModule) return state.activeModule.name === name;
+    if (typeof modules[name] === "function") return openModule(name);
+    if (state.pendingOpen) return state.pendingOpen.name === name;
+    const pending = { name, generation: state.generation };
+    state.pendingOpen = pending;
+    postJson("/token-cost/lazy-asset", { instance_id: instanceId, asset: name }).then((response) => {
+      if (!state.alive || state.pendingOpen !== pending) return;
+      if (!response || response.status !== "ok") state.pendingOpen = null;
+    }, () => {
+      if (state.alive && state.pendingOpen === pending) state.pendingOpen = null;
+    });
+    return true;
+  }
+
+  function acceptLazyError(error) {
+    if (!state.alive || !error || !MODULE_NAMES.includes(error.asset)) return false;
+    return clearPendingOpen(error.asset);
   }
 
   function emitAction(action) {
@@ -678,9 +778,9 @@
       if (!state.alive) return result;
       const updated = result?.status === "ok" && result.response?.type === "updated" ? result.response : null;
       if (updated && validConfig(updated.config) && validSnapshot(updated.snapshot)) {
-        state.config = updated.config;
+        const configChanged = applyUpdatedConfig(updated.config, updated.snapshot.revision);
         applySnapshot(updated.snapshot);
-        updateProjectedProfiles();
+        if (configChanged) updateProjectedProfiles();
       }
       return result;
     });
@@ -704,6 +804,8 @@
     if (!state.alive) return;
     state.alive = false;
     state.generation += 1;
+    state.pendingOpen = null;
+    closeActiveModule();
     state.bootstrapInFlight = false;
     if (state.retryTimer) window.clearTimeout(state.retryTimer);
     state.retryTimer = 0;
@@ -722,6 +824,7 @@
     state.settingsButton?.remove();
     state.style?.remove();
     state.config = null;
+    state.configRevision = -1;
     state.snapshot = null;
     state.root = null;
     state.settingsButton = null;
@@ -733,6 +836,7 @@
   }
 
   const api = { instanceId, acceptNativePush, registerModule, emitAction, diagnostics, destroy };
+  Object.defineProperty(api, "acceptLazyError", { value: acceptLazyError, enumerable: false });
   restoreConnectedProfiles();
   window.__codexLiveTokenCostVersion = VERSION;
   window.__codexLiveTokenCostV1 = api;

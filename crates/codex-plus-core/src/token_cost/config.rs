@@ -11,6 +11,7 @@ use super::{
 };
 
 static LOAD_FAILURE_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
+const MAX_PRICE_OVERRIDES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct UiConfigStore {
@@ -79,6 +80,10 @@ pub struct UiConfig {
 impl UiConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         ensure!(self.schema_version == 1, "schema_version must be 1");
+        ensure!(
+            self.price_overrides.len() <= MAX_PRICE_OVERRIDES,
+            "price_overrides must not exceed {MAX_PRICE_OVERRIDES} entries"
+        );
         for model in self.price_overrides.keys() {
             ensure!(!model.is_empty(), "model must not be empty");
             ensure!(
