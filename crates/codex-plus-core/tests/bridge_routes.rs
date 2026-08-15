@@ -654,6 +654,85 @@ async fn token_cost_analytics_totals_and_days_survive_recent_turn_eviction() {
     assert_eq!(filtered["days"][1]["totals"]["turns"], 256);
 }
 
+#[tokio::test]
+async fn token_cost_analytics_model_slots_age_with_the_retained_day_horizon() {
+    const DAY_MS: u64 = 86_400_000;
+    const FIRST_DAY_MS: u64 = 1_704_067_200_000;
+
+    let service = TokenCostService::in_memory();
+    let ctx = test_context().with_token_cost(service);
+    handle_bridge_request(
+        ctx.clone(),
+        "/token-cost/bootstrap",
+        json!({"instance_id": "page-analytics"}),
+    )
+    .await;
+
+    for model_index in 0..20 {
+        ingest_analytics_turn(
+            &ctx,
+            "page-analytics",
+            &format!("day-0-model-{model_index}"),
+            &format!("model-{model_index}"),
+            FIRST_DAY_MS + model_index,
+            1,
+            1,
+            (1, 0, 0, 1),
+        )
+        .await;
+    }
+    for day in 1..=30 {
+        ingest_analytics_turn(
+            &ctx,
+            "page-analytics",
+            &format!("retained-model-day-{day}"),
+            "model-0",
+            FIRST_DAY_MS + day * DAY_MS,
+            1,
+            1,
+            (1, 0, 0, 1),
+        )
+        .await;
+    }
+    ingest_analytics_turn(
+        &ctx,
+        "page-analytics",
+        "new-model-day-31",
+        "model-new",
+        FIRST_DAY_MS + 31 * DAY_MS,
+        1,
+        1,
+        (1, 0, 0, 1),
+    )
+    .await;
+
+    let unfiltered = token_cost_analytics_action(
+        &ctx,
+        json!({"type": "custom", "from_day": "2024-02-01", "to_day": "2024-02-01"}),
+        None,
+    )
+    .await;
+    let unfiltered = &unfiltered["response"]["analytics"];
+    assert_eq!(unfiltered["totals"]["turns"], 1);
+    assert_eq!(unfiltered["days"][0]["totals"]["turns"], 1);
+    assert_eq!(unfiltered["models"].as_array().unwrap().len(), 1);
+    assert_eq!(unfiltered["models"][0]["model"], "model-new");
+    assert_eq!(unfiltered["models"][0]["totals"]["turns"], 1);
+
+    let filtered = token_cost_analytics_action(
+        &ctx,
+        json!({"type": "custom", "from_day": "2024-02-01", "to_day": "2024-02-01"}),
+        Some("model-new"),
+    )
+    .await;
+    let filtered = &filtered["response"]["analytics"];
+    assert_eq!(filtered["totals"]["turns"], 1);
+    assert_eq!(filtered["days"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["days"][0]["totals"]["turns"], 1);
+    assert_eq!(filtered["models"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["models"][0]["model"], "model-new");
+}
+
 async fn ingest_analytics_turn(
     ctx: &BridgeContext,
     instance_id: &str,

@@ -906,6 +906,21 @@ impl RuntimeState {
     fn add_rollups(&mut self, model: &str, occurred_at_ms: u64, totals: &AnalyticsTotals) {
         let day = occurred_at_ms / MILLIS_PER_DAY;
         add_totals(self.day_rollups.entry(day).or_default(), totals);
+        let mut evicted_day = false;
+        while self.day_rollups.len() > DAY_ROLLUP_LIMIT {
+            let Some(oldest) = self.day_rollups.keys().next().copied() else {
+                break;
+            };
+            self.day_rollups.remove(&oldest);
+            self.day_model_rollups.remove(&oldest);
+            evicted_day = true;
+        }
+        if evicted_day {
+            self.rebuild_model_rollups();
+        }
+        if !self.day_rollups.contains_key(&day) {
+            return;
+        }
         if self.model_rollups.contains_key(model) || self.model_rollups.len() < MODEL_ROLLUP_LIMIT {
             add_totals(
                 self.model_rollups.entry(model.to_string()).or_default(),
@@ -920,13 +935,16 @@ impl RuntimeState {
                 totals,
             );
         }
-        while self.day_rollups.len() > DAY_ROLLUP_LIMIT {
-            let Some(oldest) = self.day_rollups.keys().next().copied() else {
-                break;
-            };
-            self.day_rollups.remove(&oldest);
-            self.day_model_rollups.remove(&oldest);
+    }
+
+    fn rebuild_model_rollups(&mut self) {
+        let mut model_rollups = BTreeMap::new();
+        for day_models in self.day_model_rollups.values() {
+            for (model, totals) in day_models {
+                add_totals(model_rollups.entry(model.clone()).or_default(), totals);
+            }
         }
+        self.model_rollups = model_rollups;
     }
 
     fn replace_rollups(
@@ -936,15 +954,17 @@ impl RuntimeState {
         old: &AnalyticsTotals,
         new: &AnalyticsTotals,
     ) {
-        if let Some(day) = self.day_rollups.get_mut(&(occurred_at_ms / MILLIS_PER_DAY)) {
-            replace_totals(day, old, new);
-        }
+        let day_key = occurred_at_ms / MILLIS_PER_DAY;
+        let Some(day) = self.day_rollups.get_mut(&day_key) else {
+            return;
+        };
+        replace_totals(day, old, new);
         if let Some(model_totals) = self.model_rollups.get_mut(model) {
             replace_totals(model_totals, old, new);
         }
         if let Some(day_model_totals) = self
             .day_model_rollups
-            .get_mut(&(occurred_at_ms / MILLIS_PER_DAY))
+            .get_mut(&day_key)
             .and_then(|models| models.get_mut(model))
         {
             replace_totals(day_model_totals, old, new);
