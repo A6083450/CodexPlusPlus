@@ -2252,6 +2252,11 @@ fn responses_tap_parses_lf_crlf_deltas_terminal_usage_and_done_once() {
                 estimated_output_tokens: 2,
                 ..
             },
+            TokenCostEvent::TurnStarted {
+                model,
+                fast: true,
+                ..
+            },
             TokenCostEvent::Usage {
                 usage: TokenUsage {
                     input: 10,
@@ -2263,14 +2268,20 @@ fn responses_tap_parses_lf_crlf_deltas_terminal_usage_and_done_once() {
                 ..
             },
             TokenCostEvent::TurnCompleted { usage: None, .. }
-        ]
+        ] if model == "gpt-5.6-sol"
     ));
     assert_eq!(
         events
             .iter()
             .map(|event| event_meta_ref(event).event_id.as_str())
             .collect::<Vec<_>>(),
-        ["proxy-7-1", "proxy-7-2", "proxy-7-3", "proxy-7-4"]
+        [
+            "proxy-7-1",
+            "proxy-7-2",
+            "proxy-7-3",
+            "proxy-7-4",
+            "proxy-7-5"
+        ]
     );
     assert!(tap.push_bytes(bytes.as_bytes(), 300).is_empty());
     assert!(tap.finish(400).is_empty());
@@ -2311,8 +2322,7 @@ fn responses_tap_finishes_non_stream_json_once() {
     let (mut tap, _) = ResponsesUsageTap::from_request(11, request, 1);
     let body = br#"{"id":"resp-1","object":"response","status":"completed","model":"gpt-5.6-sol","usage":{"input_tokens":7,"input_tokens_details":{"cached_tokens":2},"output_tokens":3}}"#;
 
-    assert!(tap.push_bytes(body, 2).is_empty());
-    let events = tap.finish(3);
+    let events = tap.push_bytes(body, 2);
 
     assert!(matches!(
         events.as_slice(),
@@ -2400,15 +2410,14 @@ fn chat_tap_supports_non_stream_direct_responses_style_usage() {
     let (mut tap, _) = ChatUsageTap::from_request(13, request, 1);
     let body = br#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5.4","choices":[{"message":{"content":"not retained"},"finish_reason":"stop"}],"usage":{"input_tokens":7,"output_tokens":3,"input_tokens_details":{"cached_tokens":2},"cache_read_input_tokens":1,"cache_creation_input_tokens":4}}"#;
 
-    assert!(tap.push_bytes(body, 2).is_empty());
-    let events = tap.finish(3);
+    let events = tap.push_bytes(body, 2);
 
     assert!(matches!(
         events.as_slice(),
         [
             TokenCostEvent::Usage {
                 usage: TokenUsage {
-                    input: 7,
+                    input: 8,
                     cached_input: 1,
                     cache_write: 4,
                     output: 3

@@ -21,6 +21,8 @@ struct UsageTapState {
     correlation_id: String,
     model: String,
     fast: bool,
+    announced_model: String,
+    announced_fast: bool,
     sequence: u64,
     cumulative_output_bytes: u64,
     tail: Vec<u8>,
@@ -106,6 +108,8 @@ impl UsageTapState {
             correlation_id,
             model,
             fast,
+            announced_model: String::new(),
+            announced_fast: false,
             sequence: 0,
             cumulative_output_bytes: 0,
             tail: Vec::new(),
@@ -113,22 +117,27 @@ impl UsageTapState {
             discarding_oversized_frame: false,
             terminal_seen: false,
         };
-        let events = if state.model.is_empty() {
-            Vec::new()
-        } else {
-            let meta = state.next_meta(now_ms);
-            vec![TokenCostEvent::TurnStarted {
-                meta,
-                model: state.model.clone(),
-                fast: state.fast,
-            }]
-        };
+        let mut events = Vec::new();
+        state.emit_turn_started_if_changed(now_ms, &mut events);
         (state, events)
     }
 
     fn push_bytes(&mut self, kind: ProtocolKind, bytes: &[u8], now_ms: u64) -> Vec<TokenCostEvent> {
         if self.terminal_seen {
             return Vec::new();
+        }
+        if self.tail.is_empty()
+            && self.separator.is_empty()
+            && !self.discarding_oversized_frame
+            && bytes
+                .iter()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| *byte == b'{')
+            && let Ok(value) = serde_json::from_slice::<Value>(bytes)
+        {
+            let mut events = Vec::new();
+            self.process_non_stream_value(kind, &value, now_ms, &mut events);
+            return events;
         }
         let mut events = Vec::new();
         for &byte in bytes {
@@ -246,7 +255,7 @@ impl UsageTapState {
             Some("response.completed") => {
                 let response = value.get("response").and_then(Value::as_object);
                 if let Some(response) = response {
-                    self.update_model_and_tier(response);
+                    self.update_model_and_tier(response, now_ms, events);
                 }
                 let usage = response
                     .and_then(|response| response.get("usage"))
@@ -259,7 +268,7 @@ impl UsageTapState {
 
     fn process_chat_value(&mut self, value: &Value, now_ms: u64, events: &mut Vec<TokenCostEvent>) {
         if let Some(object) = value.as_object() {
-            self.update_model_and_tier(object);
+            self.update_model_and_tier(object, now_ms, events);
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
@@ -278,8 +287,8 @@ impl UsageTapState {
                 }
             }
         }
-        if let Some(usage_value) = value.get("usage") {
-            self.emit_completed(parse_chat_usage(usage_value), now_ms, events);
+        if let Some(usage) = value.get("usage").and_then(parse_chat_usage) {
+            self.emit_completed(Some(usage), now_ms, events);
         }
     }
 
@@ -318,15 +327,25 @@ impl UsageTapState {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return;
         };
+        self.process_non_stream_value(kind, &value, now_ms, events);
+    }
+
+    fn process_non_stream_value(
+        &mut self,
+        kind: ProtocolKind,
+        value: &Value,
+        now_ms: u64,
+        events: &mut Vec<TokenCostEvent>,
+    ) {
         let Some(object) = value.as_object() else {
             return;
         };
-        self.update_model_and_tier(object);
         match kind {
             ProtocolKind::Responses => {
                 let is_response = object.get("object").and_then(Value::as_str) == Some("response")
                     || object.get("status").and_then(Value::as_str) == Some("completed");
                 if is_response {
+                    self.update_model_and_tier(object, now_ms, events);
                     self.emit_completed(
                         object.get("usage").and_then(parse_responses_usage),
                         now_ms,
@@ -335,29 +354,49 @@ impl UsageTapState {
                 }
             }
             ProtocolKind::Chat => {
-                let is_chat = object
+                let has_chat_discriminator = object
                     .get("object")
                     .and_then(Value::as_str)
-                    .is_some_and(|object| object.starts_with("chat.completion"))
-                    || object.contains_key("usage");
-                if is_chat {
-                    self.emit_completed(
-                        object.get("usage").and_then(parse_chat_usage),
-                        now_ms,
-                        events,
-                    );
+                    .is_some_and(|object| object.starts_with("chat.completion"));
+                let usage = object.get("usage").and_then(parse_chat_usage);
+                if has_chat_discriminator || usage.is_some() {
+                    self.update_model_and_tier(object, now_ms, events);
+                    self.emit_completed(usage, now_ms, events);
                 }
             }
         }
     }
 
-    fn update_model_and_tier(&mut self, object: &serde_json::Map<String, Value>) {
+    fn update_model_and_tier(
+        &mut self,
+        object: &serde_json::Map<String, Value>,
+        now_ms: u64,
+        events: &mut Vec<TokenCostEvent>,
+    ) {
         if let Some(model) = bounded_object_string(object, "model", MAX_MODEL_BYTES) {
             self.model = model;
         }
         if let Some(service_tier) = object.get("service_tier").and_then(Value::as_str) {
             self.fast = service_tier == "priority";
         }
+        self.emit_turn_started_if_changed(now_ms, events);
+    }
+
+    fn emit_turn_started_if_changed(&mut self, now_ms: u64, events: &mut Vec<TokenCostEvent>) {
+        if self.terminal_seen
+            || self.model.is_empty()
+            || (self.announced_model == self.model && self.announced_fast == self.fast)
+        {
+            return;
+        }
+        self.announced_model.clone_from(&self.model);
+        self.announced_fast = self.fast;
+        let meta = self.next_meta(now_ms);
+        events.push(TokenCostEvent::TurnStarted {
+            meta,
+            model: self.model.clone(),
+            fast: self.fast,
+        });
     }
 
     fn emit_delta(&mut self, delta: &str, now_ms: u64, events: &mut Vec<TokenCostEvent>) {
@@ -440,14 +479,15 @@ fn bounded_object_string(
 
 fn parse_responses_usage(value: &Value) -> Option<TokenUsage> {
     let object = value.as_object()?;
-    let input = direct_u64(object, "input_tokens").ok()??;
+    let direct_input = direct_u64(object, "input_tokens").ok()??;
     let output = direct_u64(object, "output_tokens").ok()??;
-    let cached_input = direct_nested_u64(object, "input_tokens_details", "cached_tokens")
-        .ok()?
-        .unwrap_or(0);
-    let cache_write = direct_u64(object, "cache_creation_input_tokens")
-        .ok()?
-        .unwrap_or(0);
+    let (cached_input, has_separate_cache_read) = parse_cached_input(object).ok()?;
+    let input = if has_separate_cache_read {
+        direct_input.checked_add(cached_input)?
+    } else {
+        direct_input
+    };
+    let cache_write = parse_cache_write(object).ok()?;
     (cached_input <= input).then_some(TokenUsage {
         input,
         cached_input,
@@ -462,21 +502,40 @@ fn parse_chat_usage(value: &Value) -> Option<TokenUsage> {
     let input_tokens = direct_u64(object, "input_tokens").ok()?;
     let completion_tokens = direct_u64(object, "completion_tokens").ok()?;
     let output_tokens = direct_u64(object, "output_tokens").ok()?;
-    let input = prompt_tokens.or(input_tokens)?;
     let output = completion_tokens.or(output_tokens)?;
-    let cache_read = direct_u64(object, "cache_read_input_tokens").ok()?;
-    let prompt_cached = direct_nested_u64(object, "prompt_tokens_details", "cached_tokens").ok()?;
-    let input_cached = direct_nested_u64(object, "input_tokens_details", "cached_tokens").ok()?;
-    let cached_input = cache_read.or(prompt_cached).or(input_cached).unwrap_or(0);
-    let cache_write = direct_u64(object, "cache_creation_input_tokens")
-        .ok()?
-        .unwrap_or(0);
+    let (cached_input, _) = parse_cached_input(object).ok()?;
+    let input = if let Some(input_tokens) = input_tokens {
+        input_tokens.checked_add(cached_input)?
+    } else {
+        prompt_tokens?
+    };
+    let cache_write = parse_cache_write(object).ok()?;
     (cached_input <= input).then_some(TokenUsage {
         input,
         cached_input,
         cache_write,
         output,
     })
+}
+
+fn parse_cached_input(object: &serde_json::Map<String, Value>) -> Result<(u64, bool), ()> {
+    let cache_read = direct_u64(object, "cache_read_input_tokens")?;
+    let prompt_cached = direct_nested_u64(object, "prompt_tokens_details", "cached_tokens")?;
+    let input_cached = direct_nested_u64(object, "input_tokens_details", "cached_tokens")?;
+    Ok((
+        cache_read.or(prompt_cached).or(input_cached).unwrap_or(0),
+        cache_read.is_some(),
+    ))
+}
+
+fn parse_cache_write(object: &serde_json::Map<String, Value>) -> Result<u64, ()> {
+    let cache_creation = direct_u64(object, "cache_creation_input_tokens")?;
+    let cache_creation_5m = direct_u64(object, "cache_creation_5m_input_tokens")?.unwrap_or(0);
+    let cache_creation_1h = direct_u64(object, "cache_creation_1h_input_tokens")?.unwrap_or(0);
+    match cache_creation {
+        Some(value) if value > 0 => Ok(value),
+        _ => cache_creation_5m.checked_add(cache_creation_1h).ok_or(()),
+    }
 }
 
 fn direct_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>, ()> {
@@ -665,6 +724,396 @@ mod tests {
         assert_eq!(snapshot.input, 10);
         assert_eq!(snapshot.cached_input, 2);
         assert_eq!(snapshot.output, 5);
+    }
+
+    #[test]
+    fn chat_stream_waits_through_null_and_invalid_usage_for_later_exact_usage() {
+        let request = br#"{"model":"gpt-5.4"}"#;
+        let (mut tap, mut events) = ChatUsageTap::from_request(5, request, 10);
+
+        let null_usage = tap.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n",
+            20,
+        );
+        assert!(matches!(
+            null_usage.as_slice(),
+            [TokenCostEvent::OutputDelta { .. }]
+        ));
+        events.extend(null_usage);
+
+        let invalid_usage = tap.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"bc\"}}],\"usage\":{}}\n\n",
+            30,
+        );
+        assert!(matches!(
+            invalid_usage.as_slice(),
+            [TokenCostEvent::OutputDelta { .. }]
+        ));
+        events.extend(invalid_usage);
+
+        let exact_usage = tap.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"d\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n",
+            40,
+        );
+        assert!(matches!(
+            exact_usage.as_slice(),
+            [
+                TokenCostEvent::OutputDelta { .. },
+                TokenCostEvent::Usage { exact: true, .. },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        events.extend(exact_usage);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.input, 10);
+        assert_eq!(snapshot.output, 3);
+        assert_eq!(snapshot.cost_nanos, 70_000);
+    }
+
+    #[test]
+    fn chat_non_stream_requires_a_valid_discriminator_or_usage_to_complete() {
+        let request = br#"{"model":"gpt-5.4"}"#;
+        let (mut tap, _) = ChatUsageTap::from_request(6, request, 10);
+
+        assert!(tap.push_bytes(br#"{"usage":null}"#, 20).is_empty());
+        assert!(matches!(
+            tap.finish(30).as_slice(),
+            [TokenCostEvent::TurnFailed { .. }]
+        ));
+
+        let (mut empty_usage, _) = ChatUsageTap::from_request(7, request, 10);
+        assert!(empty_usage.push_bytes(br#"{"usage":{}}"#, 20).is_empty());
+        assert!(matches!(
+            empty_usage.finish(30).as_slice(),
+            [TokenCostEvent::TurnFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn chat_first_response_identity_is_announced_once_before_usage() {
+        let (mut tap, mut events) = ChatUsageTap::from_request(8, b"{}", 10);
+        assert!(events.is_empty());
+
+        let first = tap.push_bytes(
+            b"data: {\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            20,
+        );
+        assert!(matches!(
+            first.as_slice(),
+            [
+                TokenCostEvent::TurnStarted {
+                    model,
+                    fast: true,
+                    ..
+                },
+                TokenCostEvent::OutputDelta { .. }
+            ] if model == "gpt-5.6-sol"
+        ));
+        events.extend(first);
+
+        let same_identity = tap.push_bytes(
+            b"data: {\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+            30,
+        );
+        assert!(matches!(
+            same_identity.as_slice(),
+            [TokenCostEvent::OutputDelta { .. }]
+        ));
+        events.extend(same_identity);
+
+        let terminal = tap.push_bytes(
+            b"data: {\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":1000000}}\n\n",
+            40,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::Usage { exact: true, .. },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        events.extend(terminal);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+        assert_eq!(snapshot.model, "gpt-5.6-sol");
+        assert!(snapshot.fast);
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.cost_nanos, 70_000_000_000);
+    }
+
+    #[test]
+    fn responses_model_change_is_announced_before_terminal_usage() {
+        let request = br#"{"model":"gpt-5.4"}"#;
+        let (mut tap, mut events) = ResponsesUsageTap::from_request(9, request, 10);
+        let terminal = tap.push_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":1000000}}}\n\n",
+            20,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::TurnStarted {
+                    model,
+                    fast: false,
+                    ..
+                },
+                TokenCostEvent::Usage { exact: true, .. },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ] if model == "gpt-5.6-sol"
+        ));
+        events.extend(terminal);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+        assert_eq!(snapshot.model, "gpt-5.6-sol");
+        assert!(!snapshot.fast);
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.cost_nanos, 35_000_000_000);
+    }
+
+    #[test]
+    fn responses_tier_change_is_announced_before_terminal_usage() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, mut events) = ResponsesUsageTap::from_request(10, request, 10);
+        let terminal = tap.push_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.6-sol\",\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":1000000}}}\n\n",
+            20,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::TurnStarted {
+                    model,
+                    fast: true,
+                    ..
+                },
+                TokenCostEvent::Usage { exact: true, .. },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ] if model == "gpt-5.6-sol"
+        ));
+        events.extend(terminal);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+        assert_eq!(snapshot.model, "gpt-5.6-sol");
+        assert!(snapshot.fast);
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.cost_nanos, 70_000_000_000);
+    }
+
+    #[test]
+    fn complete_non_stream_body_is_processed_without_retention() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(11, request, 10);
+        let body = br#"{"object":"response","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}"#;
+
+        let events = tap.push_bytes(body, 20);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TokenCostEvent::Usage {
+                    usage: TokenUsage {
+                        input: 7,
+                        output: 3,
+                        ..
+                    },
+                    exact: true,
+                    ..
+                },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        assert!(tap.state.tail.is_empty());
+        assert!(tap.state.separator.is_empty());
+        assert!(tap.finish(30).is_empty());
+    }
+
+    #[test]
+    fn responses_non_stream_body_over_sse_limit_still_extracts_exact_usage() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(12, request, 10);
+        let padding = "x".repeat(MAX_SSE_FRAME_BYTES);
+        let body = format!(
+            "{{\"object\":\"response\",\"status\":\"completed\",\"output\":\"{padding}\",\"usage\":{{\"input_tokens\":9,\"output_tokens\":4}}}}"
+        );
+        assert!(body.len() > MAX_SSE_FRAME_BYTES);
+
+        let events = tap.push_bytes(body.as_bytes(), 20);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TokenCostEvent::Usage {
+                    usage: TokenUsage {
+                        input: 9,
+                        output: 4,
+                        ..
+                    },
+                    exact: true,
+                    ..
+                },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        assert!(tap.state.tail.is_empty());
+        assert!(!tap.state.discarding_oversized_frame);
+        assert!(tap.finish(30).is_empty());
+    }
+
+    #[test]
+    fn chat_direct_cache_fields_normalize_exact_usage_and_cost() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, mut events) = ChatUsageTap::from_request(13, request, 10);
+        let terminal = tap.push_bytes(
+            b"data: {\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_5m_input_tokens\":4,\"cache_creation_1h_input_tokens\":6}}\n\n",
+            20,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::Usage {
+                    usage: TokenUsage {
+                        input: 12,
+                        cached_input: 2,
+                        cache_write: 10,
+                        output: 3
+                    },
+                    exact: true,
+                    ..
+                },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        events.extend(terminal);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.input, 12);
+        assert_eq!(snapshot.cached_input, 2);
+        assert_eq!(snapshot.output, 3);
+        assert_eq!(snapshot.cost_nanos, 203_500);
+    }
+
+    #[test]
+    fn responses_converter_cache_fields_normalize_exact_usage_and_cost() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, mut events) = ResponsesUsageTap::from_request(14, request, 10);
+        let terminal = tap.push_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"cache_read_input_tokens\":2,\"cache_creation_5m_input_tokens\":4,\"cache_creation_1h_input_tokens\":6}}}\n\n",
+            20,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::Usage {
+                    usage: TokenUsage {
+                        input: 12,
+                        cached_input: 2,
+                        cache_write: 10,
+                        output: 3
+                    },
+                    exact: true,
+                    ..
+                },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+        events.extend(terminal);
+
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        service.ingest_batch(events);
+        let snapshot = service.bootstrap("page-1").unwrap().snapshot;
+        assert_eq!(snapshot.turns, 1);
+        assert_eq!(snapshot.input, 12);
+        assert_eq!(snapshot.cached_input, 2);
+        assert_eq!(snapshot.output, 3);
+        assert_eq!(snapshot.cost_nanos, 203_500);
+    }
+
+    #[test]
+    fn chat_usage_addition_overflow_is_rejected_without_terminating() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ChatUsageTap::from_request(15, request, 10);
+
+        assert!(
+            tap.push_bytes(
+                format!(
+                    "data: {{\"usage\":{{\"input_tokens\":{},\"output_tokens\":1,\"cache_read_input_tokens\":1}}}}\n\n",
+                    u64::MAX
+                )
+                .as_bytes(),
+                20,
+            )
+            .is_empty()
+        );
+        assert!(
+            tap.push_bytes(
+                format!(
+                    "data: {{\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"cache_creation_5m_input_tokens\":{},\"cache_creation_1h_input_tokens\":1}}}}\n\n",
+                    u64::MAX
+                )
+                .as_bytes(),
+                30,
+            )
+            .is_empty()
+        );
+
+        let terminal = tap.push_bytes(
+            b"data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n",
+            40,
+        );
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                TokenCostEvent::Usage {
+                    usage: TokenUsage {
+                        input: 2,
+                        output: 1,
+                        ..
+                    },
+                    exact: true,
+                    ..
+                },
+                TokenCostEvent::TurnCompleted { usage: None, .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn responses_usage_addition_overflow_drops_exact_usage() {
+        let request = br#"{"model":"gpt-5.6-sol"}"#;
+        let (mut tap, _) = ResponsesUsageTap::from_request(16, request, 10);
+        let terminal = tap.push_bytes(
+            format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{},\"output_tokens\":1,\"cache_read_input_tokens\":1}}}}}}\n\n",
+                u64::MAX
+            )
+            .as_bytes(),
+            20,
+        );
+
+        assert!(matches!(
+            terminal.as_slice(),
+            [TokenCostEvent::TurnCompleted { usage: None, .. }]
+        ));
     }
 
     #[test]
