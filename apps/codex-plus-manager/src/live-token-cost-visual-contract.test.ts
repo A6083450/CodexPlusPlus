@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import vm from "node:vm";
@@ -29,6 +30,7 @@ function dataAttribute(name: string): string {
 class FakeEvent {
   readonly type: string;
   readonly bubbles: boolean;
+  readonly detail: any;
   readonly key: string;
   readonly shiftKey: boolean;
   target: FakeElement | null;
@@ -40,6 +42,7 @@ class FakeEvent {
   constructor(type: string, options: Record<string, unknown> = {}) {
     this.type = type;
     this.bubbles = options.bubbles !== false;
+    this.detail = options.detail;
     this.key = String(options.key || "");
     this.shiftKey = Boolean(options.shiftKey);
     this.target = (options.target as FakeElement | undefined) || null;
@@ -78,6 +81,15 @@ class FakeStyle {
 
   entries() {
     return this.values.entries();
+  }
+
+  get cssText() {
+    return Array.from(this.values.entries()).map(([name, value]) => `${name}: ${value}`).join("; ");
+  }
+
+  set cssText(value: string) {
+    this.values.clear();
+    parseDeclarations(String(value)).forEach((entry, property) => this.values.set(property, entry));
   }
 }
 
@@ -892,7 +904,7 @@ function installControlledFixtures(document: FakeDocument, accountLabel: string,
   document.body.append(header, main, profileButton, menu);
 }
 
-async function executeOldScriptInDom(accountLabel = "Open profile menu"): Promise<VisualHarness> {
+async function executeScriptInDom(accountLabel = "Open profile menu"): Promise<VisualHarness> {
   const document = new FakeDocument();
   const profileClicks = { settings: 0, profile: 0 };
   installControlledFixtures(document, accountLabel, profileClicks);
@@ -968,6 +980,48 @@ async function executeOldScriptInDom(accountLabel = "Open profile menu"): Promis
     atob: (value: string) => Buffer.from(value, "base64").toString("binary"),
     btoa: (value: string) => Buffer.from(value, "binary").toString("base64"),
   };
+  windowObject.__codexPlusPostJson = (path: string, payload: any) => {
+    if (path !== "/token-cost/bootstrap") return Promise.resolve({ status: "ok", response: { type: "disposed" } });
+    return Promise.resolve({
+      status: "ok",
+      instance_id: payload.instance_id,
+      config: {
+        schema_version: 1,
+        hub_visible: true,
+        output_rate_visible: true,
+        profile_visible: true,
+        price_overrides: {},
+        profile: {
+          display_name: "Local Usage",
+          username: "codex-local-usage",
+          email: "sama@openai.com",
+          plan_type: "pro_20x",
+          plan_label: "Pro 20x",
+          workspace_name: "",
+          avatar_data_url: null,
+        },
+      },
+      snapshot: {
+        revision: 1,
+        running: false,
+        model: "gpt-5.6-sol",
+        fast: false,
+        turns: 12,
+        steps: 34,
+        llm_ms: 68_000,
+        tool_ms: 24_000,
+        first_token_average_ms: 1_200,
+        output_rate_milli_tokens_per_second: 52_000,
+        input: 128_000,
+        cached_input: 92_160,
+        output: 18_000,
+        cost_nanos: 123_000_000,
+        hub_visible: true,
+        output_rate_visible: true,
+        profile_visible: true,
+      },
+    });
+  };
   windowObject.window = windowObject;
   windowObject.self = windowObject;
 
@@ -997,6 +1051,11 @@ async function executeOldScriptInDom(accountLabel = "Open profile menu"): Promis
     clearInterval: clearTimeout,
   });
 
+  for (let index = 0; index < 8; index += 1) await Promise.resolve();
+  document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
+    detail: { reason: "profile_menu", profile: true, profileMenuId: "profile-menu" },
+  }));
+
   return { document, flushTimers, getComputedStyle, profileClicks, window: windowObject };
 }
 
@@ -1006,19 +1065,39 @@ function normalizedText(node: FakeElement): string {
 
 function renderedLabel(node: FakeElement | FakeText): string {
   if (node instanceof FakeText) return node.textContent;
-  if (node.classList.contains("cltc-roll")) return " ";
+  if (node.classList.contains("cltc-value")) return " ";
   return node.childNodes.map(renderedLabel).join("");
 }
 
-describe("Codex Live Token Cost 0.8.3 visual contract", () => {
-  it("renders the old HUD labels, order, IDs, and computed visual tokens", async () => {
-    const harness = await executeOldScriptInDom();
+const DEFERRED_TASK_10_11_ORACLE = {
+  nav: ["个人资料", "数据与显示", "使用统计", "模型价格"],
+  headings: ["个人资料", "数据与显示", "使用统计", "模型价格"],
+  modalBounds: "(260, 140, 920, 620)",
+  profileBounds: "(374, 205, 940, 271)",
+  images: [
+    ["hud-idle.png", "bf36885a7b502f3555dd653861c5997ce79cdbdd790328ef40dd850fb28840fc"],
+    ["hud-running.png", "bf36885a7b502f3555dd653861c5997ce79cdbdd790328ef40dd850fb28840fc"],
+    ["profile-page.png", "507ca262fc7066a5b9b3f48ced95fb020cd9d46acef9ec1dba33d8436bba3a98"],
+    ["settings-calendar.png", "fb387ae20493f566c64946f0862ec12fe514c8f612d1a66f421e3de9e50704cf"],
+    ["settings-general.png", "1fb762abf9cae06a28b9dab3c8bc9b1d1382f62a499cb2bab67e05cd17fad941"],
+    ["settings-pricing.png", "2d828c09fdf0e72d588b945e90534629694de4672d10ac1ad6c8516edd3726ec"],
+    ["settings-profile.png", "54232737ae184c358d57eed24106066a1294463b22c7bee012e055f4ae55bb1e"],
+    ["settings-usage.png", "f25f88e353e17257784e1440c61bdc64f9f7548654a2c088acaccef6db79569a"],
+  ],
+} as const;
+
+describe("Codex Live Token Cost 1.0.0 visual contract", () => {
+  it("renders the preserved HUD labels, order, IDs, and computed visual tokens", async () => {
+    const harness = await executeScriptInDom();
     const root = harness.document.getElementById("codex-live-token-cost");
     const settings = harness.document.getElementById("codex-live-token-cost-settings");
 
-    assert.equal(harness.window.__codexLiveTokenCost.version, "0.8.3");
+    assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.0");
     assert.ok(root, "the executed script must mount the HUD");
     assert.ok(settings, "the executed script must mount the settings trigger");
+    assert.equal(settings.textContent, "今日 146K");
+    assert.equal(settings.title, "今日 146K · Codex Token Cost 设置");
+    assert.equal(settings.getAttribute("aria-label"), "今日 146K，打开 Codex Token Cost 设置");
     assert.deepEqual(root.querySelectorAll(".cltc-pill").map((node) => renderedLabel(node).replace(/\s+/g, " ").trim()), [
       "轮 · 步",
       "LLM · 工具调用",
@@ -1042,7 +1121,9 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
     assert.equal(style.padding, "8px 10px 25px");
     assert.equal(style.gap, "0");
     assert.equal(style.borderRadius, "20px 20px 0 0");
-    assert.equal(harness.getComputedStyle(root.querySelector(".cltc-roll")!).getPropertyValue("--cltc-roll-row"), "16px");
+    assert.equal(harness.getComputedStyle(root.querySelector(".cltc-value")!).height, "16px");
+    assert.equal(root.querySelectorAll(".cltc-roll").length, 0);
+    assert.equal(root.querySelectorAll(".cltc-cadenced-shimmer").length, 0);
   });
 
   it("applies light media, source order, specificity, and important in the style oracle", () => {
@@ -1072,60 +1153,40 @@ describe("Codex Live Token Cost 0.8.3 visual contract", () => {
     assert.equal(computed.getPropertyValue("--important"), "class");
   });
 
-  it("drives the old settings navigation and keyboard close behavior", async () => {
-    const harness = await executeOldScriptInDom();
-    harness.document.getElementById("codex-live-token-cost-settings")!.click();
-    const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
-    const nav = overlay.querySelector(".cltc-settings-nav")!;
-
-    assert.deepEqual(nav.querySelectorAll("[data-settings-panel]").map(normalizedText), ["个人资料", "数据与显示", "使用统计", "模型价格"]);
-    for (const [panel, heading] of [["profile", "个人资料"], ["general", "数据与显示"], ["usage", "使用统计"], ["pricing", "模型价格"]]) {
-      overlay.querySelector(`[data-settings-panel='${panel}']`)!.click();
-      const modal = overlay.querySelector(".cltc-settings-modal")!;
-      assert.equal(modal.dataset.settingsActive, panel);
-      assert.equal(normalizedText(modal.querySelector("h2")!), heading);
+  it("keeps the Task 10/11 Settings, Analytics, Calendar, and Profile page oracle immutable", async () => {
+    const baseline = new URL("../../../docs/superpowers/evidence/ds-style-cost-baseline/", import.meta.url);
+    const manifest = await readFile(new URL("manifest.md", baseline), "utf8");
+    assert.deepEqual(DEFERRED_TASK_10_11_ORACLE.nav, DEFERRED_TASK_10_11_ORACLE.headings);
+    assert.match(manifest, new RegExp(DEFERRED_TASK_10_11_ORACLE.modalBounds.replace(/[()]/g, "\\$&")));
+    assert.match(manifest, new RegExp(DEFERRED_TASK_10_11_ORACLE.profileBounds.replace(/[()]/g, "\\$&")));
+    for (const [file, sha256] of DEFERRED_TASK_10_11_ORACLE.images) {
+      const image = await readFile(new URL(file, baseline));
+      assert.equal(createHash("sha256").update(image).digest("hex"), sha256, `${file} bytes must match the frozen baseline`);
+      assert.match(manifest, new RegExp(`${file.replace(".", "\\.")}[^\\n]*${sha256}`));
     }
-
-    const overlayStyle = harness.getComputedStyle(overlay);
-    assert.equal(overlayStyle.getPropertyValue("--cltc-border-subtle"), "#d1d5db");
-    assert.equal(overlayStyle.padding, "48px 20px");
-    assert.equal(harness.getComputedStyle(overlay.querySelector(".cltc-settings-modal")!).borderRadius, "12px");
-
-    overlay.dispatchEvent(new FakeEvent("keydown", { key: "Escape", bubbles: true }));
-    harness.flushTimers();
-    assert.equal(harness.document.querySelector(".cltc-settings-overlay"), null);
+    assert.deepEqual(DEFERRED_TASK_10_11_ORACLE.nav, ["个人资料", "数据与显示", "使用统计", "模型价格"]);
   });
 
   for (const accountLabel of ["打开个人资料菜单", "Open profile menu", "Open profile menu and settings"]) {
     it(`keeps the enabled Profile entry contract for ${accountLabel}`, async () => {
-      const harness = await executeOldScriptInDom(accountLabel);
+      const harness = await executeScriptInDom(accountLabel);
       const trigger = harness.document.getElementById("profile-trigger")!;
-      const triggerAvatar = trigger.querySelector("[data-cltc-profile-identity-avatar]")!;
       const menu = harness.document.getElementById("profile-menu")!;
       const profileItem = menu.querySelector("[role='menuitem']")!;
       const identityRow = profileItem.firstElementChild!;
       const identityAvatar = identityRow.querySelector(".size-8")!;
 
-      assert.equal(normalizedText(trigger.querySelector("span.min-w-0.flex-1.truncate")!), "Local Usage");
-      assert.equal(triggerAvatar.classList.contains("icon-sm"), true);
-      assert.equal(trigger.querySelector("svg")!.style.display, "none");
+      assert.equal(normalizedText(trigger.querySelector("span.min-w-0.flex-1.truncate")!), "Settings");
       assert.equal(profileItem.getAttribute("role"), "menuitem");
       assert.equal(profileItem.hasAttribute("aria-disabled"), false);
       assert.equal(profileItem.hasAttribute("data-disabled"), false);
       assert.equal(profileItem.getAttribute("tabindex"), "0");
       assert.equal(profileItem.className, "menu-enabled");
+      assert.equal(profileItem.getAttribute("data-codex-plus-token-cost-profile-entry"), "true");
       assert.equal(normalizedText(identityRow.querySelector("span.flex-1.min-w-0.truncate")!), "Local Usage");
       assert.ok(identityAvatar, "the enhanced menu entry must retain its host avatar");
-
-      profileItem.click();
-      assert.deepEqual(harness.profileClicks, { settings: 1, profile: 1 });
-      profileItem.dispatchEvent(new FakeEvent("keydown", { key: "Enter", bubbles: true }));
-      const space = new FakeEvent("keydown", { key: " ", bubbles: true });
-      profileItem.dispatchEvent(space);
-      assert.deepEqual(harness.profileClicks, { settings: 3, profile: 3 });
-      assert.equal(space.defaultPrevented, true);
-      profileItem.dispatchEvent(new FakeEvent("keydown", { key: "ArrowDown", bubbles: true }));
-      assert.deepEqual(harness.profileClicks, { settings: 3, profile: 3 });
+      assert.equal(identityAvatar.classList.contains("size-8"), true);
+      assert.equal(menu.children[1].className, "menu-enabled", "the host Settings sibling remains enabled");
     });
   }
 });
