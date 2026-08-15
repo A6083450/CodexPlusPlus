@@ -135,10 +135,32 @@ api.registerModule("flatpickr", (context) => {
   let targetNode = null;
   let stopped = false;
   let diagnosticsMounted = false;
+  let recordedCalendar = null;
+
+  function appendChild(node, child) {
+    const connected = node?.isConnected === true;
+    node?.appendChild(child);
+    if (connected) context.recordDomWrite();
+  }
+
+  function remove(node) {
+    if (!node) return;
+    const connected = node.isConnected === true;
+    node.remove();
+    if (connected) context.recordDomWrite();
+  }
 
   function dayValue(date) {
     const part = (value) => String(value).padStart(2, "0");
     return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())}`;
+  }
+
+  function recordCalendarAttachment(candidate) {
+    const calendar = candidate?.calendarContainer;
+    if (calendar?.isConnected === true && calendar !== recordedCalendar) {
+      recordedCalendar = calendar;
+      context.recordDomWrite();
+    }
   }
 
   function destroyOwnedInstances(primary) {
@@ -147,7 +169,14 @@ api.registerModule("flatpickr", (context) => {
     const candidates = primary === fallback ? [primary] : [primary, fallback];
     for (const candidate of candidates) {
       if (!candidate || typeof candidate.destroy !== "function") continue;
+      const calendar = candidate.calendarContainer;
+      const calendarConnected = calendar?.isConnected === true;
+      if (calendarConnected && calendar !== recordedCalendar) {
+        recordedCalendar = calendar;
+        context.recordDomWrite();
+      }
       try { candidate.destroy(); } catch {}
+      if (calendarConnected && calendar?.isConnected !== true) context.recordDomWrite();
     }
     if (targetNode) {
       try { delete targetNode._flatpickr; } catch {}
@@ -158,11 +187,11 @@ api.registerModule("flatpickr", (context) => {
     const target = context.mountTarget;
     if (stopped || instance || !target?.isConnected || typeof flatpickrFactory !== "function") return;
     targetNode = target;
-    document.getElementById("codex-live-token-cost-flatpickr-style")?.remove();
+    remove(document.getElementById("codex-live-token-cost-flatpickr-style"));
     style = document.createElement("style");
     style.id = "codex-live-token-cost-flatpickr-style";
     style.textContent = flatpickrCss;
-    document.head?.appendChild(style);
+    appendChild(document.head, style);
     let created = null;
     try {
       created = flatpickrFactory(target, {
@@ -177,15 +206,19 @@ api.registerModule("flatpickr", (context) => {
           }
         },
       });
+      let owned = created;
+      if (!owned) {
+        try { owned = targetNode?._flatpickr; } catch {}
+      }
+      recordCalendarAttachment(owned);
       instance = created;
       if (!instance || typeof instance.destroy !== "function") throw new Error("flatpickr instance unavailable");
       instance.open();
-      context.recordDomWrite(2);
       context.recordListenerDelta(LISTENER_COUNT);
       diagnosticsMounted = true;
     } catch (error) {
       destroyOwnedInstances(created);
-      style?.remove();
+      remove(style);
       instance = null;
       style = null;
       throw error;
@@ -196,15 +229,15 @@ api.registerModule("flatpickr", (context) => {
     if (stopped) return;
     stopped = true;
     destroyOwnedInstances(instance);
-    style?.remove();
+    remove(style);
     if (diagnosticsMounted) {
-      context.recordDomWrite(2);
       context.recordListenerDelta(-LISTENER_COUNT);
       diagnosticsMounted = false;
     }
     instance = null;
     style = null;
     targetNode = null;
+    recordedCalendar = null;
   }
 
   function reopen() {

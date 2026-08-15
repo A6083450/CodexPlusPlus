@@ -37,10 +37,28 @@ api.registerModule("analytics", (context) => {
     return node;
   }
 
+  function write(node, mutation) {
+    const connected = node?.isConnected === true;
+    mutation();
+    if (connected) context.recordDomWrite();
+  }
+
+  function appendChild(node, child) {
+    const connected = node?.isConnected === true;
+    node.appendChild(child);
+    if (connected) context.recordDomWrite();
+  }
+
+  function remove(node) {
+    if (!node) return;
+    const connected = node.isConnected === true;
+    node.remove();
+    if (connected) context.recordDomWrite();
+  }
+
   function clear(node) {
-    while (node.firstElementChild) node.firstElementChild.remove();
-    node.textContent = "";
-    context.recordDomWrite();
+    while (node.firstElementChild) remove(node.firstElementChild);
+    if (node.textContent) write(node, () => { node.textContent = ""; });
   }
 
   function button(text, attribute, value) {
@@ -107,15 +125,15 @@ api.registerModule("analytics", (context) => {
   function setError(message) {
     if (!root || !statusRoot) return;
     clear(statusRoot);
-    delete statusRoot.dataset.analyticsStatus;
+    if (statusRoot.dataset.analyticsStatus !== undefined) write(statusRoot, () => { delete statusRoot.dataset.analyticsStatus; });
     const error = make("div", "cltc-analytics-error", String(message || "操作失败，请重试。").slice(0, 180));
-    statusRoot.appendChild(error);
+    appendChild(statusRoot, error);
   }
 
   function clearStatus() {
     if (!statusRoot) return;
     clear(statusRoot);
-    delete statusRoot.dataset.analyticsStatus;
+    if (statusRoot.dataset.analyticsStatus !== undefined) write(statusRoot, () => { delete statusRoot.dataset.analyticsStatus; });
   }
 
   function metric(label, value) {
@@ -159,7 +177,7 @@ api.registerModule("analytics", (context) => {
     if (!resultRoot || stopped) return;
     lastAnalytics = analytics;
     clear(resultRoot);
-    resultRoot.dataset.toDay = analytics.to_day;
+    write(resultRoot, () => { resultRoot.dataset.toDay = analytics.to_day; });
     customDates = [analytics.from_day, analytics.to_day];
     const totals = analytics.totals;
     const metrics = make("div", "cltc-analytics-metrics");
@@ -169,10 +187,10 @@ api.registerModule("analytics", (context) => {
       metric("模型调用", formatCount(totals.turns)),
       metric("缓存命中率", totals.input ? `${Math.round((totals.cached_input * 100) / totals.input)}%` : "--"),
     );
-    resultRoot.appendChild(metrics);
+    appendChild(resultRoot, metrics);
 
     if (totals.turns === 0 && analytics.days.length === 0 && analytics.models.length === 0) {
-      resultRoot.appendChild(make("div", "cltc-analytics-empty", "当前范围暂无使用记录。"));
+      appendChild(resultRoot, make("div", "cltc-analytics-empty", "当前范围暂无使用记录。"));
       return;
     }
 
@@ -191,7 +209,7 @@ api.registerModule("analytics", (context) => {
     trendHead.append(trendCopy, legend);
     trend.appendChild(trendHead);
     trend.appendChild(analyticsChart(analytics.days));
-    resultRoot.appendChild(trend);
+    appendChild(resultRoot, trend);
 
     const composition = make("section", "cltc-analytics-section");
     const compositionHead = make("div", "cltc-analytics-section-head");
@@ -216,7 +234,7 @@ api.registerModule("analytics", (context) => {
       compositionLegend.appendChild(label);
     }
     composition.appendChild(compositionLegend);
-    resultRoot.appendChild(composition);
+    appendChild(resultRoot, composition);
 
     const models = make("section", "cltc-analytics-section");
     const modelHeadCopy = make("div", "cltc-analytics-section-head");
@@ -252,14 +270,14 @@ api.registerModule("analytics", (context) => {
       expand.classList.add("cltc-analytics-expand");
       models.appendChild(expand);
     }
-    resultRoot.appendChild(models);
+    appendChild(resultRoot, models);
   }
 
   function renderModelFilter() {
     const filter = root?.querySelector("[data-action='clear-analytics-model']");
     if (!filter) return;
-    filter.hidden = !currentModel;
-    filter.textContent = currentModel ? `${currentModel} ×` : "";
+    write(filter, () => { filter.hidden = !currentModel; });
+    write(filter, () => { filter.textContent = currentModel ? `${currentModel} ×` : ""; });
   }
 
   function rangeValue() {
@@ -292,7 +310,7 @@ api.registerModule("analytics", (context) => {
     currentPreset = "custom";
     context.closeFlatpickr();
     const trigger = root?.querySelector("[data-action='open-analytics-calendar']");
-    if (trigger) trigger.textContent = `${fromDay} – ${toDay}`;
+    if (trigger) write(trigger, () => { trigger.textContent = `${fromDay} – ${toDay}`; });
     queryAnalytics();
   }
 
@@ -301,7 +319,7 @@ api.registerModule("analytics", (context) => {
     clearStatus();
     const target = root?.querySelector("[data-analytics-date-input]");
     if (!target) return;
-    target.value = customDates.length === 2 ? `${customDates[0]} 至 ${customDates[1]}` : "";
+    write(target, () => { target.value = customDates.length === 2 ? `${customDates[0]} 至 ${customDates[1]}` : ""; });
     context.requestFlatpickr(target, applyCustomRange, () => {
       if (stopped) return;
       calendarFailures += 1;
@@ -313,7 +331,7 @@ api.registerModule("analytics", (context) => {
     if (stopped || syncInFlight) return;
     syncInFlight = true;
     const syncButton = root?.querySelector("[data-action='sync-analytics-cc-switch']");
-    if (syncButton) syncButton.disabled = true;
+    if (syncButton) write(syncButton, () => { syncButton.disabled = true; });
     const sequence = ++querySequence;
     clearStatus();
     context.emitAction({ type: "sync_cc_switch" }).then((result) => {
@@ -325,31 +343,35 @@ api.registerModule("analytics", (context) => {
       currentModel = null;
       customDates = [analytics.from_day, analytics.to_day];
       context.closeFlatpickr();
-      for (const item of root.querySelectorAll("[data-analytics-preset]")) item.dataset.active = String(item.dataset.analyticsPreset === "custom");
+      for (const item of root.querySelectorAll("[data-analytics-preset]")) {
+        write(item, () => { item.dataset.active = String(item.dataset.analyticsPreset === "custom"); });
+      }
       const trigger = root.querySelector("[data-action='open-analytics-calendar']");
       if (trigger) {
-        trigger.hidden = false;
-        trigger.textContent = `${analytics.from_day} – ${analytics.to_day}`;
+        write(trigger, () => { trigger.hidden = false; });
+        write(trigger, () => { trigger.textContent = `${analytics.from_day} – ${analytics.to_day}`; });
       }
       renderModelFilter();
-      statusRoot.textContent = "";
-      statusRoot.dataset.analyticsStatus = "sync";
-      statusRoot.textContent = `已同步 ${response.imported_turns} 条。`;
+      if (statusRoot.textContent) write(statusRoot, () => { statusRoot.textContent = ""; });
+      write(statusRoot, () => { statusRoot.dataset.analyticsStatus = "sync"; });
+      write(statusRoot, () => { statusRoot.textContent = `已同步 ${response.imported_turns} 条。`; });
       renderAnalytics(analytics);
     }).catch(() => {
       if (!stopped && sequence === querySequence) setError("CC Switch 同步失败，请重试。");
     }).finally(() => {
       syncInFlight = false;
-      if (!stopped && syncButton?.isConnected) syncButton.disabled = false;
+      if (!stopped && syncButton?.isConnected) write(syncButton, () => { syncButton.disabled = false; });
     });
   }
 
   function selectPreset(name) {
     if (!["today", "7d", "30d", "custom"].includes(name)) return;
     currentPreset = name;
-    for (const item of root.querySelectorAll("[data-analytics-preset]")) item.dataset.active = String(item.dataset.analyticsPreset === name);
+    for (const item of root.querySelectorAll("[data-analytics-preset]")) {
+      write(item, () => { item.dataset.active = String(item.dataset.analyticsPreset === name); });
+    }
     const custom = root.querySelector(".cltc-date-range-trigger");
-    if (custom) custom.hidden = name !== "custom";
+    if (custom) write(custom, () => { custom.hidden = name !== "custom"; });
     if (name === "custom") return;
     context.closeFlatpickr();
     queryAnalytics();
@@ -413,7 +435,7 @@ api.registerModule("analytics", (context) => {
       .cltc-analytics-sync{margin-top:0}.cltc-analytics-status{min-height:18px;color:var(--cltc-muted);font-size:12px}.cltc-analytics-error{color:var(--cltc-danger)}.cltc-analytics-empty{padding:24px 10px;color:var(--cltc-muted);font-size:12px;text-align:center}
       @media(max-width:680px){.cltc-analytics-toolbar,.cltc-analytics-section-head{align-items:flex-start;flex-direction:column}.cltc-analytics-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.cltc-analytics-model-head,.cltc-analytics-model-row{grid-template-columns:minmax(110px,1.2fr) repeat(4,minmax(54px,.7fr))}}
     `;
-    document.head.appendChild(style);
+    appendChild(document.head, style);
     root = make("section", "cltc-settings-section cltc-analytics");
     const heading = make("div", "cltc-settings-section-heading cltc-analytics-heading");
     const headingCopy = make("div");
@@ -454,8 +476,7 @@ api.registerModule("analytics", (context) => {
     syncRow.append(syncCopy, sync);
     root.appendChild(syncRow);
     root.addEventListener("click", onClick);
-    host.appendChild(root);
-    context.recordDomWrite(2);
+    appendChild(host, root);
     context.recordListenerDelta(LISTENER_COUNT);
     diagnosticsMounted = true;
     queryAnalytics();
@@ -468,10 +489,9 @@ api.registerModule("analytics", (context) => {
     querySequence += 1;
     context.closeFlatpickr();
     root?.removeEventListener("click", onClick);
-    root?.remove();
-    style?.remove();
+    remove(root);
+    remove(style);
     if (diagnosticsMounted) {
-      context.recordDomWrite(2);
       context.recordListenerDelta(-LISTENER_COUNT);
       diagnosticsMounted = false;
     }

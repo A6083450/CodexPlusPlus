@@ -103,8 +103,10 @@ export function parseProcessList(source) {
       throw new Error(`invalid process row: ${rawLine}`);
     }
     if (processes.length >= MAX_PROCESS_ROWS) throw new Error(`process list exceeds ${MAX_PROCESS_ROWS} rows`);
+    const command = match[3];
+    if (Buffer.byteLength(command) > 4_096) throw new Error(`invalid process row: ${rawLine}`);
     seen.add(pid);
-    processes.push({ pid, ppid, command: match[3] });
+    processes.push({ pid, ppid, command });
   }
   return processes;
 }
@@ -118,8 +120,7 @@ function isCodexBrowserCommand(command) {
   return executable === "Codex" || executable.endsWith("/Codex.app/Contents/MacOS/Codex");
 }
 
-export function discoverCodexProcesses(source, debugPort) {
-  const processes = parseProcessList(source);
+function discoverCodexProcessRecords(processes, debugPort) {
   const marker = `--remote-debugging-port=${debugPort}`;
   const browsers = processes.filter((process) => {
     const args = commandArguments(process.command);
@@ -144,13 +145,17 @@ export function discoverCodexProcesses(source, debugPort) {
       pending.push(child.pid);
     }
   }
-  const rendererPids = descendants
+  const renderers = descendants
     .filter((process) => commandArguments(process.command).includes("--type=renderer"))
-    .map((process) => process.pid)
-    .sort((left, right) => left - right);
-  if (rendererPids.length === 0) throw new Error("expected at least one recursive renderer descendant");
-  if (rendererPids.length > MAX_RENDERERS) throw new Error(`renderer count exceeds ${MAX_RENDERERS}`);
-  return { browserPid: browsers[0].pid, rendererPids };
+    .sort((left, right) => left.pid - right.pid);
+  if (renderers.length === 0) throw new Error("expected at least one recursive renderer descendant");
+  if (renderers.length > MAX_RENDERERS) throw new Error(`renderer count exceeds ${MAX_RENDERERS}`);
+  return { browser: browsers[0], renderers };
+}
+
+export function discoverCodexProcesses(source, debugPort) {
+  const { browser, renderers } = discoverCodexProcessRecords(parseProcessList(source), debugPort);
+  return { browserPid: browser.pid, rendererPids: renderers.map((process) => process.pid) };
 }
 
 export function rediscoverRenderers(source, debugPort, expectedBrowserPid) {
@@ -174,6 +179,48 @@ export function parseProcessStat(source, pid) {
     throw new Error(`invalid process sample for PID ${pid}`);
   }
   return { pid, cpuPercent, rssKb };
+}
+
+function parseProcessSampleList(source) {
+  const processes = [];
+  const seen = new Set();
+  for (const rawLine of String(source).split(/\r?\n/)) {
+    if (!rawLine.trim()) continue;
+    const match = rawLine.match(/^\s*(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?|\.\d+)\s+(\d+)\s+(.+?)\s*$/);
+    if (!match) throw new Error(`invalid process sample row: ${rawLine}`);
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    const cpuPercent = Number(match[3]);
+    const rssKb = Number(match[4]);
+    const command = match[5];
+    if (
+      !Number.isSafeInteger(pid)
+      || pid <= 0
+      || !Number.isSafeInteger(ppid)
+      || ppid < 0
+      || !Number.isFinite(cpuPercent)
+      || cpuPercent < 0
+      || !Number.isSafeInteger(rssKb)
+      || rssKb < 0
+      || Buffer.byteLength(command) > 4_096
+      || seen.has(pid)
+      || processes.length >= MAX_PROCESS_ROWS
+    ) {
+      throw new Error(`invalid process sample row: ${rawLine}`);
+    }
+    seen.add(pid);
+    processes.push({ pid, ppid, command, cpuPercent, rssKb });
+  }
+  return processes;
+}
+
+export function collectRendererProcessSample(source, debugPort, expectedBrowserPid) {
+  const { browser, renderers } = discoverCodexProcessRecords(parseProcessSampleList(source), debugPort);
+  if (browser.pid !== expectedBrowserPid) throw new Error("Codex browser identity changed during measurement");
+  return {
+    rendererPids: renderers.map((process) => process.pid),
+    processes: renderers.map(({ pid, cpuPercent, rssKb }) => ({ pid, cpuPercent, rssKb })),
+  };
 }
 
 export function parseCdpSample(performanceResult, heapResult) {
@@ -532,12 +579,12 @@ async function processList() {
   return stdout;
 }
 
-async function sampleRenderer(pid) {
-  const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "%cpu=,rss="], {
+async function processSampleList() {
+  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,ppid=,%cpu=,rss=,command="], {
     encoding: "utf8",
-    maxBuffer: 64 * 1_024,
+    maxBuffer: 4 * 1_024 * 1_024,
   });
-  return parseProcessStat(stdout, pid);
+  return stdout;
 }
 
 function aggregateProcesses(processes) {
@@ -550,13 +597,13 @@ function aggregateProcesses(processes) {
   };
 }
 
-async function sampleOnce(client, debugPort, browserPid) {
-  const rendererPids = rediscoverRenderers(await processList(), debugPort, browserPid);
-  const [performanceResult, heapResult, processes] = await Promise.all([
+async function sampleOnce(client, debugPort, browserPid, listProcessSamples = processSampleList) {
+  const [performanceResult, heapResult, processSource] = await Promise.all([
     client.send("Performance.getMetrics"),
     client.send("Runtime.getHeapUsage"),
-    Promise.all(rendererPids.map((pid) => sampleRenderer(pid))),
+    listProcessSamples(),
   ]);
+  const { rendererPids, processes } = collectRendererProcessSample(processSource, debugPort, browserPid);
   return {
     timestamp: new Date().toISOString(),
     rendererPids,
@@ -586,9 +633,8 @@ async function removeTemporary(path, removeFile) {
   }
 }
 
-export async function writeJsonAtomically(outputPath, value, operations = {}) {
+async function prepareJsonOutput(outputPath, value, operations = {}) {
   const write = operations.writeFile || writeFile;
-  const renameFile = operations.rename || rename;
   const removeFile = operations.unlink || unlink;
   const serialized = JSON.stringify(value, null, 2);
   if (typeof serialized !== "string") throw new Error("metrics output is not serializable");
@@ -598,16 +644,87 @@ export async function writeJsonAtomically(outputPath, value, operations = {}) {
   await mkdir(dirname(finalPath), { recursive: true });
   try {
     await write(temporaryPath, `${serialized}\n`, "utf8");
-    await renameFile(temporaryPath, finalPath);
+    return { temporaryPath, finalPath };
   } catch (error) {
     await removeTemporary(temporaryPath, removeFile);
     throw error;
   }
 }
 
+async function discardPreparedOutput(output, operations = {}) {
+  if (output) await removeTemporary(output.temporaryPath, operations.unlink || unlink);
+}
+
+export async function publishPreparedOutputs(outputs, operations = {}) {
+  if (!Array.isArray(outputs) || outputs.length === 0 || outputs.length > 2) {
+    throw new Error("invalid prepared output group");
+  }
+  const finalPaths = new Set();
+  const temporaryPaths = new Set();
+  const states = outputs.map((output) => {
+    const finalPath = resolve(output?.finalPath || "");
+    const temporaryPath = resolve(output?.temporaryPath || "");
+    if (
+      dirname(finalPath) !== dirname(temporaryPath)
+      || !temporaryPath.startsWith(`${finalPath}.tmp-`)
+      || finalPaths.has(finalPath)
+      || temporaryPaths.has(temporaryPath)
+    ) {
+      throw new Error("invalid prepared output group");
+    }
+    finalPaths.add(finalPath);
+    temporaryPaths.add(temporaryPath);
+    return {
+      finalPath,
+      temporaryPath,
+      backupPath: `${finalPath}.backup-${process.pid}-${randomUUID()}`,
+      hadPrior: false,
+      published: false,
+    };
+  });
+  const renameFile = operations.rename || rename;
+  const removeFile = operations.unlink || unlink;
+  try {
+    for (const state of states) {
+      try {
+        await renameFile(state.finalPath, state.backupPath);
+        state.hadPrior = true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    for (const state of states) {
+      await renameFile(state.temporaryPath, state.finalPath);
+      state.published = true;
+    }
+  } catch (error) {
+    let rollbackError = null;
+    for (const state of [...states].reverse()) {
+      if (state.published) {
+        try { await removeTemporary(state.finalPath, removeFile); } catch (failure) { rollbackError ||= failure; }
+      }
+    }
+    for (const state of states) {
+      if (state.hadPrior) {
+        try { await renameFile(state.backupPath, state.finalPath); } catch (failure) { rollbackError ||= failure; }
+      }
+      try { await removeTemporary(state.temporaryPath, removeFile); } catch (failure) { rollbackError ||= failure; }
+    }
+    if (rollbackError) throw new AggregateError([error, rollbackError], "output group publication and rollback failed");
+    throw error;
+  }
+  for (const state of states) {
+    if (state.hadPrior) await removeTemporary(state.backupPath, removeFile);
+  }
+}
+
+export async function writeJsonAtomically(outputPath, value, operations = {}) {
+  const prepared = await prepareJsonOutput(outputPath, value, operations);
+  await publishPreparedOutputs([prepared], operations);
+}
+
 export async function startTrace(client, outputPath, operations = {}) {
   const createStream = operations.createStream || createWriteStream;
-  const renameFile = operations.rename || rename;
   const removeFile = operations.unlink || unlink;
   const finalPath = resolve(outputPath);
   const temporaryPath = temporarySibling(finalPath);
@@ -649,18 +766,22 @@ export async function startTrace(client, outputPath, operations = {}) {
     }
   });
   let completeTrace;
-  let rejectTrace;
-  const completed = new Promise((resolveComplete, rejectComplete) => {
+  const completed = new Promise((resolveComplete) => {
     completeTrace = resolveComplete;
-    rejectTrace = rejectComplete;
   });
+  let endRequested = false;
+  let completionError = null;
   const removeComplete = client.on("Tracing.tracingComplete", (params) => {
+    if (!endRequested) {
+      completionError ||= new Error("Tracing.tracingComplete arrived before Tracing.end was requested");
+      return;
+    }
     try {
       validateTraceCompletion(params);
-      completeTrace();
     } catch (error) {
-      rejectTrace(error);
+      completionError ||= error;
     }
+    completeTrace();
   });
   try {
     await client.send("Tracing.start", { categories: TRACE_CATEGORIES, transferMode: "ReportEvents" });
@@ -673,7 +794,8 @@ export async function startTrace(client, outputPath, operations = {}) {
     throw error;
   }
   let stopped = false;
-  return {
+  let prepared = null;
+  const controller = {
     assertHealthy() {
       if (streamError) throw streamError;
     },
@@ -687,19 +809,23 @@ export async function startTrace(client, outputPath, operations = {}) {
       try { await finished(stream); } catch {}
       await removeTemporary(temporaryPath, removeFile);
     },
-    async stop() {
-      if (stopped) return;
+    async prepare() {
+      if (prepared) return prepared;
+      if (stopped) throw new Error("trace capture is no longer available");
       stopped = true;
       let timeout;
       let stopError = null;
       try {
+        endRequested = true;
         await client.send("Tracing.end");
+        if (completionError) throw completionError;
         await Promise.race([
           completed,
           new Promise((_, rejectTimeout) => {
             timeout = setTimeout(() => rejectTimeout(new Error("Tracing.tracingComplete timed out")), 30_000);
           }),
         ]);
+        if (completionError) throw completionError;
       } catch (error) {
         stopError = error;
       } finally {
@@ -715,57 +841,71 @@ export async function startTrace(client, outputPath, operations = {}) {
         stopError ||= error;
       }
       stopError ||= streamError;
-      if (!stopError) {
-        try {
-          await renameFile(temporaryPath, finalPath);
-        } catch (error) {
-          stopError = error;
-        }
-      }
       if (stopError) {
         await removeTemporary(temporaryPath, removeFile);
         throw stopError;
       }
+      prepared = { temporaryPath, finalPath };
+      return prepared;
+    },
+    async stop() {
+      const output = await controller.prepare();
+      await publishPreparedOutputs([output], operations);
     },
   };
+  return controller;
 }
 
-async function runMeasurement(options) {
+export async function runMeasurement(options, dependencies = {}) {
+  const fetchTargets = dependencies.fetchJson || fetchJson;
+  const listProcesses = dependencies.processList || processList;
+  const connectCdp = dependencies.connectCdp || CdpClient.connect;
+  const readDiagnostics = dependencies.pageDiagnostics || pageDiagnostics;
+  const startObserver = dependencies.installLongTaskObserver || installLongTaskObserver;
+  const stopObserver = dependencies.removeLongTaskObserver || removeLongTaskObserver;
+  const startTraceCapture = dependencies.startTrace || startTrace;
+  const sleep = dependencies.delay || delay;
+  const monotonicNow = dependencies.performanceNow || (() => performance.now());
+  const takeSample = dependencies.sampleOnce
+    || ((client, debugPort, browserPid) => sampleOnce(client, debugPort, browserPid, dependencies.processSampleList));
+  const summarize = dependencies.summarizeSamples || summarizeSamples;
   const endpoint = `http://127.0.0.1:${options.debugPort}/json/list`;
-  const [targets, psOutput] = await Promise.all([fetchJson(endpoint), processList()]);
+  const [targets, psOutput] = await Promise.all([fetchTargets(endpoint), listProcesses()]);
   const page = selectPrimaryPage(targets, options.debugPort);
   const { browserPid, rendererPids } = discoverCodexProcesses(psOutput, options.debugPort);
-  const client = await CdpClient.connect(page.webSocketDebuggerUrl);
+  const client = await connectCdp(page.webSocketDebuggerUrl);
   let trace = null;
+  let preparedTrace = null;
+  let preparedMetrics = null;
   let observerInstalled = false;
   try {
     const browserVersion = parseBrowserVersion(await client.send("Browser.getVersion"));
     await client.send("Performance.enable");
-    const diagnosticsBefore = await pageDiagnostics(client);
-    await installLongTaskObserver(client);
+    const diagnosticsBefore = await readDiagnostics(client);
+    await startObserver(client);
     observerInstalled = true;
-    if (options.traceOutput) trace = await startTrace(client, options.traceOutput);
+    if (options.traceOutput) trace = await startTraceCapture(client, options.traceOutput);
     const startedAt = new Date().toISOString();
-    const startedMonotonic = performance.now();
+    const startedMonotonic = monotonicNow();
     const samples = [];
     for (let index = 0; index < options.durationSeconds; index += 1) {
       const deadline = startedMonotonic + ((index + 1) * 1_000);
-      await delay(Math.max(0, deadline - performance.now()));
-      const lateness = performance.now() - deadline;
+      await sleep(Math.max(0, deadline - monotonicNow()));
+      const lateness = monotonicNow() - deadline;
       if (lateness > 900) throw new Error(`missed 1 Hz sample deadline by ${lateness.toFixed(1)}ms`);
       trace?.assertHealthy();
-      samples.push(await sampleOnce(client, options.debugPort, browserPid));
+      samples.push(await takeSample(client, options.debugPort, browserPid));
       trace?.assertHealthy();
     }
     if (samples.length !== options.durationSeconds) throw new Error("sample collection is incomplete");
     const endedAt = new Date().toISOString();
-    const longTasks = await removeLongTaskObserver(client);
+    const longTasks = await stopObserver(client);
     observerInstalled = false;
     if (trace) {
-      await trace.stop();
+      preparedTrace = await trace.prepare();
       trace = null;
     }
-    const diagnosticsAfter = await pageDiagnostics(client);
+    const diagnosticsAfter = await readDiagnostics(client);
     const result = {
       label: options.label,
       startedAt,
@@ -778,19 +918,27 @@ async function runMeasurement(options) {
       browserPid,
       rendererPids,
       samples,
-      summary: summarizeSamples(samples),
+      summary: summarize(samples),
       longTasks,
       costDiagnostics: buildCostDiagnostics(diagnosticsBefore, diagnosticsAfter),
     };
-    await writeJsonAtomically(options.output, result);
+    preparedMetrics = await prepareJsonOutput(options.output, result, dependencies.outputOperations);
+    await publishPreparedOutputs(
+      preparedTrace ? [preparedTrace, preparedMetrics] : [preparedMetrics],
+      dependencies.outputOperations,
+    );
+    preparedTrace = null;
+    preparedMetrics = null;
     return result;
   } finally {
     if (observerInstalled) {
-      try { await removeLongTaskObserver(client); } catch {}
+      try { await stopObserver(client); } catch {}
     }
     if (trace) {
       try { await trace.abort(); } catch {}
     }
+    try { await discardPreparedOutput(preparedTrace, dependencies.outputOperations); } catch {}
+    try { await discardPreparedOutput(preparedMetrics, dependencies.outputOperations); } catch {}
     client.close();
   }
 }

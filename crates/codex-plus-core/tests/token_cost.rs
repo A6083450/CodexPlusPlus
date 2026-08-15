@@ -278,6 +278,28 @@ fn snapshot_coalescer_sends_first_immediately_and_only_newest_at_fixed_deadline(
 }
 
 #[test]
+fn snapshot_coalescer_enforces_independent_500ms_contract_at_exact_boundary() {
+    let started_at = Instant::now();
+    let contract_deadline = started_at + Duration::from_millis(500);
+    let just_before_deadline = started_at + Duration::from_nanos(499_999_999);
+    let mut coalescer = SnapshotCoalescer::default();
+    let first = snapshot_push(1, true, "gpt-5.6-sol");
+    assert_eq!(
+        coalescer.offer(started_at, first.clone()),
+        SnapshotOffer::SendNow(first)
+    );
+    assert_eq!(
+        coalescer.offer(just_before_deadline, snapshot_push(2, true, "m")),
+        SnapshotOffer::ArmAt(contract_deadline)
+    );
+    assert_eq!(coalescer.take_due(just_before_deadline), None);
+    assert_eq!(
+        coalescer.take_due(contract_deadline),
+        Some(snapshot_push(2, true, "m"))
+    );
+}
+
+#[test]
 fn snapshot_coalescer_final_snapshot_obeys_gate_and_clear_removes_pending_only() {
     let started_at = Instant::now();
     let mut coalescer = SnapshotCoalescer::default();

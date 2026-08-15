@@ -27,6 +27,25 @@ api.registerModule("profile", (context) => {
     return node;
   }
 
+  function write(node, mutation) {
+    const connected = node?.isConnected === true;
+    mutation();
+    if (connected) context.recordDomWrite();
+  }
+
+  function appendChild(node, child) {
+    const connected = node?.isConnected === true;
+    node.appendChild(child);
+    if (connected) context.recordDomWrite();
+  }
+
+  function remove(node) {
+    if (!node) return;
+    const connected = node.isConnected === true;
+    node.remove();
+    if (connected) context.recordDomWrite();
+  }
+
   function byteLength(value) {
     try { return new TextEncoder().encode(String(value)).length; } catch { return Number.MAX_SAFE_INTEGER; }
   }
@@ -89,12 +108,12 @@ api.registerModule("profile", (context) => {
 
   function setError(message) {
     const previous = root?.querySelector(".cltc-profile-error");
-    if (previous) previous.remove();
-    if (editor) editor.appendChild(make("div", "cltc-profile-error", String(message || "保存失败，请重试。").slice(0, 180)));
+    if (previous) remove(previous);
+    if (editor) appendChild(editor, make("div", "cltc-profile-error", String(message || "保存失败，请重试。").slice(0, 180)));
   }
 
   function clearError() {
-    root?.querySelector(".cltc-profile-error")?.remove();
+    remove(root?.querySelector(".cltc-profile-error"));
   }
 
   function avatarText(profile) {
@@ -104,19 +123,20 @@ api.registerModule("profile", (context) => {
 
   function applyIdentity(profile) {
     if (!root) return;
-    identityName.textContent = profile.display_name || "Local Usage";
-    identityUsername.textContent = `@${profile.username || "local-usage"}`;
-    identityEmail.textContent = profile.email || "";
+    write(identityName, () => { identityName.textContent = profile.display_name || "Local Usage"; });
+    write(identityUsername, () => { identityUsername.textContent = `@${profile.username || "local-usage"}`; });
+    write(identityEmail, () => { identityEmail.textContent = profile.email || ""; });
     const plan = profile.plan_label || profile.plan_type || "";
-    identityPlan.textContent = plan;
-    identityPlanRow.textContent = `Codex ${plan}`.trim();
+    write(identityPlan, () => { identityPlan.textContent = plan; });
+    write(identityPlanRow, () => { identityPlanRow.textContent = `Codex ${plan}`.trim(); });
     const avatar = root.querySelector(".cltc-profile-avatar");
     if (avatar) {
       const image = typeof profile.avatar_data_url === "string" ? profile.avatar_data_url : "";
-      avatar.textContent = image ? "" : avatarText(profile);
-      avatar.style.setProperty("background-image", image ? `url("${image}")` : "none");
-      avatar.style.setProperty("background-size", image ? "cover" : "auto");
-      avatar.dataset.hasAvatar = String(Boolean(image));
+      const avatarLabel = image ? "" : avatarText(profile);
+      if (avatar.textContent !== avatarLabel) write(avatar, () => { avatar.textContent = avatarLabel; });
+      write(avatar, () => { avatar.style.setProperty("background-image", image ? `url("${image}")` : "none"); });
+      write(avatar, () => { avatar.style.setProperty("background-size", image ? "cover" : "auto"); });
+      write(avatar, () => { avatar.dataset.hasAvatar = String(Boolean(image)); });
     }
   }
 
@@ -152,7 +172,7 @@ api.registerModule("profile", (context) => {
     save.dataset.profileAction = "save";
     actions.append(cancel, save);
     editor.appendChild(actions);
-    root.appendChild(editor);
+    appendChild(root, editor);
     root.querySelector("[data-profile-field='display_name']")?.focus();
   }
 
@@ -198,7 +218,7 @@ api.registerModule("profile", (context) => {
       if (stopped || sequence !== saveSequence) return;
       if (result?.status !== "ok" || result.response?.type !== "updated") throw new Error("profile rejected");
       applyIdentity(context.config.profile);
-      editor.remove();
+      remove(editor);
       editor = null;
     }).catch(() => {
       if (!stopped && sequence === saveSequence) setError("保存失败，请重试。");
@@ -208,18 +228,20 @@ api.registerModule("profile", (context) => {
   function onClick(event) {
     const tab = event.target?.closest?.("[data-profile-tab]")?.dataset.profileTab;
     if (["个人资料", "数据控制"].includes(tab)) {
-      for (const item of root.querySelectorAll("[data-profile-tab]")) item.dataset.active = String(item.dataset.profileTab === tab);
+      for (const item of root.querySelectorAll("[data-profile-tab]")) {
+        write(item, () => { item.dataset.active = String(item.dataset.profileTab === tab); });
+      }
       const card = root.querySelector(".profile-card");
       const activity = root.querySelector(".cltc-profile-activity");
-      if (card) card.hidden = tab !== "个人资料";
-      if (activity) activity.hidden = tab !== "数据控制";
+      if (card) write(card, () => { card.hidden = tab !== "个人资料"; });
+      if (activity) write(activity, () => { activity.hidden = tab !== "数据控制"; });
       return;
     }
     const action = event.target?.closest?.("[data-profile-action]")?.dataset.profileAction;
     if (action === "close") context.close();
     else if (action === "edit") renderEditor();
     else if (action === "cancel") {
-      editor?.remove();
+      remove(editor);
       editor = null;
     } else if (action === "save") saveProfile();
   }
@@ -227,8 +249,8 @@ api.registerModule("profile", (context) => {
   function mount() {
     const target = context.mountTarget;
     if (stopped || root || !target?.isConnected) return;
-    document.getElementById(ROOT_ID)?.remove();
-    document.getElementById(STYLE_ID)?.remove();
+    remove(document.getElementById(ROOT_ID));
+    remove(document.getElementById(STYLE_ID));
     style = make("style");
     style.id = STYLE_ID;
     style.textContent = `
@@ -256,7 +278,7 @@ api.registerModule("profile", (context) => {
       #${ROOT_ID} .cltc-profile-error{color:light-dark(#b42318,#f97066);font-size:12px}
       @media(max-width:620px){#${ROOT_ID} .cltc-profile-shell{width:min(calc(100% - 32px),940px);padding-top:32px}#${ROOT_ID} .cltc-profile-close{top:28px}#${ROOT_ID} .cltc-profile-identity{grid-template-columns:auto minmax(0,1fr);gap:16px;padding:20px}#${ROOT_ID} .cltc-profile-plan{grid-column:2}#${ROOT_ID} .cltc-profile-row{grid-template-columns:minmax(0,1fr);gap:4px;padding:14px 20px}#${ROOT_ID} .cltc-profile-editor{grid-template-columns:minmax(0,1fr)}}
     `;
-    document.head.appendChild(style);
+    appendChild(document.head, style);
     root = make("section", "cltc-profile-page");
     root.id = ROOT_ID;
     const shell = make("div", "cltc-profile-shell");
@@ -307,10 +329,9 @@ api.registerModule("profile", (context) => {
     shell.appendChild(activity);
     root.appendChild(shell);
     root.addEventListener("click", onClick);
-    target.appendChild(root);
+    appendChild(target, root);
     applyIdentity(profile);
     close.focus();
-    context.recordDomWrite(2);
     context.recordListenerDelta(LISTENER_COUNT);
     diagnosticsMounted = true;
   }
@@ -320,10 +341,9 @@ api.registerModule("profile", (context) => {
     stopped = true;
     saveSequence += 1;
     root?.removeEventListener("click", onClick);
-    root?.remove();
-    style?.remove();
+    remove(root);
+    remove(style);
     if (diagnosticsMounted) {
-      context.recordDomWrite(2);
       context.recordListenerDelta(-LISTENER_COUNT);
       diagnosticsMounted = false;
     }

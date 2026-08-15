@@ -54,10 +54,17 @@ function matchesSimple(element: FakeElement, selector: string): boolean {
 }
 
 class FakeStyle {
+  private readonly owner: FakeElement;
   private readonly values = new Map<string, string>();
-  setProperty(name: string, value: string) { this.values.set(name, String(value)); }
+  constructor(owner: FakeElement) { this.owner = owner; }
+  setProperty(name: string, value: string) {
+    this.values.set(name, String(value));
+    if (this.owner.isConnected) this.owner.ownerDocument.recordConnectedMutation(`style:${name}`, this.owner);
+  }
   getPropertyValue(name: string) { return this.values.get(name) || ""; }
-  removeProperty(name: string) { this.values.delete(name); }
+  removeProperty(name: string) {
+    if (this.values.delete(name) && this.owner.isConnected) this.owner.ownerDocument.recordConnectedMutation(`remove-style:${name}`, this.owner);
+  }
   get cssText() { return [...this.values].map(([name, value]) => `${name}: ${value}`).join("; "); }
   set cssText(value: string) {
     this.values.clear();
@@ -75,13 +82,13 @@ class FakeElement {
   readonly attributes = new Map<string, string>();
   readonly children: FakeElement[] = [];
   readonly listeners = new Map<string, Listener[]>();
-  readonly style = new FakeStyle() as FakeStyle & Record<string, any>;
+  readonly style: FakeStyle & Record<string, any>;
   readonly dataset: Record<string, string>;
   id = "";
   className = "";
   parentElement: FakeElement | null = null;
   type = "";
-  value = "";
+  private valueValue = "";
   checked = false;
   selectionStart: number | null = 0;
   selectionEnd: number | null = 0;
@@ -99,6 +106,7 @@ class FakeElement {
     this.ownerDocument = ownerDocument;
     this.tagName = tagName.toUpperCase();
     this.namespaceURI = namespaceURI;
+    this.style = new FakeStyle(this) as FakeStyle & Record<string, any>;
     this.dataset = new Proxy({}, {
       get: (_target, key) => typeof key === "string" ? this.getAttribute(dataAttribute(key)) ?? undefined : undefined,
       set: (_target, key, value) => {
@@ -136,11 +144,16 @@ class FakeElement {
   get offsetWidth() { return 280; }
   get offsetHeight() { return 36; }
   get disabled() { return this.disabledValue; }
-  set disabled(value: boolean) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; this.disabledValue = Boolean(value); }
+  set disabled(value: boolean) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; if (this.isConnected) this.ownerDocument.recordConnectedMutation("property:disabled", this); this.disabledValue = Boolean(value); }
   get hidden() { return this.hiddenValue; }
-  set hidden(value: boolean) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; this.hiddenValue = Boolean(value); }
+  set hidden(value: boolean) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; if (this.isConnected) this.ownerDocument.recordConnectedMutation("property:hidden", this); this.hiddenValue = Boolean(value); }
   get title() { return this.titleValue; }
   set title(value: string) { this.propertyWrites += 1; this.ownerDocument.propertyWrites += 1; this.ownerDocument.domOperations += 1; this.titleValue = String(value); }
+  get value() { return this.valueValue; }
+  set value(value: string) {
+    if (this.isConnected) this.ownerDocument.recordConnectedMutation("property:value", this);
+    this.valueValue = String(value);
+  }
   get firstElementChild() { return this.children[0] || null; }
   get nextElementSibling(): FakeElement | null {
     if (!this.parentElement) return null;
@@ -161,6 +174,7 @@ class FakeElement {
     if (this.ownText === text && this.children.length === 0) return;
     this.ownerDocument.textWrites += 1;
     this.ownerDocument.domOperations += 1;
+    if (this.isConnected) this.ownerDocument.recordConnectedMutation("text", this);
     this.textWrites += 1;
     if (this.children.length > 0) this.ownerDocument.structuralMutations += 1;
     this.children.splice(0).forEach((child) => { child.parentElement = null; });
@@ -177,6 +191,7 @@ class FakeElement {
     this.attributeWrites += 1;
     this.ownerDocument.attributeWrites += 1;
     this.ownerDocument.domOperations += 1;
+    if (this.isConnected) this.ownerDocument.recordConnectedMutation(`attribute:${name.toLowerCase()}`, this);
     const key = name.toLowerCase();
     const text = String(value);
     this.attributes.set(key, text);
@@ -201,7 +216,10 @@ class FakeElement {
   }
   removeAttribute(name: string) {
     const key = name.toLowerCase();
-    if (this.hasAttribute(key)) this.ownerDocument.domOperations += 1;
+    if (this.hasAttribute(key)) {
+      this.ownerDocument.domOperations += 1;
+      if (this.isConnected) this.ownerDocument.recordConnectedMutation(`remove-attribute:${key}`, this);
+    }
     this.attributes.delete(key);
     if (key === "id") this.id = "";
     if (key === "class") this.className = "";
@@ -221,6 +239,7 @@ class FakeElement {
     node.parentElement = this;
     this.ownerDocument.domOperations += 1;
     this.ownerDocument.structuralMutations += 1;
+    if (this.isConnected) this.ownerDocument.recordConnectedMutation("append", this, node);
     return node;
   }
   insertBefore<T extends FakeElement>(node: T, before: FakeElement | null): T {
@@ -232,15 +251,18 @@ class FakeElement {
     node.parentElement = this;
     this.ownerDocument.domOperations += 1;
     this.ownerDocument.structuralMutations += 1;
+    if (this.isConnected) this.ownerDocument.recordConnectedMutation("insert", this, node);
     return node;
   }
   remove() {
     if (!this.parentElement) return;
+    const wasConnected = this.isConnected;
     const index = this.parentElement.children.indexOf(this);
     if (index >= 0) this.parentElement.children.splice(index, 1);
     this.parentElement = null;
     this.ownerDocument.domOperations += 1;
     this.ownerDocument.structuralMutations += 1;
+    if (wasConnected) this.ownerDocument.recordConnectedMutation("remove", this);
   }
   removeChild<T extends FakeElement>(node: T): T { node.remove(); return node; }
   replaceChildren(...nodes: FakeElement[]) {
@@ -311,6 +333,8 @@ class FakeDocument {
   propertyWrites = 0;
   textWrites = 0;
   domOperations = 0;
+  connectedDomMutations = 0;
+  readonly connectedMutationRecords: Array<{ kind: string; target: FakeElement; targetClass: string; node?: FakeElement }> = [];
   structuralMutations = 0;
   observerCount = 0;
   activeElement: FakeElement;
@@ -321,6 +345,10 @@ class FakeDocument {
     this.body = new FakeElement(this, "body");
     this.activeElement = this.body;
     this.documentElement.append(this.head, this.body);
+  }
+  recordConnectedMutation(kind: string, target: FakeElement, node?: FakeElement) {
+    this.connectedDomMutations += 1;
+    this.connectedMutationRecords.push({ kind, target, targetClass: target.className, node });
   }
   createElement(tagName: string) { this.domOperations += 1; return new FakeElement(this, tagName); }
   createElementNS(namespaceURI: string, tagName: string) { this.domOperations += 1; return new FakeElement(this, tagName, namespaceURI); }
@@ -2247,7 +2275,7 @@ describe("lazy analytics calendar and profile views", () => {
     return overlay;
   }
 
-  it("reports fixed lazy listener and owned DOM write lifecycles through explicit diagnostics", async () => {
+  it("reports exact lazy listener and independently counted owned DOM write lifecycles", async () => {
     const harness = await createHarness((path, payload) => {
       if (path === "/token-cost/bootstrap") return successfulBootstrap(payload.instance_id);
       if (path === "/token-cost/lazy-asset") return { status: "ok" };
@@ -2266,31 +2294,68 @@ describe("lazy analytics calendar and profile views", () => {
     const api = harness.window.__codexLiveTokenCostV1;
     const baseline = await api.diagnostics();
     assert.equal(baseline.listenerCount, 3);
+    let previousDiagnostics = baseline;
+    let previousMutationRecord = harness.document.connectedMutationRecords.length;
+    const isLazyOwned = (node?: FakeElement) => {
+      let current = node || null;
+      while (current) {
+        if (current.id.startsWith("codex-live-token-cost-settings")
+          || current.id.startsWith("codex-live-token-cost-analytics")
+          || current.id.startsWith("codex-live-token-cost-flatpickr")
+          || current.id.startsWith("codex-live-token-cost-profile")
+          || current.className.split(/\s+/).some((name) => name.startsWith("cltc-") || name.startsWith("flatpickr-"))) return true;
+        current = current.parentElement;
+      }
+      return false;
+    };
+    const assertMutationDelta = async (label: string) => {
+      const next = await api.diagnostics();
+      const records = harness.document.connectedMutationRecords.slice(previousMutationRecord);
+      const ownedMutations = records.filter((record) => {
+        if (record.targetClass.split(/\s+/).includes("flatpickr-input") || record.kind.endsWith(":readonly")) return false;
+        return isLazyOwned(record.target) || isLazyOwned(record.node);
+      }).length;
+      assert.equal(
+        next.domWrites - previousDiagnostics.domWrites,
+        ownedMutations,
+        `${label} diagnostics must equal independent connected DOM mutations: ${records.map((record) => `${record.kind}:${record.target.id || record.target.className || record.target.tagName}->${record.node?.id || record.node?.className || record.node?.tagName || ""}`).join(", ")}`,
+      );
+      previousDiagnostics = next;
+      previousMutationRecord = harness.document.connectedMutationRecords.length;
+      return next;
+    };
 
     harness.document.getElementById("codex-live-token-cost-settings")!.click();
-    const settings = await api.diagnostics();
+    const settings = await assertMutationDelta("settings mount");
     assert.deepEqual(Array.from(settings.mountedModules), ["settings"]);
     assert.equal(settings.listenerCount, 7);
     assert.ok(settings.domWrites > baseline.domWrites);
 
     const overlay = harness.document.querySelector(".cltc-settings-overlay")!;
+    overlay.querySelector("[data-settings-panel='pricing']")!.click();
+    await assertMutationDelta("pricing panel render");
+    overlay.querySelectorAll("[data-price-pick]")[0]!.click();
+    await assertMutationDelta("pricing selection refresh");
+    overlay.querySelector("[data-action='new-price']")!.click();
+    await assertMutationDelta("pricing field clear");
     overlay.querySelector("[data-settings-panel='usage']")!.click();
     await harness.settle();
-    const analytics = await api.diagnostics();
+    const analytics = await assertMutationDelta("analytics mount");
     assert.deepEqual(Array.from(analytics.mountedModules), ["settings", "analytics"]);
     assert.equal(analytics.listenerCount, 8);
     assert.ok(analytics.domWrites > settings.domWrites);
 
     overlay.querySelector("[data-analytics-preset='custom']")!.click();
     overlay.querySelector("[data-action='open-analytics-calendar']")!.click();
-    const calendar = await api.diagnostics();
+    const calendar = await assertMutationDelta("calendar mount");
     assert.deepEqual(Array.from(calendar.mountedModules), ["settings", "analytics", "flatpickr"]);
     assert.equal(calendar.listenerCount, 20);
     assert.ok(calendar.domWrites > analytics.domWrites);
     overlay.querySelector("[data-analytics-preset='today']")!.click();
     await harness.settle();
+    await assertMutationDelta("calendar cleanup");
     overlay.querySelector("[data-action='close-price']")!.click();
-    const settingsClosed = await api.diagnostics();
+    const settingsClosed = await assertMutationDelta("settings and analytics cleanup");
     assert.deepEqual(Array.from(settingsClosed.mountedModules), []);
     assert.equal(settingsClosed.listenerCount, 3);
     assert.ok(settingsClosed.domWrites > calendar.domWrites);
@@ -2298,11 +2363,19 @@ describe("lazy analytics calendar and profile views", () => {
     harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
       detail: { reason: "profile_entry", profile: true },
     }));
-    const profile = await api.diagnostics();
+    const profile = await assertMutationDelta("profile mount");
     assert.deepEqual(Array.from(profile.mountedModules), ["profile"]);
     assert.equal(profile.listenerCount, 4);
+    harness.document.querySelector("[data-profile-action='edit']")!.click();
+    await assertMutationDelta("profile editor mount");
+    harness.document.querySelector("[data-profile-action='cancel']")!.click();
+    await assertMutationDelta("profile editor cleanup");
+    harness.document.querySelector("[data-profile-tab='数据控制']")!.click();
+    await assertMutationDelta("profile data tab");
+    harness.document.querySelector("[data-profile-tab='个人资料']")!.click();
+    await assertMutationDelta("profile identity tab");
     harness.document.querySelector("[data-profile-action='close']")!.click();
-    const cleaned = await api.diagnostics();
+    const cleaned = await assertMutationDelta("profile cleanup");
     assert.deepEqual(Array.from(cleaned.mountedModules), []);
     assert.equal(cleaned.listenerCount, 3);
     assert.ok(cleaned.domWrites > profile.domWrites);
@@ -2689,8 +2762,20 @@ describe("lazy analytics calendar and profile views", () => {
       if (path === "/token-cost/action" && payload.action.type === "query_analytics") {
         return { status: "ok", response: { type: "analytics", analytics: analyticsSnapshot() } };
       }
+      if (path === "/token-cost/action" && payload.action.type === "query_diagnostics") return nativeDiagnosticsResponse();
       return { status: "ok" };
     };
+    const lazyMutationCount = (harness: Harness, from: number) => harness.document.connectedMutationRecords
+      .slice(from)
+      .filter((record) => {
+        if (record.targetClass.split(/\s+/).includes("flatpickr-input") || record.kind.endsWith(":readonly")) return false;
+        const owned = (node?: FakeElement) => Boolean(node && (
+          node.id === "codex-live-token-cost-flatpickr-style"
+          || node.id.startsWith("codex-live-token-cost-")
+          || node.className.split(/\s+/).some((name) => name.startsWith("cltc-") || name.startsWith("flatpickr-"))
+        ));
+        return owned(record.target) || owned(record.node);
+      }).length;
 
     const lateAssignment = await createHarness(bridge);
     const lateOverlay = await openAnalytics(lateAssignment);
@@ -2713,7 +2798,15 @@ describe("lazy analytics calendar and profile views", () => {
         throw new Error("late target assignment failure");
       },
     });
+    const lateDiagnosticsBefore = await lateAssignment.window.__codexLiveTokenCostV1.diagnostics();
+    const lateMutationStart = lateAssignment.document.connectedMutationRecords.length;
     lateAssignment.runFlatpickr();
+    const lateDiagnosticsAfter = await lateAssignment.window.__codexLiveTokenCostV1.diagnostics();
+    assert.equal(
+      lateDiagnosticsAfter.domWrites - lateDiagnosticsBefore.domWrites,
+      lazyMutationCount(lateAssignment, lateMutationStart),
+      "late factory failure diagnostics must equal its independent owned DOM mutations",
+    );
     assert.equal(lateDestroyCalls, 1);
     assert.equal(lateAssignment.document.querySelectorAll(".flatpickr-calendar").length, 0);
     assert.equal(Boolean(lateAssignment.document.getElementById("codex-live-token-cost-flatpickr-style")), false);
@@ -2736,11 +2829,23 @@ describe("lazy analytics calendar and profile views", () => {
       set: (value) => {
         openInstance = value;
         const destroy = value.destroy.bind(value);
-        value.destroy = () => { openDestroyCalls += 1; return destroy(); };
+        value.destroy = () => {
+          openDestroyCalls += 1;
+          destroy();
+          throw new Error("late destroy failure after calendar removal");
+        };
         value.open = () => { throw new Error("late open failure"); };
       },
     });
+    const openDiagnosticsBefore = await openFailure.window.__codexLiveTokenCostV1.diagnostics();
+    const openMutationStart = openFailure.document.connectedMutationRecords.length;
     openFailure.runFlatpickr();
+    const openDiagnosticsAfter = await openFailure.window.__codexLiveTokenCostV1.diagnostics();
+    assert.equal(
+      openDiagnosticsAfter.domWrites - openDiagnosticsBefore.domWrites,
+      lazyMutationCount(openFailure, openMutationStart),
+      "late open failure diagnostics must equal its independent owned DOM mutations",
+    );
     assert.equal(openDestroyCalls, 1, "the returned instance and target fallback are the same owner");
     assert.equal(openFailure.document.querySelectorAll(".flatpickr-calendar").length, 0);
     assert.equal(Boolean(openFailure.document.getElementById("codex-live-token-cost-flatpickr-style")), false);

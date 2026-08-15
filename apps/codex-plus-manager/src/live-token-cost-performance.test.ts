@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ const runnerUrl = new URL("../../../scripts/measure-ds-style-cost-performance.mj
 const {
   CdpClient,
   buildCostDiagnostics,
+  collectRendererProcessSample,
   discoverCodexProcesses,
   parseArgs,
   parseBrowserVersion,
@@ -16,6 +17,7 @@ const {
   parseProcessStat,
   readBoundedResponseText,
   rediscoverRenderers,
+  runMeasurement,
   selectPrimaryPage,
   summarizeSamples,
   startTrace,
@@ -43,7 +45,7 @@ const FORBIDDEN: Array<[string, RegExp]> = [
   ["fetch replacement", /\b(?:window|globalThis)\s*(?:\.\s*fetch|\[\s*["']fetch["']\s*\])\s*=/],
   ["XMLHttpRequest", /\bXMLHttpRequest\b/],
   ["WebSocket", /\bWebSocket\b/],
-  ["electronBridge replacement", /\belectronBridge\s*=/],
+  ["electronBridge replacement", /\b(?:(?:window|globalThis)\s*(?:\.\s*electronBridge|\[\s*["']electronBridge["']\s*\])|electronBridge)\s*=/],
   ["Statsig", /\bStatsig\b/],
   ["__react", /\b__react\w*\b/],
   ["eval", /\beval\s*\(/],
@@ -113,7 +115,7 @@ function functionBody(source: string, openBrace: number) {
 
 function recursiveArbitraryEnumerators(source: string) {
   const suspects = new Set<string>();
-  const enumerates = (body: string) => /\bObject\s*\.\s*(?:keys|values|entries)\s*\(/.test(body)
+  const enumerates = (body: string) => /\bObject\s*(?:\.\s*(?:keys|values|entries)|\[\s*["'](?:keys|values|entries)["']\s*\])\s*\(/.test(body)
     || /\bfor\s*\(\s*(?:const|let|var)\s+[A-Za-z_$][\w$]*\s+in\s+/.test(body);
   const inspect = (reportedName: string, recursiveNames: string[], body: string) => {
     const recurses = recursiveNames.some((name) => new RegExp(`\\b${name.replace(/[$]/g, "\\$")}\\s*\\(`).test(body));
@@ -149,6 +151,8 @@ describe("Codex Live Token Cost startup performance policy", () => {
       "node . getBoundingClientRect ( )",
       "Array . prototype . map",
       "window . fetch = replacement",
+      "window['electronBridge'] = replacement",
+      "window [ \"electronBridge\" ] = replacement",
       "setInterval (work, 1000)",
       "new   Function ('return 1')",
     ]) {
@@ -158,7 +162,9 @@ describe("Codex Live Token Cost startup performance policy", () => {
       const walk = (value) => { for (const key in value) walk(value[key]); };
       const visit = function (value) { Object . entries (value); visit(value); };
       const mapTree = value => Object . keys (value).map((key) => mapTree(value[key]));
-    `).sort(), ["mapTree", "visit", "walk"]);
+      const bracketTree = value => Object['keys'](value).map((key) => bracketTree(value[key]));
+      const spacedBracketTree = value => Object [ "entries" ] (value).map((entry) => spacedBracketTree(entry));
+    `).sort(), ["bracketTree", "mapTree", "spacedBracketTree", "visit", "walk"]);
   });
 
   it("scans only the full startup and exactly one marked renderer block for forbidden mechanisms", async () => {
@@ -261,6 +267,30 @@ describe("DS style cost measurement runner process discovery", () => {
       204 201 Codex Helper --type=renderer
     `, 9339, 101), /browser identity changed/);
   });
+
+  it("does not sample a renderer PID reused between discovery and the resource sample", () => {
+    const discovered = rediscoverRenderers(PROCESS_LIST, 9339, 101);
+    assert.deepEqual(discovered, [103, 104]);
+    assert.deepEqual(collectRendererProcessSample(`
+      101 1 0.2 1024 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9339
+      103 1 99.9 4096 /usr/bin/reused-unrelated --type=worker
+      104 101 12.5 204800 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+    `, 9339, 101), {
+      rendererPids: [104],
+      processes: [{ pid: 104, cpuPercent: 12.5, rssKb: 204800 }],
+    });
+    assert.deepEqual(collectRendererProcessSample(`
+      101 1 0.2 1024 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9339
+      103 101 6.25 102400 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+      104 101 12.5 204800 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+    `, 9339, 101, discovered), {
+      rendererPids: [103, 104],
+      processes: [
+        { pid: 103, cpuPercent: 6.25, rssKb: 102400 },
+        { pid: 104, cpuPercent: 12.5, rssKb: 204800 },
+      ],
+    });
+  });
 });
 
 describe("DS style cost measurement runner sample parsing", () => {
@@ -332,50 +362,73 @@ describe("DS style cost measurement runner sample parsing", () => {
 });
 
 describe("DS style cost measurement runner output aggregation", () => {
-  it("rejects trace data loss and completes only after an ordered lossless event", async () => {
+  class FakeTraceClient {
+    listeners = new Map<string, Set<(params: any) => void>>();
+    sent: string[] = [];
+    sendEnd: () => Promise<any> = async () => ({});
+
+    on(method: string, listener: (params: any) => void) {
+      const bucket = this.listeners.get(method) || new Set();
+      bucket.add(listener);
+      this.listeners.set(method, bucket);
+      return () => bucket.delete(listener);
+    }
+
+    async send(method: string) {
+      this.sent.push(method);
+      return method === "Tracing.end" ? this.sendEnd() : {};
+    }
+
+    emit(method: string, params: any) {
+      for (const listener of this.listeners.get(method) || []) listener(params);
+    }
+  }
+
+  it("latches every tracingComplete received before Tracing.end as fatal", async () => {
+    for (const params of [{ dataLossOccurred: false }, { dataLossOccurred: true }, {}]) {
+      const output = join(tmpdir(), `codex-ds-early-trace-${randomUUID()}.json`);
+      const client = new FakeTraceClient();
+      try {
+        const trace = await startTrace(client, output);
+        client.emit("Tracing.tracingComplete", params);
+        await assert.rejects(trace.stop(), /before Tracing\.end/);
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        await unlink(output).catch(() => {});
+      }
+    }
+  });
+
+  it("accepts lossless completion before or after the Tracing.end response", async () => {
     assert.throws(() => validateTraceCompletion({ dataLossOccurred: true }), /data loss/);
     assert.throws(() => validateTraceCompletion({}), /dataLossOccurred/);
     assert.doesNotThrow(() => validateTraceCompletion({ dataLossOccurred: false }));
 
-    class FakeTraceClient {
-      listeners = new Map<string, Set<(params: any) => void>>();
-      sent: string[] = [];
-
-      on(method: string, listener: (params: any) => void) {
-        const bucket = this.listeners.get(method) || new Set();
-        bucket.add(listener);
-        this.listeners.set(method, bucket);
-        return () => bucket.delete(listener);
+    for (const completionBeforeResponse of [true, false]) {
+      const output = join(tmpdir(), `codex-ds-trace-${randomUUID()}.json`);
+      const client = new FakeTraceClient();
+      let resolveEnd!: () => void;
+      client.sendEnd = () => new Promise((resolve) => { resolveEnd = () => resolve({}); });
+      try {
+        const trace = await startTrace(client, output);
+        client.emit("Tracing.dataCollected", { value: [{ name: "first" }, { name: "second" }] });
+        let stopped = false;
+        const stopping = trace.stop().then(() => { stopped = true; });
+        await Promise.resolve();
+        assert.equal(stopped, false);
+        assert.deepEqual(client.sent, ["Tracing.start", "Tracing.end"]);
+        if (completionBeforeResponse) client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
+        resolveEnd();
+        await Promise.resolve();
+        if (!completionBeforeResponse) client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
+        await stopping;
+        assert.deepEqual(JSON.parse(await readFile(output, "utf8")).traceEvents, [
+          { name: "first" },
+          { name: "second" },
+        ]);
+      } finally {
+        await unlink(output).catch(() => {});
       }
-
-      async send(method: string) {
-        this.sent.push(method);
-        return {};
-      }
-
-      emit(method: string, params: any) {
-        for (const listener of this.listeners.get(method) || []) listener(params);
-      }
-    }
-
-    const output = join(tmpdir(), `codex-ds-trace-${randomUUID()}.json`);
-    const client = new FakeTraceClient();
-    try {
-      const trace = await startTrace(client, output);
-      client.emit("Tracing.dataCollected", { value: [{ name: "first" }, { name: "second" }] });
-      let stopped = false;
-      const stopping = trace.stop().then(() => { stopped = true; });
-      await Promise.resolve();
-      assert.equal(stopped, false);
-      assert.deepEqual(client.sent, ["Tracing.start", "Tracing.end"]);
-      client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
-      await stopping;
-      assert.deepEqual(JSON.parse(await readFile(output, "utf8")).traceEvents, [
-        { name: "first" },
-        { name: "second" },
-      ]);
-    } finally {
-      await unlink(output).catch(() => {});
     }
   });
 
@@ -429,15 +482,132 @@ describe("DS style cost measurement runner output aggregation", () => {
     }
   });
 
+  it("keeps the prior trace and metrics pair through every post-trace full-run failure", async () => {
+    const browserVersion = {
+      protocolVersion: "1.3",
+      product: "Chrome/140.0.0.0",
+      revision: "@abc123",
+      userAgent: "Codex Test",
+      jsVersion: "14.0",
+    };
+    const target = {
+      id: "page",
+      type: "page",
+      title: "Codex",
+      url: "app://-/index.html",
+      webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page",
+    };
+    const processSource = `
+      101 1 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9339
+      103 101 /Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer
+    `;
+    const sample = {
+      timestamp: "2026-08-16T00:00:01.000Z",
+      rendererPids: [103],
+      processes: [{ pid: 103, cpuPercent: 1, rssKb: 2048 }],
+      aggregate: { cpuPercent: 1, rssKb: 2048 },
+      cdp: {
+        metrics: { TaskDuration: 0.25 },
+        heap: { usedSize: 1024, totalSize: 2048, embedderHeapUsedSize: 128, backingStorageSize: 64 },
+      },
+    };
+
+    for (const failure of [
+      "diagnostics",
+      "summary",
+      "metrics-write",
+      "backup-trace-rename",
+      "backup-metrics-rename",
+      "publish-trace-rename",
+      "publish-metrics-rename",
+    ] as const) {
+      for (const hasPriorPair of [true, false]) {
+        const output = join(tmpdir(), `codex-ds-pair-metrics-${randomUUID()}.json`);
+        const traceOutput = join(tmpdir(), `codex-ds-pair-trace-${randomUUID()}.json`);
+        if (hasPriorPair) {
+          await writeFile(output, "prior metrics", "utf8");
+          await writeFile(traceOutput, "prior trace", "utf8");
+        }
+        const client = new FakeTraceClient() as FakeTraceClient & { close: () => void };
+        client.close = () => {};
+        client.sendEnd = async () => {
+          client.emit("Tracing.tracingComplete", { dataLossOccurred: false });
+          return {};
+        };
+        const originalSend = client.send.bind(client);
+        client.send = async (method: string) => {
+          if (method === "Browser.getVersion") return browserVersion;
+          return originalSend(method);
+        };
+        let diagnosticsCalls = 0;
+        let renameFailed = false;
+        try {
+          await assert.rejects(runMeasurement({
+            debugPort: 9339,
+            durationSeconds: 1,
+            label: "pair-failure",
+            output,
+            traceOutput,
+          }, {
+            fetchJson: async () => [target],
+            processList: async () => processSource,
+            connectCdp: async () => client,
+            pageDiagnostics: async () => {
+              diagnosticsCalls += 1;
+              if (failure === "diagnostics" && diagnosticsCalls === 2) throw new Error("injected diagnostics failure");
+              return null;
+            },
+            installLongTaskObserver: async () => {},
+            removeLongTaskObserver: async () => ({ count: 0, totalDurationMs: 0, maxDurationMs: 0 }),
+            delay: async () => {},
+            performanceNow: () => 0,
+            sampleOnce: async () => sample,
+            summarizeSamples: failure === "summary"
+              ? () => { throw new Error("injected summary failure"); }
+              : summarizeSamples,
+            outputOperations: {
+              writeFile: async (path: string, value: string, encoding: BufferEncoding) => {
+                if (failure === "metrics-write") throw new Error("injected metrics write failure");
+                await writeFile(path, value, encoding);
+              },
+              rename: async (from: string, to: string) => {
+                const injected = (failure === "backup-trace-rename" && from === traceOutput && to.includes(".backup-"))
+                  || (failure === "backup-metrics-rename" && from === output && to.includes(".backup-"))
+                  || (failure === "publish-trace-rename" && to === traceOutput && from.includes(".tmp-"))
+                  || (failure === "publish-metrics-rename" && to === output && from.includes(".tmp-"));
+                if (injected && !renameFailed) {
+                  renameFailed = true;
+                  throw new Error("injected pair publish rename failure");
+                }
+                await rename(from, to);
+              },
+            },
+          }), /injected/);
+
+          if (hasPriorPair) {
+            assert.equal(await readFile(traceOutput, "utf8"), "prior trace", `${failure} changed the prior trace`);
+            assert.equal(await readFile(output, "utf8"), "prior metrics", `${failure} changed the prior metrics`);
+          } else {
+            await assert.rejects(readFile(traceOutput), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+            await assert.rejects(readFile(output), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+          }
+        } finally {
+          await unlink(traceOutput).catch(() => {});
+          await unlink(output).catch(() => {});
+        }
+      }
+    }
+  });
+
   it("keeps before and after diagnostics outside the observer and trace window", async () => {
     const source = await readFile(runnerUrl, "utf8");
-    const before = source.indexOf("const diagnosticsBefore = await pageDiagnostics(client)");
-    const observerStart = source.indexOf("await installLongTaskObserver(client)");
-    const traceStart = source.indexOf("trace = await startTrace(client, options.traceOutput)");
+    const before = source.indexOf("const diagnosticsBefore = await readDiagnostics(client)");
+    const observerStart = source.indexOf("await startObserver(client)");
+    const traceStart = source.indexOf("trace = await startTraceCapture(client, options.traceOutput)");
     const samples = source.indexOf("const samples = []");
-    const observerStop = source.indexOf("const longTasks = await removeLongTaskObserver(client)");
-    const traceStop = source.indexOf("await trace.stop()", observerStop);
-    const after = source.indexOf("const diagnosticsAfter = await pageDiagnostics(client)");
+    const observerStop = source.indexOf("const longTasks = await stopObserver(client)");
+    const traceStop = source.indexOf("await trace.prepare()", observerStop);
+    const after = source.indexOf("const diagnosticsAfter = await readDiagnostics(client)");
     assert.ok(before >= 0 && before < observerStart);
     assert.ok(observerStart < traceStart && traceStart < samples);
     assert.ok(samples < observerStop && observerStop < traceStop && traceStop < after);

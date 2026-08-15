@@ -38,10 +38,28 @@ api.registerModule("settings", (context) => {
     return node;
   }
 
+  function write(node, mutation) {
+    const connected = node?.isConnected === true;
+    mutation();
+    if (connected) context.recordDomWrite();
+  }
+
+  function appendChild(node, child) {
+    const connected = node?.isConnected === true;
+    node.appendChild(child);
+    if (connected) context.recordDomWrite();
+  }
+
+  function remove(node) {
+    if (!node) return;
+    const connected = node.isConnected === true;
+    node.remove();
+    if (connected) context.recordDomWrite();
+  }
+
   function clear(node) {
-    while (node.firstElementChild) node.firstElementChild.remove();
-    node.textContent = "";
-    context.recordDomWrite();
+    while (node.firstElementChild) remove(node.firstElementChild);
+    if (node.textContent) write(node, () => { node.textContent = ""; });
   }
 
   function button(text, action, variant) {
@@ -81,15 +99,15 @@ api.registerModule("settings", (context) => {
     if (!node) {
       node = make("div", "cltc-settings-status");
       node.dataset.settingsStatus = kind;
-      content.appendChild(node);
+      appendChild(content, node);
     }
-    node.className = isError ? "cltc-settings-status cltc-settings-error" : "cltc-settings-status";
-    node.textContent = String(message || "").slice(0, 180);
+    write(node, () => { node.className = isError ? "cltc-settings-status cltc-settings-error" : "cltc-settings-status"; });
+    write(node, () => { node.textContent = String(message || "").slice(0, 180); });
   }
 
   function clearError() {
     const node = overlay && overlay.querySelector(".cltc-settings-error");
-    if (node) node.remove();
+    if (node) remove(node);
   }
 
   function validUpdated(result) {
@@ -281,16 +299,17 @@ api.registerModule("settings", (context) => {
         nanosToDecimal(item.cache_write_nanos_per_million) || "-",
         nanosToDecimal(item.output_nanos_per_million) || "-",
       ]) row.appendChild(make("span", "", value));
-      list.appendChild(row);
+      appendChild(list, row);
     }
   }
 
   function refreshPricing(model, preserveFocused = true) {
     if (!overlay || activePanel !== "pricing") return;
     const price = priceFor(model) || {};
-    modal.dataset.priceModel = model;
+    write(modal, () => { modal.dataset.priceModel = model; });
     const meta = overlay.querySelector(".cltc-price-meta");
-    if (meta) meta.textContent = `${model} · ${priceSource(model)}`;
+    const metaText = `${model} · ${priceSource(model)}`;
+    if (meta && meta.textContent !== metaText) write(meta, () => { meta.textContent = metaText; });
     const list = overlay.querySelector(".cltc-price-list");
     if (list) {
       clear(list);
@@ -305,7 +324,7 @@ api.registerModule("settings", (context) => {
     };
     for (const [name, value] of Object.entries(values)) {
       const input = priceField(name);
-      if (input && (!preserveFocused || document.activeElement !== input) && input.value !== value) input.value = value;
+      if (input && (!preserveFocused || document.activeElement !== input) && input.value !== value) write(input, () => { input.value = value; });
     }
   }
 
@@ -313,7 +332,7 @@ api.registerModule("settings", (context) => {
     const root = section("模型价格", "按 USD / 1M tokens 设置输入、缓存与输出价格。");
     const overrideModels = boundedOverrideModels();
     const model = currentModel(overrideModels);
-    modal.dataset.priceModel = model;
+    write(modal, () => { modal.dataset.priceModel = model; });
     const price = priceFor(model) || {};
     const meta = make("div", "cltc-price-meta", `${model} · ${priceSource(model)}`);
     root.appendChild(meta);
@@ -371,7 +390,7 @@ api.registerModule("settings", (context) => {
       item.type = "button";
       item.dataset.settingsPanel = name;
       item.dataset.active = String(name === activePanel);
-      nav.appendChild(item);
+      appendChild(nav, item);
     }
   }
 
@@ -389,22 +408,22 @@ api.registerModule("settings", (context) => {
     if (name === activePanel && content.firstElementChild) return;
     if (activePanel === "usage") context.closeAnalytics();
     activePanel = name;
-    modal.dataset.settingsActive = name;
+    write(modal, () => { modal.dataset.settingsActive = name; });
     for (const item of overlay.querySelectorAll("[data-settings-panel]")) {
-      item.dataset.active = String(item.dataset.settingsPanel === name);
+      write(item, () => { item.dataset.active = String(item.dataset.settingsPanel === name); });
     }
     clear(content);
     const panel = name === "profile" ? renderProfile()
       : name === "general" ? renderGeneral()
         : name === "pricing" ? renderPricing() : renderUsage();
-    content.appendChild(panel);
+    appendChild(content, panel);
     if (name === "usage") {
       context.requestAnalytics(panel, () => {
         if (!stopped && activePanel === "usage" && panel.isConnected) {
           clear(panel);
           const fallback = section("使用统计", "统计模块加载失败，请重新打开后重试。");
           fallback.classList.add("cltc-settings-error");
-          panel.appendChild(fallback);
+          appendChild(panel, fallback);
         }
       });
     }
@@ -528,7 +547,10 @@ api.registerModule("settings", (context) => {
       else if (type === "delete-price") deleteOrResetPrice("delete_price");
       else if (type === "reset-price") deleteOrResetPrice("reset_price");
       else if (type === "new-price") {
-        for (const name of ["model", "input", "cachedInput", "cacheWrite", "output"]) priceField(name).value = "";
+        for (const name of ["model", "input", "cachedInput", "cacheWrite", "output"]) {
+          const input = priceField(name);
+          write(input, () => { input.value = ""; });
+        }
         priceField("model").focus();
       }
       return;
@@ -641,7 +663,7 @@ api.registerModule("settings", (context) => {
         .cltc-price-row { grid-template-columns:minmax(112px,1fr) repeat(4,minmax(42px,.45fr)); font-size:11px; }
       }
     `;
-    document.head.appendChild(style);
+    appendChild(document.head, style);
 
     overlay = make("div", "cltc-settings-overlay");
     modal = make("div", "cltc-settings-modal");
@@ -671,10 +693,9 @@ api.registerModule("settings", (context) => {
     overlay.addEventListener("change", onChange);
     overlay.addEventListener("input", onInput);
     overlay.addEventListener("keydown", onKeydown);
-    document.body.appendChild(overlay);
+    appendChild(document.body, overlay);
     renderPanel(activePanel);
     close.focus();
-    context.recordDomWrite(2);
     context.recordListenerDelta(LISTENER_COUNT);
     diagnosticsMounted = true;
   }
@@ -688,11 +709,10 @@ api.registerModule("settings", (context) => {
       overlay.removeEventListener("change", onChange);
       overlay.removeEventListener("input", onInput);
       overlay.removeEventListener("keydown", onKeydown);
-      overlay.remove();
+      remove(overlay);
     }
-    if (style) style.remove();
+    if (style) remove(style);
     if (diagnosticsMounted) {
-      context.recordDomWrite(2);
       context.recordListenerDelta(-LISTENER_COUNT);
       diagnosticsMounted = false;
     }
