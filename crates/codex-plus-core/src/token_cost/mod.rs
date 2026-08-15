@@ -79,47 +79,60 @@ impl TokenCostService {
     }
 
     pub fn ingest(&self, event: TokenCostEvent) -> IngestOutcome {
+        self.ingest_batch(std::iter::once(event))
+    }
+
+    pub(crate) fn ingest_batch<I>(&self, events: I) -> IngestOutcome
+    where
+        I: IntoIterator<Item = TokenCostEvent>,
+    {
+        let events = events.into_iter();
         if !self.capture_enabled() {
+            let rejected = events.count() as u64;
             let mut inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            inner.events_rejected = inner.events_rejected.saturating_add(1);
+            inner.events_rejected = inner.events_rejected.saturating_add(rejected);
             return IngestOutcome::Rejected {
                 reason: "capture_disabled",
             };
         }
 
-        let queued_copy = event.clone();
         let (outcome, push) = {
             let mut inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            inner.events_ingested = inner.events_ingested.saturating_add(1);
             let mut before = inner.state.snapshot(&inner.config);
             before.revision = 0;
+            let mut admitted = false;
+            let mut coalesced = false;
+            let mut rejected = false;
 
-            let admission = inner.queue.push(event);
-            match admission {
-                QueueAdmission::Rejected => {
-                    inner.events_rejected = inner.events_rejected.saturating_add(1);
-                    return IngestOutcome::Rejected {
-                        reason: "queue_capacity",
-                    };
-                }
-                QueueAdmission::Coalesced => {
-                    inner.events_coalesced = inner.events_coalesced.saturating_add(1);
-                }
-                QueueAdmission::RequiresDrain => {
-                    if let Some(oldest) = inner.queue.pop_front() {
-                        let config = inner.config.clone();
-                        inner.state.apply(oldest, &config);
+            for event in events {
+                inner.events_ingested = inner.events_ingested.saturating_add(1);
+                let queued_copy = event.clone();
+                match inner.queue.push(event) {
+                    QueueAdmission::Rejected => {
+                        inner.events_rejected = inner.events_rejected.saturating_add(1);
+                        rejected = true;
                     }
-                    let replacement = inner.queue.push(queued_copy);
-                    debug_assert_eq!(replacement, QueueAdmission::Enqueued);
+                    QueueAdmission::Coalesced => {
+                        inner.events_coalesced = inner.events_coalesced.saturating_add(1);
+                        coalesced = true;
+                    }
+                    QueueAdmission::RequiresDrain => {
+                        if let Some(oldest) = inner.queue.pop_front() {
+                            let config = inner.config.clone();
+                            inner.state.apply(oldest, &config);
+                        }
+                        let replacement = inner.queue.push(queued_copy);
+                        debug_assert_eq!(replacement, QueueAdmission::Enqueued);
+                        admitted = true;
+                    }
+                    QueueAdmission::Enqueued => admitted = true,
                 }
-                QueueAdmission::Enqueued => {}
             }
 
             while let Some(next) = inner.queue.pop_front() {
@@ -137,10 +150,14 @@ impl TokenCostService {
             let revision = snapshot.revision;
             let outcome = if visible_changed {
                 IngestOutcome::Applied { revision }
-            } else if admission == QueueAdmission::Coalesced {
+            } else if coalesced {
                 IngestOutcome::Coalesced { revision }
-            } else {
+            } else if admitted || !rejected {
                 IngestOutcome::NoChange { revision }
+            } else {
+                IngestOutcome::Rejected {
+                    reason: "queue_capacity",
+                }
             };
             let push = if visible_changed {
                 self.active_instance.current().map(|instance_id| {
@@ -264,4 +281,97 @@ fn validate_instance_id(instance_id: &str) -> anyhow::Result<()> {
         "instance_id exceeds {MAX_ID_BYTES} bytes"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(turn_id: String, event_id: String, occurred_at_ms: u64) -> EventMeta {
+        EventMeta {
+            source: UsageSource::Renderer,
+            session_id: "batch-session".to_string(),
+            turn_id,
+            event_id,
+            correlation_id: "batch-correlation".to_string(),
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn synchronous_batches_exercise_real_service_queue_pressure() {
+        let deltas = TokenCostService::in_memory();
+        deltas.bootstrap("page-1").unwrap();
+        let outcome =
+            deltas.ingest_batch((0..10_000_u64).map(|index| TokenCostEvent::OutputDelta {
+                meta: meta("delta-turn".to_string(), format!("delta-{index}"), index),
+                estimated_output_tokens: index,
+            }));
+        assert_eq!(outcome, IngestOutcome::Applied { revision: 1 });
+        let inner = deltas
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let diagnostics = deltas.diagnostics_locked(&inner);
+        assert_eq!(diagnostics.events_ingested, 10_000);
+        assert_eq!(diagnostics.events_coalesced, 9_999);
+        assert_eq!(diagnostics.events_rejected, 0);
+        assert_eq!(diagnostics.queue_depth, 0);
+        assert_eq!(diagnostics.queue_high_water, 1);
+        assert_eq!(diagnostics.snapshots_published, 1);
+        assert_eq!(inner.state.snapshot(&inner.config).output, 9_999);
+        drop(inner);
+
+        let critical = TokenCostService::in_memory();
+        critical.bootstrap("page-1").unwrap();
+        let outcome = critical.ingest_batch((0..=EVENT_QUEUE_CAPACITY).map(|index| {
+            TokenCostEvent::TurnStarted {
+                meta: meta(
+                    format!("critical-turn-{index}"),
+                    format!("critical-start-{index}"),
+                    index as u64,
+                ),
+                model: "gpt-5.6-sol".to_string(),
+                fast: false,
+            }
+        }));
+        assert_eq!(outcome, IngestOutcome::Applied { revision: 1 });
+        let inner = critical
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let diagnostics = critical.diagnostics_locked(&inner);
+        assert_eq!(diagnostics.events_ingested, 257);
+        assert_eq!(diagnostics.events_coalesced, 0);
+        assert_eq!(diagnostics.events_rejected, 0);
+        assert_eq!(diagnostics.queue_depth, 0);
+        assert_eq!(diagnostics.queue_high_water, EVENT_QUEUE_CAPACITY as u64);
+        assert_eq!(diagnostics.snapshots_published, 1);
+        assert_eq!(inner.state.snapshot(&inner.config).turns, 257);
+    }
+
+    #[test]
+    fn retired_turn_support_window_stays_hard_bounded() {
+        let service = TokenCostService::in_memory();
+        service.bootstrap("page-1").unwrap();
+        for index in 0..(RECENT_TURN_LIMIT + DEDUPE_FINGERPRINT_LIMIT + 1) {
+            let turn_id = format!("retired-turn-{index}");
+            service.ingest(TokenCostEvent::TurnStarted {
+                meta: meta(turn_id.clone(), format!("start-{index}"), index as u64 * 2),
+                model: "gpt-5.6-sol".to_string(),
+                fast: false,
+            });
+            service.ingest(TokenCostEvent::TurnCompleted {
+                meta: meta(turn_id, format!("complete-{index}"), index as u64 * 2 + 1),
+                usage: None,
+            });
+        }
+
+        let inner = service
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(inner.state.recent_turn_count(), RECENT_TURN_LIMIT);
+        assert_eq!(inner.state.retired_turn_count(), DEDUPE_FINGERPRINT_LIMIT);
+    }
 }

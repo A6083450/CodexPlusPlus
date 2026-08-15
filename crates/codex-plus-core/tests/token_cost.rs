@@ -1344,6 +1344,118 @@ fn completion_before_usage_and_repeated_final_usage_never_double_count() {
 }
 
 #[test]
+fn late_turn_completed_usage_replaces_recent_without_moving_completion_time() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started(
+        "s-late-completion",
+        "t-late-completion",
+        "start",
+        "c-1",
+        1_000,
+    ));
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-late-completion",
+        "t-late-completion",
+        "renderer-complete",
+        "c-1",
+        1_100,
+        None,
+    ));
+    let completed = snapshot(&service);
+    assert_eq!(completed.llm_ms, 100);
+    assert_eq!(completed.input, 0);
+
+    assert_eq!(
+        service.ingest(turn_completed(
+            UsageSource::ProtocolProxy,
+            "s-late-completion",
+            "t-late-completion",
+            "protocol-complete",
+            "c-1",
+            9_000,
+            Some(TokenUsage {
+                input: 10,
+                cached_input: 2,
+                cache_write: 0,
+                output: 4,
+            }),
+        )),
+        IngestOutcome::Applied {
+            revision: completed.revision + 1,
+        }
+    );
+    let replaced = snapshot(&service);
+    assert_eq!(replaced.llm_ms, 100);
+    assert_eq!(replaced.input, 10);
+    assert_eq!(replaced.cached_input, 2);
+    assert_eq!(replaced.output, 4);
+    assert_eq!(replaced.cost_nanos, 161_000);
+}
+
+#[test]
+fn equal_protocol_turn_completion_promotes_rank_for_future_renderer_usage() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    let usage = TokenUsage {
+        input: 10,
+        cached_input: 2,
+        cache_write: 0,
+        output: 4,
+    };
+    service.ingest(turn_started(
+        "s-completion-rank",
+        "t-completion-rank",
+        "start",
+        "c-1",
+        1_000,
+    ));
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-completion-rank",
+        "t-completion-rank",
+        "renderer-complete",
+        "c-1",
+        1_100,
+        Some(usage),
+    ));
+    let renderer = snapshot(&service);
+
+    assert_eq!(
+        service.ingest(turn_completed(
+            UsageSource::ProtocolProxy,
+            "s-completion-rank",
+            "t-completion-rank",
+            "protocol-complete",
+            "c-1",
+            5_000,
+            Some(usage),
+        )),
+        IngestOutcome::NoChange {
+            revision: renderer.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), renderer);
+
+    assert_eq!(
+        service.ingest(exact_usage(
+            UsageSource::Renderer,
+            "s-completion-rank",
+            "t-completion-rank",
+            "renderer-late-change",
+            "c-1",
+            6_000,
+            TokenUsage { output: 5, ..usage },
+        )),
+        IngestOutcome::NoChange {
+            revision: renderer.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), renderer);
+}
+
+#[test]
 fn failed_turn_closes_without_inventing_usage() {
     let service = TokenCostService::in_memory();
     service.bootstrap("page-1").unwrap();
@@ -1368,6 +1480,75 @@ fn failed_turn_closes_without_inventing_usage() {
     assert_eq!(failed.cached_input, 0);
     assert_eq!(failed.output, 0);
     assert_eq!(failed.cost_nanos, 0);
+}
+
+#[test]
+fn missing_turn_tool_completion_is_a_semantic_no_op() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    let before = snapshot(&service);
+
+    assert_eq!(
+        service.ingest(tool_completed(
+            "s-missing-tool",
+            "t-missing-tool",
+            "tool-complete",
+            "c-1",
+            1_000,
+            "missing-call",
+        )),
+        IngestOutcome::NoChange {
+            revision: before.revision,
+        }
+    );
+    let after = snapshot(&service);
+    assert_eq!(after, before);
+    assert!(!after.running);
+    assert_eq!(after.turns, 0);
+}
+
+#[test]
+fn late_turn_start_cannot_change_a_completed_turns_display_state() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started(
+        "s-late-start",
+        "t-late-start",
+        "start",
+        "c-1",
+        1_000,
+    ));
+    service.ingest(turn_completed(
+        UsageSource::Renderer,
+        "s-late-start",
+        "t-late-start",
+        "complete",
+        "c-1",
+        1_100,
+        None,
+    ));
+    let completed = snapshot(&service);
+    assert_eq!(completed.model, "gpt-5.6-sol");
+    assert!(!completed.fast);
+
+    assert_eq!(
+        service.ingest(TokenCostEvent::TurnStarted {
+            meta: runtime_meta(
+                UsageSource::Renderer,
+                "s-late-start",
+                "t-late-start",
+                "late-start",
+                "c-1",
+                9_000,
+            ),
+            model: "late-wrong-model".to_string(),
+            fast: true,
+        }),
+        IngestOutcome::NoChange {
+            revision: completed.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), completed);
 }
 
 #[tokio::test]
@@ -1410,6 +1591,118 @@ async fn completed_history_and_dedupe_fingerprints_stay_hard_bounded() {
     assert_eq!(totals.turns, (RECENT_TURN_LIMIT + 1) as u32);
     assert_eq!(totals.input, (RECENT_TURN_LIMIT + 1) as u64);
     assert_eq!(totals.output, (RECENT_TURN_LIMIT + 1) as u64);
+}
+
+#[tokio::test]
+async fn dedupe_windows_are_removed_after_sequential_sessions_complete() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    for index in 0..2_048_u64 {
+        let session_id = format!("sequential-session-{index}");
+        service.ingest(turn_started(
+            &session_id,
+            "turn",
+            "start",
+            "correlation",
+            index * 10,
+        ));
+        service.ingest(turn_completed(
+            UsageSource::ProtocolProxy,
+            &session_id,
+            "turn",
+            "complete",
+            "correlation",
+            index * 10 + 5,
+            Some(TokenUsage {
+                input: 1,
+                cached_input: 0,
+                cache_write: 0,
+                output: 1,
+            }),
+        ));
+    }
+
+    let bounded = diagnostics(&service).await;
+    assert_eq!(bounded.recent_turns, RECENT_TURN_LIMIT as u64);
+    assert_eq!(bounded.dedupe_fingerprints, 0);
+    assert_eq!(snapshot(&service).turns, 2_048);
+}
+
+#[test]
+fn late_usage_for_the_257th_evicted_turn_is_ignored() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+
+    for index in 0..=RECENT_TURN_LIMIT {
+        let turn_id = format!("eviction-turn-{index}");
+        let correlation_id = format!("eviction-correlation-{index}");
+        service.ingest(turn_started(
+            "s-eviction",
+            &turn_id,
+            format!("start-{index}"),
+            correlation_id.clone(),
+            index as u64 * 10,
+        ));
+        service.ingest(turn_completed(
+            UsageSource::ProtocolProxy,
+            "s-eviction",
+            &turn_id,
+            format!("complete-{index}"),
+            correlation_id,
+            index as u64 * 10 + 5,
+            Some(TokenUsage {
+                input: 1,
+                cached_input: 0,
+                cache_write: 0,
+                output: 1,
+            }),
+        ));
+    }
+
+    let before_late = snapshot(&service);
+    assert_eq!(before_late.turns, 257);
+    assert_eq!(before_late.input, 257);
+    assert!(!before_late.running);
+    assert_eq!(
+        service.ingest(exact_usage(
+            UsageSource::ProtocolProxy,
+            "s-eviction",
+            "eviction-turn-0",
+            "late-evicted-usage",
+            "eviction-correlation-0",
+            50_000,
+            TokenUsage {
+                input: 100,
+                cached_input: 0,
+                cache_write: 0,
+                output: 100,
+            },
+        )),
+        IngestOutcome::NoChange {
+            revision: before_late.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), before_late);
+
+    assert_eq!(
+        service.ingest(TokenCostEvent::TurnStarted {
+            meta: runtime_meta(
+                UsageSource::Renderer,
+                "s-eviction",
+                "eviction-turn-0",
+                "late-evicted-start",
+                "eviction-correlation-0",
+                60_000,
+            ),
+            model: "late-wrong-model".to_string(),
+            fast: true,
+        }),
+        IngestOutcome::NoChange {
+            revision: before_late.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), before_late);
 }
 
 #[test]
@@ -1499,6 +1792,80 @@ fn bounded_queue_coalesces_cumulative_events_under_ten_thousand_delta_pressure()
             ..
         })
     ));
+}
+
+#[test]
+fn public_ingest_merges_inexact_usage_fields_monotonically() {
+    let service = TokenCostService::in_memory();
+    service.bootstrap("page-1").unwrap();
+    service.ingest(turn_started(
+        "s-estimate-state",
+        "t-estimate-state",
+        "start",
+        "c-1",
+        0,
+    ));
+
+    let estimate = |event_id: &str, occurred_at_ms: u64, usage: TokenUsage| TokenCostEvent::Usage {
+        meta: runtime_meta(
+            UsageSource::Renderer,
+            "s-estimate-state",
+            "t-estimate-state",
+            event_id,
+            "c-1",
+            occurred_at_ms,
+        ),
+        usage,
+        exact: false,
+    };
+
+    service.ingest(estimate(
+        "estimate-1",
+        10,
+        TokenUsage {
+            input: 100,
+            cached_input: 50,
+            cache_write: 20,
+            output: 30,
+        },
+    ));
+    let before_merge = snapshot(&service);
+    assert_eq!(
+        service.ingest(estimate(
+            "estimate-2",
+            20,
+            TokenUsage {
+                input: 90,
+                cached_input: 60,
+                cache_write: 10,
+                output: 25,
+            },
+        )),
+        IngestOutcome::Applied {
+            revision: before_merge.revision + 1,
+        }
+    );
+    let merged = snapshot(&service);
+    assert_eq!(merged.input, 100);
+    assert_eq!(merged.cached_input, 60);
+    assert_eq!(merged.output, 30);
+
+    assert_eq!(
+        service.ingest(estimate(
+            "estimate-3",
+            30,
+            TokenUsage {
+                input: 80,
+                cached_input: 55,
+                cache_write: 15,
+                output: 29,
+            },
+        )),
+        IngestOutcome::NoChange {
+            revision: merged.revision,
+        }
+    );
+    assert_eq!(snapshot(&service), merged);
 }
 
 #[test]

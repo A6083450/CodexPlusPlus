@@ -435,13 +435,26 @@ impl TurnState {
             if rank < existing.rank || (rank == existing.rank && usage == existing.usage) {
                 return changed;
             }
-            if rank > existing.rank && usage == existing.usage {
+            if rank == 0 && existing.rank == 0 {
+                let merged = TokenUsage {
+                    input: existing.usage.input.max(usage.input),
+                    cached_input: existing.usage.cached_input.max(usage.cached_input),
+                    cache_write: existing.usage.cache_write.max(usage.cache_write),
+                    output: existing.usage.output.max(usage.output),
+                };
+                if merged == existing.usage {
+                    return changed;
+                }
+                existing.usage = merged;
+                changed = true;
+            } else if rank > existing.rank && usage == existing.usage {
                 existing.rank = rank;
                 return changed;
+            } else {
+                existing.usage = usage;
+                existing.rank = rank;
+                changed = true;
             }
-            existing.usage = usage;
-            existing.rank = rank;
-            changed = true;
         } else {
             if self.usage_by_correlation.len() >= DEDUPE_FINGERPRINT_LIMIT {
                 if let Some(oldest) = self.usage_order.pop_front()
@@ -547,6 +560,8 @@ struct CompletedTurn {
 pub struct RuntimeState {
     active_turns: HashMap<TurnKey, TurnState>,
     recent_turns: VecDeque<CompletedTurn>,
+    retired_turns: VecDeque<TurnKey>,
+    retired_turn_keys: HashSet<TurnKey>,
     dedupe_by_session: HashMap<String, DedupeWindow>,
     totals: AnalyticsTotals,
     day_rollups: BTreeMap<u64, AnalyticsTotals>,
@@ -567,6 +582,8 @@ impl RuntimeState {
         Self {
             active_turns: HashMap::new(),
             recent_turns: VecDeque::with_capacity(RECENT_TURN_LIMIT),
+            retired_turns: VecDeque::with_capacity(DEDUPE_FINGERPRINT_LIMIT),
+            retired_turn_keys: HashSet::with_capacity(DEDUPE_FINGERPRINT_LIMIT),
             dedupe_by_session: HashMap::new(),
             totals: AnalyticsTotals::default(),
             day_rollups: BTreeMap::new(),
@@ -578,7 +595,24 @@ impl RuntimeState {
     }
 
     pub fn apply(&mut self, event: TokenCostEvent, config: &UiConfig) -> bool {
+        let session_id = event_meta(&event).session_id.clone();
+        let changed = self.apply_event(event, config);
+        if !self
+            .active_turns
+            .keys()
+            .any(|key| key.session_id == session_id)
+        {
+            self.dedupe_by_session.remove(&session_id);
+        }
+        changed
+    }
+
+    fn apply_event(&mut self, event: TokenCostEvent, config: &UiConfig) -> bool {
         let meta = event_meta(&event).clone();
+        let key = TurnKey::from_meta(&meta);
+        if self.retired_turn_keys.contains(&key) {
+            return false;
+        }
         let dedupe = self
             .dedupe_by_session
             .entry(meta.session_id.clone())
@@ -588,14 +622,13 @@ impl RuntimeState {
             return false;
         }
 
-        let key = TurnKey::from_meta(&meta);
         match event {
             TokenCostEvent::TurnStarted { model, fast, .. } => {
-                self.display_model = model.clone();
-                self.display_fast = fast;
                 if self.recent_turn(&key).is_some() {
                     return false;
                 }
+                self.display_model = model.clone();
+                self.display_fast = fast;
                 if let Some(turn) = self.active_turns.get_mut(&key) {
                     let changed = turn.model != model || turn.fast != fast;
                     turn.model = model;
@@ -627,7 +660,9 @@ impl RuntimeState {
                 if self.recent_turn(&key).is_some() {
                     return false;
                 }
-                self.ensure_turn(&key, &meta).complete_tool(&meta, &call_id)
+                self.active_turns
+                    .get_mut(&key)
+                    .is_some_and(|turn| turn.complete_tool(&meta, &call_id))
             }
             TokenCostEvent::Usage { usage, exact, .. } => {
                 if let Some(turn) = self.active_turns.get_mut(&key) {
@@ -642,7 +677,9 @@ impl RuntimeState {
             }
             TokenCostEvent::TurnCompleted { usage, .. } => {
                 if self.recent_turn(&key).is_some() {
-                    return false;
+                    return usage.is_some_and(|usage| {
+                        self.apply_late_usage(&key, &meta, usage, true, config)
+                    });
                 }
                 let turn = self.ensure_turn(&key, &meta);
                 if let Some(usage) = usage {
@@ -704,6 +741,11 @@ impl RuntimeState {
         self.recent_turns.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retired_turn_count(&self) -> usize {
+        self.retired_turns.len()
+    }
+
     pub(crate) fn dedupe_fingerprint_count(&self) -> usize {
         self.dedupe_by_session
             .values()
@@ -737,10 +779,23 @@ impl RuntimeState {
             completed_at_ms: occurred_at_ms,
             totals,
         });
-        if self.recent_turns.len() > RECENT_TURN_LIMIT {
-            self.recent_turns.pop_front();
+        if self.recent_turns.len() > RECENT_TURN_LIMIT
+            && let Some(evicted) = self.recent_turns.pop_front()
+        {
+            self.remember_retired(evicted.key);
         }
         true
+    }
+
+    fn remember_retired(&mut self, key: TurnKey) {
+        if self.retired_turn_keys.insert(key.clone()) {
+            self.retired_turns.push_back(key);
+        }
+        while self.retired_turns.len() > DEDUPE_FINGERPRINT_LIMIT {
+            if let Some(oldest) = self.retired_turns.pop_front() {
+                self.retired_turn_keys.remove(&oldest);
+            }
+        }
     }
 
     fn apply_late_usage(
