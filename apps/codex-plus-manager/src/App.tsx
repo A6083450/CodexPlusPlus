@@ -96,6 +96,7 @@ import {
 } from "./model-windows";
 import { relayAuthForLiveDraft } from "./relay-live-files";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
+import { syncMarketInstalledState, type ScriptMarketItem, type ScriptMarketResult, type UserScriptInventory } from "./script-market-sync";
 import {
   defaultDreamSkinTheme,
   defaultDreamSkinColors,
@@ -358,23 +359,6 @@ const emptyContextSelection = (): RelayContextSelection => ({
   skills: [],
   plugins: [],
 });
-
-type UserScriptInventory = {
-  enabled?: boolean;
-  scripts?: Array<{
-    key: string;
-    name: string;
-    source: string;
-    enabled: boolean;
-    status: string;
-    error: string;
-    market_id?: string;
-    version?: string;
-    installed?: boolean;
-    source_url?: string;
-    homepage?: string;
-  }>;
-};
 
 type SettingsResult = CommandResult<{
   settings: BackendSettings;
@@ -683,31 +667,6 @@ type UpdateResult = CommandResult<{
   progress?: number;
 }>;
 
-type ScriptMarketItem = {
-  id: string;
-  name: string;
-  description: string;
-  version: string;
-  author: string;
-  tags: string[];
-  homepage: string;
-  script_url: string;
-  sha256: string;
-  installed: boolean;
-  installedVersion: string;
-  updateAvailable: boolean;
-};
-
-type ScriptMarketResult = CommandResult<{
-  market: {
-    status: string;
-    message: string;
-    indexUrl: string;
-    updatedAt: string;
-    scripts: ScriptMarketItem[];
-  };
-  user_scripts: UserScriptInventory;
-}>;
 
 function providerSyncProgressMessage(result: CommandResult<ProviderSyncPayload>): string {
   const changed = result.changedSessionFiles ?? 0;
@@ -740,31 +699,6 @@ function providerSyncTargetLabel(target: ProviderSyncTargetOption): string {
   const labels = target.sources.map((source) => providerSyncSourceLabels[source]).filter(Boolean);
   const current = target.isCurrentProvider ? [t("当前")] : [];
   return [...labels, ...current].join(" / ") || t("发现");
-}
-
-function syncMarketInstalledState(current: ScriptMarketResult | null, userScripts: UserScriptInventory): ScriptMarketResult | null {
-  if (!current) return current;
-  const installed = new Map(
-    (userScripts.scripts ?? [])
-      .filter((script) => script.market_id)
-      .map((script) => [script.market_id || "", script.version || ""]),
-  );
-  return {
-    ...current,
-    user_scripts: userScripts,
-    market: {
-      ...current.market,
-      scripts: current.market.scripts.map((script) => {
-        const installedVersion = installed.get(script.id) || "";
-        return {
-          ...script,
-          installed: Boolean(installedVersion),
-          installedVersion,
-          updateAvailable: Boolean(installedVersion) && installedVersion !== script.version,
-        };
-      }),
-    },
-  };
 }
 
 type StartupResult = CommandResult<{

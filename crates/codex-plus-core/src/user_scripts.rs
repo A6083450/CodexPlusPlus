@@ -333,6 +333,13 @@ impl UserScriptManager {
             .into_iter()
             .map(|script| {
                 let market = config.market.get(&script.key);
+                // 版本以磁盘文件上的 @version 头为准：内置脚本升级会覆盖
+                // 文件但不会同步 market 安装快照，快照可能已陈旧，仅作回退。
+                let file_version = script_file_version(&script.path);
+                let version = file_version
+                    .as_deref()
+                    .or_else(|| market.map(|item| item.version.as_str()))
+                    .unwrap_or("");
                 let fallback_status = if !config.enabled || !script.enabled {
                     "disabled"
                 } else {
@@ -359,7 +366,7 @@ impl UserScriptManager {
                     "status": status,
                     "error": error,
                     "market_id": market.as_ref().map(|item| item.id.as_str()).unwrap_or(""),
-                    "version": market.as_ref().map(|item| item.version.as_str()).unwrap_or(""),
+                    "version": version,
                     "installed": market.is_some(),
                     "source_url": market.as_ref().map(|item| item.script_url.as_str()).unwrap_or(""),
                     "homepage": market.as_ref().map(|item| item.homepage.as_str()).unwrap_or("")
@@ -493,6 +500,11 @@ fn user_script_version(source: &str) -> Option<&str> {
             .split_whitespace()
             .next()
     })
+}
+
+fn script_file_version(path: &Path) -> Option<String> {
+    let source = fs::read_to_string(path).ok()?;
+    user_script_version(&source).map(ToOwned::to_owned)
 }
 
 fn bundled_script_is_newer(installed_path: &Path, bundled_source: &str) -> bool {
