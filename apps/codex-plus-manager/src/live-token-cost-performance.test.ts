@@ -237,6 +237,33 @@ describe("DS style cost measurement runner process discovery", () => {
     });
   });
 
+  it("accepts only the exact installed ChatGPT browser identities used by Task 14", () => {
+    const renderer = "ChatGPT Helper (Renderer) --type=renderer";
+    assert.deepEqual(discoverCodexProcesses(`
+      201 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9339
+      204 201 ${renderer}
+    `, 9339), { browserPid: 201, rendererPids: [204] });
+    assert.deepEqual(discoverCodexProcesses(`
+      201 1 ChatGPT --remote-debugging-port=9339
+      204 201 ${renderer}
+    `, 9339), { browserPid: 201, rendererPids: [204] });
+
+    for (const executable of [
+      "FooChatGPT",
+      "/Applications/FooChatGPT.app/Contents/MacOS/ChatGPT",
+      "/tmp/ChatGPT.app/Contents/MacOS/ChatGPT",
+    ]) {
+      assert.throws(() => discoverCodexProcesses(`
+        201 1 ${executable} --remote-debugging-port=9339
+        204 201 ${renderer}
+      `, 9339), /exactly one Codex browser/);
+    }
+    assert.throws(() => discoverCodexProcesses(`
+      201 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=93390
+      204 201 ${renderer}
+    `, 9339), /exactly one Codex browser/);
+  });
+
   it("rejects malformed process rows, ambiguous browsers, and missing renderers", () => {
     assert.throws(() => parseProcessList("not a ps row"), /invalid process row/);
     assert.throws(() => discoverCodexProcesses(`${PROCESS_LIST}\n  106 1 Codex --remote-debugging-port=9339`, 9339), /exactly one Codex browser/);
@@ -246,6 +273,14 @@ describe("DS style cost measurement runner process discovery", () => {
       102 101 Codex Helper --type=zygote
       103 102 Codex Helper --type=renderer
     `, 9339), /cycle/);
+  });
+
+  it("truncates unrelated over-long process commands instead of aborting", () => {
+    const overLong = "x".repeat(5_000);
+    const rows = parseProcessList(`106 1 ${overLong}`);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].pid, 106);
+    assert.equal(rows[0].command.length, 4_096);
   });
 
   it("rediscovers renderer additions and exits without sampling a reused PID", () => {
@@ -749,6 +784,7 @@ describe("DS style cost measurement runner output aggregation", () => {
   it("selects one primary Codex page and summarizes every retained sample", () => {
     assert.deepEqual(selectPrimaryPage([
       { id: "worker", type: "worker", url: "app://-/worker.js", webSocketDebuggerUrl: "ws://worker" },
+      { id: "avatar", type: "page", title: "Codex", url: "app://-/index.html?initialRoute=%2Favatar-overlay", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/avatar" },
       { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page" },
     ], 9339), { id: "page", type: "page", title: "Codex", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1:9339/devtools/page/page" });
     assert.deepEqual(parseBrowserVersion({

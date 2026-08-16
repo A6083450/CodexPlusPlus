@@ -103,8 +103,9 @@ export function parseProcessList(source) {
       throw new Error(`invalid process row: ${rawLine}`);
     }
     if (processes.length >= MAX_PROCESS_ROWS) throw new Error(`process list exceeds ${MAX_PROCESS_ROWS} rows`);
-    const command = match[3];
-    if (Buffer.byteLength(command) > 4_096) throw new Error(`invalid process row: ${rawLine}`);
+    // Unrelated long-lived user processes (e.g. IDE build servers) can exceed
+    // the command buffer; truncate them so process discovery stays usable.
+    const command = Buffer.byteLength(match[3]) > 4_096 ? match[3].slice(0, 4_096) : match[3];
     seen.add(pid);
     processes.push({ pid, ppid, command });
   }
@@ -117,7 +118,10 @@ function commandArguments(command) {
 
 function isCodexBrowserCommand(command) {
   const executable = commandArguments(command)[0] || "";
-  return executable === "Codex" || executable.endsWith("/Codex.app/Contents/MacOS/Codex");
+  return executable === "Codex"
+    || executable.endsWith("/Codex.app/Contents/MacOS/Codex")
+    || executable === "ChatGPT"
+    || executable === "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
 }
 
 function discoverCodexProcessRecords(processes, debugPort) {
@@ -192,7 +196,8 @@ function parseProcessSampleList(source) {
     const ppid = Number(match[2]);
     const cpuPercent = Number(match[3]);
     const rssKb = Number(match[4]);
-    const command = match[5];
+    // Same truncation policy as parseProcessList for unrelated over-long commands.
+    const command = Buffer.byteLength(match[5]) > 4_096 ? match[5].slice(0, 4_096) : match[5];
     if (
       !Number.isSafeInteger(pid)
       || pid <= 0
@@ -202,7 +207,6 @@ function parseProcessSampleList(source) {
       || cpuPercent < 0
       || !Number.isSafeInteger(rssKb)
       || rssKb < 0
-      || Buffer.byteLength(command) > 4_096
       || seen.has(pid)
       || processes.length >= MAX_PROCESS_ROWS
     ) {
@@ -271,7 +275,7 @@ export function selectPrimaryPage(targets, debugPort) {
     && Buffer.byteLength(target.title) <= 1_024
     && typeof target.url === "string"
     && Buffer.byteLength(target.url) <= 4_096
-    && target.url.startsWith("app://-/")
+    && target.url === "app://-/index.html"
     && typeof target.webSocketDebuggerUrl === "string"
     && Buffer.byteLength(target.webSocketDebuggerUrl) <= 4_096
     && target.webSocketDebuggerUrl === `ws://127.0.0.1:${debugPort}/devtools/page/${target.id}`
