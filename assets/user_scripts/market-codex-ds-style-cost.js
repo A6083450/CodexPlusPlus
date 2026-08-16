@@ -53,6 +53,7 @@
     configRevision: -1,
     generation: 1,
     pendingOpen: null,
+    profileTrigger: null,
     retryTimer: 0,
     revision: -1,
     root: null,
@@ -308,7 +309,6 @@
         min-width: 0;
         height: 16px;
         line-height: 16px;
-        color: var(--cltc-text);
         font-variant-numeric: tabular-nums;
       }
       #${ROOT_ID}[data-cltc-output-rate-visible="true"] {
@@ -360,9 +360,16 @@
     }
   }
 
+  function findComposerAnchor() {
+    const editable = document.querySelector("textarea");
+    if (!editable) return null;
+    const form = editable.closest("form");
+    return form?.parentElement || null;
+  }
+
   function ensureRoot() {
     ensureStyle();
-    const composer = document.querySelector("textarea")?.closest("form");
+    const composer = findComposerAnchor();
     if (!composer || !composer.parentElement) return null;
     if (!state.root) {
       const root = document.createElement("div");
@@ -594,7 +601,51 @@
     }
   }
 
+  function restoreProfileTrigger() {
+    const owner = state.profileTrigger;
+    state.profileTrigger = null;
+    if (!owner) return;
+    owner.avatar.remove();
+    if (!owner.trigger.isConnected) return;
+    if (owner.label.isConnected) owner.label.textContent = owner.labelText;
+    if (owner.gear.isConnected) owner.gear.style.display = owner.gearDisplay;
+  }
+
+  function profileTriggerParts(trigger) {
+    const labels = Array.from(trigger.querySelectorAll("span.min-w-0.flex-1.truncate"));
+    const gears = Array.from(trigger.querySelectorAll("svg"));
+    if (labels.length !== 1 || gears.length !== 1) return null;
+    const labelText = labels[0].textContent;
+    const gearDisplay = gears[0].style.display || "";
+    if (utf8Length(labelText) > 1024 || utf8Length(gearDisplay) > 1024) return null;
+    return { label: labels[0], labelText, gear: gears[0], gearDisplay };
+  }
+
+  function applyProfileTriggerPresentation(owner, profile) {
+    const displayName = profile.display_name || profile.username || "Local Usage";
+    owner.label.textContent = displayName;
+    owner.gear.style.display = "none";
+    owner.avatar.className = "icon-sm flex shrink-0 items-center justify-center rounded-full bg-token-charts-purple/10 text-[10px] leading-none font-medium text-token-charts-purple";
+    owner.avatar.textContent = profile.avatar_data_url ? "" : displayName.slice(0, 1);
+    owner.avatar.style.cssText = "";
+    if (profile.avatar_data_url) {
+      owner.avatar.style.setProperty("background-image", `url("${profile.avatar_data_url}")`);
+      owner.avatar.style.setProperty("background-position", "center");
+      owner.avatar.style.setProperty("background-size", "cover");
+    }
+  }
+
+  function projectProfileTrigger(trigger, parts, profile) {
+    const avatar = document.createElement("span");
+    avatar.setAttribute("data-cltc-profile-identity-avatar", "");
+    const owner = { trigger, avatar, ...parts };
+    trigger.insertBefore(avatar, parts.gear);
+    state.profileTrigger = owner;
+    applyProfileTriggerPresentation(owner, profile);
+  }
+
   function restoreConnectedProfiles() {
+    restoreProfileTrigger();
     for (const item of document.querySelectorAll(`[${PROFILE_MARKER}='true']`)) {
       if (item.isConnected) restoreProfileItem(item);
     }
@@ -632,6 +683,8 @@
     if (!boundedString(labelledBy, 160)) return false;
     const trigger = labelledBy && document.getElementById(labelledBy);
     if (!trigger || !boundedString(trigger.id, 160) || trigger.id !== labelledBy || trigger.getAttribute("aria-controls") !== menuId) return false;
+    const triggerParts = profileTriggerParts(trigger);
+    if (!triggerParts) return false;
     const items = Array.from(menu.querySelectorAll("[role='menuitem']"));
     const disabled = items.filter(itemDisabled);
     const settings = items.filter((item) => !itemDisabled(item) && ["Settings", "设置"].includes(item.textContent.trim()));
@@ -653,6 +706,7 @@
     item.setAttribute("tabindex", "0");
     applyProfilePresentation(item, parts, config.profile);
     item.setAttribute(PROFILE_MARKER, "true");
+    projectProfileTrigger(trigger, triggerParts, config.profile);
     return true;
   }
 
@@ -666,6 +720,7 @@
       const parts = profileParts(item);
       if (parts) applyProfilePresentation(item, parts, state.config.profile);
     }
+    if (state.profileTrigger?.trigger.isConnected) applyProfileTriggerPresentation(state.profileTrigger, state.config.profile);
   }
 
   function acceptNativePush(push) {
@@ -754,7 +809,7 @@
     const detail = event?.detail;
     if (detail?.profile === false) {
       closeProfileOwner();
-      if (detail.reason === "profile_menu") projectProfile(detail.profileMenuId);
+      restoreConnectedProfiles();
       return;
     }
     if (detail?.reason === "profile_menu") {
@@ -1041,7 +1096,7 @@
   }
 
   function ownedNodeCount() {
-    const roots = [state.root, state.settingsButton, state.style];
+    const roots = [state.root, state.settingsButton, state.style, state.profileTrigger?.avatar];
     for (const selector of [".cltc-settings-overlay", ".cltc-profile-page", ".flatpickr-" + "calendar"]) {
       const root = document.querySelector(selector);
       if (root) roots.push(root);

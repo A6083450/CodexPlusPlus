@@ -601,6 +601,12 @@ function installProfileMenu(document: FakeDocument, menuId = "profile-menu") {
   const trigger = document.createElement("button");
   trigger.id = `${menuId}-trigger`;
   trigger.setAttribute("aria-controls", menuId);
+  trigger.setAttribute("aria-label", "Open profile menu and settings");
+  const gear = document.createElement("svg");
+  const triggerLabel = document.createElement("span");
+  triggerLabel.className = "min-w-0 flex-1 truncate";
+  triggerLabel.textContent = "Settings";
+  trigger.append(gear, triggerLabel);
   const menu = document.createElement("div");
   menu.id = menuId;
   menu.setAttribute("role", "menu");
@@ -628,7 +634,7 @@ function installProfileMenu(document: FakeDocument, menuId = "profile-menu") {
   group.append(identityItem, settings);
   menu.appendChild(group);
   document.body.append(trigger, menu);
-  return { trigger, menu, group, identityItem, settings, avatar, label };
+  return { trigger, triggerLabel, gear, menu, group, identityItem, settings, avatar, label };
 }
 
 function actionCalls(harness: Harness, type?: string) {
@@ -1961,6 +1967,32 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
       "--cltc-primary-text": "var(--color-token-main-surface-primary, light-dark(#ffffff, #18181b))",
     });
     assert.equal(root.get("--cltc-danger"), "light-dark(#b42318, #f97066)");
+    assert.equal(root.has("font"), false, "the frozen overlay inherits the host font metrics");
+    const closeStyle = cssDeclarations(style.textContent, ".cltc-price-head button");
+    assert.equal(closeStyle.get("font"), "20px/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif");
+    assert.equal(closeStyle.get("min-height"), "0");
+    assert.equal(closeStyle.get("padding"), "0");
+    assert.equal(
+      closeStyle.get("transition"),
+      "transform .16s cubic-bezier(.23,1,.32,1),background .16s cubic-bezier(.23,1,.32,1),color .16s cubic-bezier(.23,1,.32,1),border-color .16s cubic-bezier(.23,1,.32,1)",
+    );
+    const focusedCloseStyle = cssDeclarations(style.textContent, ".cltc-price-head button:focus-visible");
+    assert.equal(resolveSettingsCssValue(focusedCloseStyle.get("background"), root), root.get("--cltc-hover"));
+    assert.equal(focusedCloseStyle.get("outline"), "none");
+    const profileSelect = cssDeclarations(style.textContent, ".cltc-profile-select");
+    assert.equal(profileSelect.get("appearance"), "base-select");
+    assert.equal(profileSelect.get("cursor"), "pointer");
+    const profilePicker = cssDeclarations(style.textContent, ".cltc-profile-select::picker(select)");
+    assert.equal(profilePicker.get("appearance"), "base-select");
+    assert.equal(profilePicker.get("margin-top"), "5px");
+    assert.equal(profilePicker.get("padding"), "5px");
+    assert.equal(profilePicker.get("border-radius"), "10px");
+    assert.equal(resolveSettingsCssValue(profilePicker.get("background"), root), root.get("--cltc-popover"));
+    assert.equal(resolveSettingsCssValue(profilePicker.get("color"), root), root.get("--cltc-text"));
+    const profilePickerIcon = cssDeclarations(style.textContent, ".cltc-profile-select::picker-icon");
+    assert.equal(resolveSettingsCssValue(profilePickerIcon.get("color"), root), root.get("--cltc-muted"));
+    assert.equal(profilePickerIcon.has("transition"), false, "the rewritten picker keeps static parity without animation work");
+    assert.equal(overlay.querySelector(".cltc-settings-version")!.textContent, "v0.8.3");
 
     overlay.querySelector("[data-settings-panel='pricing']")!.click();
     const activeRow = overlay.querySelector(".cltc-price-row[data-active='true']")!;
@@ -2066,6 +2098,12 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.equal(profile.identityItem.getAttribute("tabindex"), "0");
     assert.equal(profile.label.textContent, "Local Usage");
     assert.equal(profile.avatar.classList.contains("size-8"), true);
+    const triggerAvatar = profile.trigger.querySelector("[data-cltc-profile-identity-avatar]")!;
+    assert.ok(triggerAvatar);
+    assert.equal(triggerAvatar.classList.contains("icon-sm"), true);
+    assert.equal(triggerAvatar.textContent, "L");
+    assert.equal(profile.triggerLabel.textContent, "Local Usage");
+    assert.equal(profile.gear.style.display, "none");
     assert.equal(decoy.label.textContent, "Account");
     harness.document.dispatchEvent(new FakeEvent("codex-plus:token-cost-lifecycle", {
       detail: { reason: "profile_menu", profile: true, profileMenuId: "missing-menu" },
@@ -2075,6 +2113,9 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.equal(profile.identityItem.getAttribute("aria-disabled"), "true");
     assert.equal(profile.identityItem.hasAttribute("data-disabled"), true);
     assert.equal(profile.identityItem.getAttribute("tabindex"), "-1");
+    assert.equal(profile.trigger.querySelector("[data-cltc-profile-identity-avatar]"), null);
+    assert.equal(profile.triggerLabel.textContent, "Settings");
+    assert.equal(profile.gear.style.display, "");
   });
 
   it("rejects malformed Profile menu structures without partial mutation", async () => {
@@ -2171,6 +2212,9 @@ describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
     assert.equal(profile.label.textContent, "Account");
     assert.equal(profile.avatar.textContent, "A");
     assert.equal(profile.avatar.style.cssText, "");
+    assert.equal(profile.triggerLabel.textContent, "Settings");
+    assert.equal(profile.trigger.querySelector("[data-cltc-profile-identity-avatar]"), null);
+    assert.equal(profile.gear.style.display, "");
   });
 
   it("restores and skips Profile projection when native visibility is disabled", async () => {
@@ -2427,7 +2471,12 @@ describe("lazy analytics calendar and profile views", () => {
     const chart = analytics.querySelector("[data-analytics-chart]")!;
     assert.equal(chart.tagName, "SVG");
     assert.equal(chart.namespaceURI, "http://www.w3.org/2000/svg");
+    assert.equal(chart.getAttribute("viewBox"), "0 0 720 230");
     assert.equal(chart.querySelector("rect")!.namespaceURI, "http://www.w3.org/2000/svg");
+    assert.match(
+      harness.document.getElementById("codex-live-token-cost-analytics-style")!.textContent,
+      /\.cltc-analytics-control\{[^}]*text-align:center/,
+    );
     assert.deepEqual(analytics.querySelector(".cltc-analytics-model-head")!.children.map((node) => node.textContent), ["模型", "Token", "模型调用", "花费", "占比"]);
     assert.match(analytics.textContent, /146K/);
     assert.match(analytics.textContent, /\$0\.12/);
@@ -2692,10 +2741,21 @@ describe("lazy analytics calendar and profile views", () => {
     success.runFlatpickr();
     const libraryWritesAfterColdOpen = success.evaluate("window.__flatpickrLibraryWrites");
     assert.equal(success.document.querySelectorAll(".flatpickr-calendar").length, 1);
+    assert.equal(success.document.querySelector(".flatpickr-calendar")!.classList.contains("animate"), true,
+      "the frozen calendar retains its one-shot open animation class");
     assert.equal(success.document.querySelectorAll("#codex-live-token-cost-flatpickr-style").length, 1);
     assert.equal(success.window.flatpickr, undefined, "library globals are restored after instance creation");
     assert.equal(success.evaluate("Date.prototype.fp_incr"), datePrototypeBefore);
     assert.equal(success.evaluate("HTMLElement.prototype.flatpickr"), elementPrototypeBefore);
+    const calendarTarget = successOverlay.querySelector("[data-analytics-date-input]")! as any;
+    const calendarInstance = calendarTarget._flatpickr;
+    assert.equal(calendarInstance.l10n.firstDayOfWeek, 1, "the frozen calendar starts weeks on Monday");
+    assert.equal(calendarInstance.config.disableMobile, true);
+    assert.equal(calendarInstance.config.allowInput, false);
+    assert.equal(calendarInstance.config.appendTo, successOverlay, "the calendar remains owned by the settings overlay");
+    assert.equal(calendarInstance.selectedDates.length, 2, "the current custom range seeds the calendar");
+    assert.equal(Math.floor((calendarInstance.config.maxDate.getTime() - calendarInstance.config.minDate.getTime()) / 86_400_000), 364,
+      "the frozen calendar exposes the latest 365 local days");
     const firstDay = success.document.querySelectorAll(".flatpickr-day").find((node) => !node.classList.contains("flatpickr-disabled"))!;
     const firstTime = (firstDay as any).dateObj.getTime();
     firstDay.click();
@@ -2991,8 +3051,22 @@ describe("lazy analytics calendar and profile views", () => {
     assert.equal(activity.hidden, true);
     assert.equal(page.querySelector(".profile-card")!.hidden, false);
     const profileStyle = harness.document.getElementById("codex-live-token-cost-profile-style")!.textContent;
-    assert.match(profileStyle, /main:has\(> #codex-live-token-cost-profile-page\)\{position:relative/);
-    assert.match(profileStyle, /width:min\(940px,calc\(100% - 64px\)\)/);
+    assert.doesNotMatch(profileStyle, /main:has\(> #codex-live-token-cost-profile-page\)\{[^}]*position:/);
+    assert.match(profileStyle, /#codex-live-token-cost-profile-page\{[^}]*font:inherit/);
+    assert.match(profileStyle, /#codex-live-token-cost-profile-page\{[^}]*color:inherit/);
+    assert.match(profileStyle, /--profile-nav-border:light-dark\(#e5e7eb,#34343a\)/);
+    assert.match(profileStyle, /\.cltc-profile-tabs\{[^}]*border-bottom:1px solid var\(--profile-nav-border\)/);
+    assert.match(profileStyle, /\.cltc-profile-tab\{[^}]*border:0;[^}]*background:/);
+    assert.doesNotMatch(profileStyle, /\.cltc-profile-tab\{[^}]*border-bottom:2px solid transparent/);
+    assert.match(profileStyle, /\.cltc-profile-tab\[data-active='true'\]\{[^}]*border-bottom:2px solid var\(--profile-text\)/);
+    assert.match(profileStyle, /\.cltc-profile-name\{[^}]*font-weight:inherit/);
+    assert.doesNotMatch(profileStyle, /\.cltc-profile-tab\[data-active='true'\]\{[^}]*font-weight:/);
+    assert.match(profileStyle, /width:min\(940px,calc\(100% - 64px\)\);margin:54px auto/);
+    const profileCard = page.querySelector(".profile-card")!;
+    assert.deepEqual(profileCard.children.map((node) => node.tagName), ["BUTTON", "DIV", "SPAN", "DL"]);
+    assert.deepEqual(profileCard.querySelector(".cltc-profile-details")!.children.map((node) => node.children.map((child) => child.tagName)), [["DT", "DD"], ["DT", "DD"]]);
+    assert.match(profileStyle, /\.profile-card\{[^}]*grid-template-columns:72px minmax\(0,1fr\) auto;[^}]*gap:20px;[^}]*padding:28px/);
+    assert.match(profileStyle, /\.cltc-profile-details\{[^}]*grid-column:1\/-1;[^}]*margin:14px 0 0/);
     assert.match(profileStyle, /width:64px;height:64px/);
 
     page.querySelector("[data-profile-action='edit']")!.click();
@@ -3006,7 +3080,8 @@ describe("lazy analytics calendar and profile views", () => {
       display_name: "Updated Local", username: "updated-local", email: "local@example.com", plan_label: "Pro 20x",
     });
     assert.match(page.textContent, /Updated Local/);
-    assert.equal(menu.label.textContent, "Updated Local");
+    assert.equal(menu.label.textContent, "Account", "a closed Profile menu stays restored until its next exact lifecycle");
+    assert.equal(menu.triggerLabel.textContent, "Settings");
 
     page.querySelector("[data-profile-action='edit']")!.click();
     page.querySelector("[data-profile-field='email']")!.value = "";
@@ -3093,7 +3168,7 @@ describe("lazy analytics calendar and profile views", () => {
     });
   });
 
-  it("closes an active Profile before projecting a profile_menu false lifecycle", async () => {
+  it("closes an active Profile and restores projection on a profile_menu false lifecycle", async () => {
     const harness = await createHarness();
     const menu = installProfileMenu(harness.document);
     harness.run();
@@ -3109,8 +3184,10 @@ describe("lazy analytics calendar and profile views", () => {
     }));
     assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-page")), false);
     assert.equal(Boolean(harness.document.getElementById("codex-live-token-cost-profile-style")), false);
-    assert.equal(menu.identityItem.getAttribute("data-codex-plus-token-cost-profile-entry"), "true");
-    assert.equal(menu.identityItem.className, menu.settings.className);
+    assert.equal(menu.identityItem.getAttribute("data-codex-plus-token-cost-profile-entry"), null);
+    assert.equal(menu.identityItem.className, "menu-disabled");
+    assert.equal(menu.triggerLabel.textContent, "Settings");
+    assert.equal(menu.trigger.querySelector("[data-cltc-profile-identity-avatar]"), null);
   });
 
   it("closes only Profile ownership when a native snapshot hides it", async () => {

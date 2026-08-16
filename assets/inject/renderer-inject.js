@@ -6680,6 +6680,21 @@
     return true;
   }
 
+  function tokenCostCloseOwningAccountMenu(entry) {
+    const menu = entry.closest?.("[role='menu']");
+    const menuId = tokenCostBoundedString(menu?.id, tokenCostMaxIdBytes);
+    const triggerId = tokenCostBoundedString(menu?.getAttribute?.("aria-labelledby"), tokenCostMaxIdBytes);
+    if (!menuId || !triggerId || menu.getAttribute?.("role") !== "menu") return false;
+    const trigger = document.getElementById(triggerId);
+    if (!trigger
+        || trigger.id !== triggerId
+        || trigger.getAttribute?.("aria-controls") !== menuId
+        || !tokenCostAccountLabels.has(trigger.getAttribute?.("aria-label"))
+        || typeof trigger.click !== "function") return false;
+    trigger.click();
+    return true;
+  }
+
   function tokenCostAccountEvent(event) {
     if (!tokenCostCaptureMatches(tokenCostActiveInstanceId)) return;
     if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
@@ -6691,6 +6706,7 @@
           || target.hasAttribute?.("data-disabled")) return;
       event.preventDefault();
       event.stopPropagation();
+      tokenCostCloseOwningAccountMenu(target);
       tokenCostEmitLifecycle("profile_entry", true, "");
       return;
     }

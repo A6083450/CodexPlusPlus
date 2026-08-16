@@ -209,8 +209,10 @@ class FakeTokenCostCustomEvent extends FakeTokenCostEvent {
 class FakeTokenCostNode {
   readonly attributes = new Map<string, string>();
   readonly menuItems: FakeTokenCostNode[] = [];
+  readonly closestMatches = new Map<string, FakeTokenCostNode>();
   closestCalls: string[] = [];
   closestMatch: FakeTokenCostNode | null = null;
+  clickCount = 0;
   id = "";
   textContent = "";
 
@@ -234,7 +236,11 @@ class FakeTokenCostNode {
 
   closest(selector: string) {
     this.closestCalls.push(selector);
-    return this.closestMatch;
+    return this.closestMatches.get(selector) ?? this.closestMatch;
+  }
+
+  click() {
+    this.clickCount += 1;
   }
 
   querySelectorAll(selector: string) {
@@ -915,12 +921,21 @@ describe("renderer token-cost lifecycle and account boundary", () => {
     assert.equal(runtime.pendingFrames.size, 1);
     runtime.flushFrames();
 
+    const menu = validMenu(button);
+    const unrelatedTrigger = triggerNode("Open profile menu", "unrelated-trigger", "unrelated-menu");
+    const unrelatedMenu = validMenu(unrelatedTrigger);
+    runtime.document.nodes.set("profile-trigger", button);
+    runtime.document.nodes.set("unrelated-trigger", unrelatedTrigger);
+    runtime.document.nodes.set("unrelated-menu", unrelatedMenu);
     const entry = new FakeTokenCostNode({ "data-codex-plus-token-cost-profile-entry": "", role: "menuitem" });
     entry.closestMatch = entry;
+    entry.closestMatches.set("[role='menu']", menu);
     const entryClick = new FakeTokenCostEvent("click", { target: entry });
     runtime.document.dispatchEvent(entryClick);
     assert.equal(entryClick.defaultPrevented, true);
     assert.equal(entryClick.propagationStopped, true);
+    assert.equal(button.clickCount, 1, "the exact aria-labelledby trigger closes the owning menu");
+    assert.equal(unrelatedTrigger.clickCount, 0, "an unrelated menu trigger is never clicked");
     assert.equal(lifecycleDetails(runtime).at(-1)?.reason, "profile_entry");
     assert.equal(lifecycleDetails(runtime).at(-1)?.profile, true);
 

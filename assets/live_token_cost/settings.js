@@ -591,7 +591,6 @@ api.registerModule("settings", (context) => {
         --cltc-danger: light-dark(#b42318, #f97066);
         position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center;
         padding: 48px 20px; background: transparent; color: var(--cltc-text); color-scheme: light dark; -webkit-app-region: no-drag;
-        font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       html.electron-dark .cltc-settings-overlay {
         --cltc-text: #f4f4f5; --cltc-muted: #a1a1aa; --cltc-border: #3f3f46; --cltc-border-subtle: #323238;
@@ -606,7 +605,8 @@ api.registerModule("settings", (context) => {
       .cltc-price-head { display:flex; justify-content:space-between; align-items:center; min-height:54px; padding:10px 14px 10px 18px;
         border-bottom:1px solid var(--cltc-border-subtle); }
       .cltc-price-title { font-size:15px; font-weight:600; }
-      .cltc-price-head button { width:30px; height:30px; border:0; border-radius:8px; background:transparent; color:var(--cltc-muted); cursor:pointer; font-size:20px; }
+      .cltc-price-head button { width:30px; height:30px; min-height:0; padding:0; border:0; border-radius:8px; background:transparent; color:var(--cltc-muted); cursor:pointer; font:20px/1 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; transition:transform .16s cubic-bezier(.23,1,.32,1),background .16s cubic-bezier(.23,1,.32,1),color .16s cubic-bezier(.23,1,.32,1),border-color .16s cubic-bezier(.23,1,.32,1); }
+      .cltc-price-head button:focus-visible { background:var(--cltc-hover); outline:none; }
       .cltc-settings-shell { display:grid; grid-template-columns:176px minmax(0, 1fr); min-height:0; overflow:hidden; }
       .cltc-settings-sidebar { display:flex; flex-direction:column; min-width:0; padding:18px 10px; border-right:1px solid var(--cltc-border-subtle); background:color-mix(in srgb, var(--cltc-surface-secondary) 62%, var(--cltc-popover)); }
       .cltc-settings-nav { display:grid; gap:2px; }
@@ -634,7 +634,9 @@ api.registerModule("settings", (context) => {
       .cltc-price-field { display:grid; gap:6px; } .cltc-price-field-full { grid-column:1/-1; }
       .cltc-price-field span { color:var(--cltc-muted); font-size:12px; }
       .cltc-price-input, .cltc-profile-select { box-sizing:border-box; min-width:0; width:100%; height:36px; padding:7px 10px; border:1px solid var(--cltc-border); border-radius:8px; background:var(--cltc-input); color:var(--cltc-text); font:inherit; outline:none; }
-      .cltc-profile-select { cursor:pointer; }
+      .cltc-profile-select { appearance:base-select; cursor:pointer; }
+      .cltc-profile-select::picker(select) { appearance:base-select; margin-top:5px; padding:5px; border:1px solid var(--cltc-border); border-radius:10px; background:var(--cltc-popover); box-shadow:0 12px 32px var(--cltc-shadow); color:var(--cltc-text); }
+      .cltc-profile-select::picker-icon { color:var(--cltc-muted); }
       .cltc-price-input:disabled, .cltc-profile-select:disabled { cursor:not-allowed; opacity:.55; pointer-events:none; }
       .cltc-profile-field-note { margin-top:-2px; color:var(--cltc-muted); font-size:11px; line-height:16px; }
       .cltc-price-input:focus, .cltc-profile-select:focus { border-color:color-mix(in srgb, var(--cltc-text) 58%, var(--cltc-border)); box-shadow:0 0 0 2px color-mix(in srgb, var(--cltc-text) 10%, transparent); }
@@ -681,7 +683,7 @@ api.registerModule("settings", (context) => {
     nav.setAttribute("aria-label", "设置分组");
     renderNavigation();
     const footer = make("div", "cltc-settings-footer");
-    footer.append(make("span", "", "Tianzora"), make("span", "cltc-settings-version", "v1.0.0"));
+    footer.append(make("span", "", "Tianzora"), make("span", "cltc-settings-version", "v0.8.3"));
     sidebar.append(nav, footer);
     content = make("div", "cltc-settings-content");
     content.setAttribute("role", "region");

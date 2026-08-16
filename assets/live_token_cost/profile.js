@@ -19,6 +19,7 @@ api.registerModule("profile", (context) => {
   let stopped = false;
   let diagnosticsMounted = false;
   let saveSequence = 0;
+  let targetPositionOwnership = null;
 
   function make(tag, className, text) {
     const node = document.createElement(tag);
@@ -249,25 +250,34 @@ api.registerModule("profile", (context) => {
   function mount() {
     const target = context.mountTarget;
     if (stopped || root || !target?.isConnected) return;
+    const targetPosition = typeof getComputedStyle === "function" ? getComputedStyle(target).position : "";
+    if (targetPosition === "static") {
+      targetPositionOwnership = {
+        target,
+        value: target.style.getPropertyValue("position"),
+        priority: typeof target.style.getPropertyPriority === "function" ? target.style.getPropertyPriority("position") : "",
+      };
+      target.style.setProperty("position", "relative", "important");
+    }
     remove(document.getElementById(ROOT_ID));
     remove(document.getElementById(STYLE_ID));
     style = make("style");
     style.id = STYLE_ID;
     style.textContent = `
-      main:has(> #${ROOT_ID}){position:relative!important;overflow:hidden!important}
-      #${ROOT_ID}{--profile-bg:var(--color-token-main-surface-primary,light-dark(#fff,#18181b));--profile-panel:var(--color-token-main-surface-secondary,light-dark(#f7f7f8,#242426));--profile-text:var(--color-token-text-primary,light-dark(#111827,#f4f4f5));--profile-muted:var(--color-token-text-tertiary,light-dark(#6b7280,#a1a1aa));--profile-border:var(--color-token-border-light,light-dark(#e5e7eb,#34343a));position:absolute;inset:0;z-index:2147483646;box-sizing:border-box;overflow:auto;background:var(--profile-bg);color:var(--profile-text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
-      #${ROOT_ID} .cltc-profile-shell{position:relative;width:min(940px,calc(100% - 64px));margin:0 auto;padding:64px 0 48px}
-      #${ROOT_ID} button{font:inherit}#${ROOT_ID} .cltc-profile-close{position:absolute;top:60px;right:0;width:32px;height:32px;border:0;border-radius:8px;background:transparent;color:var(--profile-muted);cursor:pointer;font-size:20px;opacity:.55}
-      #${ROOT_ID} .cltc-profile-tabs{display:flex;gap:28px;margin:0 0 36px;border-bottom:1px solid var(--profile-border)}
-      #${ROOT_ID} .cltc-profile-tab{min-height:42px;padding:9px 16px 10px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--profile-muted);font-size:14px;cursor:default}
-      #${ROOT_ID} .cltc-profile-tab[data-active='true']{border-bottom-color:var(--profile-text);color:var(--profile-text);font-weight:600}
-      #${ROOT_ID} .profile-card{display:grid;gap:0;border:1px solid var(--profile-border);border-radius:8px;background:var(--profile-bg);overflow:hidden}#${ROOT_ID} .profile-card[hidden],#${ROOT_ID} .cltc-profile-activity[hidden]{display:none}
-      #${ROOT_ID} .cltc-profile-identity{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:28px;min-height:126px;box-sizing:border-box;padding:28px}
-      #${ROOT_ID} .cltc-profile-avatar{display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border:0;border-radius:50%;background:light-dark(#dbeafe,#263b5e);color:light-dark(#1d4ed8,#bfdbfe);cursor:pointer;font-size:24px;font-weight:500}
-      #${ROOT_ID} .cltc-profile-name{font-size:20px;font-weight:500}#${ROOT_ID} .cltc-profile-username{margin-top:4px;color:var(--profile-muted);font-size:14px}
-      #${ROOT_ID} .cltc-profile-plan{padding:5px 10px;border:1px solid light-dark(#a7f3d0,#166534);border-radius:999px;background:light-dark(#ecfdf5,#102c20);color:light-dark(#166534,#86efac);font-size:12px}
-      #${ROOT_ID} .cltc-profile-row{display:grid;grid-template-columns:160px minmax(0,1fr);align-items:center;gap:0;min-height:57px;box-sizing:border-box;padding:16px 28px;border-top:1px solid var(--profile-border)}
-      #${ROOT_ID} .cltc-profile-row span{color:var(--profile-muted);font-size:14px}#${ROOT_ID} .cltc-profile-row strong{font-size:14px;font-weight:400}
+      main:has(> #${ROOT_ID}){overflow:hidden!important}
+      #${ROOT_ID}{--profile-bg:var(--color-token-main-surface-primary,light-dark(#fff,#18181b));--profile-panel:var(--color-token-main-surface-secondary,light-dark(#f7f7f8,#242426));--profile-text:var(--color-token-text-primary,light-dark(#111827,#f4f4f5));--profile-muted:var(--color-token-text-tertiary,light-dark(#6b7280,#a1a1aa));--profile-border:var(--color-token-border-light,light-dark(#e5e7eb,#34343a));--profile-card-border:light-dark(#e5e7eb,#34343a);--profile-nav-border:light-dark(#e5e7eb,#34343a);position:absolute;inset:0;z-index:2147483646;box-sizing:border-box;overflow:auto;background:var(--profile-bg);color:inherit;color-scheme:light dark;font:inherit;letter-spacing:0}
+      #${ROOT_ID} .cltc-profile-shell{position:relative;width:min(940px,calc(100% - 64px));margin:54px auto;padding:0}
+      #${ROOT_ID} button{font:inherit}#${ROOT_ID} .cltc-profile-close{position:absolute;top:0;right:0;width:32px;height:32px;border:0;border-radius:8px;background:transparent;color:var(--profile-muted);cursor:pointer;font-size:20px;opacity:0}
+      #${ROOT_ID} .cltc-profile-tabs{display:flex;gap:4px;margin:0;border-bottom:1px solid var(--profile-nav-border)}
+      #${ROOT_ID} .cltc-profile-tab{min-height:0;padding:12px 16px;border:0;background:transparent;color:var(--profile-muted);font-size:16px;cursor:default}
+      #${ROOT_ID} .cltc-profile-tab[data-active='true']{border-bottom:2px solid var(--profile-text);color:var(--profile-text)}
+      #${ROOT_ID} .profile-card{display:grid;grid-template-columns:72px minmax(0,1fr) auto;align-items:center;gap:20px;margin:36px 0 0;padding:28px;border:1px solid var(--profile-card-border);border-radius:8px;background:var(--profile-bg)}#${ROOT_ID} .profile-card[hidden],#${ROOT_ID} .cltc-profile-activity[hidden]{display:none}
+      #${ROOT_ID} .cltc-profile-avatar{box-sizing:border-box;display:grid;place-items:center;width:64px;height:64px;padding:0;border:0;border-radius:50%;background:light-dark(#dbeafe,#263b5e);color:light-dark(#1d4ed8,#bfdbfe);cursor:pointer;font-size:24px;font-weight:650}
+      #${ROOT_ID} .cltc-profile-name{margin:0 0 5px;font-size:20px;font-weight:inherit}#${ROOT_ID} .cltc-profile-username{margin:0;color:var(--profile-muted)}
+      #${ROOT_ID} .cltc-profile-plan{padding:5px 9px;border:1px solid light-dark(#bbf7d0,#166534);border-radius:999px;background:light-dark(#f0fdf4,#102c20);color:light-dark(#166534,#86efac);font-size:12px}
+      #${ROOT_ID} .cltc-profile-details{grid-column:1/-1;margin:14px 0 0;border-top:1px solid var(--profile-card-border)}
+      #${ROOT_ID} .cltc-profile-detail{display:grid;grid-template-columns:160px minmax(0,1fr);padding:16px 0;border-bottom:1px solid light-dark(#f1f1f1,#2d2d31)}
+      #${ROOT_ID} .cltc-profile-detail dt{color:var(--profile-muted)}#${ROOT_ID} .cltc-profile-detail dd{margin:0}
       #${ROOT_ID} .cltc-profile-activity{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:18px}
       #${ROOT_ID} .cltc-profile-stat{display:grid;gap:4px;padding:16px;border:1px solid var(--profile-border);border-radius:8px}#${ROOT_ID} .cltc-profile-stat span{color:var(--profile-muted);font-size:12px}#${ROOT_ID} .cltc-profile-stat strong{font-size:18px}
       #${ROOT_ID} .cltc-profile-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px;padding:18px;border:1px solid var(--profile-border);border-radius:8px;background:var(--profile-panel)}
@@ -276,7 +286,7 @@ api.registerModule("profile", (context) => {
       #${ROOT_ID} .cltc-profile-input{box-sizing:border-box;width:100%;height:36px;padding:7px 10px;border:1px solid var(--profile-border);border-radius:8px;background:var(--profile-bg);color:var(--profile-text);font:inherit;outline:none}
       #${ROOT_ID} .cltc-profile-actions{display:flex;justify-content:flex-end;gap:8px}#${ROOT_ID} .cltc-profile-button{min-height:32px;padding:6px 11px;border:1px solid var(--profile-border);border-radius:8px;background:transparent;color:inherit;cursor:pointer}#${ROOT_ID} .cltc-profile-primary{background:var(--profile-text);color:var(--profile-bg)}
       #${ROOT_ID} .cltc-profile-error{color:light-dark(#b42318,#f97066);font-size:12px}
-      @media(max-width:620px){#${ROOT_ID} .cltc-profile-shell{width:min(calc(100% - 32px),940px);padding-top:32px}#${ROOT_ID} .cltc-profile-close{top:28px}#${ROOT_ID} .cltc-profile-identity{grid-template-columns:auto minmax(0,1fr);gap:16px;padding:20px}#${ROOT_ID} .cltc-profile-plan{grid-column:2}#${ROOT_ID} .cltc-profile-row{grid-template-columns:minmax(0,1fr);gap:4px;padding:14px 20px}#${ROOT_ID} .cltc-profile-editor{grid-template-columns:minmax(0,1fr)}}
+      @media(max-width:620px){#${ROOT_ID} .cltc-profile-shell{width:min(calc(100% - 32px),940px);padding-top:32px}#${ROOT_ID} .cltc-profile-close{top:28px}#${ROOT_ID} .profile-card{grid-template-columns:72px minmax(0,1fr);gap:16px;padding:20px}#${ROOT_ID} .cltc-profile-plan{grid-column:2}#${ROOT_ID} .cltc-profile-detail{grid-template-columns:minmax(0,1fr);gap:4px}#${ROOT_ID} .cltc-profile-editor{grid-template-columns:minmax(0,1fr)}}
     `;
     appendChild(document.head, style);
     root = make("section", "cltc-profile-page");
@@ -297,26 +307,25 @@ api.registerModule("profile", (context) => {
     }
     shell.appendChild(tabs);
     const profile = profileValue();
-    const card = make("section", "profile-card");
-    const identity = make("div", "cltc-profile-identity");
+    const card = make("article", "profile-card");
     const avatar = make("button", "cltc-profile-avatar", avatarText(profile));
     avatar.type = "button";
     avatar.dataset.profileAction = "edit";
     avatar.setAttribute("aria-label", "编辑个人资料");
     const labels = make("div", "cltc-profile-labels");
-    identityName = make("div", "cltc-profile-name");
-    identityUsername = make("div", "cltc-profile-username");
+    identityName = make("h1", "cltc-profile-name");
+    identityUsername = make("p", "cltc-profile-username");
     labels.append(identityName, identityUsername);
     identityPlan = make("span", "cltc-profile-plan");
-    identity.append(avatar, labels, identityPlan);
-    card.appendChild(identity);
-    const emailRow = make("div", "cltc-profile-row");
-    identityEmail = make("strong");
-    emailRow.append(make("span", "", "电子邮箱"), identityEmail);
-    const planRow = make("div", "cltc-profile-row");
-    identityPlanRow = make("strong");
-    planRow.append(make("span", "", "订阅计划"), identityPlanRow);
-    card.append(emailRow, planRow);
+    const details = make("dl", "cltc-profile-details");
+    const emailRow = make("div", "cltc-profile-detail");
+    identityEmail = make("dd");
+    emailRow.append(make("dt", "", "电子邮箱"), identityEmail);
+    const planRow = make("div", "cltc-profile-detail");
+    identityPlanRow = make("dd");
+    planRow.append(make("dt", "", "订阅计划"), identityPlanRow);
+    details.append(emailRow, planRow);
+    card.append(avatar, labels, identityPlan, details);
     shell.appendChild(card);
     const snapshot = context.snapshot;
     const activity = make("section", "cltc-profile-activity");
@@ -343,6 +352,14 @@ api.registerModule("profile", (context) => {
     root?.removeEventListener("click", onClick);
     remove(root);
     remove(style);
+    if (targetPositionOwnership) {
+      const owner = targetPositionOwnership;
+      targetPositionOwnership = null;
+      if (owner.target.style.getPropertyValue("position") === "relative") {
+        if (owner.value) owner.target.style.setProperty("position", owner.value, owner.priority);
+        else owner.target.style.removeProperty("position");
+      }
+    }
     if (diagnosticsMounted) {
       context.recordListenerDelta(-LISTENER_COUNT);
       diagnosticsMounted = false;

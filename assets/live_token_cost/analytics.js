@@ -145,27 +145,27 @@ api.registerModule("analytics", (context) => {
   function analyticsChart(days) {
     const chart = makeSvg("svg", "cltc-analytics-chart");
     chart.dataset.analyticsChart = "true";
-    chart.setAttribute("viewBox", "0 0 640 190");
+    chart.setAttribute("viewBox", "0 0 720 230");
     chart.setAttribute("role", "graphics-document");
     chart.setAttribute("aria-label", currentMetric === "cost" ? "花费趋势" : "Token 趋势");
     const maximum = Math.max(1, ...days.map((day) => currentMetric === "cost"
       ? day.totals.cost_nanos : day.totals.input + day.totals.output));
-    const slot = 640 / Math.max(1, days.length);
+    const slot = 720 / Math.max(1, days.length);
     const width = Math.max(3, Math.min(18, slot - 4));
     days.forEach((day, index) => {
       const value = currentMetric === "cost" ? day.totals.cost_nanos : day.totals.input + day.totals.output;
-      const height = Math.max(value > 0 ? 2 : 0, Math.round((value / maximum) * 146));
+      const height = Math.max(value > 0 ? 2 : 0, Math.round((value / maximum) * 160));
       const group = makeSvg("g", "cltc-analytics-bar");
       const rect = makeSvg("rect");
       rect.dataset.chartIndex = String(index);
       rect.setAttribute("x", String(Math.round(index * slot + (slot - width) / 2)));
-      rect.setAttribute("y", String(158 - height));
+      rect.setAttribute("y", String(196 - height));
       rect.setAttribute("width", String(width));
       rect.setAttribute("height", String(height));
       rect.setAttribute("rx", "2");
       const label = makeSvg("text", "", day.day.slice(5));
       label.setAttribute("x", String(Math.round(index * slot + slot / 2)));
-      label.setAttribute("y", "178");
+      label.setAttribute("y", "220");
       label.setAttribute("text-anchor", "middle");
       group.append(rect, label);
       chart.appendChild(group);
@@ -420,7 +420,7 @@ api.registerModule("analytics", (context) => {
       .cltc-analytics{display:grid;gap:26px;color:var(--cltc-text)}
       .cltc-analytics-heading,.cltc-analytics-toolbar,.cltc-analytics-section-head{display:flex;align-items:center;justify-content:space-between;gap:14px}.cltc-analytics-heading{align-items:flex-start;gap:18px}.cltc-analytics-heading>div{min-width:0}
       .cltc-segmented{display:inline-flex;align-items:center;gap:2px;padding:3px;border-radius:8px;background:var(--cltc-surface-secondary)}
-      .cltc-analytics-control{min-height:30px;padding:5px 9px;border:0;border-radius:6px;background:transparent;color:var(--cltc-muted);cursor:pointer;font:inherit;text-align:left}.cltc-analytics-control[data-active='true']{background:var(--cltc-surface);color:var(--cltc-text);box-shadow:0 1px 2px color-mix(in srgb,var(--cltc-shadow) 34%,transparent);font-weight:600}
+      .cltc-analytics-control{min-height:30px;padding:5px 9px;border:0;border-radius:6px;background:transparent;color:var(--cltc-muted);cursor:pointer;font:inherit;text-align:center}.cltc-analytics-control[data-active='true']{background:var(--cltc-surface);color:var(--cltc-text);box-shadow:0 1px 2px color-mix(in srgb,var(--cltc-shadow) 34%,transparent);font-weight:600}
       .cltc-date-range-trigger{border:1px solid var(--cltc-border);color:var(--cltc-text)}.cltc-date-range-trigger[hidden],.cltc-analytics-filter[hidden]{display:none}.cltc-analytics-filter{flex:0 1 auto;max-width:230px;overflow:hidden;background:var(--cltc-surface-secondary);color:var(--cltc-text);text-overflow:ellipsis;white-space:nowrap}.cltc-analytics-date-input{position:fixed;width:1px;height:1px;padding:0;border:0;opacity:0;pointer-events:none}
       .cltc-analytics-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--cltc-border-subtle);border-bottom:1px solid var(--cltc-border-subtle)}
       .cltc-analytics-metric{display:grid;min-width:0;gap:4px;padding:16px 14px;border-right:1px solid var(--cltc-border-subtle)}.cltc-analytics-metric:first-child{padding-left:0}.cltc-analytics-metric:last-child{border-right:0}

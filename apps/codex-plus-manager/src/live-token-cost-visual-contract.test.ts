@@ -1095,6 +1095,10 @@ describe("Codex Live Token Cost 1.0.0 visual contract", () => {
     assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.0");
     assert.ok(root, "the executed script must mount the HUD");
     assert.ok(settings, "the executed script must mount the settings trigger");
+    const composer = harness.document.querySelector("textarea")!.closest("form")!;
+    const composerWrap = composer.parentElement!;
+    assert.equal(root.parentElement, composerWrap.parentElement, "the HUD must retain the frozen outer composer anchor");
+    assert.equal(root.nextElementSibling, composerWrap, "the HUD must precede the frozen outer composer surface");
     assert.equal(settings.textContent, "今日 146K");
     assert.equal(settings.title, "今日 146K · Codex Token Cost 设置");
     assert.equal(settings.getAttribute("aria-label"), "今日 146K，打开 Codex Token Cost 设置");
@@ -1122,6 +1126,12 @@ describe("Codex Live Token Cost 1.0.0 visual contract", () => {
     assert.equal(style.gap, "0");
     assert.equal(style.borderRadius, "20px 20px 0 0");
     assert.equal(harness.getComputedStyle(root.querySelector(".cltc-value")!).height, "16px");
+    const startupStyle = harness.document.getElementById("codex-live-token-cost-style")!.textContent;
+    assert.doesNotMatch(
+      startupStyle,
+      /#codex-live-token-cost \.cltc-value\s*\{[^}]*\bcolor\s*:/,
+      "frozen rolling values inherit the HUD muted color",
+    );
     assert.equal(root.querySelectorAll(".cltc-roll").length, 0);
     assert.equal(root.querySelectorAll(".cltc-cadenced-shimmer").length, 0);
   });
@@ -1176,7 +1186,11 @@ describe("Codex Live Token Cost 1.0.0 visual contract", () => {
       const identityRow = profileItem.firstElementChild!;
       const identityAvatar = identityRow.querySelector(".size-8")!;
 
-      assert.equal(normalizedText(trigger.querySelector("span.min-w-0.flex-1.truncate")!), "Settings");
+      assert.equal(normalizedText(trigger.querySelector("span.min-w-0.flex-1.truncate")!), "Local Usage");
+      const triggerAvatar = trigger.querySelector("[data-cltc-profile-identity-avatar]")!;
+      assert.ok(triggerAvatar);
+      assert.equal(triggerAvatar.classList.contains("icon-sm"), true);
+      assert.equal(triggerAvatar.textContent, "L");
       assert.equal(profileItem.getAttribute("role"), "menuitem");
       assert.equal(profileItem.hasAttribute("aria-disabled"), false);
       assert.equal(profileItem.hasAttribute("data-disabled"), false);

@@ -205,12 +205,21 @@ api.registerModule("flatpickr", (context) => {
     appendChild(document.head, style);
     let created = null;
     try {
+      const now = new Date();
+      const minDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      minDate.setDate(minDate.getDate() - 364);
+      const locale = { ...flatpickrFactory.l10ns.zh, firstDayOfWeek: 1 };
       created = flatpickrFactory(target, {
         mode: "range",
-        locale: flatpickrFactory.l10ns.zh,
+        locale,
         dateFormat: "Y-m-d",
+        minDate,
+        maxDate: new Date(),
         showMonths: 2,
-        animate: false,
+        disableMobile: true,
+        allowInput: false,
+        appendTo: target.closest(".cltc-settings-overlay") || undefined,
+        animate: true,
         onChange(selectedDates) {
           if (!stopped && selectedDates.length === 2 && typeof context.onApply === "function") {
             context.onApply(dayValue(selectedDates[0]), dayValue(selectedDates[1]));
