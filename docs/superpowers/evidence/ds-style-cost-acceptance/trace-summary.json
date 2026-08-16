@@ -1,0 +1,74 @@
+{
+  "source": "target/ds-style-cost-perf-20260815/enabled-soak-trace-attribution.json",
+  "duration_seconds": 300,
+  "trace_bytes": 59953264,
+  "events": {
+    "total": 213065,
+    "profile_chunks": 19680,
+    "v8_call_function": 33642,
+    "timer_fire": 10336,
+    "animation_frame": 20018,
+    "major_concurrent_marking_rescheduled": 8303
+  },
+  "long_tasks": {
+    "count": 2,
+    "total_duration_ms": 201,
+    "max_duration_ms": 107,
+    "attribution": [
+      {
+        "duration_ms": 107,
+        "entry": "TimerFire -> v8.callFunction -> FunctionCall",
+        "bundle": "app-initial-BqZ9AFkF.js",
+        "cost_function": false
+      },
+      {
+        "duration_ms": 94,
+        "entry": "TimerFire -> v8.callFunction -> FunctionCall",
+        "bundle": "app-initial-BqZ9AFkF.js",
+        "cost_function": false
+      }
+    ]
+  },
+  "spike_windows": [
+    {
+      "window_seconds": "56-60",
+      "renderer_cpu_max_percent": 45.9,
+      "js_cpu_total_ms": 98,
+      "top_functions": [
+        { "function": "applySnapshot", "samples_ms": 97 },
+        { "function": "acceptNativePush", "samples_ms": 1 }
+      ],
+      "conclusion": "GC/compositing spike; cost JS 2.4% of one core"
+    },
+    {
+      "window_seconds": "109-113",
+      "renderer_cpu_max_percent": 45.7,
+      "js_cpu_total_ms": 345,
+      "top_functions": [
+        { "function": "boundedString", "samples_ms": 97 },
+        { "function": "Mft @ app-initial-BqZ9AFkF.js", "samples_ms": 95 },
+        { "function": "T @ app-initial-BqZ9AFkF.js", "samples_ms": 94 },
+        { "function": "getCurrentSnapshot @ app-initial-BqZ9AFkF.js", "samples_ms": 36 }
+      ],
+      "conclusion": "Mixed official React + bounded HUD string work; no cost hot loop"
+    },
+    {
+      "window_seconds": "212-216",
+      "renderer_cpu_max_percent": 45.8,
+      "js_cpu_total_ms": 198,
+      "top_functions": [
+        { "function": "setText", "samples_ms": 187 },
+        { "function": "renderSnapshot", "samples_ms": 11 }
+      ],
+      "conclusion": "HUD text update; 5% of one core"
+    }
+  ],
+  "worst_5s_window": {
+    "run": "enabled-soak-fast-realistic-final2.json",
+    "delta_over_disabled_points": 16.88,
+    "cause": "one-second 72.8% GC/compositing spike (sample 143, next sample 25%)",
+    "attribution_rerun_delta_over_disabled_points": 9.1,
+    "budget_points": 10
+  },
+  "note": "The raw 60 MB trace stays under target/ and is not committed."
+}
