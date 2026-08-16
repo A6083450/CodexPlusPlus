@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      1.0.0
+// @version      1.0.1
 // @description  Native-backed token usage HUD for Codex++
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.1";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -361,10 +361,19 @@
   }
 
   function findComposerAnchor() {
-    const editable = document.querySelector("textarea");
-    if (!editable) return null;
-    const form = editable.closest("form");
-    return form?.parentElement || null;
+    // The host composer is either a textarea or a contenteditable region
+    // (newer Codex builds use a formless ProseMirror div). Prefer the last
+    // editable in document order and use only structural queries, never
+    // layout reads.
+    const editables = document.querySelectorAll("textarea,[contenteditable='true']");
+    for (let index = editables.length - 1; index >= 0; index--) {
+      const editable = editables[index];
+      const form = editable.closest("form");
+      if (form?.parentElement) return form.parentElement;
+      const surface = editable.closest("[data-testid*='composer'],[data-codex-composer]");
+      if (surface?.parentElement) return surface;
+    }
+    return null;
   }
 
   function ensureRoot() {

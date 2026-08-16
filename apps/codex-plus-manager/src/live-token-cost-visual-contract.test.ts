@@ -1086,13 +1086,13 @@ const DEFERRED_TASK_10_11_ORACLE = {
   ],
 } as const;
 
-describe("Codex Live Token Cost 1.0.0 visual contract", () => {
+describe("Codex Live Token Cost 1.0.1 visual contract", () => {
   it("renders the preserved HUD labels, order, IDs, and computed visual tokens", async () => {
     const harness = await executeScriptInDom();
     const root = harness.document.getElementById("codex-live-token-cost");
     const settings = harness.document.getElementById("codex-live-token-cost-settings");
 
-    assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.0");
+    assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.1");
     assert.ok(root, "the executed script must mount the HUD");
     assert.ok(settings, "the executed script must mount the settings trigger");
     const composer = harness.document.querySelector("textarea")!.closest("form")!;

@@ -1878,7 +1878,7 @@ fn user_script_manager_installs_missing_bundled_market_scripts_and_reinstalls_on
     );
     let upgraded_source = std::fs::read_to_string(&ds_style_cost_path).unwrap();
     assert_eq!(upgraded_source, bundled_source);
-    assert!(upgraded_source.contains("@version      1.0.0"));
+    assert!(upgraded_source.contains("@version      1.0.1"));
     assert!(upgraded_source.len() <= 61_440);
     for legacy_identifier in [
         "localStorage",
@@ -2036,7 +2036,7 @@ async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_
         id: "demo".to_string(),
         name: "Demo".to_string(),
         description: String::new(),
-        version: "1.0.0".to_string(),
+        version: "1.0.1".to_string(),
         author: String::new(),
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
@@ -2209,7 +2209,7 @@ fn script_market_manifest_filters_invalid_entries() {
                 "id": "demo",
                 "name": "Demo",
                 "description": "Useful demo",
-                "version": "1.0.0",
+                "version": "1.0.1",
                 "author": "BigPizzaV3",
                 "tags": ["ui", 42],
                 "homepage": "https://example.com/demo",
@@ -2247,7 +2247,7 @@ fn user_script_inventory_includes_market_metadata() {
             id: "demo".to_string(),
             name: "Demo".to_string(),
             description: "Useful demo".to_string(),
-            version: "1.0.0".to_string(),
+            version: "1.0.1".to_string(),
             author: "BigPizzaV3".to_string(),
             tags: vec!["ui".to_string()],
             homepage: "https://example.com/demo".to_string(),
@@ -2260,7 +2260,7 @@ fn user_script_inventory_includes_market_metadata() {
 
     assert_eq!(inventory["scripts"][0]["key"], "user:market-demo.js");
     assert_eq!(inventory["scripts"][0]["market_id"], "demo");
-    assert_eq!(inventory["scripts"][0]["version"], "1.0.0");
+    assert_eq!(inventory["scripts"][0]["version"], "1.0.1");
     assert_eq!(inventory["scripts"][0]["installed"], true);
     assert_eq!(
         inventory["scripts"][0]["source_url"],
@@ -2284,7 +2284,7 @@ fn install_market_script_writes_file_and_records_metadata() {
         id: "demo".to_string(),
         name: "Demo".to_string(),
         description: String::new(),
-        version: "1.0.0".to_string(),
+        version: "1.0.1".to_string(),
         author: String::new(),
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
@@ -2322,7 +2322,7 @@ fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() 
         id: "demo".to_string(),
         name: "Demo".to_string(),
         description: String::new(),
-        version: "1.0.0".to_string(),
+        version: "1.0.1".to_string(),
         author: String::new(),
         tags: Vec::new(),
         homepage: String::new(),

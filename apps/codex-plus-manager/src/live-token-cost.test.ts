@@ -715,13 +715,36 @@ function deferred<T = any>() {
   return { promise, resolve, reject };
 }
 
-describe("Codex Live Token Cost 1.0.0 thin HUD bootstrap", () => {
+describe("Codex Live Token Cost 1.0.1 thin HUD bootstrap", () => {
+  it("mounts the HUD beside the host composer when the editable is a formless contenteditable div", async () => {
+    const harness = await createHarness();
+    const textarea = harness.document.querySelector("textarea")!;
+    const form = textarea.closest("form")!;
+    const formParent = form.parentElement!;
+    form.remove();
+    const editable = harness.document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    editable.setAttribute("data-testid", "composer");
+    formParent.insertBefore(editable, null);
+    assert.equal(harness.document.querySelectorAll("textarea").length, 0);
+    assert.equal(harness.document.querySelectorAll("form").length, 0);
+    assert.equal(harness.document.querySelectorAll("[contenteditable='true']").length, 1);
+    harness.run();
+    const root = harness.document.querySelector("#codex-live-token-cost");
+    assert.equal(harness.document.querySelectorAll("#codex-live-token-cost").length, 1);
+    assert.equal(root!.parentElement, editable.parentElement);
+    assert.equal(root!.nextElementSibling, editable);
+    assert.equal(harness.document.querySelectorAll("#codex-live-token-cost-settings").length, 1);
+    await harness.settle();
+    assert.equal(harness.window.__codexLiveTokenCostCaptureV1.enabled, true);
+  });
+
   it("installs one bounded runtime and activates capture only after bootstrap", async () => {
     const harness = await createHarness();
     harness.run();
     const api = harness.window.__codexLiveTokenCostV1;
     assert.deepEqual(Object.keys(api).sort(), ["acceptNativePush", "destroy", "diagnostics", "emitAction", "instanceId", "registerModule"]);
-    assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.0");
+    assert.equal(harness.window.__codexLiveTokenCostVersion, "1.0.1");
     assert.deepEqual(JSON.parse(JSON.stringify(harness.window.__codexLiveTokenCostCaptureV1)), { enabled: false, instanceId: api.instanceId });
     assert.equal(harness.bridgeCalls.length, 1);
     assert.deepEqual(harness.bridgeCalls[0].payload, { instance_id: api.instanceId });
