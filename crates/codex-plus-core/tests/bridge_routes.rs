@@ -859,9 +859,11 @@ fn user_script_manager_migrates_legacy_cost_script_name() {
         migrated.scripts.get("user:market-codex-ds-style-cost.js"),
         Some(&true)
     );
-    assert!(!migrated
-        .scripts
-        .contains_key("user:market-codex-live-token-cost.js"));
+    assert!(
+        !migrated
+            .scripts
+            .contains_key("user:market-codex-live-token-cost.js")
+    );
 }
 
 #[test]
@@ -1340,7 +1342,6 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppSessionDelete",
             "codexAppMarkdownExport",
             "codexAppForceChineseLocale",
-            "codexAppProjectMove",
             "codexAppThreadIdBadge",
             "codexAppConversationView",
             "codexAppThreadScrollRestore",
@@ -1659,11 +1660,19 @@ impl BridgeDataService for FakeData {
         session: SessionRef,
         target_cwd: String,
     ) -> anyhow::Result<Value> {
-        Ok(json!({"status": "moved", "session_id": session.session_id, "target_cwd": target_cwd}))
+        Ok(json!({
+            "status": "moved",
+            "session_id": session.session_id,
+            "target_cwd": target_cwd
+        }))
     }
 
     async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        Ok(json!({"status": "ok", "session_id": session.session_id, "updated_at": 123}))
+        Ok(json!({
+            "status": "ok",
+            "session_id": session.session_id,
+            "updated_at": 123
+        }))
     }
 
     async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {

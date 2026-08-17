@@ -6,6 +6,7 @@ use codex_plus_core::launcher::{
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, GeneratedImagesResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
+use codex_plus_core::status::LaunchStatus;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -47,22 +48,34 @@ impl LauncherHooks {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Err(error) = launcher_main().await {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let helper_only = args.iter().any(|arg| arg == "--helper-only");
+    let options = parse_launch_options(args.iter());
+    if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.failed",
             json!({
                 "message": error.to_string()
             }),
         );
+        if !helper_only {
+            let _ = options.status_store.save_latest(&LaunchStatus {
+                status: "failed".to_string(),
+                message: error.to_string(),
+                started_at_ms: current_timestamp_ms(),
+                debug_port: Some(options.debug_port),
+                helper_port: Some(options.helper_port),
+                codex_app: options
+                    .app_dir
+                    .map(|path| path.to_string_lossy().to_string()),
+            });
+        }
         return Err(error);
     }
     Ok(())
 }
 
-async fn launcher_main() -> Result<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let helper_only = args.iter().any(|arg| arg == "--helper-only");
-    let options = parse_launch_options(args.iter());
+async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
@@ -72,6 +85,16 @@ async fn launcher_main() -> Result<()> {
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
+        options.status_store.save_latest(&LaunchStatus {
+            status: "running".to_string(),
+            message: "Existing Codex instance activated".to_string(),
+            started_at_ms: current_timestamp_ms(),
+            debug_port: Some(options.debug_port),
+            helper_port: Some(options.helper_port),
+            codex_app: options
+                .app_dir
+                .map(|path| path.to_string_lossy().to_string()),
+        })?;
         return Ok(());
     };
     tokio::spawn(async {
@@ -82,6 +105,13 @@ async fn launcher_main() -> Result<()> {
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn acquire_single_instance_guard(
@@ -1140,6 +1170,8 @@ mod tests {
         assert!(source.contains("acquire_single_instance_guard(options.debug_port)?"));
         assert!(source.contains("launcher_guard_port"));
         assert!(source.contains("launcher.already_running"));
+        assert!(source.contains("Existing Codex instance activated"));
+        assert!(source.contains("status: \"failed\".to_string()"));
     }
 
     #[test]

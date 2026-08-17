@@ -363,7 +363,9 @@ impl SQLiteStorageAdapter {
             }
             Ok(payload)
         })();
-        result.unwrap_or_else(|err| json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()}))
+        result.unwrap_or_else(|err| {
+            json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()})
+        })
     }
 
     pub fn codex_thread_sort_key(&self, session: &SessionRef) -> serde_json::Value {
@@ -389,7 +391,9 @@ impl SQLiteStorageAdapter {
                 ),
             }
         })();
-        result.unwrap_or_else(|err| json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()}))
+        result.unwrap_or_else(|err| {
+            json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()})
+        })
     }
 
     pub fn codex_thread_sort_keys(&self, sessions: &[SessionRef]) -> serde_json::Value {

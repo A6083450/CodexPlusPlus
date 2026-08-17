@@ -969,7 +969,7 @@ fn sessions_from_payload(payload: &Value) -> Vec<SessionRef> {
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item.as_object())
+                .filter_map(Value::as_object)
                 .map(|item| SessionRef {
                     session_id: item
                         .get("session_id")
