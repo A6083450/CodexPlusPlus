@@ -7,7 +7,6 @@ const LATEST_STATUS_FILE: &str = "latest-status.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codex-plus.log";
 const PENDING_PROVIDER_IMPORT_FILE: &str = "pending-provider-import.json";
 const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recovery.json";
-pub const TOKEN_COST_UI_FILE: &str = "token-cost-ui.json";
 
 pub fn default_app_state_dir() -> PathBuf {
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
@@ -31,10 +30,6 @@ pub fn default_codex_plus_config_dir() -> PathBuf {
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("Codex++")
-}
-
-pub fn token_cost_ui_path() -> PathBuf {
-    default_codex_plus_config_dir().join(TOKEN_COST_UI_FILE)
 }
 
 pub fn default_settings_path() -> PathBuf {
@@ -113,14 +108,6 @@ mod tests {
         let path = default_diagnostic_log_path();
 
         assert!(path.ends_with(".codex-session-delete/codex-plus.log"));
-    }
-
-    #[test]
-    fn token_cost_ui_path_uses_codex_plus_config_directory() {
-        assert_eq!(
-            token_cost_ui_path(),
-            default_codex_plus_config_dir().join(TOKEN_COST_UI_FILE)
-        );
     }
 
     #[test]

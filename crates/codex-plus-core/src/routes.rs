@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::models::{
@@ -14,10 +13,6 @@ use crate::models::{
 };
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
-use crate::token_cost::{
-    IngestOutcome, LazyAsset, MAX_RENDERER_EVENT_BYTES, TokenCostAction, TokenCostEvent,
-    TokenCostService, UsageSource, validate_renderer_event,
-};
 use crate::user_scripts::UserScriptManager;
 
 pub type UserScriptEvaluator = Arc<dyn Fn(&str, &str) -> anyhow::Result<Value> + Send + Sync>;
@@ -28,7 +23,6 @@ pub struct BridgeContext {
     settings: Arc<dyn BridgeSettingsService>,
     runtime: Arc<dyn BridgeRuntimeService>,
     data: Arc<dyn BridgeDataService>,
-    token_cost: Arc<TokenCostService>,
 }
 
 impl BridgeContext {
@@ -41,7 +35,6 @@ impl BridgeContext {
             settings,
             runtime,
             data,
-            token_cost: TokenCostService::in_memory(),
         }
     }
 
@@ -66,11 +59,6 @@ impl BridgeContext {
             runtime,
             data,
         )
-    }
-
-    pub fn with_token_cost(mut self, service: Arc<TokenCostService>) -> Self {
-        self.token_cost = service;
-        self
     }
 }
 
@@ -157,30 +145,6 @@ pub async fn handle_bridge_request(
                 .unwrap_or_default()
         }),
     );
-    if matches!(
-        path,
-        "/token-cost/bootstrap"
-            | "/token-cost/event"
-            | "/token-cost/action"
-            | "/token-cost/lazy-asset"
-    ) {
-        let response = match path {
-            "/token-cost/bootstrap" => token_cost_bootstrap_value(&ctx, payload),
-            "/token-cost/event" => token_cost_event_value(&ctx, payload),
-            "/token-cost/action" => token_cost_action_value(&ctx, payload).await,
-            "/token-cost/lazy-asset" => token_cost_lazy_asset_value(&ctx, payload),
-            _ => unreachable!(),
-        };
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "bridge.response",
-            json!({
-                "path": path,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "status": response.get("status").and_then(Value::as_str).unwrap_or("")
-            }),
-        );
-        return response;
-    }
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
         "/settings/set" => {
@@ -350,211 +314,6 @@ pub async fn handle_bridge_request(
         }),
     );
     response
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenCostBootstrapRequest {
-    instance_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenCostEventRequest {
-    instance_id: String,
-    event: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenCostActionRequest {
-    action: TokenCostAction,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenCostLazyAssetRequest {
-    instance_id: String,
-    asset: LazyAsset,
-}
-
-fn token_cost_bootstrap_value(ctx: &BridgeContext, payload: Value) -> Value {
-    let request = match serde_json::from_value::<TokenCostBootstrapRequest>(payload) {
-        Ok(request) => request,
-        Err(_) => return token_cost_failure("invalid_request", "invalid bootstrap request"),
-    };
-    match ctx.token_cost.bootstrap(&request.instance_id) {
-        Ok(bootstrap) => json!({
-            "status": "ok",
-            "instance_id": bootstrap.instance_id,
-            "config": bootstrap.config,
-            "snapshot": bootstrap.snapshot,
-        }),
-        Err(error) => token_cost_service_failure(&error),
-    }
-}
-
-fn token_cost_event_value(ctx: &BridgeContext, payload: Value) -> Value {
-    let request = match serde_json::from_value::<TokenCostEventRequest>(payload) {
-        Ok(request) => request,
-        Err(_) => return token_cost_failure("invalid_request", "invalid event request"),
-    };
-    if let Err(error) = crate::token_cost::validate_instance_id(&request.instance_id) {
-        return token_cost_service_failure(&error);
-    }
-    if !ctx.token_cost.matches_instance(&request.instance_id) {
-        return token_cost_failure("stale_instance", "stale token cost instance");
-    }
-
-    let bytes = match serialize_renderer_event_limited(&request.event) {
-        Ok(bytes) => bytes,
-        Err(RendererEventSerializationError::TooLarge) => {
-            return token_cost_failure("payload_too_large", "renderer event is too large");
-        }
-        Err(RendererEventSerializationError::Invalid) => {
-            return token_cost_failure("invalid_request", "invalid renderer event");
-        }
-    };
-    let event = match serde_json::from_slice::<TokenCostEvent>(&bytes) {
-        Ok(event) => event,
-        Err(_) => return token_cost_failure("invalid_request", "invalid renderer event"),
-    };
-    if event_source(&event) != UsageSource::Renderer {
-        return token_cost_failure("invalid_event", "renderer source required");
-    }
-    let event = match validate_renderer_event(event) {
-        Ok(event) => event,
-        Err(_) => return token_cost_failure("invalid_event", "invalid renderer event"),
-    };
-    let outcome = match ctx
-        .token_cost
-        .ingest_for_instance(&request.instance_id, event)
-    {
-        IngestOutcome::Applied { revision } => {
-            json!({"type": "applied", "revision": revision})
-        }
-        IngestOutcome::NoChange { revision } => {
-            json!({"type": "no_change", "revision": revision})
-        }
-        IngestOutcome::Coalesced { revision } => {
-            json!({"type": "coalesced", "revision": revision})
-        }
-        IngestOutcome::Rejected { reason } => {
-            if reason == "stale_instance" {
-                return token_cost_failure("stale_instance", "stale token cost instance");
-            }
-            return token_cost_failure("event_rejected", reason);
-        }
-    };
-    json!({"status": "ok", "outcome": outcome})
-}
-
-async fn token_cost_action_value(ctx: &BridgeContext, payload: Value) -> Value {
-    let request = match serde_json::from_value::<TokenCostActionRequest>(payload) {
-        Ok(request) => request,
-        Err(_) => return token_cost_failure("invalid_request", "invalid action request"),
-    };
-    match ctx.token_cost.apply_action(request.action).await {
-        Ok(response) => json!({"status": "ok", "response": response}),
-        Err(error) => token_cost_service_failure(&error),
-    }
-}
-
-fn token_cost_lazy_asset_value(ctx: &BridgeContext, payload: Value) -> Value {
-    let request = match serde_json::from_value::<TokenCostLazyAssetRequest>(payload) {
-        Ok(request) => request,
-        Err(_) => return token_cost_failure("invalid_request", "invalid lazy asset request"),
-    };
-    match ctx
-        .token_cost
-        .request_lazy_asset(&request.instance_id, request.asset)
-    {
-        Ok(()) => json!({"status": "ok"}),
-        Err(error) => token_cost_service_failure(&error),
-    }
-}
-
-fn token_cost_service_failure(error: &anyhow::Error) -> Value {
-    let message = error.to_string();
-    if message.starts_with("invalid_instance") {
-        token_cost_failure("invalid_instance", "invalid token cost instance")
-    } else if message.starts_with("stale_instance") {
-        token_cost_failure("stale_instance", "stale token cost instance")
-    } else if message.starts_with("sync_in_progress") {
-        token_cost_failure("sync_in_progress", "CC Switch sync is already running")
-    } else if message.starts_with("cc_switch") {
-        token_cost_failure("cc_switch_error", "CC Switch sync failed")
-    } else {
-        token_cost_failure("action_failed", "token cost action failed")
-    }
-}
-
-fn token_cost_failure(category: &'static str, message: &'static str) -> Value {
-    json!({
-        "status": "failed",
-        "category": category,
-        "message": message,
-    })
-}
-
-fn event_source(event: &TokenCostEvent) -> UsageSource {
-    match event {
-        TokenCostEvent::TurnStarted { meta, .. }
-        | TokenCostEvent::OutputDelta { meta, .. }
-        | TokenCostEvent::ToolStarted { meta, .. }
-        | TokenCostEvent::ToolCompleted { meta, .. }
-        | TokenCostEvent::Usage { meta, .. }
-        | TokenCostEvent::TurnCompleted { meta, .. }
-        | TokenCostEvent::TurnFailed { meta } => meta.source,
-    }
-}
-
-enum RendererEventSerializationError {
-    TooLarge,
-    Invalid,
-}
-
-struct LimitedEventBuffer {
-    bytes: Vec<u8>,
-    exceeded: bool,
-}
-
-impl LimitedEventBuffer {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(MAX_RENDERER_EVENT_BYTES.min(1024)),
-            exceeded: false,
-        }
-    }
-}
-
-impl std::io::Write for LimitedEventBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > MAX_RENDERER_EVENT_BYTES {
-            self.exceeded = true;
-            return Err(std::io::Error::other("renderer event byte limit"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialize_renderer_event_limited(
-    event: &Value,
-) -> Result<Vec<u8>, RendererEventSerializationError> {
-    let mut buffer = LimitedEventBuffer::new();
-    if serde_json::to_writer(&mut buffer, event).is_err() {
-        return Err(if buffer.exceeded {
-            RendererEventSerializationError::TooLarge
-        } else {
-            RendererEventSerializationError::Invalid
-        });
-    }
-    Ok(buffer.bytes)
 }
 
 #[derive(Default)]

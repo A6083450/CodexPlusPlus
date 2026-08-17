@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.8.3
+// @version      0.8.8
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.8.3";
+const VERSION = "0.8.8";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -26,6 +26,7 @@ const VERSION = "0.8.3";
   const ANALYTICS_MAX_DAYS = 365;
   const RUNTIME_SESSION_BINDING_TTL_MS = 5 * 60 * 1000;
   const OFFICIAL_RUNTIME_STATE_TTL_MS = 10 * 60 * 1000;
+  const SIDEBAR_SELECTION_GRACE_MS = 30 * 1000;
   const PROFILE_PREFS_KEY = "__codexLiveTokenCostProfilePrefsV1";
   const PROFILE_OVERRIDES_KEY = "__codexLiveTokenCostProfileOverridesV1";
   const PROFILE_DEFAULTS_KEY = "__codexLiveTokenCostProfileDefaultsV1";
@@ -40,9 +41,13 @@ const VERSION = "0.8.3";
   const PROFILE_LEDGER_STORE_USAGE_CALLS = "profileUsageCalls";
   const PROFILE_LEDGER_STORE_INVOCATIONS = "profileInvocations";
   const PROFILE_LEDGER_STORE_DAILY_ROLLUPS = "profileDailyRollups";
+  const PROFILE_LEDGER_WRITE_COALESCE_MS = 500;
+  const PROFILE_UI_AUTH_GATE_TTL_MS = 500;
   let profileUnlockEnabledRuntime;
   const PROJECT_CONTEXT_ROW_SELECTOR =
     "[data-codex-composer-root] [data-composer-utility-bar-scroll-area] [data-composer-navigation-target='workspace-project']";
+  const PROFILE_IDENTITY_SELECTOR =
+    "button[aria-label='打开个人资料菜单'], button[aria-label='Open profile menu'], button[aria-label='Open profile menu and settings'], [role='menu'][aria-labelledby], [role='menuitem']";
   const PROFILE_GATE_ID = "2478676115";
   const PROFILE_USAGE_QUERY_KEY = ["profile", "usage"];
   const PROFILE_ACCOUNT_INFO_QUERY_KEY = ["vscode", "account-info"];
@@ -77,6 +82,7 @@ const VERSION = "0.8.3";
   const LEGACY_FAST_MODE_ICON_PATH_PREFIX = "M9.80999 17.8302C9.49666 18.1969";
   const RENDER_THROTTLE_MS = 250;
   const OUTPUT_RATE_REFRESH_MS = 1000;
+  const CAPTURE_MAX_PAYLOAD_LENGTH = 262144;
   const SETTINGS_MODAL_EXIT_MS = 160;
   const PROFILE_SAVE_STATUS_DURATION_MS = 1800;
   const CC_SWITCH_TURNS_URL = "http://127.0.0.1:17888/cc-switch/turns";
@@ -90,8 +96,6 @@ const VERSION = "0.8.3";
   const HELPER_STATUS_CONNECTED = "Helper 已连接：CC Switch bridge 可用；Profile activity 仍以本地 ledger 为准。";
   const HELPER_STATUS_DEGRADED = "Helper 未运行：本地 Profile ledger 继续工作；CC Switch 同步不可用。";
   const HELPER_STATUS_CC_SWITCH_DEGRADED = "Helper 未运行：无法同步 CC Switch；今日统计仅使用本地捕获与已有本地记录。";
-  const SHIMMER_ACTIVE_MS = 1000;
-  const SHIMMER_INTERVAL_MS = 4000;
   const FAST_MODE_COST_MULTIPLIERS = [
     { pattern: /^gpt-5\.6(?:$|[-_.])/, multiplier: 2 },
     { pattern: /^gpt-5\.5(?:$|[-_.])/, multiplier: 2.5 },
@@ -254,6 +258,11 @@ const VERSION = "0.8.3";
     localLast: null,
     localCurrentTurn: null,
     localCurrentTurns: new Map(),
+    sideChatActivityTurns: new Map(),
+    sideChatStreamTurns: new Map(),
+    sideChatObserver: null,
+    sideChatObserverRoot: null,
+    sideChatObserverMode: "",
     localTurnTimer: 0,
     localTurnTimers: new Map(),
     localTurnSeq: 0,
@@ -267,6 +276,11 @@ const VERSION = "0.8.3";
     profileLedgerDb: null,
     profileLedgerDbPromise: null,
     profileLedgerWriteQueue: Promise.resolve(),
+    profileLedgerWriteTimer: 0,
+    profileLedgerPendingTurns: new Map(),
+    profileLedgerPendingCalls: new Map(),
+    profileLedgerPendingInvocations: new Map(),
+    profileLedgerPendingSnapshot: false,
     profileLedgerMigrationChecked: false,
     profileInvocationSeq: 0,
     legacySessionMigrations: new Set(),
@@ -300,6 +314,8 @@ const VERSION = "0.8.3";
     profileQueryCacheObserverUnsubscribe: null,
     profileQueryCacheSyncQueued: false,
     profileSyntheticAuth: false,
+    profileUiAuthGateAt: 0,
+    profileUiAuthGateActive: false,
     profileUiReadinessObserver: null,
     profileIdentityObserver: null,
     profileIdentitySyncTimer: 0,
@@ -338,14 +354,8 @@ const VERSION = "0.8.3";
     settingsFocusFrame: 0,
     analyticsRangeSwitchFrame: 0,
     analyticsRangeSwitchTimer: 0,
-    hubValueCache: new Map(),
+    hubValueSlots: new Map(),
     hubSkeletonVersion: "",
-    shimmerDelayTimer: 0,
-    shimmerIntervalTimer: 0,
-    shimmerActiveTimer: 0,
-    shimmerActiveStartedAt: 0,
-    shimmerActiveUntil: 0,
-    shimmerRunning: false,
     turnShimmerRunning: false,
     turnShimmerStartedAt: 0,
     turnShimmerOutputStartedAt: 0,
@@ -770,8 +780,9 @@ const VERSION = "0.8.3";
       });
   }
 
-  function profileLedgerQueueWrite(turn, calls = [], invocations = []) {
+  function profileLedgerQueueWrite(turnOrTurns, calls = [], invocations = []) {
     if (state.profileLedgerStorage !== "indexeddb") return;
+    const turns = Array.isArray(turnOrTurns) ? turnOrTurns : turnOrTurns ? [turnOrTurns] : [];
     state.profileLedgerWriteQueue = state.profileLedgerWriteQueue
       .then(
         () => (state.profileLedgerDbPromise || state.profileLedgerDb),
@@ -784,7 +795,7 @@ const VERSION = "0.8.3";
             [PROFILE_LEDGER_STORE_TURNS, PROFILE_LEDGER_STORE_USAGE_CALLS, PROFILE_LEDGER_STORE_INVOCATIONS, PROFILE_LEDGER_STORE_DAILY_ROLLUPS],
             "readwrite",
           );
-          if (turn) tx.objectStore(PROFILE_LEDGER_STORE_TURNS).put(turn);
+          turns.forEach((turn) => tx.objectStore(PROFILE_LEDGER_STORE_TURNS).put(turn));
           calls.forEach((call) => tx.objectStore(PROFILE_LEDGER_STORE_USAGE_CALLS).put(call));
           invocations.forEach((invocation) => tx.objectStore(PROFILE_LEDGER_STORE_INVOCATIONS).put(invocation));
           rollupDays.forEach((day) => tx.objectStore(PROFILE_LEDGER_STORE_DAILY_ROLLUPS).put(day));
@@ -813,6 +824,50 @@ const VERSION = "0.8.3";
         state.profileLedgerDb = null;
         saveProfileLedgerSnapshot();
       });
+  }
+
+  function scheduleProfileLedgerFlush() {
+    if (state.profileLedgerWriteTimer || typeof window.setTimeout !== "function") return;
+    state.profileLedgerWriteTimer = window.setTimeout(() => {
+      state.profileLedgerWriteTimer = 0;
+      flushProfileLedgerWrites();
+    }, PROFILE_LEDGER_WRITE_COALESCE_MS);
+  }
+
+  function scheduleProfileLedgerSnapshotSave() {
+    state.profileLedgerPendingSnapshot = true;
+    scheduleProfileLedgerFlush();
+  }
+
+  function scheduleProfileLedgerWrite(turn, calls = [], invocations = []) {
+    if (turn) {
+      const key = normalizeText(turn?.turnId || turn?.id, 300);
+      if (key) state.profileLedgerPendingTurns.set(key, turn);
+    }
+    for (const call of Array.isArray(calls) ? calls : []) {
+      const key = normalizeText(call?.id, 300);
+      if (key) state.profileLedgerPendingCalls.set(key, call);
+    }
+    for (const invocation of Array.isArray(invocations) ? invocations : []) {
+      const key = normalizeText(invocation?.invocationId || invocation?.id, 300);
+      if (key) state.profileLedgerPendingInvocations.set(key, invocation);
+    }
+    scheduleProfileLedgerFlush();
+  }
+
+  function flushProfileLedgerWrites() {
+    if (state.profileLedgerWriteTimer) window.clearTimeout(state.profileLedgerWriteTimer);
+    state.profileLedgerWriteTimer = 0;
+    const turns = Array.from(state.profileLedgerPendingTurns.values());
+    const calls = Array.from(state.profileLedgerPendingCalls.values());
+    const invocations = Array.from(state.profileLedgerPendingInvocations.values());
+    const shouldSaveSnapshot = state.profileLedgerPendingSnapshot;
+    state.profileLedgerPendingTurns.clear();
+    state.profileLedgerPendingCalls.clear();
+    state.profileLedgerPendingInvocations.clear();
+    state.profileLedgerPendingSnapshot = false;
+    if (shouldSaveSnapshot) saveProfileLedgerSnapshot();
+    if (turns.length || calls.length || invocations.length) profileLedgerQueueWrite(turns, calls, invocations);
   }
 
   function ensureProfileLedgerLoaded() {
@@ -1018,8 +1073,9 @@ const VERSION = "0.8.3";
     if (index !== undefined) ledger.turns[index] = merged;
     else profileLedgerTurnIndex(ledger).set(merged.turnId, ledger.turns.push(merged) - 1);
     if (!options.deferRollup) profileLedgerRebuildRollup();
-    if (!options.deferSnapshot) saveProfileLedgerSnapshot();
-    if (!options.deferWrite) profileLedgerQueueWrite(merged, options.calls, options.invocations);
+    if (!options.deferSnapshot) scheduleProfileLedgerSnapshotSave();
+    if (!options.deferWrite) scheduleProfileLedgerWrite(merged, options.calls, options.invocations);
+    if (options.flush) flushProfileLedgerWrites();
     return merged;
   }
 
@@ -1108,8 +1164,9 @@ const VERSION = "0.8.3";
     if (previousIndex !== undefined) ledger.turns[previousIndex] = merged;
     else profileLedgerTurnIndex(ledger).set(merged.turnId, ledger.turns.push(merged) - 1);
     profileLedgerRebuildRollup();
-    saveProfileLedgerSnapshot();
-    profileLedgerQueueWrite(merged, calls, invocations);
+    scheduleProfileLedgerSnapshotSave();
+    scheduleProfileLedgerWrite(merged, calls, invocations);
+    if (options.flush) flushProfileLedgerWrites();
     return true;
   }
 
@@ -1195,6 +1252,27 @@ const VERSION = "0.8.3";
     return Array.from(mutations).some((mutation) => !isLiveTokenCostUiNode(mutation?.target));
   }
 
+  function mutationTouchesSelector(mutation, selector) {
+    const touches = (node) => {
+      const element = node?.nodeType === 1 ? node : node?.parentElement;
+      return Boolean(
+        element?.matches?.(selector) ||
+        element?.closest?.(selector) ||
+        node?.querySelector?.(selector),
+      );
+    };
+    if (touches(mutation?.target)) return true;
+    return [...Array.from(mutation?.addedNodes || []), ...Array.from(mutation?.removedNodes || [])].some(touches);
+  }
+
+  function mutationTouchesHubVisibility(mutation) {
+    return mutationTouchesSelector(mutation, PROJECT_CONTEXT_ROW_SELECTOR);
+  }
+
+  function mutationTouchesProfileIdentity(mutation) {
+    return mutationTouchesSelector(mutation, PROFILE_IDENTITY_SELECTOR);
+  }
+
   function syncHubVisibility(root = state.root, doc = document) {
     const projectContextRow = hasCodexProjectContextRow(doc);
     const visible = hubVisible() && !projectContextRow;
@@ -1228,7 +1306,9 @@ const VERSION = "0.8.3";
     const target = document.body || document.documentElement;
     if (!target) return;
     state.hubVisibilityObserver = new MutationObserver((mutations) => {
-      if (shouldScheduleObservedUiSync(mutations)) scheduleHubVisibilitySync();
+      if (mutations.some(mutationTouchesHubVisibility)) scheduleHubVisibilitySync();
+      if (!state.officialModelTrigger?.isConnected && mutations.some(mutationTouchesOfficialModelTrigger)) bindOfficialModelTrigger();
+      if (!state.sideChatObserverRoot?.isConnected) syncSideChatObserver();
     });
     state.hubVisibilityObserver.observe(target, { childList: true, subtree: true });
   }
@@ -1631,6 +1711,21 @@ const VERSION = "0.8.3";
     });
   }
 
+  function profileUiAuthReadGateActive() {
+    if (!state.profileSyntheticAuth) return false;
+    const now = Date.now();
+    if (now - state.profileUiAuthGateAt < PROFILE_UI_AUTH_GATE_TTL_MS) return state.profileUiAuthGateActive;
+    state.profileUiAuthGateAt = now;
+    try {
+      state.profileUiAuthGateActive = Boolean(
+        document.querySelector?.("input[type='file'], [aria-label='编辑个人资料'], [aria-label='Edit profile']"),
+      );
+    } catch {
+      state.profileUiAuthGateActive = false;
+    }
+    return state.profileUiAuthGateActive;
+  }
+
   function isProfileQueryClient(value) {
     return Boolean(value && typeof value.invalidateQueries === "function" && typeof value.getQueryCache === "function");
   }
@@ -1760,6 +1855,7 @@ const VERSION = "0.8.3";
             const value = descriptor?.get ? descriptor.get.call(this) : currentValue;
             if (
               profileUnlockEnabled() &&
+              profileUiAuthReadGateActive() &&
               isProfileUiAuthRead(new Error().stack, authContext.__codexLiveTokenCostProfileUiComponents)
             ) {
               return profileUiAuthContextValue(value);
@@ -2269,16 +2365,69 @@ const VERSION = "0.8.3";
     }
   }
 
+  function sideChatRoot(doc = document) {
+    return doc?.querySelector?.(
+      "[data-quick-chat-thread-scroll-content], [data-quick-chat-thread-scroll-container]",
+    ) || null;
+  }
+
+  function sideChatDomTurns(doc = document, sessionKey = "") {
+    const root = sideChatRoot(doc);
+    if (!root) return [];
+    const key = localStateSessionKey(sessionKey || recentDetectedSessionKey() || locationSessionKey());
+    const seen = new Set();
+    const nodes = Array.from(root.querySelectorAll?.('[data-chatgpt-conversation-turn="true"]') || []);
+    return nodes.flatMap((node, index) => {
+      const rawId = normalizeText(
+        node.getAttribute?.("data-chatgpt-conversation-turn-id") || node.dataset?.chatgptConversationTurnId,
+        240,
+      );
+      const stableId = rawId || `dom-${index}`;
+      if (seen.has(stableId)) return [];
+      seen.add(stableId);
+      const turnId = `side-chat:${key}:${stableId}`;
+      return [{
+        id: turnId,
+        turnId,
+        sessionKey: key,
+        threadKey: key,
+        callCount: 1,
+        source: "quick-chat-dom",
+        activityOnly: true,
+      }];
+    });
+  }
+
+  function sideChatActivityTurnsForSession(sessionKey) {
+    const key = localStateSessionKey(sessionKey);
+    const turns = state.sideChatActivityTurns.get(key);
+    return turns ? Array.from(turns.values()) : [];
+  }
+
+  function sideChatDisplayTurns(exactTurns, sessionKey, doc = document, sideTurnsOverride = null) {
+    const turns = Array.isArray(exactTurns) ? exactTurns.slice() : [];
+    const sideTurns = Array.isArray(sideTurnsOverride) ? sideTurnsOverride : sideChatDomTurns(doc, sessionKey);
+    const fallbackTurns = sideTurns.length ? sideTurns : sideChatActivityTurnsForSession(sessionKey);
+    const seen = new Set(turns.map((turn) => normalizeText(turn?.turnId || turn?.id, 240)).filter(Boolean));
+    for (const turn of fallbackTurns) {
+      const turnId = normalizeText(turn?.turnId || turn?.id, 240);
+      if (!turnId || seen.has(turnId)) continue;
+      seen.add(turnId);
+      turns.push(turn);
+    }
+    return turns;
+  }
+
   function activeSidebarThreadKey(doc = document) {
     if (recentNewConversationSessionKey()) return "";
-    const activeElementKey = sidebarThreadKeyFromNode(doc?.activeElement);
-    if (activeElementKey) {
-      state.lastClickedSidebarThreadKey = resolveSessionKey(activeElementKey);
-      state.lastClickedSidebarThreadAt = Date.now();
-      return state.lastClickedSidebarThreadKey;
-    }
+    const recentClickedKey =
+      state.lastClickedSidebarThreadKey && Date.now() - state.lastClickedSidebarThreadAt < SIDEBAR_SELECTION_GRACE_MS
+        ? resolveSessionKey(state.lastClickedSidebarThreadKey)
+        : "";
+    if (recentClickedKey) return recentClickedKey;
     const selectors = [
       "[data-app-action-sidebar-thread-active='true'][data-app-action-sidebar-thread-id]",
+      "[data-app-action-sidebar-thread-selected='true'][data-app-action-sidebar-thread-id]",
       "[aria-current='page'][data-app-action-sidebar-thread-id]",
       "[aria-selected='true'][data-app-action-sidebar-thread-id]",
       "[data-state='active'][data-app-action-sidebar-thread-id]",
@@ -2290,13 +2439,19 @@ const VERSION = "0.8.3";
       const id = sidebarThreadKeyFromNode(node);
       if (id) return resolveSessionKey(id);
     }
-    if (state.lastClickedSidebarThreadKey && Date.now() - state.lastClickedSidebarThreadAt < 30000) return state.lastClickedSidebarThreadKey;
+    const activeElementKey = sidebarThreadKeyFromNode(doc?.activeElement);
+    if (activeElementKey) {
+      state.lastClickedSidebarThreadKey = resolveSessionKey(activeElementKey);
+      state.lastClickedSidebarThreadAt = Date.now();
+      return state.lastClickedSidebarThreadKey;
+    }
     return "";
   }
 
   function hasActiveSidebarThreadDom(doc = document) {
     const selectors = [
       "[data-app-action-sidebar-thread-active='true'][data-app-action-sidebar-thread-id]",
+      "[data-app-action-sidebar-thread-selected='true'][data-app-action-sidebar-thread-id]",
       "[aria-current='page'][data-app-action-sidebar-thread-id]",
       "[aria-selected='true'][data-app-action-sidebar-thread-id]",
       "[data-state='active'][data-app-action-sidebar-thread-id]",
@@ -2519,6 +2674,7 @@ const VERSION = "0.8.3";
   function startupBlankConversationSessionKey(doc = document) {
     const main = doc?.querySelector?.("main");
     if (!main) return "";
+    if (sideChatRoot(doc)) return "";
     const detectedKey = recentDetectedSessionKey();
     const selectedKey = state.userSelectedSidebarThreadKey || "";
     const runningCandidates = [detectedKey, selectedKey].filter(Boolean);
@@ -2532,7 +2688,7 @@ const VERSION = "0.8.3";
     if (state.localCurrentTurn) return "";
     if (recentDetectedSessionKey() || recentNewConversationSessionKey()) return "";
     if (hasActiveSidebarThreadDom()) return "";
-    if (state.lastClickedSidebarThreadKey && Date.now() - state.lastClickedSidebarThreadAt < 30000) return "";
+    if (state.lastClickedSidebarThreadKey && Date.now() - state.lastClickedSidebarThreadAt < SIDEBAR_SELECTION_GRACE_MS) return "";
     return state.startupSessionKey;
   }
 
@@ -2910,6 +3066,69 @@ const VERSION = "0.8.3";
     return /\/(responses|chat\/completions|conversation|thread|api)\b/i.test(text) || /codex/i.test(text);
   }
 
+  const CAPTURED_PAYLOAD_MARKER_RE =
+    /(?:codex|conversation|thread|session[_-]?(?:id|key|started|completed|status)?|turn[_-]?(?:id|started|completed|status)?|(?:input|output|cached)[_-]?tokens?|token[_-]?count|usage|response[._-]|mcp[_-]?notification|custom[_-]?tool|tool[_-]?call|assistant|side[_-]?chat|fetch[_-]?response)/i;
+  const CAPTURED_METRIC_MARKER_RE =
+    /(?:turn\/(?:started|completed)|item\/(?:started|completed|agentMessage\/delta|reasoning\/[^\s"']+)|thread\/tokenUsage\/updated|(?:input|output|cached)[_-]?tokens?|token[_-]?usage|usage|response[._-]?(?:completed|output|delta)|tool[_-]?call|mcp[_-]?notification|conversation[_-]?(?:id|started|completed)|thread[_-]?(?:id|started|completed)|session[_-]?(?:id|started|completed)|turn[_-]?id|assistant[_-]?(?:message|delta)|side[_-]?chat|fetch[_-]?response|output[_-]?text|content[_-]?delta)/i;
+  const CAPTURED_REQUEST_MARKER_RE =
+    /(?:messages?|input|prompt|model|stream|user[_-]?message|create[_-]?turn|start[_-]?turn|conversation[_-]?id|thread[_-]?id|session[_-]?id)/i;
+
+  function capturedPayloadHasMarker(value, depth = 0, seen = new WeakSet()) {
+    if (!value || depth > 2) return false;
+    if (typeof value === "string") {
+      const text = value.length > 8192 ? `${value.slice(0, 4096)}${value.slice(-4096)}` : value;
+      return CAPTURED_PAYLOAD_MARKER_RE.test(text);
+    }
+    if (typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.slice(0, 24).some((item) => capturedPayloadHasMarker(item, depth + 1, seen));
+    const keys = Object.keys(value).slice(0, 48);
+    const descriptors = [value.type, value.event, value.name, value.method, value.kind, value.channel]
+      .filter((item) => typeof item === "string")
+      .join(" ");
+    if (CAPTURED_PAYLOAD_MARKER_RE.test(`${keys.join(" ")} ${descriptors}`)) return true;
+    return ["data", "payload", "body", "message", "params", "item", "response", "result"].some((key) =>
+      capturedPayloadHasMarker(value[key], depth + 1, seen),
+    );
+  }
+
+  function capturedPayloadHasMetricMarker(value, depth = 0, seen = new WeakSet(), allowRequest = false) {
+    if (!value || depth > 2) return false;
+    if (typeof value === "string") {
+      const text = value.length > CAPTURE_MAX_PAYLOAD_LENGTH
+        ? `${value.slice(0, 32768)}${value.slice(-32768)}`
+        : value;
+      return (allowRequest ? CAPTURED_REQUEST_MARKER_RE : CAPTURED_METRIC_MARKER_RE).test(text);
+    }
+    if (typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.slice(0, 16).some((item) => capturedPayloadHasMetricMarker(item, depth + 1, seen, allowRequest));
+    const keys = Object.keys(value).slice(0, 64);
+    const descriptors = [value.type, value.event, value.name, value.method, value.kind, value.channel]
+      .filter((item) => typeof item === "string")
+      .join(" ");
+    const markerRe = allowRequest ? CAPTURED_REQUEST_MARKER_RE : CAPTURED_METRIC_MARKER_RE;
+    if (markerRe.test(`${keys.join(" ")} ${descriptors}`)) return true;
+    return ["data", "payload", "body", "message", "params", "item", "response", "result", "usage"].some((key) =>
+      capturedPayloadHasMetricMarker(value[key], depth + 1, seen, allowRequest),
+    );
+  }
+
+  function shouldInspectCapturedPayload(payload, source = "", options = {}) {
+    const url = String(options.url || "");
+    if (url) {
+      if (isProfileUsageUrl(url) || isProfilePhotoUrl(url) || isProfileAccountsCheckUrl(url)) return true;
+      if (isCodexApiUrl(url)) return capturedPayloadHasMetricMarker(payload, 0, new WeakSet(), /body/i.test(String(source || "")));
+      return /websocket/i.test(String(source || "")) ? capturedPayloadHasMetricMarker(payload) : false;
+    }
+    if (payload?.__codexLiveTokenCostProfileLocal === true || payload?.type === "fetch" || payload?.type === "fetch-response") return true;
+    return capturedPayloadHasMarker(payload);
+  }
+
+  function shouldCaptureCodexResponse(url) {
+    return isCodexApiUrl(url) && /\/(responses|chat\/completions|conversation|thread|session|turn)(?:[/?#]|$)/i.test(String(url || ""));
+  }
+
   function isProfileUsageUrl(url) {
     return /\/wham\/profiles\/me(?:[?#].*)?$/i.test(String(url || ""));
   }
@@ -3005,7 +3224,14 @@ const VERSION = "0.8.3";
     if (!value || depth > 8) return emptySessionIdentity();
     if (typeof value === "string") {
       const parsed = parseMaybeJson(value);
-      return parsed ? extractSessionIdentity(parsed, depth + 1, seen) : extractSessionIdentityFromUrl(value);
+      if (parsed) return extractSessionIdentity(parsed, depth + 1, seen);
+      if (!/\bdata\s*:/i.test(value)) return extractSessionIdentityFromUrl(value);
+      let identity = extractSessionIdentityFromUrl(value);
+      for (const fragment of extractJsonFragmentsFromSse(value)) {
+        const fragmentIdentity = extractSessionIdentity(parseMaybeJson(fragment), depth + 1, seen);
+        identity = mergeSessionIdentity(identity, fragmentIdentity);
+      }
+      return identity;
     }
     if (Array.isArray(value)) {
       let identity = emptySessionIdentity();
@@ -3496,6 +3722,108 @@ const VERSION = "0.8.3";
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trim())
       .filter((line) => line && line !== "[DONE]");
+  }
+
+  function sideChatStreamCandidates(value, depth = 0, out = [], seen = new WeakSet()) {
+    if (!value || depth > 5) return out;
+    if (typeof value === "string") {
+      const parsed = parseMaybeJson(value);
+      if (parsed) sideChatStreamCandidates(parsed, depth + 1, out, seen);
+      else {
+        for (const fragment of extractJsonFragmentsFromSse(value)) {
+          const fragmentValue = parseMaybeJson(fragment);
+          if (fragmentValue) sideChatStreamCandidates(fragmentValue, depth + 1, out, seen);
+        }
+      }
+      return out;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) sideChatStreamCandidates(item, depth + 1, out, seen);
+      return out;
+    }
+    if (typeof value !== "object" || seen.has(value)) return out;
+    seen.add(value);
+    out.push(value);
+    for (const key of ["payload", "data", "body", "message", "result"]) {
+      if (key in value) sideChatStreamCandidates(value[key], depth + 1, out, seen);
+    }
+    return out;
+  }
+
+  function sideChatStreamInfo(payload) {
+    const envelopeType = normalizeText(payload?.type, 120).toLowerCase();
+    if (!/^fetch-stream-(event|complete|error)$/.test(envelopeType)) return null;
+    const candidates = sideChatStreamCandidates(payload?.data, 0, []);
+    candidates.push(payload);
+    for (const candidate of candidates) {
+      const identity = extractSessionIdentity(candidate);
+      const type = normalizeText(candidate?.type || candidate?.event, 120).toLowerCase();
+      const message = candidate?.message || candidate?.input_message || null;
+      const role = normalizeText(message?.author?.role || message?.role || candidate?.author?.role, 40).toLowerCase();
+      const isInputMessage = type === "input_message" || Boolean(candidate?.input_message);
+      const isAssistantMessage = role === "assistant" || (type === "message" && Boolean(message) && !isInputMessage);
+      const isComplete = type === "message_stream_complete" || envelopeType === "fetch-stream-complete";
+      if (!isInputMessage && !isAssistantMessage && !isComplete) continue;
+      return {
+        identity,
+        isInputMessage,
+        isAssistantMessage,
+        isComplete,
+        messageId: normalizeText(message?.id || candidate?.message_id || candidate?.messageId, 240),
+      };
+    }
+    return null;
+  }
+
+  function observeSideChatStreamPayload(payload, source, fallbackSessionKey = "") {
+    if (!/message/i.test(String(source || "")) || !sideChatRoot(document)) return false;
+    const envelopeType = normalizeText(payload?.type, 120).toLowerCase();
+    const info = sideChatStreamInfo(payload);
+    if (!info) return false;
+    const resolved = resolveSessionIdentity(info.identity);
+    const sessionKey = localStateSessionKey(resolved.sessionKey || fallbackSessionKey || recentDetectedSessionKey() || locationSessionKey());
+    if (!sessionKey) return false;
+    if (resolved.sessionKey) {
+      state.detectedSessionKey = sessionKey;
+      state.detectedSessionKeyAt = Date.now();
+    }
+    const requestId = normalizeText(payload?.requestId, 240);
+    const requestKey = `${sessionKey}\u0001${requestId || info.messageId || "current"}`;
+    let stream = state.sideChatStreamTurns.get(requestKey);
+    let changed = false;
+    if (info.isInputMessage || info.isAssistantMessage) {
+      if (!stream) {
+        stream = {
+          sessionKey,
+          turnId: `side-chat:${sessionKey}:stream:${requestId || info.messageId || Date.now().toString(36)}`,
+          startedAt: Date.now(),
+        };
+        state.sideChatStreamTurns.set(requestKey, stream);
+      }
+      let turns = state.sideChatActivityTurns.get(sessionKey);
+      if (!turns) {
+        turns = new Map();
+        state.sideChatActivityTurns.set(sessionKey, turns);
+      }
+      if (!turns.has(stream.turnId)) {
+        turns.set(stream.turnId, {
+          id: stream.turnId,
+          turnId: stream.turnId,
+          sessionKey,
+          threadKey: sessionKey,
+          callCount: 1,
+          source: "quick-chat-stream",
+          activityOnly: true,
+          startedAt: stream.startedAt,
+        });
+        while (turns.size > 200) turns.delete(turns.keys().next().value);
+        changed = true;
+      }
+    }
+    if (info.isComplete || envelopeType === "fetch-stream-error") {
+      if (stream) state.sideChatStreamTurns.delete(requestKey);
+    }
+    return changed;
   }
 
   function collectUsages(value, depth = 0, out = [], seen = new WeakSet()) {
@@ -4133,7 +4461,6 @@ const VERSION = "0.8.3";
     if (!item.running) return false;
     if (isActiveLocalStateSession(sessionKey)) cancelOutputRateRefresh();
     setTurnShimmerState(sessionKey, { ...item, running: false, outputStartedAt: Date.now() });
-    if (isActiveLocalStateSession(sessionKey)) stopCadencedShimmer({ finishActive: options.finishActive !== false });
     scheduleRender(0);
     return true;
   }
@@ -4654,6 +4981,7 @@ const VERSION = "0.8.3";
       threadAttributionStatus: profileThreadAttributionStatus,
       calls: [],
       invocations: [],
+      flush: options.flush === true || options.durationStatus === "completed" || ["final", "complete", "interrupted"].includes(reason),
     });
     if (!metric) return false;
     if (isTransientSessionKey(key)) return false;
@@ -4725,44 +5053,48 @@ const VERSION = "0.8.3";
   }
 
   function inspectLocalPayload(payload, source) {
-    if (isComposerDraftPayload(payload)) return false;
-    const identity = extractSessionIdentity(payload);
+    if (typeof payload === "string" && payload.length > CAPTURE_MAX_PAYLOAD_LENGTH) return false;
+    const inspectedPayload = parseMaybeJson(payload) || payload;
+    if (isComposerDraftPayload(inspectedPayload)) return false;
+    const identity = extractSessionIdentity(inspectedPayload);
     const resolvedSession = resolveSessionIdentity(identity);
     const payloadSessionKey = resolvedSession.sessionKey;
     const hasSessionReference = sessionIdentityHasSessionReference(identity);
     const unresolvedSessionIdentity = hasSessionReference && !payloadSessionKey;
-    const fallbackRuntimeSessionKey = hasSessionReference ? "" : sessionlessUsageRuntimeSessionKey(payload);
+    const fallbackRuntimeSessionKey = hasSessionReference ? "" : sessionlessUsageRuntimeSessionKey(inspectedPayload);
     const sessionKey = localStateSessionKey(payloadSessionKey || fallbackRuntimeSessionKey || currentSessionKey());
     const hasReliableSessionKey = Boolean(payloadSessionKey || fallbackRuntimeSessionKey);
-    const sessionChanged = observeSessionInfo(payload);
-    const info = extractModelInfo(payload);
-    const modelChanged = observeModelInfo(payload);
-    const resultOutputStarted = hasAssistantResultOutputStarted(payload, source);
-    const tokenCountPayload = isTokenCountPayload(payload);
-    const taskCompletePayload = isTaskCompletePayload(payload);
-    const fastMode = extractFastMode(payload);
-    const invocations = collectProfileInvocations(payload);
-    const invocationEventId = profileInvocationEventId(payload) || normalizeText(identity.requestId || identity.streamId, 180);
+    const sessionChanged = observeSessionInfo(inspectedPayload);
+    const info = extractModelInfo(inspectedPayload);
+    const modelChanged = observeModelInfo(inspectedPayload);
+    const resultOutputStarted = hasAssistantResultOutputStarted(inspectedPayload, source);
+    const tokenCountPayload = isTokenCountPayload(inspectedPayload);
+    const taskCompletePayload = isTaskCompletePayload(inspectedPayload);
+    const fastMode = extractFastMode(inspectedPayload);
+    const invocations = collectProfileInvocations(inspectedPayload);
+    const usages = collectUsages(inspectedPayload);
+    const invocationEventId = profileInvocationEventId(inspectedPayload) || normalizeText(identity.requestId || identity.streamId, 180);
     const explicitContext = normalizeProfileContext({
       effort: info.effort,
       fastMode,
       invocations,
     });
-    const requestStart = /body/i.test(String(source || "")) && shouldStartTurnFromRequestPayload(payload);
+    const requestStart = /body/i.test(String(source || "")) && shouldStartTurnFromRequestPayload(inspectedPayload);
+    const sideChatChanged = observeSideChatStreamPayload(inspectedPayload, source, sessionKey);
     const canStartRequest = requestStart && !unresolvedSessionIdentity;
     const profileAttribution = {
       profileThreadKey: hasReliableSessionKey ? sessionKey : "",
       threadAttributionStatus: hasReliableSessionKey ? "reliable" : "unknown",
     };
     if (canStartRequest) beginLocalRequestTurn({ sessionKey, ...profileAttribution });
-    const performanceChanged = observeTurnPerformancePayload(payload, sessionKey);
+    const performanceChanged = observeTurnPerformancePayload(inspectedPayload, sessionKey);
     const canUseSessionlessCurrentTurn = !hasSessionReference && officialRuntimeRunningCount() <= 1;
     const canUseCurrentSessionForUsage = Boolean(hasReliableSessionKey || canStartRequest || (!unresolvedSessionIdentity && canUseSessionlessCurrentTurn && localCurrentTurn(sessionKey)));
     if (hasProfileContext(explicitContext) && /body|websocket|message/i.test(String(source || ""))) {
       const turn = localCurrentTurn(sessionKey) || (canStartRequest ? beginLocalRequestTurn({ sessionKey, ...profileAttribution }) : null);
       if (turn) {
         turn.context = mergeProfileContext(turn.context, explicitContext);
-        if (!collectUsages(payload).length) {
+        if (!usages.length) {
           profileLedgerObserveLocalTurn(turn, explicitContext, {
             reason: "context-observed",
             durationStatus: "incomplete",
@@ -4781,9 +5113,9 @@ const VERSION = "0.8.3";
       invocations: invocations.length ? invocations : turnContext.invocations,
     });
     let changed = false;
-    const persistUsage = shouldPersistUsagePayload(payload, source);
+    const persistUsage = shouldPersistUsagePayload(inspectedPayload, source);
     if (canUseCurrentSessionForUsage) {
-      for (const usage of collectUsages(payload)) {
+      for (const usage of usages) {
         changed =
           rememberLocalUsage(usage, source, context, {
             persist: persistUsage,
@@ -4795,12 +5127,12 @@ const VERSION = "0.8.3";
           }) || changed;
       }
     }
-    const genericTaskCompleteWithoutSession = !hasSessionReference && isGenericTaskCompletePayload(payload);
+    const genericTaskCompleteWithoutSession = !hasSessionReference && isGenericTaskCompletePayload(inspectedPayload);
     const sessionlessTaskCompleteKey = genericTaskCompleteWithoutSession ? sessionlessTaskCompleteSessionKey(identity.turnId) : "";
     const taskCompleteSessionKey = payloadSessionKey || sessionlessTaskCompleteKey;
-    const taskCompleteTiming = taskCompletePayload ? officialRuntimeSignalFromPayload(payload) || officialRuntimeTimingFromPayload(payload) : {};
+    const taskCompleteTiming = taskCompletePayload ? officialRuntimeSignalFromPayload(inspectedPayload) || officialRuntimeTimingFromPayload(inspectedPayload) : {};
     const taskCompleteHandled = Boolean(taskCompletePayload && taskCompleteSessionKey && turnCompletionMatchesCurrent(taskCompleteSessionKey, identity.turnId));
-    const officialRuntimeChanged = observeOfficialRuntimePayload(payload, source);
+    const officialRuntimeChanged = observeOfficialRuntimePayload(inspectedPayload, source);
     if (taskCompleteHandled) {
       clearLocalTurnTimer(taskCompleteSessionKey);
       if (localCurrentTurn(taskCompleteSessionKey)) {
@@ -4817,8 +5149,8 @@ const VERSION = "0.8.3";
     } else if (changed && !persistUsage && tokenCountPayload) persistLocalCurrentTurn("live", sessionKey);
     else if (changed && !persistUsage) scheduleLocalTurnCompletionCheck(0, { sessionKey });
     const taskCompleteVisibleHandled = taskCompleteHandled || genericTaskCompleteWithoutSession;
-    if (changed || modelChanged || sessionChanged || resultOutputStarted || performanceChanged || taskCompleteVisibleHandled || officialRuntimeChanged) scheduleRender();
-    return changed || modelChanged || sessionChanged || resultOutputStarted || performanceChanged || taskCompleteVisibleHandled || officialRuntimeChanged;
+    if (changed || modelChanged || sessionChanged || resultOutputStarted || performanceChanged || taskCompleteVisibleHandled || officialRuntimeChanged || sideChatChanged) scheduleRender();
+    return changed || modelChanged || sessionChanged || resultOutputStarted || performanceChanged || taskCompleteVisibleHandled || officialRuntimeChanged || sideChatChanged;
   }
 
   function localUsageExport() {
@@ -5423,7 +5755,7 @@ const VERSION = "0.8.3";
   }
 
   function rememberSidebarThreadClick(event) {
-    if (event?.type !== "click") return;
+    if (event?.type !== "click" && event?.type !== "pointerdown") return;
     const threadKey = sidebarThreadKeyFromNode(event.target);
     if (!threadKey) return;
     state.newConversationSessionKey = "";
@@ -5432,6 +5764,7 @@ const VERSION = "0.8.3";
     state.lastClickedSidebarThreadAt = Date.now();
     state.userSelectedSidebarThreadKey = state.lastClickedSidebarThreadKey;
     state.userSelectedSidebarThreadAt = state.lastClickedSidebarThreadAt;
+    if (event.type === "pointerdown") return;
     syncActiveLocalCurrentTurn();
     syncActiveTurnShimmerState();
     scheduleRender(0);
@@ -5468,6 +5801,8 @@ const VERSION = "0.8.3";
     if (!localCurrentTurn(sessionKey)) restoreRunningCurrentTurnFromLast(sessionKey);
     const source = readTokenUsage();
     const turns = currentSessionTurns(source.turns, sessionKey);
+    const sideChatTurns = sideChatDomTurns(document, sessionKey);
+    const displayTurns = sideChatDisplayTurns(turns, sessionKey, document, sideChatTurns);
     const lastTurn = sameSessionKey(turnSessionKey(source.last), sessionKey) ? source.last : turns[turns.length - 1] || null;
     const currentTurn = sameSessionKey(source.currentTurn?.sessionKey, sessionKey) ? source.currentTurn : null;
     const modelInfo = activeModelInfo();
@@ -5498,8 +5833,8 @@ const VERSION = "0.8.3";
     const outputRateEnabled = outputRateVisible();
     const rate = outputRateEnabled ? outputTokenRate(currentTurn, running) : { active: false, visible: false, value: 0 };
     const averageRate = outputRateEnabled ? averageOutputTokenRate(lastTurn, running) : { visible: false, value: 0 };
-    const performance = sessionPerformance(turns, currentTurn);
-    return { current, session: displaySession, turns: turns.length, sessionKey, model, modelInfo, price, sessionCost, dayCost, dayUsage, confidence, running, fastMode, outputRateEnabled, rate, averageRate, performance };
+    const performance = sessionPerformance(displayTurns, currentTurn);
+    return { current, session: displaySession, turns: displayTurns.length, sessionKey, model, modelInfo, price, sessionCost, dayCost, dayUsage, confidence, running, fastMode, outputRateEnabled, rate, averageRate, performance };
   }
 
   function emptyDailyUsageBucket(date = "") {
@@ -5965,7 +6300,7 @@ const VERSION = "0.8.3";
     const target = document.body || document.documentElement;
     if (!target) return;
     state.profileIdentityObserver = new MutationObserver((mutations) => {
-      if (shouldScheduleObservedUiSync(mutations)) scheduleSidebarProfileIdentitySync(80);
+      if (mutations.some(mutationTouchesProfileIdentity)) scheduleSidebarProfileIdentitySync(80);
     });
     // 不监听 characterData：同步回调会写回 label.textContent，若页面随后重渲染会互相触发形成循环
     state.profileIdentityObserver.observe(target, { childList: true, subtree: true });
@@ -5983,7 +6318,11 @@ const VERSION = "0.8.3";
 
   function bindOfficialModelTrigger() {
     const trigger = document.querySelector?.(OFFICIAL_MODEL_TRIGGER_SELECTOR);
-    if (trigger && trigger === state.officialModelTrigger) return readOfficialModelTrigger(trigger);
+    if (trigger && trigger === state.officialModelTrigger) {
+      state.officialModelRootObserver?.disconnect?.();
+      state.officialModelRootObserver = null;
+      return readOfficialModelTrigger(trigger);
+    }
     state.officialModelObserver?.disconnect?.();
     state.officialModelObserver = null;
     state.officialModelTrigger = trigger || null;
@@ -6008,6 +6347,8 @@ const VERSION = "0.8.3";
       attributes: true,
       attributeFilter: ["data-selected-reasoning-effort", "aria-label", "title", "data-state", "class", "style", "hidden", "aria-hidden"],
     });
+    state.officialModelRootObserver?.disconnect?.();
+    state.officialModelRootObserver = null;
     if (changed) scheduleRender(0);
     return changed;
   }
@@ -6027,6 +6368,11 @@ const VERSION = "0.8.3";
   function installOfficialModelObserver() {
     if (window.__CODEX_LIVE_TOKEN_COST_TEST__) return;
     bindOfficialModelTrigger();
+    if (state.officialModelTrigger?.isConnected) {
+      state.officialModelRootObserver?.disconnect?.();
+      state.officialModelRootObserver = null;
+      return;
+    }
     if (state.officialModelRootObserver || typeof MutationObserver !== "function") return;
     const target = document.body || document.documentElement;
     if (!target) return;
@@ -6701,6 +7047,8 @@ const VERSION = "0.8.3";
     state.profileUsageRefreshTimer = 0;
     state.profileAccountsRefreshPromise = null;
     state.profileSyntheticAuth = false;
+    state.profileUiAuthGateAt = 0;
+    state.profileUiAuthGateActive = false;
     state.profileRequestIds.clear();
     if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock === VERSION) {
       Array.prototype.filter = Array.prototype.__codexLiveTokenCostOriginalFilter;
@@ -6880,7 +7228,6 @@ const VERSION = "0.8.3";
         --cltc-danger: light-dark(#b42318, #f97066);
         --cltc-arc-bg: light-dark(rgb(246, 246, 246), rgba(255, 255, 255, .08));
         --cltc-arc-radius: var(--radius-2xl, 20px);
-        --cltc-shimmer-contrast: #fff;
         --cltc-ease-out: cubic-bezier(0.23, 1, 0.32, 1);
         --cltc-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
         --cltc-duration-press: 160ms;
@@ -6892,13 +7239,14 @@ const VERSION = "0.8.3";
         color-scheme: light dark;
         position: relative;
         display: grid;
-        grid-template-columns: minmax(0, .72fr) minmax(0, 1.18fr) minmax(0, 1.35fr) minmax(0, .75fr) minmax(0, 1.32fr);
+        grid-template-columns: minmax(0, .95fr) minmax(0, 1.35fr) minmax(0, 1.3fr) minmax(0, .9fr) minmax(0, 1.3fr);
         align-items: center;
         gap: 0;
         width: min(100%, 1100px);
         height: 61px;
         margin: 0 auto -18px;
         padding: 8px 10px 25px;
+        border: 0;
         border-radius: var(--cltc-arc-radius) var(--cltc-arc-radius) 0 0;
         background: var(--cltc-arc-bg);
         color: var(--cltc-muted);
@@ -6943,13 +7291,21 @@ const VERSION = "0.8.3";
         background: color-mix(in srgb, var(--cltc-muted) 30%, transparent);
         transform: translateY(-50%);
       }
-      #${ROOT_ID} .cltc-current-flow {
+      #${ROOT_ID} .cltc-current-flow,
+      #${ROOT_ID} .cltc-metric-flow {
         display: inline-flex;
         align-items: center;
+        justify-content: center;
         gap: 3px;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       #${ROOT_ID}[data-cltc-output-rate-visible="true"] {
-        grid-template-columns: minmax(0, .72fr) minmax(0, 1.18fr) minmax(0, 1.48fr) minmax(0, .75fr) minmax(0, 1.32fr);
+        grid-template-columns: minmax(0, .95fr) minmax(0, 1.35fr) minmax(0, 1.45fr) minmax(0, .9fr) minmax(0, 1.3fr);
       }
       #${ROOT_ID}[data-cltc-output-rate-visible="true"] .cltc-current-flow {
         min-width: 0;
@@ -6999,127 +7355,8 @@ const VERSION = "0.8.3";
       #${ROOT_ID} .cltc-fast-mode-icon[hidden] {
         display: none;
       }
-      #${ROOT_ID} .cltc-cadenced-shimmer {
-        --cltc-shimmer-text-primary: var(--cltc-muted);
-        --cltc-shimmer-text-secondary: var(--cltc-shimmer-text-primary);
-        position: relative;
-        display: inline-block;
-        color: var(--cltc-shimmer-text-secondary);
-        -webkit-text-fill-color: currentColor;
-        text-fill-color: currentColor;
-        background: transparent;
-        -webkit-background-clip: border-box;
-        background-clip: border-box;
-        animation: none;
-      }
-      #${ROOT_ID} .cltc-cadenced-shimmer-sweep {
-        position: absolute;
-        inset: 0 auto 0 0;
-        width: 100%;
-        overflow: hidden;
-        pointer-events: none;
-        transform: translate(-50%);
-        -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 20% 30%, transparent 50% 100%);
-        mask-image: linear-gradient(90deg, transparent 0%, #000 20% 30%, transparent 50% 100%);
-      }
-      #${ROOT_ID} .cltc-cadenced-shimmer-highlight {
-        display: block;
-        width: 100%;
-        color: var(--cltc-shimmer-contrast);
-        -webkit-text-fill-color: currentColor;
-        text-fill-color: currentColor;
-        transform: translate(50%);
-      }
-      #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-sweep,
-      #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-highlight {
-        animation-duration: 1s;
-        animation-timing-function: steps(48, end);
-        animation-iteration-count: 1;
-        animation-delay: var(--cltc-shimmer-active-delay, 0ms);
-        animation-fill-mode: both;
-      }
-      #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-sweep {
-        animation-name: cltc-cadenced-shimmer-sweep;
-      }
-      #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-highlight {
-        animation-name: cltc-cadenced-shimmer-highlight;
-      }
       #${ROOT_ID} .cltc-muted {
         opacity: .68;
-      }
-      #${ROOT_ID} .cltc-roll {
-        --cltc-roll-row: 16px;
-        display: inline-flex;
-        align-items: center;
-        height: var(--cltc-roll-row);
-        line-height: var(--cltc-roll-row);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-      }
-      #${ROOT_ID} .cltc-roll::before {
-        content: "0";
-        flex: 0 0 0;
-        width: 0;
-        height: var(--cltc-roll-row);
-        line-height: var(--cltc-roll-row);
-        overflow: hidden;
-        visibility: hidden;
-      }
-      #${ROOT_ID} .cltc-roll-separator {
-        display: inline-block;
-        height: var(--cltc-roll-row);
-        line-height: var(--cltc-roll-row);
-      }
-      #${ROOT_ID} .cltc-roll-digit-column {
-        position: relative;
-        display: inline-block;
-        width: 1ch;
-        height: var(--cltc-roll-row);
-        line-height: var(--cltc-roll-row);
-        contain: layout paint style;
-      }
-      #${ROOT_ID} .cltc-roll-digit-column::before {
-        content: "0";
-        visibility: hidden;
-      }
-      #${ROOT_ID} .cltc-roll-digit-clip {
-        position: absolute;
-        inset: 0;
-        overflow: hidden;
-      }
-      #${ROOT_ID} .cltc-roll-digit-stack {
-        display: flex;
-        flex-direction: column;
-        height: var(--cltc-roll-row);
-        contain: layout size style;
-        transform: translateY(var(--cltc-roll-to-y, 0px));
-        transition: transform var(--cltc-duration-data) var(--cltc-ease-out);
-      }
-      #${ROOT_ID} .cltc-roll-digit-stack > span {
-        flex: 0 0 var(--cltc-roll-row);
-        display: block;
-        height: var(--cltc-roll-row);
-        line-height: var(--cltc-roll-row);
-      }
-      #${ROOT_ID} .cltc-roll-digit-stack[data-animate="true"] {
-        transform: translateY(var(--cltc-roll-from-y, var(--cltc-roll-to-y, 0px)));
-      }
-      @keyframes cltc-cadenced-shimmer-sweep {
-        0% { transform: translate(-50%); }
-        to { transform: translate(125%); }
-      }
-      @keyframes cltc-cadenced-shimmer-highlight {
-        0% { transform: translate(50%); }
-        to { transform: translate(-125%); }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        #${ROOT_ID} .cltc-roll-digit-stack,
-        #${ROOT_ID} .cltc-roll-digit-stack[data-animate="true"],
-        #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-sweep,
-        #${ROOT_ID} .cltc-cadenced-shimmer-active .cltc-cadenced-shimmer-highlight {
-          animation: none;
-          transition: none;
-        }
       }
       @media (prefers-color-scheme: light) {
         #${ROOT_ID} {
@@ -7129,7 +7366,6 @@ const VERSION = "0.8.3";
           --cltc-border: #d1d5db;
           --cltc-surface: #ffffff;
           --cltc-arc-bg: rgb(246, 246, 246);
-          --cltc-shimmer-contrast: #fff;
         }
       }
       @media (prefers-color-scheme: dark) {
@@ -7141,7 +7377,6 @@ const VERSION = "0.8.3";
           --cltc-surface: #2d2d2d;
           --cltc-input: #2d2d2d;
           --cltc-arc-bg: rgb(31, 31, 31);
-          --cltc-shimmer-contrast: #fff;
         }
       }
       html.electron-dark #${ROOT_ID} {
@@ -7152,7 +7387,6 @@ const VERSION = "0.8.3";
         --cltc-surface: #2d2d2d;
         --cltc-input: #2d2d2d;
         --cltc-arc-bg: rgb(31, 31, 31);
-        --cltc-shimmer-contrast: #fff;
       }
       .cltc-settings-overlay {
         --cltc-text: var(--color-token-text-primary, light-dark(#111827, #f4f4f5));
@@ -8104,18 +8338,15 @@ const VERSION = "0.8.3";
       @media (max-width: 680px) {
         #${ROOT_ID},
         #${ROOT_ID}[data-cltc-output-rate-visible="true"] {
-          grid-template-columns: repeat(5, max-content);
-          justify-content: start;
-          overflow-x: auto;
-          overscroll-behavior-x: contain;
-          scrollbar-width: none;
-        }
-        #${ROOT_ID}::-webkit-scrollbar {
-          display: none;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          justify-content: stretch;
+          overflow-x: hidden;
+          font-size: 11px;
         }
         #${ROOT_ID} .cltc-pill {
-          width: auto;
-          min-width: max-content;
+          width: 100%;
+          min-width: 0;
+          padding-inline: 4px;
         }
         .cltc-settings-overlay {
           align-items: stretch;
@@ -9284,260 +9515,8 @@ const VERSION = "0.8.3";
     syncAnalyticsTimer();
   }
 
-  function rollComparableValue(text) {
-    const value = normalizeText(text, 80).replace(/,/g, "");
-    const match = value.match(/-?\d+(?:\.\d+)?/);
-    if (!match) return null;
-    const unit = value.slice(match.index + match[0].length).trim().toUpperCase();
-    let multiplier = 1;
-    if (unit.startsWith("K")) multiplier = 1_000;
-    else if (unit.startsWith("M")) multiplier = 1_000_000;
-    else if (unit.startsWith("B")) multiplier = 1_000_000_000;
-    return Number(match[0]) * multiplier;
-  }
-
-  function rollTrend(previous, next) {
-    const before = rollComparableValue(previous);
-    const after = rollComparableValue(next);
-    if (before == null || after == null || before === after) return "same";
-    return after > before ? "up" : "down";
-  }
-
-  function digitChars(text) {
-    return Array.from(normalizeText(text, 80));
-  }
-
-  function previousDigitByPosition(previous, digitPositionFromRight) {
-    if (!previous) return null;
-    let position = 0;
-    const chars = digitChars(previous);
-    for (let index = chars.length - 1; index >= 0; index -= 1) {
-      const char = chars[index];
-      if (!/\d/.test(char)) continue;
-      if (position === digitPositionFromRight) return char;
-      position += 1;
-    }
-    return null;
-  }
-
-  function rollingTokens(text) {
-    let digitPosition = digitChars(text).filter((char) => /\d/.test(char)).length;
-    return digitChars(text).map((char, index) => {
-      if (!/\d/.test(char)) return { type: "separator", char, index };
-      digitPosition -= 1;
-      return { type: "digit", char, digitPosition };
-    });
-  }
-
-  function createRollingDigitColumn() {
-    const column = document.createElement("span");
-    column.className = "cltc-roll-digit-column";
-    column.setAttribute("aria-hidden", "true");
-    column.dataset.cltcTokenType = "digit";
-    const clip = document.createElement("span");
-    clip.className = "cltc-roll-digit-clip";
-    const stack = document.createElement("span");
-    stack.className = "cltc-roll-digit-stack";
-    stack.dataset.animate = "false";
-    "0123456789".split("").forEach((digit) => {
-      const row = document.createElement("span");
-      row.textContent = digit;
-      stack.append(row);
-    });
-    clip.append(stack);
-    column.append(clip);
-    return column;
-  }
-
-  function updateRollingDigitColumn(column, char, shouldAnimate) {
-    const to = Number(char);
-    const toY = `-${to * 16}px`;
-    const stack = column.querySelector(".cltc-roll-digit-stack");
-    if (!stack) return;
-    stack.style.setProperty("--cltc-roll-to", String(to));
-    stack.style.setProperty("--cltc-roll-to-y", toY);
-    stack.dataset.animate = shouldAnimate ? "true" : "false";
-    if (!shouldAnimate) {
-      stack.style.transform = `translateY(${toY})`;
-      stack.style.willChange = "";
-      stack.dataset.animate = "false";
-      return;
-    }
-    stack.style.willChange = "transform";
-    const settle = () => {
-      stack.style.transform = `translateY(${toY})`;
-      stack.style.willChange = "";
-      stack.dataset.animate = "false";
-    };
-    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(settle);
-    else settle();
-  }
-
-  function createRollingSeparator(char) {
-    const separator = document.createElement("span");
-    separator.className = "cltc-roll-separator";
-    separator.setAttribute("aria-hidden", "true");
-    separator.dataset.cltcTokenType = "separator";
-    separator.textContent = char;
-    return separator;
-  }
-
-  function updateRollingValueSlot(slot, key, value) {
-    const cacheKey = normalizeText(key, 80);
-    const text = normalizeText(value, 80);
-    const previous = state.hubValueCache.get(cacheKey);
-    const animate = Boolean(previous && previous !== text);
-    let roll = slot.firstElementChild;
-    const existingRollIsValid = roll
-      && roll.classList?.contains("cltc-roll")
-      && roll.dataset.rollKey === cacheKey;
-    if (previous === text && existingRollIsValid && roll.getAttribute?.("aria-label") === text) return;
-    if (!existingRollIsValid) {
-      roll = document.createElement("span");
-      roll.className = "cltc-roll";
-      roll.dataset.rollKey = cacheKey;
-      slot.replaceChildren(roll);
-    }
-    roll.setAttribute("aria-label", text);
-    const oldDigits = new Map();
-    Array.from(roll.querySelectorAll(".cltc-roll-digit-column")).forEach((column) => {
-      oldDigits.set(column.dataset.cltcDigitPosition || "", column);
-    });
-    const oldSeparators = Array.from(roll.querySelectorAll(".cltc-roll-separator"));
-    let separatorIndex = 0;
-    const nodes = rollingTokens(text).map((token) => {
-      if (token.type === "separator") {
-        const separator = oldSeparators[separatorIndex++] || createRollingSeparator(token.char);
-        separator.textContent = token.char;
-        return separator;
-      }
-      const positionKey = String(token.digitPosition);
-      const column = oldDigits.get(positionKey) || createRollingDigitColumn();
-      const previousChar = previousDigitByPosition(previous, token.digitPosition);
-      column.dataset.cltcDigitPosition = positionKey;
-      updateRollingDigitColumn(column, token.char, animate && previousChar !== token.char);
-      return column;
-    });
-    const currentNodes = Array.from(roll.childNodes || []);
-    const sameNodeOrder = currentNodes.length === nodes.length
-      && currentNodes.every((node, index) => node === nodes[index]);
-    if (!sameNodeOrder) roll.replaceChildren(...nodes);
-    state.hubValueCache.set(cacheKey, text);
-  }
-
-  function cadencedShimmerText(text) {
-    const safe = escapeHtml(text);
-    return `<span class="cltc-cadenced-shimmer">${safe}<span class="cltc-cadenced-shimmer-sweep" aria-hidden="true"><span class="cltc-cadenced-shimmer-highlight">${safe}</span></span></span>`;
-  }
-
-  function cadencedShimmerHtml(html) {
-    return `<span class="cltc-cadenced-shimmer">${html}<span class="cltc-cadenced-shimmer-sweep" aria-hidden="true"><span class="cltc-cadenced-shimmer-highlight">${html}</span></span></span>`;
-  }
-
-  function prefersReducedMotion() {
-    try {
-      return Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
-    } catch {
-      return false;
-    }
-  }
-
-  function applyCadencedShimmerActive(active) {
-    const nodes = state.root?.querySelectorAll?.(".cltc-cadenced-shimmer");
-    if (!nodes) return;
-    const elapsed = active && state.shimmerActiveStartedAt ? Math.max(0, Math.min(Date.now() - state.shimmerActiveStartedAt, SHIMMER_ACTIVE_MS)) : 0;
-    nodes.forEach((node) => {
-      const isActive = node.classList.contains("cltc-cadenced-shimmer-active");
-      if (active) {
-        if (!isActive) {
-          node.style.setProperty("--cltc-shimmer-active-delay", `-${elapsed}ms`);
-          node.classList.add("cltc-cadenced-shimmer-active");
-        }
-      } else if (isActive) {
-        node.style.removeProperty("--cltc-shimmer-active-delay");
-        node.classList.remove("cltc-cadenced-shimmer-active");
-      }
-    });
-  }
-
-  function clearCadencedShimmerTimers(options = {}) {
-    const clearActive = options.clearActive !== false;
-    if (state.shimmerDelayTimer) {
-      window.clearTimeout(state.shimmerDelayTimer);
-      state.shimmerDelayTimer = 0;
-    }
-    if (state.shimmerIntervalTimer) {
-      window.clearInterval(state.shimmerIntervalTimer);
-      state.shimmerIntervalTimer = 0;
-    }
-    if (clearActive && state.shimmerActiveTimer) {
-      window.clearTimeout(state.shimmerActiveTimer);
-      state.shimmerActiveTimer = 0;
-    }
-  }
-
-  function pulseCadencedShimmer() {
-    if (!state.shimmerRunning || prefersReducedMotion()) return;
-    if (state.shimmerActiveTimer) {
-      window.clearTimeout(state.shimmerActiveTimer);
-      state.shimmerActiveTimer = 0;
-    }
-    applyCadencedShimmerActive(false);
-    void state.root?.offsetWidth;
-    state.shimmerActiveStartedAt = Date.now();
-    state.shimmerActiveUntil = Date.now() + SHIMMER_ACTIVE_MS;
-    applyCadencedShimmerActive(true);
-    state.shimmerActiveTimer = window.setTimeout(() => {
-      state.shimmerActiveTimer = 0;
-      state.shimmerActiveStartedAt = 0;
-      state.shimmerActiveUntil = 0;
-      applyCadencedShimmerActive(false);
-    }, SHIMMER_ACTIVE_MS);
-  }
-
-  function stopCadencedShimmer(options = {}) {
-    const finishActive = Boolean(options.finishActive);
-    state.shimmerRunning = false;
-    const remaining = Math.max(0, (state.shimmerActiveUntil || 0) - Date.now());
-    clearCadencedShimmerTimers({ clearActive: !finishActive });
-    if (finishActive && remaining > 0) {
-      applyCadencedShimmerActive(true);
-      if (!state.shimmerActiveTimer) {
-        state.shimmerActiveTimer = window.setTimeout(() => {
-          state.shimmerActiveTimer = 0;
-          state.shimmerActiveStartedAt = 0;
-          state.shimmerActiveUntil = 0;
-          applyCadencedShimmerActive(false);
-        }, remaining);
-      }
-      return;
-    }
-    state.shimmerActiveStartedAt = 0;
-    state.shimmerActiveUntil = 0;
-    applyCadencedShimmerActive(false);
-  }
-
-  function syncCadencedShimmer(running) {
-    if (!running) {
-      if (state.shimmerRunning || state.shimmerActiveUntil) stopCadencedShimmer({ finishActive: true });
-      return;
-    }
-    if (state.shimmerRunning) {
-      applyCadencedShimmerActive(state.shimmerActiveUntil > Date.now());
-      return;
-    }
-    state.shimmerRunning = true;
-    if (prefersReducedMotion()) return;
-    pulseCadencedShimmer();
-    state.shimmerIntervalTimer = window.setInterval(pulseCadencedShimmer, SHIMMER_INTERVAL_MS);
-  }
-
   function valueSlot(key) {
     return `<span class="cltc-value-slot" data-cltc-value-key="${escapeHtml(key)}"></span>`;
-  }
-
-  function textSlot(key) {
-    return `<span class="cltc-text-slot" data-cltc-text-key="${escapeHtml(key)}"></span>`;
   }
 
   function currentFlowSkeleton(showOutputRate = outputRateVisible()) {
@@ -9552,11 +9531,19 @@ const VERSION = "0.8.3";
       : "";
     return `
       <span class="cltc-pill cltc-current-pill"><span class="cltc-current-flow">${currentFlow}</span></span>
-      <span class="cltc-pill">LLM ${valueSlot("session-llm-duration")} · 工具调用 ${valueSlot("session-tool-duration")}</span>
-      <span class="cltc-pill">首 token 平均${valueSlot("session-first-token")}${outputRateMarkup}</span>
-      <span class="cltc-pill">缓存命中 ${valueSlot("session-cache-percent")}</span>
-      <span class="cltc-pill">输入 ${valueSlot("session-input")} tok · 输出 ${valueSlot("session-output")} tok</span>
+      <span class="cltc-pill"><span class="cltc-metric-flow">LLM ${valueSlot("session-llm-duration")} · 工具调用 ${valueSlot("session-tool-duration")}</span></span>
+      <span class="cltc-pill"><span class="cltc-metric-flow">首 token 平均${valueSlot("session-first-token")}${outputRateMarkup}</span></span>
+      <span class="cltc-pill"><span class="cltc-metric-flow">缓存命中 ${valueSlot("session-cache-percent")}</span></span>
+      <span class="cltc-pill"><span class="cltc-metric-flow">输入 ${valueSlot("session-input")} tok · 输出 ${valueSlot("session-output")} tok</span></span>
     `;
+  }
+
+  function cacheHubValueSlots(root) {
+    state.hubValueSlots.clear();
+    root.querySelectorAll?.("[data-cltc-value-key]").forEach((slot) => {
+      const key = slot.dataset.cltcValueKey;
+      if (key) state.hubValueSlots.set(key, slot);
+    });
   }
 
   function ensureHubSkeleton(root, showOutputRate = outputRateVisible()) {
@@ -9570,21 +9557,17 @@ const VERSION = "0.8.3";
     ) return;
     root.innerHTML = hubSkeletonHtml(outputRateEnabled);
     root.dataset.cltcSkeletonVersion = VERSION;
+    cacheHubValueSlots(root);
   }
 
   function updateValueSlot(root, key, value) {
-    root.querySelectorAll?.("[data-cltc-value-key]").forEach((slot) => {
-      if (slot.dataset.cltcValueKey !== key) return;
-      updateRollingValueSlot(slot, key, value);
-    });
-  }
-
-  function updateTextSlot(root, key, value) {
     const text = String(value ?? "");
-    root.querySelectorAll?.("[data-cltc-text-key]").forEach((slot) => {
-      if (slot.dataset.cltcTextKey !== key) return;
-      if (slot.textContent !== text) slot.textContent = text;
-    });
+    let slot = state.hubValueSlots.get(key);
+    if (!slot?.isConnected) {
+      cacheHubValueSlots(root);
+      slot = state.hubValueSlots.get(key);
+    }
+    if (slot && slot.textContent !== text) slot.textContent = text;
   }
 
   function updateHubContent(root, snap) {
@@ -9600,11 +9583,51 @@ const VERSION = "0.8.3";
     updateValueSlot(root, "session-output", fmtCount(performance.output));
   }
 
+  function disconnectSideChatObserver() {
+    state.sideChatObserver?.disconnect?.();
+    state.sideChatObserver = null;
+    state.sideChatObserverRoot = null;
+    state.sideChatObserverMode = "";
+  }
+
+  function mutationTouchesSideChatTurn(mutation) {
+    const selector = '[data-chatgpt-conversation-turn="true"]';
+    const touchesTurn = (node) => {
+      const element = node?.nodeType === 1 ? node : node?.parentElement;
+      return Boolean(
+        element?.matches?.(selector) ||
+        element?.closest?.(selector) ||
+        node?.querySelector?.(selector),
+      );
+    };
+    if (touchesTurn(mutation?.target)) return true;
+    return [...Array.from(mutation?.addedNodes || []), ...Array.from(mutation?.removedNodes || [])].some(touchesTurn);
+  }
+
+  function syncSideChatObserver() {
+    if (window.__CODEX_LIVE_TOKEN_COST_TEST__ || typeof MutationObserver !== "function") return;
+    const root = sideChatRoot(document);
+    if (root) {
+      if (state.sideChatObserverMode === "root" && state.sideChatObserverRoot === root) return;
+      disconnectSideChatObserver();
+      state.sideChatObserver = new MutationObserver((mutations) => {
+        if (!Array.from(mutations).some(mutationTouchesSideChatTurn)) return;
+        scheduleRender(0);
+      });
+      state.sideChatObserverRoot = root;
+      state.sideChatObserverMode = "root";
+      state.sideChatObserver.observe(root, { childList: true, subtree: true, characterData: true });
+      return;
+    }
+    if (state.sideChatObserverMode === "root") disconnectSideChatObserver();
+  }
+
   function render(force = false) {
     if (!force && state.priceEditorOpen && state.settingsOverlay?.contains(document.activeElement) && document.activeElement?.closest?.(".cltc-settings-modal")) {
       return;
     }
     state.lastRenderAt = Date.now();
+    syncSideChatObserver();
     ensureHeaderSettingsButton();
     const root = ensureRoot();
     if (!root) return;
@@ -9613,7 +9636,6 @@ const VERSION = "0.8.3";
     root.dataset.running = String(snap.running);
     ensureHubSkeleton(root, snap.outputRateEnabled);
     updateHubContent(root, snap);
-    syncCadencedShimmer(snap.running);
     syncOutputRateRefresh({ active: snap.running });
     syncHubVisibility(root);
     if (!state.settingsOverlay?.isConnected || !state.priceEditorOpen) renderSettingsOverlay(snap);
@@ -9651,6 +9673,7 @@ const VERSION = "0.8.3";
   }
 
   function handleDocumentPointerDown(event) {
+    rememberSidebarThreadClick(event);
     if (state.priceEditorOpen && !state.root?.contains(event.target) && !state.settingsOverlay?.contains(event.target)) {
       state.priceEditorOpen = false;
       state.analyticsModel = "";
@@ -9672,7 +9695,7 @@ const VERSION = "0.8.3";
         });
       }
       const isCodexApi = isCodexApiUrl(url);
-      if (isCodexApi) {
+      if (isCodexApi && shouldInspectCapturedPayload(init?.body, "fetch-body", { url })) {
         observeSessionInfo(url);
         try {
           inspectLocalPayload(init?.body, "fetch-body");
@@ -9681,8 +9704,10 @@ const VERSION = "0.8.3";
         }
       }
       const response = await originalFetch.call(this, input, init);
-      if (response?.clone && isCodexApi) {
-        response.clone().text().then((text) => inspectLocalPayload(text, "fetch")).catch(() => {});
+      if (response?.clone && shouldCaptureCodexResponse(url)) {
+        response.clone().text().then((text) => {
+          if (shouldInspectCapturedPayload(text, "fetch", { url })) inspectLocalPayload(text, "fetch");
+        }).catch(() => {});
       }
       return response;
     }
@@ -9703,7 +9728,7 @@ const VERSION = "0.8.3";
     Xhr.prototype.send = function send(...args) {
       const url = this.__codexLiveTokenCostUrl || "";
       const isCodexApi = isCodexApiUrl(url);
-      if (isCodexApi) {
+      if (isCodexApi && shouldInspectCapturedPayload(args[0], "xhr-body", { url })) {
         observeSessionInfo(url);
         try {
           inspectLocalPayload(args[0], "xhr-body");
@@ -9711,14 +9736,16 @@ const VERSION = "0.8.3";
           // Keep XHR behavior untouched.
         }
       }
-      this.addEventListener?.("loadend", () => {
-        if (!isCodexApiUrl(this.__codexLiveTokenCostUrl)) return;
-        try {
-          inspectLocalPayload(this.responseText || "", "xhr");
-        } catch {
-          // Ignore unreadable XHR bodies.
-        }
-      });
+      if (isCodexApi) {
+        this.addEventListener?.("loadend", () => {
+          if (!shouldInspectCapturedPayload(this.responseText || "", "xhr", { url: this.__codexLiveTokenCostUrl })) return;
+          try {
+            inspectLocalPayload(this.responseText || "", "xhr");
+          } catch {
+            // Ignore unreadable XHR bodies.
+          }
+        });
+      }
       return originalSend.apply(this, args);
     };
     Xhr.prototype.__codexLiveTokenCostOriginalOpen = originalOpen;
@@ -9731,11 +9758,17 @@ const VERSION = "0.8.3";
     const NativeWebSocket = window.WebSocket.__codexLiveTokenCostOriginal || window.WebSocket;
     function WrappedWebSocket(...args) {
       const socket = new NativeWebSocket(...args);
+      const url = requestUrl(args[0]);
+      socket.__codexLiveTokenCostUrl = url;
+      if (url && !isCodexApiUrl(url) && !isProfileUsageUrl(url) && !isProfilePhotoUrl(url)) return socket;
       socket.addEventListener?.("message", (event) => {
         try {
+          if (!shouldInspectCapturedPayload(event.data, "websocket", { url })) return;
           if (typeof event.data === "string") inspectLocalPayload(event.data, "websocket");
           else if (event.data instanceof Blob && event.data.size <= 512000) {
-            event.data.text().then((text) => inspectLocalPayload(text, "websocket")).catch(() => {});
+            event.data.text().then((text) => {
+              if (shouldInspectCapturedPayload(text, "websocket", { url })) inspectLocalPayload(text, "websocket");
+            }).catch(() => {});
           }
         } catch {
           // Keep socket delivery untouched.
@@ -9761,7 +9794,10 @@ const VERSION = "0.8.3";
     if (state.localMessageHandler) return;
     const previous = window.__codexLiveTokenCostMessageHandler;
     if (typeof previous === "function") window.removeEventListener?.("message", previous, true);
-    const handler = (event) => inspectLocalPayload(event.data, "message");
+    const handler = (event) => {
+      if (!shouldInspectCapturedPayload(event?.data, "message")) return;
+      inspectLocalPayload(event.data, "message");
+    };
     state.localMessageHandler = handler;
     window.__codexLiveTokenCostMessageHandler = handler;
     window.addEventListener?.("message", handler, true);
@@ -9994,6 +10030,7 @@ const VERSION = "0.8.3";
 
   function destroy() {
     state.started = false;
+    flushProfileLedgerWrites();
     stopProfileUiReadinessCoordinator();
     stopSidebarProfileIdentitySync();
     if (state.renderTimer) window.clearTimeout(state.renderTimer);
@@ -10021,6 +10058,7 @@ const VERSION = "0.8.3";
     state.officialModelObserver?.disconnect?.();
     state.officialModelRootObserver?.disconnect?.();
     state.taskRunningObserver?.disconnect?.();
+    disconnectSideChatObserver();
     state.officialModelObserver = null;
     state.officialModelRootObserver = null;
     state.officialModelTrigger = null;
@@ -10079,8 +10117,8 @@ const VERSION = "0.8.3";
     document.removeEventListener("pointerdown", handleDocumentPointerDown, true);
     for (const sessionKey of Array.from(state.localTurnTimers.keys())) clearLocalTurnTimer(sessionKey);
     clearLocalTurnTimer();
-    stopCadencedShimmer();
     state.root?.remove();
+    state.hubValueSlots.clear();
     state.settingsButton?.remove?.();
     state.settingsOverlay?.remove?.();
     state.settingsOverlay = null;
@@ -10169,8 +10207,6 @@ const VERSION = "0.8.3";
       fmtCount,
       fmtMoney,
       fmtPercent,
-      rollComparableValue,
-      rollTrend,
       parseModelEffortText,
       officialModelInfoFromText,
       officialModelTriggerInfo,
@@ -10193,6 +10229,11 @@ const VERSION = "0.8.3";
       readTokenUsage,
       liveSnapshot,
       locationSessionKey,
+      sideChatRoot,
+      sideChatDomTurns,
+      sideChatDisplayTurns,
+      sideChatStreamInfo,
+      observeSideChatStreamPayload,
       activeSidebarThreadKey,
       extractSessionKeyFromUrl,
       extractSessionInfo,
@@ -10243,7 +10284,6 @@ const VERSION = "0.8.3";
       cancelOutputRateRefresh,
       currentFlowSkeleton,
       hubSkeletonHtml,
-      updateRollingValueSlot,
       updateValueSlot,
       rememberLocalUsage,
       persistLocalCurrentTurn,

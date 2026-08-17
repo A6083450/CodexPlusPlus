@@ -16,10 +16,6 @@ use serde_json::{Value, json};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::token_cost::{
-    SnapshotCoalescer, SnapshotOffer, TokenCostPushReceiver, assets as token_cost_assets,
-};
-
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -325,23 +321,6 @@ pub async fn install_bridge(
     handler: BridgeHandler,
     new_document_scripts: &[String],
 ) -> anyhow::Result<()> {
-    install_bridge_with_pushes(
-        websocket_url,
-        binding_name,
-        handler,
-        new_document_scripts,
-        None,
-    )
-    .await
-}
-
-pub async fn install_bridge_with_pushes(
-    websocket_url: &str,
-    binding_name: &str,
-    handler: BridgeHandler,
-    new_document_scripts: &[String],
-    pushes: Option<TokenCostPushReceiver>,
-) -> anyhow::Result<()> {
     let pump_key = format!("{websocket_url}\n{binding_name}");
     let replacing_active_pump = {
         let mut pumps = bridge_message_pumps().lock().await;
@@ -406,17 +385,6 @@ pub async fn install_bridge_with_pushes(
     session.drain_binding_queue().await?;
     let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let (mut snapshots, mut lazy, metrics, active_instance) = match pushes {
-            Some(pushes) => (
-                Some(pushes.snapshots),
-                Some(pushes.lazy),
-                Some(pushes.metrics),
-                Some(pushes.active_instance),
-            ),
-            None => (None, None, None, None),
-        };
-        let mut coalescer = SnapshotCoalescer::default();
-        let mut snapshot_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         {
             let pump = async {
                 loop {
@@ -428,199 +396,6 @@ pub async fn install_bridge_with_pushes(
                             match message {
                                 Ok(Some(_)) => {}
                                 Ok(None) | Err(_) => break,
-                            }
-                        }
-                        changed = async {
-                            match snapshots.as_mut() {
-                                Some(receiver) => receiver.changed().await,
-                                None => std::future::pending().await,
-                            }
-                        }, if snapshots.is_some() => {
-                            match changed {
-                                Ok(()) => {
-                                    let push = snapshots
-                                        .as_mut()
-                                        .and_then(|receiver| receiver.borrow_and_update().clone());
-                                    let Some(push) = push else {
-                                        coalescer.clear();
-                                        snapshot_sleep = None;
-                                        continue;
-                                    };
-                                    let is_active = active_instance.as_ref().is_some_and(|active| {
-                                        let instance_id = snapshot_instance_id(&push);
-                                        active.matches(instance_id)
-                                    });
-                                    if !is_active {
-                                        continue;
-                                    }
-                                    match coalescer.offer(std::time::Instant::now(), push) {
-                                        SnapshotOffer::SendNow(push) => {
-                                            snapshot_sleep = None;
-                                            let instance_id = snapshot_instance_id(&push);
-                                            if !active_instance
-                                                .as_ref()
-                                                .is_some_and(|active| active.matches(instance_id))
-                                            {
-                                                continue;
-                                            }
-                                            let expression = match token_cost_assets::snapshot_expression(&push) {
-                                                Ok(expression) => expression,
-                                                Err(error) => {
-                                                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                                                        "token_cost.snapshot_push_rejected",
-                                                        json!({ "message": error.to_string() }),
-                                                    );
-                                                    continue;
-                                                }
-                                            };
-                                            if session
-                                                .send_command_without_wait(
-                                                    next_message_id(),
-                                                    "Runtime.evaluate",
-                                                    runtime_evaluate_params(&expression),
-                                                )
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
-                                            }
-                                            if let Some(metrics) = &metrics {
-                                                metrics.increment_snapshots_sent();
-                                            }
-                                        }
-                                        SnapshotOffer::ArmAt(deadline) => {
-                                            snapshot_sleep = Some(Box::pin(tokio::time::sleep_until(
-                                                tokio::time::Instant::from_std(deadline),
-                                            )));
-                                        }
-                                        SnapshotOffer::ReplacedPending => {}
-                                    }
-                                }
-                                Err(_) => {
-                                    snapshots = None;
-                                    coalescer.clear();
-                                    snapshot_sleep = None;
-                                }
-                            }
-                        }
-                        command = async {
-                            match lazy.as_mut() {
-                                Some(receiver) => receiver.recv().await,
-                                None => std::future::pending().await,
-                            }
-                        }, if lazy.is_some() => {
-                            match command {
-                                Ok(command) => {
-                                    if !active_instance
-                                        .as_ref()
-                                        .is_some_and(|active| active.matches(&command.instance_id))
-                                    {
-                                        continue;
-                                    }
-                                    let expression = match token_cost_assets::lazy_asset_expression(&command)
-                                        .and_then(|expression| {
-                                            token_cost_assets::validate_lazy_expression(&expression)?;
-                                            Ok(expression)
-                                        })
-                                    {
-                                        Ok(expression) => expression,
-                                        Err(_) => continue,
-                                    };
-                                    if !active_instance
-                                        .as_ref()
-                                        .is_some_and(|active| active.matches(&command.instance_id))
-                                    {
-                                        continue;
-                                    }
-                                    if session
-                                        .send_command_without_wait(
-                                            next_message_id(),
-                                            "Runtime.evaluate",
-                                            runtime_evaluate_params(&expression),
-                                        )
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    if let Some(metrics) = &metrics {
-                                        metrics.increment_lazy_commands_sent();
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    let lagged = lazy.as_mut().and_then(|receiver| receiver.try_recv().ok());
-                                    if let Some(receiver) = lazy.as_mut() {
-                                        *receiver = receiver.resubscribe();
-                                    }
-                                    let Some(command) = lagged else {
-                                        continue;
-                                    };
-                                    if !active_instance
-                                        .as_ref()
-                                        .is_some_and(|active| active.matches(&command.instance_id))
-                                    {
-                                        continue;
-                                    }
-                                    let Ok(expression) = token_cost_assets::lazy_lag_expression(&command) else {
-                                        continue;
-                                    };
-                                    if session
-                                        .send_command_without_wait(
-                                            next_message_id(),
-                                            "Runtime.evaluate",
-                                            runtime_evaluate_params(&expression),
-                                        )
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    lazy = None;
-                                }
-                            }
-                        }
-                        _ = async {
-                            match snapshot_sleep.as_mut() {
-                                Some(sleep) => sleep.as_mut().await,
-                                None => std::future::pending().await,
-                            }
-                        }, if snapshot_sleep.is_some() => {
-                            snapshot_sleep = None;
-                            let Some(push) = coalescer.take_due(std::time::Instant::now()) else {
-                                continue;
-                            };
-                            let instance_id = snapshot_instance_id(&push);
-                            if !active_instance
-                                .as_ref()
-                                .is_some_and(|active| active.matches(instance_id))
-                            {
-                                continue;
-                            }
-                            let expression = match token_cost_assets::snapshot_expression(&push) {
-                                Ok(expression) => expression,
-                                Err(error) => {
-                                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                                        "token_cost.snapshot_push_rejected",
-                                        json!({ "message": error.to_string() }),
-                                    );
-                                    continue;
-                                }
-                            };
-                            if session
-                                .send_command_without_wait(
-                                    next_message_id(),
-                                    "Runtime.evaluate",
-                                    runtime_evaluate_params(&expression),
-                                )
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            if let Some(metrics) = &metrics {
-                                metrics.increment_snapshots_sent();
                             }
                         }
                     }
@@ -644,12 +419,6 @@ pub async fn install_bridge_with_pushes(
     }
 
     Ok(())
-}
-
-fn snapshot_instance_id(push: &crate::token_cost::SnapshotPush) -> &str {
-    match push {
-        crate::token_cost::SnapshotPush::Snapshot { instance_id, .. } => instance_id,
-    }
 }
 
 pub fn runtime_evaluate_params(script: &str) -> Value {
@@ -858,25 +627,6 @@ where
                     return Ok(());
                 }
             };
-            let path = parsed
-                .value
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if path.starts_with("/token-cost/") && parsed.has_duplicate_key {
-                if let Some(request_id) = parsed.value.get("id").and_then(Value::as_str) {
-                    self.resolve_bridge_request(
-                        request_id,
-                        &json!({
-                            "status": "failed",
-                            "category": "invalid_request",
-                            "message": "invalid token cost request",
-                        }),
-                    )
-                    .await?;
-                }
-                return Ok(());
-            }
             self.route_parsed_binding_call(&handler, parsed.value).await
         })
     }

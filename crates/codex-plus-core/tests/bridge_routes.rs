@@ -14,7 +14,6 @@ use codex_plus_core::routes::{
 };
 use codex_plus_core::settings::BackendSettings;
 use codex_plus_core::status::StatusStore;
-use codex_plus_core::token_cost::{MAX_RENDERER_EVENT_BYTES, TokenCostService};
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 
@@ -37,22 +36,6 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/manager/open", json!({})),
         ("/manager/open-transient", json!({})),
         ("/backend/status", json!({})),
-        (
-            "/token-cost/bootstrap",
-            json!({"instance_id": "route-page"}),
-        ),
-        (
-            "/token-cost/event",
-            json!({"instance_id": "route-page", "event": renderer_turn_started()}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "query_diagnostics", "instance_id": "route-page"}}),
-        ),
-        (
-            "/token-cost/lazy-asset",
-            json!({"instance_id": "route-page", "asset": "settings"}),
-        ),
         ("/codex-model-catalog", json!({})),
         ("/codex-config-model", json!({})),
         (
@@ -134,1015 +117,6 @@ async fn bridge_routes_cover_all_current_paths() {
             "{path} should be routed"
         );
     }
-}
-
-#[tokio::test]
-async fn token_cost_routes_expose_bootstrap_event_action_and_lazy_asset() {
-    let service = TokenCostService::in_memory();
-    let _pushes = service.subscribe();
-    let ctx = test_context().with_token_cost(Arc::clone(&service));
-    let status_before = handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await;
-
-    let bootstrap = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-1"}),
-    )
-    .await;
-    assert_eq!(bootstrap["status"], "ok");
-    assert_eq!(bootstrap["instance_id"], "page-1");
-    assert_eq!(bootstrap["config"]["schema_version"], 1);
-    assert_eq!(bootstrap["snapshot"]["revision"], 0);
-    assert!(service.capture_enabled());
-
-    let event = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/event",
-        json!({"instance_id": "page-1", "event": renderer_turn_started()}),
-    )
-    .await;
-    assert_eq!(event["status"], "ok");
-    assert_eq!(event["outcome"]["type"], "applied");
-    assert_eq!(event["outcome"]["revision"], 1);
-
-    let action = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/action",
-        json!({"action": {"type": "query_diagnostics", "instance_id": "page-1"}}),
-    )
-    .await;
-    assert_eq!(action["status"], "ok");
-    assert_eq!(action["response"]["type"], "diagnostics");
-    assert_eq!(action["response"]["diagnostics"]["events_ingested"], 1);
-
-    let lazy = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/lazy-asset",
-        json!({"instance_id": "page-1", "asset": "settings"}),
-    )
-    .await;
-    assert_eq!(lazy, json!({"status": "ok"}));
-
-    let status_after = handle_bridge_request(ctx, "/backend/status", json!({})).await;
-    assert_eq!(status_after, status_before);
-}
-
-#[tokio::test]
-async fn token_cost_routes_reject_non_strict_wrappers_without_echoing_payloads() {
-    let service = TokenCostService::in_memory();
-    let _pushes = service.subscribe();
-    let ctx = test_context().with_token_cost(service);
-    let sentinel = "secret-token-cost-payload-sentinel";
-
-    let cases = [
-        (
-            "/token-cost/bootstrap",
-            json!({"instance_id": "page", "unexpected": sentinel}),
-        ),
-        (
-            "/token-cost/event",
-            json!({"instance_id": "page", "event": renderer_turn_started(), "unexpected": sentinel}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "query_diagnostics", "instance_id": "page"}, "unexpected": sentinel}),
-        ),
-        (
-            "/token-cost/lazy-asset",
-            json!({"instance_id": "page", "asset": "settings", "unexpected": sentinel}),
-        ),
-        ("/token-cost/bootstrap", json!({"instance_id": 7})),
-        (
-            "/token-cost/event",
-            json!({"instance_id": 7, "event": renderer_turn_started()}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "query_diagnostics", "instance_id": 7}}),
-        ),
-        (
-            "/token-cost/lazy-asset",
-            json!({"instance_id": 7, "asset": "settings"}),
-        ),
-        ("/token-cost/bootstrap", json!({})),
-        (
-            "/token-cost/event",
-            json!({"event": renderer_turn_started()}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "query_diagnostics"}}),
-        ),
-        ("/token-cost/lazy-asset", json!({"asset": "settings"})),
-    ];
-
-    for (path, payload) in cases {
-        let response = handle_bridge_request(ctx.clone(), path, payload).await;
-        assert_eq!(response["status"], "failed", "{path}: {response}");
-        assert_eq!(
-            response["category"], "invalid_request",
-            "{path}: {response}"
-        );
-        assert!(
-            !response.to_string().contains(sentinel),
-            "{path}: {response}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn token_cost_routes_enforce_page_instance_id_boundaries() {
-    let service = TokenCostService::in_memory();
-    let _pushes = service.subscribe();
-    let ctx = test_context().with_token_cost(service);
-
-    for invalid_id in [String::new(), "x".repeat(129)] {
-        let cases = [
-            ("/token-cost/bootstrap", json!({"instance_id": invalid_id})),
-            (
-                "/token-cost/event",
-                json!({"instance_id": invalid_id, "event": renderer_turn_started()}),
-            ),
-            (
-                "/token-cost/action",
-                json!({"action": {"type": "query_diagnostics", "instance_id": invalid_id}}),
-            ),
-            (
-                "/token-cost/lazy-asset",
-                json!({"instance_id": invalid_id, "asset": "settings"}),
-            ),
-        ];
-        for (path, payload) in cases {
-            let response = handle_bridge_request(ctx.clone(), path, payload).await;
-            assert_eq!(response["status"], "failed", "{path}: {response}");
-            assert_eq!(
-                response["category"], "invalid_instance",
-                "{path}: {response}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn token_cost_event_route_checks_raw_size_and_renderer_source_before_ingest() {
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(Arc::clone(&service));
-    assert_eq!(
-        handle_bridge_request(
-            ctx.clone(),
-            "/token-cost/bootstrap",
-            json!({"instance_id": "page-size"}),
-        )
-        .await["status"],
-        "ok"
-    );
-
-    let exact = serialized_renderer_event_of_size(MAX_RENDERER_EVENT_BYTES, "");
-    let exact_response = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/event",
-        json!({"instance_id": "page-size", "event": exact}),
-    )
-    .await;
-    assert_eq!(exact_response["status"], "failed");
-    assert_eq!(exact_response["category"], "invalid_request");
-
-    let sentinel = "oversized-secret-marker";
-    let over = serialized_renderer_event_of_size(MAX_RENDERER_EVENT_BYTES + 1, sentinel);
-    let over_response = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/event",
-        json!({"instance_id": "page-size", "event": over}),
-    )
-    .await;
-    assert_eq!(over_response["status"], "failed");
-    assert_eq!(over_response["category"], "payload_too_large");
-    assert!(!over_response.to_string().contains(sentinel));
-
-    let mut protocol = renderer_turn_started();
-    protocol["meta"]["source"] = json!("protocol_proxy");
-    let protocol_response = handle_bridge_request(
-        ctx,
-        "/token-cost/event",
-        json!({"instance_id": "page-size", "event": protocol}),
-    )
-    .await;
-    assert_eq!(protocol_response["status"], "failed");
-    assert_eq!(protocol_response["category"], "invalid_event");
-}
-
-#[tokio::test]
-async fn token_cost_replacement_and_dispose_reject_every_stale_operation() {
-    let service = TokenCostService::in_memory();
-    let _pushes = service.subscribe();
-    let ctx = test_context().with_token_cost(Arc::clone(&service));
-    for instance_id in ["page-old", "page-current"] {
-        assert_eq!(
-            handle_bridge_request(
-                ctx.clone(),
-                "/token-cost/bootstrap",
-                json!({"instance_id": instance_id}),
-            )
-            .await["status"],
-            "ok"
-        );
-    }
-    assert!(service.capture_enabled());
-
-    let stale_cases = [
-        (
-            "/token-cost/event",
-            json!({"instance_id": "page-old", "event": renderer_turn_started()}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "set_visibility", "instance_id": "page-old", "hub_visible": false, "output_rate_visible": false, "profile_visible": false}}),
-        ),
-        (
-            "/token-cost/lazy-asset",
-            json!({"instance_id": "page-old", "asset": "settings"}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "dispose_instance", "instance_id": "page-old"}}),
-        ),
-    ];
-    for (path, payload) in stale_cases {
-        let response = handle_bridge_request(ctx.clone(), path, payload).await;
-        assert_eq!(response["status"], "failed", "{path}: {response}");
-        assert_eq!(response["category"], "stale_instance", "{path}: {response}");
-    }
-    assert!(service.capture_enabled());
-
-    let disposed = handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/action",
-        json!({"action": {"type": "dispose_instance", "instance_id": "page-current"}}),
-    )
-    .await;
-    assert_eq!(disposed["status"], "ok");
-    assert_eq!(disposed["response"]["type"], "disposed");
-    assert!(!service.capture_enabled());
-
-    for (path, payload) in [
-        (
-            "/token-cost/event",
-            json!({"instance_id": "page-current", "event": renderer_turn_started()}),
-        ),
-        (
-            "/token-cost/action",
-            json!({"action": {"type": "query_diagnostics", "instance_id": "page-current"}}),
-        ),
-        (
-            "/token-cost/lazy-asset",
-            json!({"instance_id": "page-current", "asset": "settings"}),
-        ),
-    ] {
-        let response = handle_bridge_request(ctx.clone(), path, payload).await;
-        assert_eq!(response["category"], "stale_instance", "{path}: {response}");
-    }
-}
-
-#[tokio::test]
-async fn token_cost_mutating_actions_validate_and_only_advance_changed_config() {
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(service);
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-actions"}),
-    )
-    .await;
-
-    let visibility = json!({"action": {
-        "type": "set_visibility",
-        "instance_id": "page-actions",
-        "hub_visible": false,
-        "output_rate_visible": false,
-        "profile_visible": false
-    }});
-    let first = handle_bridge_request(ctx.clone(), "/token-cost/action", visibility.clone()).await;
-    assert_eq!(first["status"], "ok");
-    assert_eq!(first["response"]["config"]["hub_visible"], false);
-    assert_eq!(first["response"]["snapshot"]["hub_visible"], false);
-    let revision = first["response"]["snapshot"]["revision"].as_u64().unwrap();
-    let repeated = handle_bridge_request(ctx.clone(), "/token-cost/action", visibility).await;
-    assert_eq!(repeated["response"]["snapshot"]["revision"], revision);
-
-    let price = json!({
-        "input_nanos_per_million": 10,
-        "cached_input_nanos_per_million": 5,
-        "cache_write_nanos_per_million": null,
-        "output_nanos_per_million": 20
-    });
-    for action in [
-        json!({"type": "save_price", "instance_id": "page-actions", "model": "gpt-test", "price": price}),
-        json!({"type": "reset_price", "instance_id": "page-actions", "model": "gpt-test"}),
-        json!({"type": "save_price", "instance_id": "page-actions", "model": "gpt-test", "price": price}),
-        json!({"type": "delete_price", "instance_id": "page-actions", "model": "gpt-test"}),
-        json!({"type": "save_profile", "instance_id": "page-actions", "profile": {
-            "display_name": "Native Profile",
-            "username": "native-profile",
-            "email": "native@example.com",
-            "plan_type": "pro_20x",
-            "plan_label": "Pro 20x",
-            "workspace_name": "Local",
-            "avatar_data_url": null
-        }}),
-    ] {
-        let response =
-            handle_bridge_request(ctx.clone(), "/token-cost/action", json!({"action": action}))
-                .await;
-        assert_eq!(response["status"], "ok", "{response}");
-        assert_eq!(response["response"]["type"], "updated", "{response}");
-    }
-
-    let analytics = handle_bridge_request(
-        ctx,
-        "/token-cost/action",
-        json!({"action": {"type": "query_analytics", "instance_id": "page-actions", "range": {"type": "today"}, "model": null}}),
-    )
-    .await;
-    assert_eq!(analytics["status"], "ok", "{analytics}");
-    assert_eq!(analytics["response"]["type"], "analytics");
-    assert!(analytics["response"]["analytics"]["days"].is_array());
-    assert!(analytics["response"]["analytics"]["models"].is_array());
-}
-
-#[tokio::test]
-async fn token_cost_analytics_queries_real_bounded_turn_rollups() {
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(service);
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-analytics"}),
-    )
-    .await;
-
-    ingest_analytics_turn(
-        &ctx,
-        "page-analytics",
-        "turn-a",
-        "model-a",
-        1_704_067_200_000,
-        100,
-        300,
-        (10, 2, 3, 4),
-    )
-    .await;
-    ingest_analytics_turn(
-        &ctx,
-        "page-analytics",
-        "turn-b",
-        "model-b",
-        1_704_153_600_000,
-        50,
-        200,
-        (20, 3, 5, 8),
-    )
-    .await;
-    let today_start = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-        / 86_400_000)
-        * 86_400_000;
-    ingest_analytics_turn(
-        &ctx,
-        "page-analytics",
-        "turn-today",
-        "model-today",
-        today_start,
-        25,
-        10,
-        (3, 1, 1, 2),
-    )
-    .await;
-
-    let custom = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-01-01", "to_day": "2024-01-02"}),
-        None,
-    )
-    .await;
-    let custom = &custom["response"]["analytics"];
-    assert_eq!(custom["totals"]["turns"], 2);
-    assert_eq!(custom["totals"]["input"], 30);
-    assert_eq!(custom["totals"]["cached_input"], 5);
-    assert_eq!(custom["totals"]["cache_write"], 8);
-    assert_eq!(custom["totals"]["output"], 12);
-    assert_eq!(custom["totals"]["first_token_total_ms"], 150);
-    assert_eq!(custom["totals"]["first_token_samples"], 2);
-    assert_eq!(custom["totals"]["generation_ms"], 500);
-    assert_eq!(custom["totals"]["generation_output_tokens"], 12);
-    assert_eq!(custom["days"].as_array().unwrap().len(), 2);
-    assert_eq!(custom["days"][0]["day"], "2024-01-01");
-    assert_eq!(custom["days"][1]["day"], "2024-01-02");
-    assert_eq!(custom["models"].as_array().unwrap().len(), 2);
-
-    let filtered = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-01-01", "to_day": "2024-01-02"}),
-        Some("model-a"),
-    )
-    .await;
-    let filtered = &filtered["response"]["analytics"];
-    assert_eq!(filtered["totals"]["turns"], 1);
-    assert_eq!(filtered["totals"]["cache_write"], 3);
-    assert_eq!(filtered["totals"]["generation_ms"], 300);
-    assert_eq!(filtered["days"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["models"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["models"][0]["model"], "model-a");
-
-    let today = token_cost_analytics_action(&ctx, json!({"type": "today"}), None).await;
-    let today = &today["response"]["analytics"];
-    assert_eq!(today["totals"]["turns"], 1);
-    assert_eq!(today["totals"]["input"], 3);
-    assert_eq!(today["totals"]["cache_write"], 1);
-    assert_eq!(today["totals"]["generation_ms"], 10);
-}
-
-#[tokio::test]
-async fn token_cost_analytics_totals_and_days_survive_recent_turn_eviction() {
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(service);
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-analytics"}),
-    )
-    .await;
-
-    for index in 0..257_u64 {
-        let (day_start, day_index) = if index == 0 {
-            (1_704_067_200_000, 0)
-        } else {
-            (1_704_153_600_000, index - 1)
-        };
-        let turn_id = format!("evicted-turn-{index}");
-        let started = handle_bridge_request(
-            ctx.clone(),
-            "/token-cost/event",
-            json!({
-                "instance_id": "page-analytics",
-                "event": {
-                    "type": "turn_started",
-                    "meta": renderer_meta(
-                        &turn_id,
-                        &format!("{turn_id}-start"),
-                        &format!("correlation-{turn_id}"),
-                        day_start + day_index,
-                    ),
-                    "model": "model-eviction",
-                    "fast": false
-                }
-            }),
-        )
-        .await;
-        assert_eq!(started["status"], "ok", "index {index}: {started}");
-        let response = handle_bridge_request(
-            ctx.clone(),
-            "/token-cost/event",
-            json!({
-                "instance_id": "page-analytics",
-                "event": {
-                    "type": "turn_completed",
-                    "meta": renderer_meta(
-                        &turn_id,
-                        &format!("{turn_id}-complete"),
-                        &format!("correlation-{turn_id}"),
-                        day_start + day_index,
-                    ),
-                    "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
-                }
-            }),
-        )
-        .await;
-        assert_eq!(response["status"], "ok", "index {index}: {response}");
-    }
-
-    let analytics = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-01-01", "to_day": "2024-01-02"}),
-        None,
-    )
-    .await;
-    let analytics = &analytics["response"]["analytics"];
-    assert_eq!(analytics["totals"]["turns"], 257);
-    assert_eq!(analytics["totals"]["input"], 257);
-    assert_eq!(analytics["days"].as_array().unwrap().len(), 2);
-    assert_eq!(analytics["days"][0]["day"], "2024-01-01");
-    assert_eq!(analytics["days"][0]["totals"]["turns"], 1);
-    assert_eq!(analytics["days"][1]["day"], "2024-01-02");
-    assert_eq!(analytics["days"][1]["totals"]["turns"], 256);
-    assert_eq!(analytics["models"].as_array().unwrap().len(), 1);
-    assert_eq!(analytics["models"][0]["model"], "model-eviction");
-    assert_eq!(analytics["models"][0]["totals"]["turns"], 257);
-
-    let filtered = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-01-01", "to_day": "2024-01-02"}),
-        Some("model-eviction"),
-    )
-    .await;
-    let filtered = &filtered["response"]["analytics"];
-    assert_eq!(filtered["totals"]["turns"], 257);
-    assert_eq!(filtered["totals"]["input"], 257);
-    assert_eq!(filtered["days"].as_array().unwrap().len(), 2);
-    assert_eq!(filtered["days"][0]["totals"]["turns"], 1);
-    assert_eq!(filtered["days"][1]["totals"]["turns"], 256);
-}
-
-#[tokio::test]
-async fn token_cost_analytics_model_slots_age_with_the_retained_day_horizon() {
-    const DAY_MS: u64 = 86_400_000;
-    const FIRST_DAY_MS: u64 = 1_704_067_200_000;
-
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(service);
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-analytics"}),
-    )
-    .await;
-
-    for model_index in 0..20 {
-        ingest_analytics_turn(
-            &ctx,
-            "page-analytics",
-            &format!("day-0-model-{model_index}"),
-            &format!("model-{model_index}"),
-            FIRST_DAY_MS + model_index,
-            1,
-            1,
-            (1, 0, 0, 1),
-        )
-        .await;
-    }
-    for day in 1..=30 {
-        ingest_analytics_turn(
-            &ctx,
-            "page-analytics",
-            &format!("retained-model-day-{day}"),
-            "model-0",
-            FIRST_DAY_MS + day * DAY_MS,
-            1,
-            1,
-            (1, 0, 0, 1),
-        )
-        .await;
-    }
-    ingest_analytics_turn(
-        &ctx,
-        "page-analytics",
-        "new-model-day-31",
-        "model-new",
-        FIRST_DAY_MS + 31 * DAY_MS,
-        1,
-        1,
-        (1, 0, 0, 1),
-    )
-    .await;
-
-    let unfiltered = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-02-01", "to_day": "2024-02-01"}),
-        None,
-    )
-    .await;
-    let unfiltered = &unfiltered["response"]["analytics"];
-    assert_eq!(unfiltered["totals"]["turns"], 1);
-    assert_eq!(unfiltered["days"][0]["totals"]["turns"], 1);
-    assert_eq!(unfiltered["models"].as_array().unwrap().len(), 1);
-    assert_eq!(unfiltered["models"][0]["model"], "model-new");
-    assert_eq!(unfiltered["models"][0]["totals"]["turns"], 1);
-
-    let filtered = token_cost_analytics_action(
-        &ctx,
-        json!({"type": "custom", "from_day": "2024-02-01", "to_day": "2024-02-01"}),
-        Some("model-new"),
-    )
-    .await;
-    let filtered = &filtered["response"]["analytics"];
-    assert_eq!(filtered["totals"]["turns"], 1);
-    assert_eq!(filtered["days"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["days"][0]["totals"]["turns"], 1);
-    assert_eq!(filtered["models"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["models"][0]["model"], "model-new");
-}
-
-async fn ingest_analytics_turn(
-    ctx: &BridgeContext,
-    instance_id: &str,
-    turn_id: &str,
-    model: &str,
-    started_at_ms: u64,
-    first_token_ms: u64,
-    generation_ms: u64,
-    usage: (u64, u64, u64, u64),
-) {
-    let correlation_id = format!("correlation-{turn_id}");
-    let events = [
-        json!({
-            "type": "turn_started",
-            "meta": renderer_meta(turn_id, &format!("{turn_id}-start"), &correlation_id, started_at_ms),
-            "model": model,
-            "fast": false
-        }),
-        json!({
-            "type": "output_delta",
-            "meta": renderer_meta(turn_id, &format!("{turn_id}-delta-1"), &correlation_id, started_at_ms + first_token_ms),
-            "estimated_output_tokens": 1
-        }),
-        json!({
-            "type": "output_delta",
-            "meta": renderer_meta(turn_id, &format!("{turn_id}-delta-2"), &correlation_id, started_at_ms + first_token_ms + generation_ms),
-            "estimated_output_tokens": usage.3
-        }),
-        json!({
-            "type": "usage",
-            "meta": renderer_meta(turn_id, &format!("{turn_id}-usage"), &correlation_id, started_at_ms + first_token_ms + generation_ms + 1),
-            "usage": {"input": usage.0, "cached_input": usage.1, "cache_write": usage.2, "output": usage.3},
-            "exact": true
-        }),
-        json!({
-            "type": "turn_completed",
-            "meta": renderer_meta(turn_id, &format!("{turn_id}-complete"), &correlation_id, started_at_ms + first_token_ms + generation_ms + 2),
-            "usage": null
-        }),
-    ];
-    for event in events {
-        let response = handle_bridge_request(
-            ctx.clone(),
-            "/token-cost/event",
-            json!({"instance_id": instance_id, "event": event}),
-        )
-        .await;
-        assert_eq!(response["status"], "ok", "{response}");
-    }
-}
-
-fn renderer_meta(
-    turn_id: &str,
-    event_id: &str,
-    correlation_id: &str,
-    occurred_at_ms: u64,
-) -> Value {
-    json!({
-        "source": "renderer",
-        "session_id": "analytics-session",
-        "turn_id": turn_id,
-        "event_id": event_id,
-        "correlation_id": correlation_id,
-        "occurred_at_ms": occurred_at_ms
-    })
-}
-
-async fn token_cost_analytics_action(
-    ctx: &BridgeContext,
-    range: Value,
-    model: Option<&str>,
-) -> Value {
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/action",
-        json!({"action": {
-            "type": "query_analytics",
-            "instance_id": "page-analytics",
-            "range": range,
-            "model": model
-        }}),
-    )
-    .await
-}
-
-#[tokio::test]
-async fn token_cost_cc_switch_sync_is_single_bounded_and_resets_its_guard() {
-    use std::time::Duration;
-
-    let Some(listener) = bind_cc_switch_listener().await else {
-        eprintln!("skipping fixed-port CC Switch test because 127.0.0.1:17888 is occupied");
-        return;
-    };
-    let service = TokenCostService::in_memory();
-    let ctx = test_context().with_token_cost(service);
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/bootstrap",
-        json!({"instance_id": "page-sync"}),
-    )
-    .await;
-
-    let success_body = serde_json::to_vec(&json!({
-        "ok": true,
-        "turns": [
-            {
-                "turn_id": "cc-turn-1",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 86_400_000,
-                "usage": {
-                    "input": 10,
-                    "cached_input": 2,
-                    "cache_write": 1,
-                    "output": 4
-                }
-            },
-            {
-                "turn_id": "cc-turn-2",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 86_400_001,
-                "usage": {
-                    "input": 20,
-                    "cached_input": 3,
-                    "cache_write": 2,
-                    "output": 6
-                }
-            }
-        ]
-    }))
-    .unwrap();
-    let success_server =
-        serve_cc_switch_response(listener, success_body.clone(), Duration::ZERO, None);
-    let synced = token_cost_sync_action(&ctx).await;
-    assert_eq!(synced["status"], "ok", "{synced}");
-    assert_eq!(synced["response"]["type"], "synced");
-    assert_eq!(synced["response"]["imported_turns"], 2);
-    assert_eq!(synced["response"]["analytics"]["totals"]["input"], 30);
-    assert_eq!(success_server.await.unwrap(), 1);
-
-    let reordered_update = serde_json::to_vec(&json!({
-        "ok": true,
-        "turns": [
-            {
-                "turn_id": "cc-turn-2",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 86_400_001,
-                "usage": {
-                    "input": 25,
-                    "cached_input": 4,
-                    "cache_write": 3,
-                    "output": 7
-                }
-            },
-            {
-                "turn_id": "cc-turn-1",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 86_400_000,
-                "usage": {
-                    "input": 10,
-                    "cached_input": 2,
-                    "cache_write": 1,
-                    "output": 4
-                }
-            }
-        ]
-    }))
-    .unwrap();
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let reordered_server =
-        serve_cc_switch_response(listener, reordered_update, Duration::ZERO, None);
-    let reordered = token_cost_sync_action(&ctx).await;
-    assert_eq!(reordered["status"], "ok", "{reordered}");
-    assert_eq!(reordered["response"]["imported_turns"], 0);
-    assert_eq!(
-        reordered["response"]["analytics"]["totals"]["input"], 35,
-        "a reordered exact update must replace the old turn usage"
-    );
-    assert_eq!(reordered["response"]["analytics"]["totals"]["output"], 11);
-    assert_eq!(reordered_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let invalid_server =
-        serve_cc_switch_response(listener, b"{not-json".to_vec(), Duration::ZERO, None);
-    let invalid = token_cost_sync_action(&ctx).await;
-    assert_eq!(invalid["category"], "cc_switch_error", "{invalid}");
-    assert_eq!(invalid_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let reset_server =
-        serve_cc_switch_response(listener, success_body.clone(), Duration::ZERO, None);
-    assert_eq!(token_cost_sync_action(&ctx).await["status"], "ok");
-    assert_eq!(reset_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let oversized_server =
-        serve_cc_switch_response(listener, vec![b'x'; 1024 * 1024 + 1], Duration::ZERO, None);
-    let oversized = token_cost_sync_action(&ctx).await;
-    assert_eq!(oversized["category"], "cc_switch_error", "{oversized}");
-    assert_eq!(oversized_server.await.unwrap(), 1);
-
-    for invalid_body in [
-        serde_json::to_vec(&json!({"ok": false, "turns": []})).unwrap(),
-        serde_json::to_vec(&json!({
-            "ok": true,
-            "turns": [{
-                "turn_id": "x".repeat(161),
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 1,
-                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
-            }]
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "ok": true,
-            "turns": [{
-                "turn_id": "invalid-usage",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 1,
-                "usage": {"input": 1, "cached_input": 2, "cache_write": 0, "output": 1}
-            }]
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "ok": true,
-            "turns": [{
-                "turn_id": "unsupported-calendar-day",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": 253_402_300_800_000_u64,
-                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
-            }]
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "ok": true,
-            "turns": [{
-                "turn_id": "maximum-u64-time",
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": u64::MAX,
-                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
-            }]
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "ok": true,
-            "turns": (0..257).map(|index| json!({
-                "turn_id": format!("turn-{index}"),
-                "model": "gpt-5.6-sol",
-                "occurred_at_ms": index + 1,
-                "usage": {"input": 1, "cached_input": 0, "cache_write": 0, "output": 1}
-            })).collect::<Vec<_>>()
-        }))
-        .unwrap(),
-    ] {
-        let listener = bind_cc_switch_listener().await.unwrap();
-        let invalid_schema_server =
-            serve_cc_switch_response(listener, invalid_body, Duration::ZERO, None);
-        let invalid_schema = token_cost_sync_action(&ctx).await;
-        assert_eq!(
-            invalid_schema["category"], "cc_switch_error",
-            "{invalid_schema}"
-        );
-        assert_eq!(invalid_schema_server.await.unwrap(), 1);
-    }
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let delayed_server = serve_cc_switch_response(
-        listener,
-        success_body.clone(),
-        Duration::from_millis(250),
-        Some(accepted_tx),
-    );
-    let first_ctx = ctx.clone();
-    let first = tokio::spawn(async move { token_cost_sync_action(&first_ctx).await });
-    accepted_rx.await.unwrap();
-    let concurrent = token_cost_sync_action(&ctx).await;
-    assert_eq!(concurrent["category"], "sync_in_progress", "{concurrent}");
-    assert_eq!(first.await.unwrap()["status"], "ok");
-    assert_eq!(delayed_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-    let cancelled_server = serve_cc_switch_response(
-        listener,
-        success_body.clone(),
-        Duration::from_millis(250),
-        Some(cancel_tx),
-    );
-    let cancelled_ctx = ctx.clone();
-    let cancelled = tokio::spawn(async move { token_cost_sync_action(&cancelled_ctx).await });
-    cancel_rx.await.unwrap();
-    cancelled.abort();
-    assert!(cancelled.await.unwrap_err().is_cancelled());
-    assert_eq!(cancelled_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let cancel_reset_server =
-        serve_cc_switch_response(listener, success_body.clone(), Duration::ZERO, None);
-    assert_eq!(token_cost_sync_action(&ctx).await["status"], "ok");
-    assert_eq!(cancel_reset_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let timeout_server = serve_cc_switch_response(
-        listener,
-        success_body.clone(),
-        Duration::from_millis(2_200),
-        None,
-    );
-    let started = std::time::Instant::now();
-    let timed_out = token_cost_sync_action(&ctx).await;
-    assert_eq!(timed_out["category"], "cc_switch_error", "{timed_out}");
-    assert!(started.elapsed() >= Duration::from_millis(1_800));
-    assert!(started.elapsed() < Duration::from_millis(2_500));
-    assert_eq!(timeout_server.await.unwrap(), 1);
-
-    let listener = bind_cc_switch_listener().await.unwrap();
-    let final_server = serve_cc_switch_response(listener, success_body, Duration::ZERO, None);
-    assert_eq!(token_cost_sync_action(&ctx).await["status"], "ok");
-    assert_eq!(final_server.await.unwrap(), 1);
-}
-
-async fn token_cost_sync_action(ctx: &BridgeContext) -> Value {
-    handle_bridge_request(
-        ctx.clone(),
-        "/token-cost/action",
-        json!({"action": {"type": "sync_cc_switch", "instance_id": "page-sync"}}),
-    )
-    .await
-}
-
-async fn bind_cc_switch_listener() -> Option<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(("127.0.0.1", 17_888)).await {
-        Ok(listener) => Some(listener),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
-        Err(error) => panic!("failed to bind CC Switch test listener: {error}"),
-    }
-}
-
-fn serve_cc_switch_response(
-    listener: tokio::net::TcpListener,
-    body: Vec<u8>,
-    delay: std::time::Duration,
-    accepted: Option<tokio::sync::oneshot::Sender<()>>,
-) -> tokio::task::JoinHandle<usize> {
-    tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = stream.read(&mut buffer).await.unwrap();
-            assert!(read > 0, "CC Switch request closed before headers");
-            request.extend_from_slice(&buffer[..read]);
-            assert!(
-                request.len() <= 8 * 1024,
-                "CC Switch request headers are unbounded"
-            );
-        }
-        assert!(
-            request.starts_with(b"GET /cc-switch/turns?refresh=1 HTTP/1.1\r\n"),
-            "unexpected CC Switch request: {}",
-            String::from_utf8_lossy(&request)
-        );
-        if let Some(accepted) = accepted {
-            let _ = accepted.send(());
-        }
-        tokio::time::sleep(delay).await;
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(headers.as_bytes()).await;
-        let _ = stream.write_all(&body).await;
-        let _ = stream.shutdown().await;
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(120), listener.accept())
-                .await
-                .is_err(),
-            "CC Switch sync retried the request"
-        );
-        1
-    })
-}
-
-fn renderer_turn_started() -> Value {
-    json!({
-        "type": "turn_started",
-        "meta": {
-            "source": "renderer",
-            "session_id": "session-1",
-            "turn_id": "turn-1",
-            "event_id": "event-1",
-            "correlation_id": "correlation-1",
-            "occurred_at_ms": 42
-        },
-        "model": "gpt-5.6-sol",
-        "fast": false
-    })
-}
-
-fn serialized_renderer_event_of_size(target: usize, marker: &str) -> Value {
-    let mut event = renderer_turn_started();
-    event["padding"] = json!(marker);
-    let base = serde_json::to_vec(&event).unwrap().len();
-    assert!(base <= target);
-    event["padding"] = json!(format!("{marker}{}", "x".repeat(target - base)));
-    assert_eq!(serde_json::to_vec(&event).unwrap().len(), target);
-    event
 }
 
 #[tokio::test]
@@ -1770,6 +744,71 @@ async fn user_script_manager_scans_and_persists_inventory_shape() {
 }
 
 #[test]
+fn user_script_manager_installs_missing_bundled_market_scripts_and_reinstalls_on_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    let bundled_source =
+        include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js");
+    let translate_path = user_dir.join("market-codex-zhcn-translate.js");
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+
+    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        installed.scripts.get("user:market-codex-zhcn-translate.js"),
+        Some(&true)
+    );
+    assert!(
+        std::fs::read_to_string(&translate_path)
+            .unwrap()
+            .contains("Codex简体中文汉化")
+    );
+
+    manager
+        .set_script_enabled("user:market-codex-zhcn-translate.js", false)
+        .unwrap();
+    std::fs::write(
+        &translate_path,
+        "// ==UserScript==\n// @version      1.1\n// ==/UserScript==\nwindow.oldBundle = true;",
+    )
+    .unwrap();
+    let upgraded = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        upgraded.scripts.get("user:market-codex-zhcn-translate.js"),
+        Some(&false)
+    );
+    let upgraded_source = std::fs::read_to_string(&translate_path).unwrap();
+    assert_eq!(upgraded_source, bundled_source);
+    assert!(upgraded_source.contains("@version      1.3"));
+
+    std::fs::write(&translate_path, "window.localOverride = true;").unwrap();
+    let existing = manager.install_missing_bundled_market_scripts().unwrap();
+    assert_eq!(
+        existing.scripts.get("user:market-codex-zhcn-translate.js"),
+        Some(&false)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&translate_path).unwrap(),
+        "window.localOverride = true;"
+    );
+
+    let reinstalled = manager.reinstall_bundled_market_scripts().unwrap();
+    assert_eq!(
+        reinstalled
+            .scripts
+            .get("user:market-codex-zhcn-translate.js"),
+        Some(&true)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&translate_path).unwrap(),
+        bundled_source
+    );
+}
+
+#[test]
 fn user_script_manager_installs_ds_style_cost_script_name() {
     let temp = tempfile::tempdir().unwrap();
     let user_dir = temp.path().join("user");
@@ -1785,13 +824,12 @@ fn user_script_manager_installs_ds_style_cost_script_name() {
         installed.scripts.get("user:market-codex-ds-style-cost.js"),
         Some(&true)
     );
-    assert!(
-        !installed
-            .scripts
-            .contains_key("user:market-codex-live-token-cost.js")
-    );
     assert!(user_dir.join("market-codex-ds-style-cost.js").is_file());
-    assert!(!user_dir.join("market-codex-live-token-cost.js").exists());
+    assert!(
+        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
+            .unwrap()
+            .contains("@version      0.8.8")
+    );
 }
 
 #[test]
@@ -1809,9 +847,6 @@ fn user_script_manager_migrates_legacy_cost_script_name() {
         user_dir.clone(),
         temp.path().join("user_scripts.json"),
     );
-    manager
-        .set_script_enabled("user:market-codex-live-token-cost.js", false)
-        .unwrap();
 
     let migrated = manager.install_missing_bundled_market_scripts().unwrap();
 
@@ -1820,132 +855,13 @@ fn user_script_manager_migrates_legacy_cost_script_name() {
         std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js")).unwrap(),
         "window.localOverride = true;"
     );
-    assert!(
-        !migrated
-            .scripts
-            .contains_key("user:market-codex-live-token-cost.js")
-    );
     assert_eq!(
         migrated.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&false)
-    );
-}
-
-#[test]
-fn user_script_manager_installs_missing_bundled_market_scripts_and_reinstalls_on_request() {
-    let temp = tempfile::tempdir().unwrap();
-    let user_dir = temp.path().join("user");
-    let bundled_source = include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js");
-    let ds_style_cost_path = user_dir.join("market-codex-ds-style-cost.js");
-    let manager = UserScriptManager::new(
-        temp.path().join("builtin"),
-        user_dir.clone(),
-        temp.path().join("user_scripts.json"),
-    );
-
-    let installed = manager.install_missing_bundled_market_scripts().unwrap();
-    assert_eq!(
-        installed.scripts.get("user:market-codex-ds-style-cost.js"),
         Some(&true)
     );
-    assert_eq!(
-        installed.scripts.get("user:market-codex-zhcn-translate.js"),
-        Some(&true)
-    );
-    assert!(
-        std::fs::read_to_string(&ds_style_cost_path)
-            .unwrap()
-            .contains("Codex Live Token Cost")
-    );
-    assert!(
-        std::fs::read_to_string(user_dir.join("market-codex-zhcn-translate.js"))
-            .unwrap()
-            .contains("Codex简体中文汉化")
-    );
-
-    manager
-        .set_script_enabled("user:market-codex-ds-style-cost.js", false)
-        .unwrap();
-    std::fs::write(
-        &ds_style_cost_path,
-        "// ==UserScript==\n// @version      0.8.3\n// ==/UserScript==\nwindow.oldBundle = true;",
-    )
-    .unwrap();
-    let upgraded = manager.install_missing_bundled_market_scripts().unwrap();
-    assert_eq!(
-        upgraded.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&false)
-    );
-    let upgraded_source = std::fs::read_to_string(&ds_style_cost_path).unwrap();
-    assert_eq!(upgraded_source, bundled_source);
-    assert!(upgraded_source.contains("@version      1.0.1"));
-    assert!(upgraded_source.len() <= 61_440);
-    for legacy_identifier in [
-        "localStorage",
-        "indexedDB",
-        "__codexLiveTokenCostPriceOverridesV1",
-        "__codexLiveTokenCostDailyUsageV1",
-        "__codexLiveTokenCostAnalyticsRollupV1",
-        "__codexLiveTokenCostProfilePrefsV1",
-        "codex-live-token-cost-profile",
-    ] {
-        assert!(
-            !upgraded_source.contains(legacy_identifier),
-            "bundled ds style cost script still contains {legacy_identifier}"
-        );
-    }
-
-    std::fs::write(&ds_style_cost_path, "window.localOverride = true;").unwrap();
-    let existing = manager.install_missing_bundled_market_scripts().unwrap();
-    assert_eq!(
-        existing.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&false)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&ds_style_cost_path).unwrap(),
-        "window.localOverride = true;"
-    );
-
-    let reinstalled = manager.reinstall_bundled_market_scripts().unwrap();
-    assert_eq!(
-        reinstalled
-            .scripts
-            .get("user:market-codex-ds-style-cost.js"),
-        Some(&true)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&ds_style_cost_path).unwrap(),
-        bundled_source
-    );
-}
-
-#[test]
-fn user_script_manager_preserves_newer_ds_style_cost_override() {
-    let temp = tempfile::tempdir().unwrap();
-    let user_dir = temp.path().join("user");
-    std::fs::create_dir_all(&user_dir).unwrap();
-    let ds_style_cost_path = user_dir.join("market-codex-ds-style-cost.js");
-    let newer_source = "// ==UserScript==\n// @version      1.0.1\n// ==/UserScript==\nwindow.newerOverride = true;";
-    std::fs::write(&ds_style_cost_path, newer_source).unwrap();
-    let manager = UserScriptManager::new(
-        temp.path().join("builtin"),
-        user_dir,
-        temp.path().join("user_scripts.json"),
-    );
-    manager
-        .set_script_enabled("user:market-codex-ds-style-cost.js", false)
-        .unwrap();
-
-    let config = manager.install_missing_bundled_market_scripts().unwrap();
-
-    assert_eq!(
-        config.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&false)
-    );
-    assert_eq!(
-        std::fs::read_to_string(ds_style_cost_path).unwrap(),
-        newer_source
-    );
+    assert!(!migrated
+        .scripts
+        .contains_key("user:market-codex-live-token-cost.js"));
 }
 
 #[test]
@@ -1979,7 +895,7 @@ fn user_script_manager_upgrades_older_bundled_translation_script() {
         upgraded_source,
         include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js")
     );
-    assert!(upgraded_source.contains("@version      1.2"));
+    assert!(upgraded_source.contains("@version      1.3"));
     assert!(upgraded_source.contains("轻度(low)"));
     assert!(upgraded_source.contains("极高(ultra)"));
 }

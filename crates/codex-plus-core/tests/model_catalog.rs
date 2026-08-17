@@ -43,7 +43,6 @@ experimental_bearer_token = "relay-key"
         reqwest::Client::builder().no_proxy().build().unwrap(),
     )
     .await;
-
     assert_eq!(result["status"], "ok");
     assert_eq!(result["model_provider"], "relay");
     assert_eq!(result["provider_name"], "Relay");

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex简体中文汉化
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Codex客户端全界面简体汉化补丁
 // @author       BigPizzaV3
 // @match        app://openai-codex/*
@@ -9,9 +9,19 @@
 // ==/UserScript==
 (function () {
   const observerKey = "__codexZhCnTranslateObserver";
+  const observerTimerKey = "__codexZhCnTranslateObserverTimer";
+  const clickHandlerKey = "__codexZhCnTranslateClickHandler";
   const previousObserver = window[observerKey];
   if (previousObserver && typeof previousObserver.disconnect === "function") {
     previousObserver.disconnect();
+  }
+  if (window[observerTimerKey]) {
+    window.clearTimeout(window[observerTimerKey]);
+    window[observerTimerKey] = 0;
+  }
+  if (window[clickHandlerKey] && typeof document.removeEventListener === "function") {
+    document.removeEventListener("click", window[clickHandlerKey], true);
+    window[clickHandlerKey] = null;
   }
 
   const translations = new Map([
@@ -57,6 +67,9 @@
     ["ultra", "ultra"],
   ]);
   const ignoredParentSelector = "script, style, textarea, code, pre, [contenteditable='true']";
+  const structuralUiSelector = "button, [role='button'], [role='menu'], [role='menuitem'], [role='dialog'], header, nav, [data-selected-reasoning-effort]";
+  const reasoningUiSelector = "[role='menu'], [role='menuitem'], [data-selected-reasoning-effort]";
+  const reasoningObserverRootSelector = "[role='menu'], [data-selected-reasoning-effort]";
 
   function trimmedText(node) {
     return String(node?.nodeValue || "").trim();
@@ -194,31 +207,103 @@
     }
   }
 
+  function elementForNode(node) {
+    if (!node) return null;
+    if (node.nodeType === Node.ELEMENT_NODE) return node;
+    return node.parentElement || null;
+  }
+
+  function nodeMatchesSelector(node, selector) {
+    const element = elementForNode(node);
+    if (!element || typeof element.matches !== "function") return false;
+    if (element.matches(selector) || element.closest?.(selector)) return true;
+    if (element.childElementCount > 24 || typeof element.querySelector !== "function") return false;
+    return Boolean(element.querySelector(selector));
+  }
+
+  function shouldTranslateAddedNode(node) {
+    return nodeMatchesSelector(node, structuralUiSelector);
+  }
+
+  function mutationTouchesReasoningUi(mutation) {
+    if (nodeMatchesSelector(mutation?.target, reasoningUiSelector)) return true;
+    return Array.from(mutation?.addedNodes || []).some((node) => nodeMatchesSelector(node, reasoningUiSelector));
+  }
+
+  function mutationTouchesTranslationUi(mutation) {
+    if (nodeMatchesSelector(mutation?.target, structuralUiSelector)) return true;
+    return Array.from(mutation?.addedNodes || []).some(shouldTranslateAddedNode);
+  }
+
   function install() {
     const root = document.body || document.documentElement;
     if (!root || typeof MutationObserver !== "function") return;
 
     translateSubtree(root);
     syncReasoningEffortLabels();
-    const observer = new MutationObserver((mutations) => {
+    let reasoningSyncTimer = 0;
+    const setTimer = typeof window.setTimeout === "function" ? window.setTimeout.bind(window) : null;
+    const reasoningObservers = new Map();
+    const scheduleReasoningSync = () => {
+      if (reasoningSyncTimer) return;
+      if (!setTimer) {
+        syncReasoningEffortLabels();
+        return;
+      }
+      reasoningSyncTimer = setTimer(() => {
+        reasoningSyncTimer = 0;
+        syncReasoningEffortLabels();
+      }, 80);
+      window[observerTimerKey] = reasoningSyncTimer;
+    };
+    const attachReasoningObserver = (reasoningRoot) => {
+      if (!reasoningRoot || reasoningObservers.has(reasoningRoot)) return;
+      const reasoningObserver = new MutationObserver((mutations) => {
+        if (mutations.some(mutationTouchesReasoningUi)) scheduleReasoningSync();
+      });
+      reasoningObserver.observe(reasoningRoot, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["aria-checked", "data-state", "data-value", "data-selected-reasoning-effort", "aria-label"],
+      });
+      reasoningObservers.set(reasoningRoot, reasoningObserver);
+    };
+    const attachReasoningObservers = () => {
+      for (const reasoningRoot of document.querySelectorAll(reasoningObserverRootSelector)) attachReasoningObserver(reasoningRoot);
+    };
+    const clickHandler = (event) => {
+      if (nodeMatchesSelector(event?.target, reasoningUiSelector)) scheduleReasoningSync();
+    };
+    document.addEventListener("click", clickHandler, true);
+    window[clickHandlerKey] = clickHandler;
+    const structuralObserver = new MutationObserver((mutations) => {
+      let shouldAttachReasoningObservers = false;
       for (const mutation of mutations) {
-        if (mutation.type === "characterData") {
-          translateTextNode(mutation.target);
-        }
+        if (!mutationTouchesTranslationUi(mutation)) continue;
         for (const node of mutation.addedNodes || []) {
-          translateSubtree(node);
+          if (shouldTranslateAddedNode(node)) translateSubtree(node);
+        }
+        if (mutationTouchesReasoningUi(mutation)) {
+          shouldAttachReasoningObservers = true;
+          scheduleReasoningSync();
         }
       }
-      syncReasoningEffortLabels();
+      if (shouldAttachReasoningObservers) attachReasoningObservers();
     });
-    observer.observe(root, {
+    structuralObserver.observe(root, {
       childList: true,
       subtree: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: ["aria-checked", "data-state", "data-value", "data-selected-reasoning-effort", "aria-label"],
     });
-    window[observerKey] = observer;
+    attachReasoningObservers();
+    window[observerKey] = {
+      disconnect() {
+        structuralObserver.disconnect();
+        for (const observer of reasoningObservers.values()) observer.disconnect();
+        reasoningObservers.clear();
+        document.removeEventListener("click", clickHandler, true);
+      },
+    };
   }
 
   if (!document.body && document.readyState === "loading") {
