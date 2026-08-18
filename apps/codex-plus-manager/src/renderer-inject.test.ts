@@ -13,6 +13,19 @@ function loadCodexPlusTriggerClassNormalizer(renderer: string) {
   return vm.runInNewContext(`(${source})`) as (className: string) => string;
 }
 
+function loadNativeMenuInsertionBefore(renderer: string) {
+  const normalizedRenderer = renderer.replace(/\r\n/g, "\n");
+  const start = normalizedRenderer.indexOf("  function nativeMenuInsertionBefore(");
+  const end = normalizedRenderer.indexOf("\n\n  function findNativeMenuInsertionPoint", start);
+  assert.ok(start >= 0 && end > start, "native menu insertion anchor helper should exist");
+
+  const source = normalizedRenderer.slice(start, end).trim();
+  return vm.runInNewContext(`(${source})`) as (
+    children: Array<{ id?: string }>,
+    menu: { id?: string },
+  ) => { id?: string } | null;
+}
+
 type FakeElementOptions = {
   className?: string;
   dismissLabel?: string;
@@ -90,6 +103,21 @@ function usageAlertRuntime(renderer: string, cards: FakeElement[], managed: Fake
 }
 
 describe("renderer injection header compatibility", () => {
+  it("keeps the native menu after Today without competing insertion anchors", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const insertionBefore = loadNativeMenuInsertionBefore(renderer);
+    const today = { id: "codex-live-token-cost-settings" };
+    const menu = { id: "codex-plus-menu" };
+    const nativeButton = { id: "native-header-button" };
+
+    assert.equal(insertionBefore([today, menu], menu), null);
+    assert.equal(insertionBefore([menu, today], menu), null);
+    assert.equal(insertionBefore([today, menu, nativeButton], menu), nativeButton);
+    assert.equal(insertionBefore([menu, today, nativeButton], menu), nativeButton);
+    assert.match(renderer, /nativeMenuInsertionBefore\(Array\.from\(headerActionSlot\.children/);
+    assert.match(renderer, /const todayButton = menuBarChildren\.find/);
+  });
+
   it("anchors the Codex++ menu to current and legacy application top bars only", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 

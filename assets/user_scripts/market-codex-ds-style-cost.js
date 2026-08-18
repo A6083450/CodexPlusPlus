@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.8.8
+// @version      0.8.9
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.8.8";
+const VERSION = "0.8.9";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -1222,9 +1222,9 @@ const VERSION = "0.8.8";
   function profileUnlockEnabled() {
     if (typeof profileUnlockEnabledRuntime === "boolean") return profileUnlockEnabledRuntime;
     try {
-      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false";
+      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) === "true";
     } catch {
-      return true;
+      return false;
     }
   }
 
@@ -3114,6 +3114,25 @@ const VERSION = "0.8.8";
     );
   }
 
+  function shouldInspectCapturedBridgeResponse(payload) {
+    if (!payload || payload.type !== "fetch-response") return false;
+    if (payload.__codexLiveTokenCostProfileLocal === true) return true;
+    const candidates = [payload.bodyJsonString, payload.body, payload.data, payload.result, payload.response]
+      .filter((value) => value != null && value !== "");
+    for (const candidate of candidates) {
+      if (typeof candidate === "string") {
+        if (candidate.length > CAPTURE_MAX_PAYLOAD_LENGTH) continue;
+        if (/fetch-stream-(?:event|complete|error)/i.test(candidate)) return true;
+        if (CAPTURED_METRIC_MARKER_RE.test(candidate) && !/fetch[_-]?response/i.test(candidate)) return true;
+        const parsed = parseMaybeJson(candidate);
+        if (parsed && capturedPayloadHasMetricMarker(parsed, 0, new WeakSet())) return true;
+        continue;
+      }
+      if (capturedPayloadHasMetricMarker(candidate, 0, new WeakSet())) return true;
+    }
+    return false;
+  }
+
   function shouldInspectCapturedPayload(payload, source = "", options = {}) {
     const url = String(options.url || "");
     if (url) {
@@ -3121,12 +3140,56 @@ const VERSION = "0.8.8";
       if (isCodexApiUrl(url)) return capturedPayloadHasMetricMarker(payload, 0, new WeakSet(), /body/i.test(String(source || "")));
       return /websocket/i.test(String(source || "")) ? capturedPayloadHasMetricMarker(payload) : false;
     }
-    if (payload?.__codexLiveTokenCostProfileLocal === true || payload?.type === "fetch" || payload?.type === "fetch-response") return true;
+    if (payload?.__codexLiveTokenCostProfileLocal === true || payload?.type === "fetch") return true;
+    if (payload?.type === "fetch-response") return shouldInspectCapturedBridgeResponse(payload);
     return capturedPayloadHasMarker(payload);
   }
 
   function shouldCaptureCodexResponse(url) {
     return isCodexApiUrl(url) && /\/(responses|chat\/completions|conversation|thread|session|turn)(?:[/?#]|$)/i.test(String(url || ""));
+  }
+
+  function shouldCaptureCodexResponseBody(response, url) {
+    if (!shouldCaptureCodexResponse(url)) return false;
+    const contentType = String(response?.headers?.get?.("content-type") || "").toLowerCase();
+    if (/(?:^|[;\s])text\/event-stream(?:[;\s]|$)/i.test(contentType)) return false;
+    if (/(?:^|[;\s])application\/(?:x-)?ndjson(?:[;\s]|$)/i.test(contentType)) return false;
+    const isJson = /application\/(?:json|[^;\s]+\+json)/i.test(contentType);
+    const isPlainText = /text\/plain/i.test(contentType);
+    if (contentType && !isJson && !isPlainText) return false;
+    const contentLength = Number(response?.headers?.get?.("content-length"));
+    return !Number.isFinite(contentLength) || contentLength <= CAPTURE_MAX_PAYLOAD_LENGTH;
+  }
+
+  async function readBoundedResponseText(response) {
+    if (!response) return "";
+    const reader = response.body?.getReader?.();
+    if (!reader) {
+      const text = await response.text();
+      return text.length <= CAPTURE_MAX_PAYLOAD_LENGTH ? text : "";
+    }
+    const decoder = new TextDecoder();
+    let totalBytes = 0;
+    let text = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value?.byteLength || 0;
+        if (totalBytes > CAPTURE_MAX_PAYLOAD_LENGTH) {
+          await reader.cancel();
+          return "";
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      return text + decoder.decode();
+    } catch {
+      try {
+        await reader.cancel();
+      } catch {
+      }
+      return "";
+    }
   }
 
   function isProfileUsageUrl(url) {
@@ -9704,8 +9767,8 @@ const VERSION = "0.8.8";
         }
       }
       const response = await originalFetch.call(this, input, init);
-      if (response?.clone && shouldCaptureCodexResponse(url)) {
-        response.clone().text().then((text) => {
+      if (response?.clone && shouldCaptureCodexResponseBody(response, url)) {
+        readBoundedResponseText(response.clone()).then((text) => {
           if (shouldInspectCapturedPayload(text, "fetch", { url })) inspectLocalPayload(text, "fetch");
         }).catch(() => {});
       }

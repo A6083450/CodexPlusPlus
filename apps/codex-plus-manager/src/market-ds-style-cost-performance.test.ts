@@ -114,6 +114,25 @@ test("network capture bounds payload work and requires a metric marker", async (
   assert.doesNotMatch(captureGate, /if \(isCodexApiUrl\(url\)\) return true;/);
 });
 
+test("network capture skips streaming and oversized response clones", async () => {
+  const source = await readScript();
+  const responseGate = functionBody(source, "shouldCaptureCodexResponseBody", "isProfileUsageUrl");
+
+  assert.match(responseGate, /event-stream/);
+  assert.match(responseGate, /const isJson =/);
+  assert.match(responseGate, /CAPTURE_MAX_PAYLOAD_LENGTH/);
+  assert.match(source, /shouldCaptureCodexResponseBody\(response, url\)/);
+});
+
+test("message capture ignores bridge responses without usage or stream markers", async () => {
+  const source = await readScript();
+  const captureGate = functionBody(source, "shouldInspectCapturedPayload", "isProfileUsageUrl");
+
+  assert.match(captureGate, /payload\?\.type === "fetch-response"/);
+  assert.match(captureGate, /capturedPayloadHasMetricMarker/);
+  assert.doesNotMatch(captureGate, /payload\?\.type === "fetch-response"\) return true/);
+});
+
 test("profile auth stack inspection is gated to visible profile UI", async () => {
   const source = await readScript();
   const authPatch = functionBody(source, "patchProfileReactAuthContext", "isSettingsSectionsArray");
@@ -121,6 +140,14 @@ test("profile auth stack inspection is gated to visible profile UI", async () =>
   assert.match(source, /const PROFILE_UI_AUTH_GATE_TTL_MS = 500;/);
   assert.match(source, /function profileUiAuthReadGateActive\(/);
   assert.match(authPatch, /profileUiAuthReadGateActive\(\)\s*&&\s*isProfileUiAuthRead\(new Error\(\)\.stack/);
+});
+
+test("profile unlock is opt-in and does not patch the renderer by default", async () => {
+  const source = await readScript();
+  const profileToggle = functionBody(source, "profileUnlockEnabled", "saveProfileUnlockEnabled");
+
+  assert.match(profileToggle, /localStorage\.getItem\(PROFILE_UNLOCK_ENABLED_KEY\) === "true"/);
+  assert.match(profileToggle, /catch \{\s*return false;/);
 });
 
 test("Chinese translation observes only structural UI mutations", async () => {

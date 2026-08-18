@@ -4083,6 +4083,13 @@
     loadUserScripts();
   }
 
+  function nativeMenuInsertionBefore(children, menu) {
+    const nodes = Array.from(children || []);
+    const todayIndex = nodes.findIndex((node) => node?.id === "codex-live-token-cost-settings");
+    const startIndex = todayIndex >= 0 ? todayIndex + 1 : 0;
+    return nodes.slice(startIndex).find((node) => node && node !== menu) || null;
+  }
+
   function findNativeMenuInsertionPoint() {
     if (!codexPlusSettings().nativeMenuPlacement) return null;
     const header = findCodexAppHeader();
@@ -4104,7 +4111,11 @@
       const buttons = Array.from(menuBar.querySelectorAll("button")).filter((button) => !button.closest(`#${codexPlusMenuId}`));
       if (buttons.length && buttons.every(isIconOnlyButton)) {
         return headerActionSlot
-          ? { parent: headerActionSlot, before: headerActionSlot.firstChild, nativeButtonClass: headerIconTextButtonClass }
+          ? {
+            parent: headerActionSlot,
+            before: nativeMenuInsertionBefore(Array.from(headerActionSlot.children || []), document.getElementById(codexPlusMenuId)),
+            nativeButtonClass: headerIconTextButtonClass,
+          }
           : null;
       }
       const openLocationButton = buttons.find(isCodexHeaderOpenLocationButton);
@@ -4115,7 +4126,16 @@
         : buttons[buttons.length - 1]?.className || "";
       if (openLocationGroup?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup, nativeButtonClass };
       if (openLocationGroup?.parentElement?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup.parentElement, nativeButtonClass };
-      return { parent: menuBar, before: buttons[buttons.length - 1]?.nextSibling || null, nativeButtonClass: buttons[buttons.length - 1]?.className || "" };
+      const menu = document.getElementById(codexPlusMenuId);
+      const menuBarChildren = Array.from(menuBar.children || []);
+      const todayButton = menuBarChildren.find((node) => node?.id === "codex-live-token-cost-settings");
+      return {
+        parent: menuBar,
+        before: todayButton
+          ? nativeMenuInsertionBefore(menuBarChildren, menu)
+          : buttons[buttons.length - 1]?.nextSibling || null,
+        nativeButtonClass: buttons[buttons.length - 1]?.className || "",
+      };
     }
     const contextSurface = header?.querySelector(selectors.headerContextMenuSurface);
     const buttons = Array.from(contextSurface?.querySelectorAll?.("button") || [])
