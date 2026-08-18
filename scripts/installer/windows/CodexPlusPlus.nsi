@@ -35,6 +35,11 @@ Section "Install"
 
   File "${ROOT}\dist\windows\app\codex-plus-plus.exe"
   File "${ROOT}\dist\windows\app\codex-plus-plus-manager.exe"
+  CreateDirectory "$INSTDIR\codex-token-cost-helper"
+  SetOutPath "$INSTDIR\codex-token-cost-helper"
+  File "${ROOT}\scripts\codex-local-usage-helper.cjs"
+  File "${ROOT}\scripts\start-helper.ps1"
+  SetOutPath "$INSTDIR"
 
   Delete "$DESKTOP\Codex++ 绠＄悊宸ュ叿.lnk"
   Delete "$SMPROGRAMS\Codex++\Codex++ 绠＄悊宸ュ叿.lnk"
@@ -73,6 +78,9 @@ Section "Uninstall"
 
   Delete "$INSTDIR\codex-plus-plus.exe"
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
+  Delete "$INSTDIR\codex-token-cost-helper\codex-local-usage-helper.cjs"
+  Delete "$INSTDIR\codex-token-cost-helper\start-helper.ps1"
+  RMDir "$INSTDIR\codex-token-cost-helper"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

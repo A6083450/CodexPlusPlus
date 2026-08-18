@@ -321,6 +321,49 @@ pub async fn install_bridge(
     handler: BridgeHandler,
     new_document_scripts: &[String],
 ) -> anyhow::Result<()> {
+    install_bridge_impl(
+        websocket_url,
+        binding_name,
+        handler,
+        new_document_scripts,
+        new_document_scripts,
+        &[],
+    )
+    .await
+}
+
+/// Installs the bridge immediately but delays the first execution of heavy user scripts.
+///
+/// The scripts are still registered for future documents synchronously. Only execution in the
+/// currently loaded page is delayed, which prevents a large userscript bundle from blocking the
+/// first renderer paint during application startup.
+pub async fn install_bridge_with_deferred_runtime_scripts(
+    websocket_url: &str,
+    binding_name: &str,
+    handler: BridgeHandler,
+    new_document_scripts: &[String],
+    immediate_runtime_scripts: &[String],
+    deferred_runtime_scripts: &[String],
+) -> anyhow::Result<()> {
+    install_bridge_impl(
+        websocket_url,
+        binding_name,
+        handler,
+        new_document_scripts,
+        immediate_runtime_scripts,
+        deferred_runtime_scripts,
+    )
+    .await
+}
+
+async fn install_bridge_impl(
+    websocket_url: &str,
+    binding_name: &str,
+    handler: BridgeHandler,
+    new_document_scripts: &[String],
+    immediate_runtime_scripts: &[String],
+    deferred_runtime_scripts: &[String],
+) -> anyhow::Result<()> {
     let pump_key = format!("{websocket_url}\n{binding_name}");
     let replacing_active_pump = {
         let mut pumps = bridge_message_pumps().lock().await;
@@ -372,6 +415,9 @@ pub async fn install_bridge(
                 )
                 .await?;
         }
+    }
+
+    for script in immediate_runtime_scripts {
         let message_id = next_message_id();
         session
             .send_command(
@@ -380,6 +426,25 @@ pub async fn install_bridge(
                 runtime_evaluate_params(script),
             )
             .await?;
+    }
+
+    if !replacing_active_pump && !deferred_runtime_scripts.is_empty() {
+        let websocket_url = websocket_url.to_string();
+        let deferred_runtime_scripts = deferred_runtime_scripts.to_vec();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            for script in deferred_runtime_scripts {
+                if let Err(error) = evaluate_script(&websocket_url, &script).await {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "bridge.deferred_runtime_script_failed",
+                        json!({
+                            "script_bytes": script.len(),
+                            "error": error.to_string()
+                        }),
+                    );
+                }
+            }
+        });
     }
 
     session.drain_binding_queue().await?;

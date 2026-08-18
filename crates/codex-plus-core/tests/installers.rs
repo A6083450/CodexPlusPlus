@@ -118,6 +118,17 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
 }
 
 #[test]
+fn macos_dmg_bundles_the_optional_token_cost_helper() {
+    let script = std::fs::read_to_string("../../scripts/installer/macos/package-dmg.sh")
+        .expect("read macOS DMG packaging script");
+
+    assert!(script.contains("codex-token-cost-helper"));
+    assert!(script.contains("codex-local-usage-helper.cjs"));
+    assert!(script.contains("start-helper.sh"));
+    assert!(script.contains("start-helper.ps1"));
+}
+
+#[test]
 fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
     let temp = tempfile::tempdir().unwrap();
     let manager_exe = temp

@@ -191,7 +191,6 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
-    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -217,9 +216,6 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(helper_port).await?;
-    }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     let mut activated = false;
     #[cfg(windows)]
@@ -231,31 +227,15 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             }
         }
     }
-    let injection_ready = if settings.enhancements_enabled {
-        hooks
-            .ensure_injection(options.debug_port, helper_port, &app_dir)
-            .await
-    } else {
-        false
-    };
-    if injection_ready {
-        hooks
-            .start_bridge_watchdog(options.debug_port, helper_port)
-            .await?;
-        hooks.write_status("running").await;
-    } else if settings.enhancements_enabled {
-        hooks.write_status("running_degraded").await;
-    }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
         json!({
             "app_dir": app_dir.to_string_lossy(),
             "debug_port": options.debug_port,
-            "helper_port": helper_port,
             "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
-            "injection_ready": injection_ready,
+            "runtime_reused": true,
             "launch_ok": launch_result.is_ok(),
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
         }),
@@ -1011,6 +991,12 @@ impl BridgeRuntimeService for LauncherRuntimeService {
     }
 }
 
+const INJECT_WITH_CONTEXT_ATTEMPT_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
 async fn inject_with_context(
     debug_port: u16,
     helper_port: u16,
@@ -1018,12 +1004,14 @@ async fn inject_with_context(
     runtime: Arc<LauncherRuntimeService>,
 ) -> anyhow::Result<()> {
     let mut last_error = None;
-    for _ in 0..20 {
+    for (attempt, delay) in INJECT_WITH_CONTEXT_ATTEMPT_DELAYS.iter().enumerate() {
         match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if attempt + 1 < INJECT_WITH_CONTEXT_ATTEMPT_DELAYS.len() {
+                    tokio::time::sleep(*delay).await;
+                }
             }
         }
     }
@@ -1052,22 +1040,36 @@ async fn try_inject_with_context(
         .build_enabled_bundle()
         .unwrap_or_default();
     let new_document_scripts = if user_bundle.is_empty() {
-        vec![script]
+        vec![script.clone()]
     } else {
-        vec![script, user_bundle]
+        vec![script.clone(), user_bundle.clone()]
     };
-    codex_plus_core::bridge::install_bridge(
-        websocket_url,
-        codex_plus_core::bridge::BRIDGE_BINDING_NAME,
-        Arc::new(move |path, payload| {
+    let handler: codex_plus_core::bridge::BridgeHandler =
+        Arc::new(move |path: String, payload: serde_json::Value| {
             let ctx = ctx.clone();
             Box::pin(async move {
                 Ok(codex_plus_core::routes::handle_bridge_request(ctx, &path, payload).await)
             })
-        }),
-        &new_document_scripts,
-    )
-    .await
+        });
+    if user_bundle.is_empty() {
+        codex_plus_core::bridge::install_bridge(
+            websocket_url,
+            codex_plus_core::bridge::BRIDGE_BINDING_NAME,
+            handler,
+            &new_document_scripts,
+        )
+        .await
+    } else {
+        codex_plus_core::bridge::install_bridge_with_deferred_runtime_scripts(
+            websocket_url,
+            codex_plus_core::bridge::BRIDGE_BINDING_NAME,
+            handler,
+            &new_document_scripts,
+            std::slice::from_ref(&script),
+            std::slice::from_ref(&user_bundle),
+        )
+        .await
+    }
 }
 
 fn default_codex_db_path() -> PathBuf {
@@ -1221,6 +1223,60 @@ mod tests {
         assert!(
             body[recovery..launch].contains("hooks.run_remote_control_session_recovery().await?")
         );
+    }
+
+    #[test]
+    fn existing_launcher_path_reuses_the_primary_runtime() {
+        let source = include_str!("main.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("launcher source should contain production code");
+        let start = production_source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = start
+            + production_source[start..]
+                .find("fn should_finalize_pending_remote_control_recovery")
+                .expect("existing launcher activation function boundary");
+        let body = &production_source[start..end];
+
+        assert!(body.contains("\"runtime_reused\": true"));
+        assert!(!body.contains("hooks.start_helper(helper_port)"));
+        assert!(!body.contains("ensure_injection("));
+    }
+
+    #[test]
+    fn initial_injection_defers_the_user_script_bundle() {
+        let source = include_str!("main.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("launcher source should contain production code");
+
+        assert!(production_source.contains("install_bridge_with_deferred_runtime_scripts"));
+        assert!(production_source.contains("std::slice::from_ref(&user_bundle)"));
+    }
+
+    #[test]
+    fn launcher_reinjection_uses_bounded_backoff() {
+        let source = include_str!("main.rs");
+        let production_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("launcher source should contain production code");
+        let start = production_source
+            .find("async fn inject_with_context")
+            .expect("launcher injection retry function");
+        let end = start
+            + production_source[start..]
+                .find("async fn try_inject_with_context")
+                .expect("launcher injection retry function boundary");
+        let body = &production_source[start..end];
+
+        assert!(body.contains("INJECT_WITH_CONTEXT_ATTEMPT_DELAYS"));
+        assert!(production_source.contains("Duration::from_secs(30)"));
+        assert!(!body.contains("for _ in 0..20"));
     }
 
     #[test]

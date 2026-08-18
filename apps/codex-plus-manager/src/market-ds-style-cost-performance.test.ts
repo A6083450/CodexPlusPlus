@@ -4,6 +4,8 @@ import test from "node:test";
 
 const scriptPath = new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url);
 const zhcnScriptPath = new URL("../../../assets/user_scripts/market-codex-zhcn-translate.js", import.meta.url);
+const helperPath = new URL("../../../scripts/codex-local-usage-helper.cjs", import.meta.url);
+const helperLauncherPath = new URL("../../../scripts/start-helper.sh", import.meta.url);
 
 async function readScript() {
   return readFile(scriptPath, "utf8");
@@ -148,6 +150,17 @@ test("profile unlock is opt-in and does not patch the renderer by default", asyn
 
   assert.match(profileToggle, /localStorage\.getItem\(PROFILE_UNLOCK_ENABLED_KEY\) === "true"/);
   assert.match(profileToggle, /catch \{\s*return false;/);
+});
+
+test("the optional CC Switch helper is bundled with a matching launcher", async () => {
+  const [helper, launcher] = await Promise.all([readFile(helperPath, "utf8"), readFile(helperLauncherPath, "utf8")]);
+
+  assert.match(helper, /const DEFAULT_PORT = 17888;/);
+  assert.match(helper, /url\.pathname === "\/cc-switch\/turns"/);
+  assert.match(helper, /url\.pathname === "\/health"/);
+  assert.match(helper, /if \(require\.main === module\) startServer/);
+  assert.match(launcher, /codex-local-usage-helper\.cjs/);
+  assert.match(launcher, /PORT="\$\{PORT:-17888\}"/);
 });
 
 test("Chinese translation observes only structural UI mutations", async () => {

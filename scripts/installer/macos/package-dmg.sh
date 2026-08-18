@@ -5,19 +5,26 @@ VERSION="${1:-0.0.0}"
 ARCH="${2:-$(uname -m)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DIST="$ROOT/dist/macos"
-STAGE="$DIST/stage"
+STAGE="$DIST/stage-${VERSION}-${ARCH}"
 BINARY_DIR="${BINARY_DIR:-$ROOT/target/release}"
 DMG="$DIST/CodexPlusPlus-${VERSION}-macos-${ARCH}.dmg"
 ICON_SOURCE="$ROOT/apps/codex-plus-manager/src-tauri/icons/icon.png"
 ICON_NAME="codex-plus-plus.icns"
-ICON_ICNS="$DIST/$ICON_NAME"
+ICON_ICNS="$DIST/codex-plus-plus-${VERSION}-${ARCH}.icns"
 
-rm -rf "$DIST"
+mkdir -p "$DIST"
+if [ -e "$STAGE" ]; then
+  echo "error: staging directory already exists: $STAGE" >&2
+  exit 1
+fi
 mkdir -p "$STAGE"
 
 prepare_icon() {
-  local iconset="$DIST/codex-plus-plus.iconset"
-  rm -rf "$iconset"
+  local iconset="$DIST/codex-plus-plus-${VERSION}-${ARCH}.iconset"
+  if [ -e "$iconset" ]; then
+    echo "error: icon staging directory already exists: $iconset" >&2
+    return 1
+  fi
   mkdir -p "$iconset"
 
   sips -z 16 16 "$ICON_SOURCE" --out "$iconset/icon_16x16.png" >/dev/null
@@ -48,10 +55,21 @@ create_app() {
     return 1
   fi
 
-  rm -rf "$app_dir"
+  if [ -e "$app_dir" ]; then
+    echo "error: app staging directory already exists: $app_dir" >&2
+    return 1
+  fi
   mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
   cp "$binary_path" "$app_dir/Contents/MacOS/$executable_name"
   cp "$ICON_ICNS" "$app_dir/Contents/Resources/$ICON_NAME"
+  if [ "$executable_name" = "CodexPlusPlusManager" ]; then
+    local helper_resource_dir="$app_dir/Contents/Resources/codex-token-cost-helper"
+    mkdir -p "$helper_resource_dir"
+    cp "$ROOT/scripts/codex-local-usage-helper.cjs" "$helper_resource_dir/codex-local-usage-helper.cjs"
+    cp "$ROOT/scripts/start-helper.sh" "$helper_resource_dir/start-helper.sh"
+    cp "$ROOT/scripts/start-helper.ps1" "$helper_resource_dir/start-helper.ps1"
+    chmod +x "$helper_resource_dir/start-helper.sh"
+  fi
   chmod +x "$app_dir/Contents/MacOS/$executable_name"
   printf 'APPL????' > "$app_dir/Contents/PkgInfo"
   if [ "$executable_name" = "CodexPlusPlusManager" ]; then

@@ -131,9 +131,12 @@ jobs:
       - name: Verify macOS bundle structure
         run: |
           set -euo pipefail
-          test -L "dist/macos/stage/Applications"
-          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
-          for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION#V}"
+          STAGE="dist/macos/stage-${VERSION}-${{ matrix.arch }}"
+          test -L "$STAGE/Applications"
+          test "$(readlink "$STAGE/Applications")" = "/Applications"
+          for app in "$STAGE/Codex++.app" "$STAGE/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
             test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"

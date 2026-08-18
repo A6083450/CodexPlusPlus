@@ -43,6 +43,17 @@ fn bridge_script_defines_expected_globals_and_binding() {
 }
 
 #[test]
+fn deferred_runtime_scripts_are_only_scheduled_for_initial_bridge_install() {
+    let source = include_str!("../src/bridge.rs");
+
+    assert!(source.contains("if !replacing_active_pump && !deferred_runtime_scripts.is_empty()"));
+    assert!(
+        !source
+            .contains("if replacing_active_pump {\n        for script in deferred_runtime_scripts")
+    );
+}
+
+#[test]
 fn screenshot_command_uses_png_from_surface() {
     assert_eq!(
         bridge::capture_screenshot_params(),
