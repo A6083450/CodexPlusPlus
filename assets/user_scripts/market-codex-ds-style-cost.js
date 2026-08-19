@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.8.17
+// @version      0.8.18
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.8.17";
+const VERSION = "0.8.18";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -28,19 +28,22 @@ const VERSION = "0.8.17";
   const OFFICIAL_RUNTIME_STATE_TTL_MS = 10 * 60 * 1000;
   const SIDEBAR_SELECTION_GRACE_MS = 30 * 1000;
   const PROFILE_PREFS_KEY = "__codexLiveTokenCostProfilePrefsV1";
+  const PROFILE_IMAGE_ASSET_ID = "profile-avatar";
+  const PROFILE_IMAGE_ASSET_REF = "idb:profile-avatar";
   const PROFILE_OVERRIDES_KEY = "__codexLiveTokenCostProfileOverridesV1";
   const PROFILE_DEFAULTS_KEY = "__codexLiveTokenCostProfileDefaultsV1";
   const HUB_VISIBLE_KEY = "__codexLiveTokenCostHubVisibleV1";
   const OUTPUT_RATE_VISIBLE_KEY = "__codexLiveTokenCostOutputRateVisibleV1";
   const PROFILE_UNLOCK_ENABLED_KEY = "__codexLiveTokenCostProfileUnlockEnabledV1";
   const PROFILE_LEDGER_DB_NAME = "codex-live-token-cost-profile";
-  const PROFILE_LEDGER_DB_VERSION = 2;
+  const PROFILE_LEDGER_DB_VERSION = 3;
   const PROFILE_LEDGER_SNAPSHOT_KEY = "__codexLiveTokenCostProfileLedgerV2";
   const PROFILE_LEDGER_VERSION = 2;
   const PROFILE_LEDGER_STORE_TURNS = "profileTurns";
   const PROFILE_LEDGER_STORE_USAGE_CALLS = "profileUsageCalls";
   const PROFILE_LEDGER_STORE_INVOCATIONS = "profileInvocations";
   const PROFILE_LEDGER_STORE_DAILY_ROLLUPS = "profileDailyRollups";
+  const PROFILE_LEDGER_STORE_ASSETS = "profileAssets";
   const PROFILE_LEDGER_WRITE_COALESCE_MS = 500;
   const PROFILE_UI_AUTH_GATE_TTL_MS = 500;
   let profileUnlockEnabledRuntime;
@@ -287,6 +290,8 @@ const VERSION = "0.8.17";
     sessionAliases: new Map(),
     localMessageHandler: null,
     profileUnlockInstallScheduled: false,
+    profileImageAssetHydrated: false,
+    localLedgerPersistWarned: false,
     profileRequestIds: new Map(),
     codexModulePromises: new Map(),
     detectedModel: "",
@@ -680,6 +685,39 @@ const VERSION = "0.8.17";
     });
   }
 
+  // 头像等大体积资产放 IndexedDB：localStorage 与官方 statsig 缓存共享 ~10MB
+  // 配额，账本增长后曾把配额挤满导致头像保存报"存储空间不足"。
+  function profileAssetTransaction(mode, action) {
+    if (state.profileLedgerStorage !== "indexeddb" || !globalThis.indexedDB) return Promise.resolve(null);
+    if (!state.profileLedgerDbPromise && !state.profileLedgerDb) openProfileLedgerDatabase();
+    const dbPromise = state.profileLedgerDbPromise || Promise.resolve(state.profileLedgerDb);
+    return dbPromise.then((db) => {
+      if (!db) return null;
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(PROFILE_LEDGER_STORE_ASSETS, mode);
+          const request = action(tx.objectStore(PROFILE_LEDGER_STORE_ASSETS));
+          request.onsuccess = () => resolve(request.result ?? true);
+          request.onerror = () => resolve(null);
+        } catch {
+          resolve(null);
+        }
+      });
+    }).catch(() => null);
+  }
+
+  function profileAssetGet(id) {
+    return profileAssetTransaction("readonly", (store) => store.get(id)).then((record) => record?.value || null);
+  }
+
+  function profileAssetPut(id, value) {
+    return profileAssetTransaction("readwrite", (store) => store.put({ id, value }));
+  }
+
+  function profileAssetDelete(id) {
+    return profileAssetTransaction("readwrite", (store) => store.delete(id));
+  }
+
   function mergeProfileTurn(existing, next) {
     if (!existing) return next;
     const merged = { ...existing, ...next };
@@ -731,9 +769,28 @@ const VERSION = "0.8.17";
         if (!db.objectStoreNames.contains(PROFILE_LEDGER_STORE_USAGE_CALLS)) db.createObjectStore(PROFILE_LEDGER_STORE_USAGE_CALLS, { keyPath: "id" });
         if (!db.objectStoreNames.contains(PROFILE_LEDGER_STORE_INVOCATIONS)) db.createObjectStore(PROFILE_LEDGER_STORE_INVOCATIONS, { keyPath: "invocationId" });
         if (!db.objectStoreNames.contains(PROFILE_LEDGER_STORE_DAILY_ROLLUPS)) db.createObjectStore(PROFILE_LEDGER_STORE_DAILY_ROLLUPS, { keyPath: "date" });
+        if (!db.objectStoreNames.contains(PROFILE_LEDGER_STORE_ASSETS)) db.createObjectStore(PROFILE_LEDGER_STORE_ASSETS, { keyPath: "id" });
       };
-      request.onsuccess = () => resolve(request.result);
+      // 同一 origin 可能有多个页面（主窗口/avatar-overlay）持有旧版本连接，
+      // 收到 versionchange 必须立刻关闭，否则其它页面的版本升级会被永久阻塞。
+      request.onsuccess = () => {
+        const db = request.result;
+        db.onversionchange = () => {
+          try {
+            db.close();
+            state.profileLedgerDb = null;
+            state.profileLedgerDbPromise = null;
+          } catch {
+            // Best effort: the next open retries on demand.
+          }
+        };
+        resolve(db);
+      };
       request.onerror = () => reject(request.error || new Error("profile ledger IndexedDB open failed"));
+      request.onblocked = () => {
+        state.profileLedgerDbPromise = null;
+        reject(new Error("profile ledger IndexedDB open blocked"));
+      };
     })
       .then(async (db) => {
         state.profileLedgerDb = db;
@@ -871,6 +928,17 @@ const VERSION = "0.8.17";
     if (turns.length || calls.length || invocations.length) profileLedgerQueueWrite(turns, calls, invocations);
   }
 
+  function hydrateProfileImageAsset() {
+    if (state.profileImageAssetHydrated) return;
+    state.profileImageAssetHydrated = true;
+    void profileAssetGet(PROFILE_IMAGE_ASSET_ID).then((stored) => {
+      if (!stored || state.profilePrefs?.imageUrl) return;
+      state.profilePrefs = { ...(state.profilePrefs || localProfilePrefs()), imageUrl: stored };
+      syncProfileUsageQueryCache();
+      scheduleSidebarProfileIdentitySync(0);
+    });
+  }
+
   function ensureProfileLedgerLoaded() {
     if (state.profileLedgerLoaded) return state.profileLedger;
     state.profileLedgerLoaded = true;
@@ -889,6 +957,7 @@ const VERSION = "0.8.17";
     if (hasLedgerDetails || !hasSnapshotRollup) profileLedgerRebuildRollup();
     saveProfileLedgerSnapshot();
     openProfileLedgerDatabase();
+    hydrateProfileImageAsset();
     return state.profileLedger;
   }
 
@@ -2830,6 +2899,25 @@ const VERSION = "0.8.17";
     if (!state.localLedgerLoaded) loadLocalLedger();
   }
 
+  // 持久化时剥离 invocations 明细（重度会话单条 turn 可达数千条、占 99% 体积，
+  // 曾把 localStorage 配额挤满导致账本静默停写），技能计数折叠为 invocationSummary。
+  function slimLocalTurnForPersist(turn) {
+    const invocations = Array.isArray(turn?.invocations) ? turn.invocations : null;
+    if (!invocations?.length) return turn;
+    const summary = {};
+    for (const raw of invocations) {
+      const invocation = normalizeProfileInvocation(raw);
+      if (!invocation) continue;
+      const key = profileInvocationKey(invocation);
+      const item = summary[key] || { invocation, count: 0 };
+      item.count++;
+      summary[key] = item;
+    }
+    const slim = { ...turn, invocations: [] };
+    if (Object.keys(summary).length) slim.invocationSummary = summary;
+    return slim;
+  }
+
   function saveLocalLedger() {
     try {
       const compacted = compactLocalLedger(state.localLedger, state.localUsageArchive);
@@ -2839,7 +2927,7 @@ const VERSION = "0.8.17";
       localStorage.setItem(
         LOCAL_USAGE_KEY,
         JSON.stringify({
-          turns: state.localLedger,
+          turns: state.localLedger.map(slimLocalTurnForPersist),
           archive: state.localUsageArchive,
           last: state.localLast,
           seq: state.localTurnSeq,
@@ -2847,8 +2935,15 @@ const VERSION = "0.8.17";
         }),
       );
       refreshAnalyticsRollupDates([...compacted.dates, localDateKey(turnTimestampMs(state.localLast))]);
-    } catch {
-      // Ignore quota or privacy-mode failures.
+    } catch (error) {
+      if (!state.localLedgerPersistWarned) {
+        state.localLedgerPersistWarned = true;
+        try {
+          console.warn("[codex-live-token-cost] local ledger persist failed", error);
+        } catch {
+          // Ignore console failures.
+        }
+      }
     }
   }
 
@@ -4350,6 +4445,15 @@ const VERSION = "0.8.17";
         const key = profileInvocationKey(invocation);
         const item = activity.invocationCounts[key] || { invocation, count: 0 };
         item.count++;
+        activity.invocationCounts[key] = item;
+      }
+      const invocationSummary = turn?.invocationSummary && typeof turn.invocationSummary === "object" ? turn.invocationSummary : null;
+      for (const [key, summaryItem] of Object.entries(invocationSummary || {})) {
+        const invocation = normalizeProfileInvocation(summaryItem?.invocation);
+        const count = toCount(summaryItem?.count);
+        if (!invocation || !count) continue;
+        const item = activity.invocationCounts[key] || { invocation, count: 0 };
+        item.count += count;
         activity.invocationCounts[key] = item;
       }
     }
@@ -6013,7 +6117,7 @@ const VERSION = "0.8.17";
     const defaultEmail = profileDefaultEmail();
     const username = profileUsernameAllowed(saved.username) ? stripProfileUsername(saved.username) : "codex-local-usage";
     const plan = normalizeProfilePlan(saved.planType ?? saved.plan, saved.planLabel);
-    const rawImageUrl = normalizeText(saved.imageUrl, PROFILE_IMAGE_MAX_LENGTH);
+    const rawImageUrl = saved.imageUrl === PROFILE_IMAGE_ASSET_REF ? "" : normalizeText(saved.imageUrl, PROFILE_IMAGE_MAX_LENGTH);
     const imageUrl = normalizeProfileImageUrl(rawImageUrl);
     const savedEmail = validProfileEmail(saved.email);
     if (savedEmail && savedEmail !== LOCAL_PROFILE_EMAIL && defaultEmail === LOCAL_PROFILE_EMAIL) saveProfileDefaultEmail(savedEmail);
@@ -6045,6 +6149,10 @@ const VERSION = "0.8.17";
     return state.profilePrefs;
   }
 
+  function persistProfileImageAsset(imageUrl) {
+    void (imageUrl ? profileAssetPut(PROFILE_IMAGE_ASSET_ID, imageUrl) : profileAssetDelete(PROFILE_IMAGE_ASSET_ID));
+  }
+
   function saveLocalProfilePrefs(prefs, options = {}) {
     const plan = normalizeProfilePlan(prefs?.planType ?? prefs?.plan, prefs?.planLabel);
     const next = {
@@ -6057,12 +6165,15 @@ const VERSION = "0.8.17";
       planLabel: plan.planLabel,
       imageUrl: normalizeProfileImageUrl(prefs?.imageUrl),
     };
+    // 头像数据 URL 存 IndexedDB，localStorage 只留引用标记，避免挤占共享配额
+    const storedPrefs = { ...next, imageUrl: next.imageUrl ? PROFILE_IMAGE_ASSET_REF : null };
     try {
-      localStorage.setItem(PROFILE_PREFS_KEY, JSON.stringify(next));
+      localStorage.setItem(PROFILE_PREFS_KEY, JSON.stringify(storedPrefs));
     } catch (error) {
       if (isProfileStorageQuotaError(error)) throw profileStorageQuotaError(error);
       throw error;
     }
+    persistProfileImageAsset(next.imageUrl);
     if (options.profileEditor) saveProfileDefaultEmail(next.email);
     state.profilePrefs = next;
     syncProfileUsageQueryCache();

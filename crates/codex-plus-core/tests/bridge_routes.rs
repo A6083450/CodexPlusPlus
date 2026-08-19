@@ -828,7 +828,7 @@ fn user_script_manager_installs_ds_style_cost_script_name() {
     assert!(
         std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
             .unwrap()
-            .contains("@version      0.8.17")
+            .contains("@version      0.8.18")
     );
 }
 
@@ -846,13 +846,13 @@ fn user_script_manager_preserves_newer_scripts_and_upgrades_older_scripts() {
 
     std::fs::write(
         &script_path,
-        "// ==UserScript==\n// @version      0.8.17\n// ==/UserScript==\nwindow.customNewer = true;",
+        "// ==UserScript==\n// @version      0.8.19\n// ==/UserScript==\nwindow.customNewer = true;",
     )
     .unwrap();
     manager.install_missing_bundled_market_scripts().unwrap();
     assert_eq!(
         std::fs::read_to_string(&script_path).unwrap(),
-        "// ==UserScript==\n// @version      0.8.17\n// ==/UserScript==\nwindow.customNewer = true;"
+        "// ==UserScript==\n// @version      0.8.19\n// ==/UserScript==\nwindow.customNewer = true;"
     );
 
     std::fs::write(

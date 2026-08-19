@@ -223,6 +223,38 @@ test("profile identity sync re-runs when profile UI mutates", async () => {
   assert.match(source, /scheduleSidebarProfileIdentitySync\(0\);/);
 });
 
+test("profile avatar persists to IndexedDB instead of localStorage", async () => {
+  const source = await readScript();
+  const save = functionBody(source, "saveLocalProfilePrefs", "extractProfilePhotoDataUrl");
+  const load = functionBody(source, "localProfilePrefs", "persistProfileImageAsset");
+  const ensure = functionBody(source, "ensureProfileLedgerLoaded", "profileRollupDay");
+
+  assert.match(source, /const PROFILE_LEDGER_DB_VERSION = 3;/);
+  assert.match(source, /const PROFILE_LEDGER_STORE_ASSETS = "profileAssets";/);
+  assert.match(source, /db\.createObjectStore\(PROFILE_LEDGER_STORE_ASSETS, \{ keyPath: "id" \}\)/);
+  assert.match(source, /db\.onversionchange = \(\) => \{/);
+  assert.match(source, /request\.onblocked = \(\) => \{/);
+  assert.match(source, /function profileAssetPut\(/);
+  assert.match(source, /function profileAssetDelete\(/);
+  assert.match(save, /imageUrl: next\.imageUrl \? PROFILE_IMAGE_ASSET_REF : null/);
+  assert.match(save, /persistProfileImageAsset\(next\.imageUrl\);/);
+  assert.match(load, /saved\.imageUrl === PROFILE_IMAGE_ASSET_REF \? "" : normalizeText/);
+  assert.match(ensure, /hydrateProfileImageAsset\(\);/);
+});
+
+test("local ledger persist strips invocation payloads but keeps skill counts", async () => {
+  const source = await readScript();
+  const save = functionBody(source, "saveLocalLedger", "normalizedDurationMs");
+  const activity = functionBody(source, "localProfileActivityStats", "normalizeHelperStatsPayload");
+
+  assert.match(source, /function slimLocalTurnForPersist\(/);
+  assert.match(save, /turns: state\.localLedger\.map\(slimLocalTurnForPersist\)/);
+  assert.match(source, /const item = summary\[key\] \|\| \{ invocation, count: 0 \};/);
+  assert.match(source, /slim\.invocationSummary = summary;/);
+  assert.match(activity, /turn\?\.invocationSummary/);
+  assert.match(activity, /item\.count \+= count;/);
+});
+
 test("profile menu sync supports Radix portal menus without aria-controls", async () => {
   const source = await readScript();
   const sync = functionBody(source, "syncSidebarProfileMenuIdentity", "restoreSidebarProfileMenuIdentity");
