@@ -13,8 +13,12 @@ async function readScript() {
 
 function functionBody(source: string, name: string, nextName: string) {
   const normalizedSource = source.replace(/\r\n/g, "\n");
-  const start = normalizedSource.indexOf(`  function ${name}(`);
-  const end = normalizedSource.indexOf(`\n\n  function ${nextName}(`, start);
+  const startMatch = normalizedSource.match(new RegExp(`^  (?:async )?function ${name}\\(`, "m"));
+  const start = startMatch?.index ?? -1;
+  const endMatch = start >= 0
+    ? normalizedSource.slice(start).match(new RegExp(`\\n\\n  (?:async )?function ${nextName}\\(`))
+    : null;
+  const end = endMatch ? start + endMatch.index : -1;
   assert.ok(start >= 0 && end > start, `${name} should be present before ${nextName}`);
   return normalizedSource.slice(start, end);
 }
@@ -160,9 +164,68 @@ test("profile unlock defaults on without eagerly patching the renderer", async (
 
   assert.match(profileToggle, /localStorage\.getItem\(PROFILE_UNLOCK_ENABLED_KEY\) !== "false"/);
   assert.match(profileToggle, /catch \{\s*return true;/);
-  assert.match(source, /function installProfileUnlockOnDemand\(\)/);
-  assert.match(startup, /if \(profileUnlockEnabled\(\)\) installProfileUnlockOnDemand\(\);/);
-  assert.doesNotMatch(source, /if \(profileUnlockEnabled\(\)\) installOfficialProfileUnlock\(\);/);
+  assert.doesNotMatch(source, /function installProfileUnlockOnDemand\(\)/);
+  assert.match(startup, /if \(profileUnlockEnabled\(\)\) installSidebarProfileIdentitySync\(\);/);
+  assert.doesNotMatch(source, /installOfficialProfileUnlock/);
+});
+
+test("profile entry opens the official profile route without renderer-wide prototype hooks", async () => {
+  const source = await readScript();
+  const refresh = functionBody(source, "scheduleProfileUsageRefresh", "patchProfileRequestClient");
+
+  assert.match(source, /function openOfficialProfileFromMenu\(doc, menu\) \{/);
+  assert.match(source, /settingsItem\.click\(\);/);
+  assert.match(source, /findOfficialProfileSettingsControl\(doc\)/);
+  assert.match(source, /state\.profileNavigationTimer = window\.setTimeout\(openProfile, 50\)/);
+  assert.doesNotMatch(source, /state\.settingsPanel = "profile";/);
+  assert.match(source, /profileNavigationAuthUntil/);
+  assert.match(source, /profileNavigationAuthActive\(\)\s*&&\s*isProfileUiAuthRead/);
+  assert.match(source, /member_profiles_enabled/);
+  assert.match(source, /patchProfileStatsigGate\(\);/);
+  assert.doesNotMatch(source, /function installProfileUnlockOnDemand\(\)/);
+  assert.doesNotMatch(source, /Array\.prototype\.filter\s*=/);
+  assert.doesNotMatch(source, /Promise\.prototype\.then\s*=/);
+  assert.doesNotMatch(source, /RegExp\.prototype\.test\s*=/);
+  assert.doesNotMatch(refresh, /setTimeout|invalidateProfileUsageQuery/);
+});
+
+test("profile account settings spoof preserves the official response fields", async () => {
+  const source = await readScript();
+  const requestPatch = functionBody(source, "patchProfileRequestClient", "patchProfilePhotoUploadClient");
+
+  assert.match(source, /function spoofProfileAccountSettingsPayload\(/);
+  assert.match(source, /const source = value && typeof value === "object" && !Array\.isArray\(value\) \? value : \{\};/);
+  assert.match(source, /return \{ \.\.\.source, member_profiles_enabled: true \};/);
+  assert.match(requestPatch, /const response = await originalSafeGet\(url, \.\.\.args\);/);
+  assert.match(requestPatch, /spoofProfileAccountSettingsPayload\(response\)/);
+});
+
+test("profile request patch discovers the official client from app-initial exports", async () => {
+  const source = await readScript();
+  const requestPatch = functionBody(source, "installProfileRequestClientPatch", "installProfilePhotoUploadPatch");
+
+  assert.match(requestPatch, /loadCodexAppModule\("app-initial-"\)/);
+  assert.match(requestPatch, /Object\.values\(appInitialModule \|\| \{\}\)/);
+  assert.doesNotMatch(requestPatch, /const module = await loadCodexAppModule\("request-"\);/);
+});
+
+test("profile identity sync avoids a document-wide mutation observer", async () => {
+  const source = await readScript();
+  const install = functionBody(source, "installSidebarProfileIdentitySync", "stopSidebarProfileIdentitySync");
+
+  assert.doesNotMatch(install, /document\.body|document\.documentElement/);
+  assert.doesNotMatch(install, /new MutationObserver/);
+  assert.match(source, /scheduleSidebarProfileIdentitySync\(0\);/);
+});
+
+test("profile menu sync supports Radix portal menus without aria-controls", async () => {
+  const source = await readScript();
+  const sync = functionBody(source, "syncSidebarProfileMenuIdentity", "restoreSidebarProfileMenuIdentity");
+
+  assert.match(sync, /button\?\.getAttribute\?\.\("aria-controls"\)/);
+  assert.match(sync, /querySelectorAll\?\.\("\[role='menu'\]"\)/);
+  assert.match(sync, /node\.getAttribute\?\.\("aria-labelledby"\) === button\.id/);
+  assert.match(sync, /menu\.getAttribute\?\.\("aria-labelledby"\) !== button\.id/);
 });
 
 test("the optional CC Switch helper is bundled with a matching launcher", async () => {
@@ -200,7 +263,7 @@ test("mutation observers stop discovery work and ignore non-turn side-chat mutat
   assert.match(modelObserver, /if \(state\.officialModelTrigger\?\.isConnected\) \{/);
   assert.match(source, /function mutationTouchesHubVisibility\(/);
   assert.match(source, /function mutationTouchesProfileIdentity\(/);
-  assert.match(source, /if \(mutations\.some\(mutationTouchesProfileIdentity\)\) scheduleSidebarProfileIdentitySync\(80\)/);
+  assert.doesNotMatch(source, /if \(mutations\.some\(mutationTouchesProfileIdentity\)\) scheduleSidebarProfileIdentitySync\(80\)/);
   assert.match(source, /function mutationTouchesSideChatTurn\(/);
   assert.match(sideObserver, /new MutationObserver\(\(mutations\) => \{/);
   assert.match(sideObserver, /if \(!Array\.from\(mutations\)\.some\(mutationTouchesSideChatTurn\)\) return;/);

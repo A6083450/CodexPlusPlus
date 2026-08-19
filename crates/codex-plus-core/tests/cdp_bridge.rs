@@ -1280,8 +1280,8 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
     assert!(script.contains("pluginMarketplaceUnlock: true"));
     assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
     assert!(script.contains("if (!codexPlusSettings().pluginMarketplaceUnlock) return"));
-    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
+    assert!(!script.contains("installPluginBuildFlavorFilterPatch"));
 }
 
 #[test]
@@ -1332,12 +1332,9 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
-    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
-    assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
-    assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
-    assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
-    assert!(!script.contains("if (!source.includes(\"name\")) return false"));
+    assert!(!script.contains("isCodexPluginBuildFlavorFilter"));
+    assert!(!script.contains("isCodexPluginMarketplaceHiddenFilter"));
+    assert!(!script.contains("Array.prototype.filter"));
 }
 
 #[test]
@@ -1347,18 +1344,7 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
-    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
-    assert!(script.contains("Array.prototype.filter"));
-    assert!(script.contains("codexPluginBuildFlavorFilterPatch"));
-    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin)"
-    ));
-    assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
-    assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(marketplace?.name) && !callback(marketplace)"
-    ));
-    assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
+    assert!(!script.contains("Array.prototype.filter"));
     assert!(script.contains("method === \"list-plugins\""));
     assert!(script.contains("method === \"vscode://codex/list-plugins\""));
     assert!(script.contains("message.type === \"fetch\""));
@@ -1403,7 +1389,7 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("OpenAI插件3(Codex++)"));
     assert!(script.contains("method === \"install-plugin\""));
     assert!(script.contains("plugin_marketplace_response_expanded"));
-    assert!(script.contains("plugin_build_flavor_filter_bypassed"));
+    assert!(!script.contains("plugin_build_flavor_filter_bypassed"));
     assert!(script.contains("plugin_install_request_debug"));
     assert!(script.contains("plugin_install_request_failed"));
     assert!(!script.contains("marketplace.path ="));
