@@ -1471,14 +1471,12 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
         tokio::time::sleep(Duration::from_secs(2)).await;
     });
 
+    let request = upstream_http_client()
+        .unwrap()
+        .get(format!("http://{addr}/v1/models"));
     let started = Instant::now();
-    let result = send_upstream_request_with_header_timeout(
-        upstream_http_client()
-            .unwrap()
-            .get(format!("http://{addr}/v1/models")),
-        Duration::from_millis(100),
-    )
-    .await;
+    let result =
+        send_upstream_request_with_header_timeout(request, Duration::from_millis(100)).await;
 
     assert!(result.is_err());
     assert!(started.elapsed() < Duration::from_secs(1));

@@ -8,12 +8,13 @@ use codex_plus_core::app_paths::{
 };
 use codex_plus_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
-    browser_identity_changed, build_codex_arguments, build_codex_arguments_for_settings,
-    build_codex_arguments_with_native_menu_inspector, build_codex_command,
-    build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
-    build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
-    build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
-    launch_and_inject_with_hooks,
+    MacosDebugLaunchAction, browser_identity_changed, build_codex_arguments,
+    build_codex_arguments_for_settings, build_codex_arguments_with_native_menu_inspector,
+    build_codex_command, build_codex_command_with_native_menu_inspector,
+    build_macos_cleanup_command, build_macos_open_command,
+    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
+    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
+    select_macos_debug_launch_action,
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
@@ -880,7 +881,6 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
         .with_settings(BackendSettings {
             provider_sync_enabled: true,
             relay_profiles_enabled: true,
-            computer_use_guard_enabled: true,
             codex_app_plugin_marketplace_unlock: true,
             ..BackendSettings::default()
         })
@@ -910,10 +910,8 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
             "select-helper:57321",
             "load-settings",
             "provider-sync",
-            "computer-use-guard",
             "start-helper:57321",
             "launch:9229",
-            "computer-use-guard-watchdog",
             "inject:9229:57321",
             "status:running",
             "wait-codex",
@@ -923,8 +921,6 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
     assert!(events.contains(&"provider-sync".to_string()));
-    assert!(events.contains(&"computer-use-guard".to_string()));
-    assert!(events.contains(&"computer-use-guard-watchdog".to_string()));
     assert_eq!(
         handle
             .status_store
@@ -1080,77 +1076,6 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
             "wait-codex",
         ]
     );
-}
-
-#[tokio::test]
-async fn launch_lifecycle_runs_computer_use_guard_when_enabled() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        computer_use_guard_enabled: true,
-        ..BackendSettings::default()
-    });
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-    handle.wait_for_codex_exit().await.unwrap();
-
-    assert_eq!(
-        *events.lock().unwrap(),
-        vec![
-            "select-debug:9229",
-            "select-helper:57321",
-            "load-settings",
-            "computer-use-guard",
-            "start-helper:57321",
-            "launch:9229",
-            "computer-use-guard-watchdog",
-            "inject:9229:57321",
-            "status:running",
-            "wait-codex",
-            "shutdown-helper:57321",
-        ]
-    );
-}
-
-#[tokio::test]
-async fn launch_lifecycle_skips_computer_use_guard_by_default() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone());
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-    handle.wait_for_codex_exit().await.unwrap();
-
-    let events = events.lock().unwrap().clone();
-    assert!(!events.contains(&"computer-use-guard".to_string()));
-    assert!(!events.contains(&"computer-use-guard-watchdog".to_string()));
-    assert!(events.contains(&"launch:9229".to_string()));
 }
 
 #[tokio::test]
@@ -1326,7 +1251,6 @@ async fn launch_lifecycle_skips_active_relay_profile_when_supplier_config_disabl
 
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
-    assert!(!events.contains(&"computer-use-guard".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -1378,7 +1302,6 @@ experimental_bearer_token = "sk-test"
 
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
-    assert!(!events.contains(&"computer-use-guard".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -1745,6 +1668,30 @@ fn launcher_macos_cleanup_is_skipped_when_app_was_already_running() {
     assert_eq!(command, None);
 }
 
+#[test]
+fn launcher_macos_debug_launch_starts_when_app_is_not_running() {
+    assert_eq!(
+        select_macos_debug_launch_action(false, false),
+        MacosDebugLaunchAction::LaunchNew
+    );
+}
+
+#[test]
+fn launcher_macos_debug_launch_reuses_existing_codex_cdp_instance() {
+    assert_eq!(
+        select_macos_debug_launch_action(true, true),
+        MacosDebugLaunchAction::ReuseRunningDebugApp
+    );
+}
+
+#[test]
+fn launcher_macos_debug_launch_restarts_existing_non_cdp_instance() {
+    assert_eq!(
+        select_macos_debug_launch_action(true, false),
+        MacosDebugLaunchAction::RestartRunningApp
+    );
+}
+
 #[tokio::test]
 async fn default_launch_hooks_provider_sync_enabled_returns_explicit_error() {
     let error = DefaultLaunchHooks::default()
@@ -1889,11 +1836,6 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
-        self.event("computer-use-guard");
-        Ok(())
-    }
-
     async fn ensure_plugin_marketplace_config(
         &self,
         _settings: &BackendSettings,
@@ -1952,14 +1894,6 @@ impl LaunchHooks for FakeHooks {
         _debug_port: u16,
         _helper_port: u16,
     ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.event("computer-use-guard-watchdog");
         Ok(())
     }
 

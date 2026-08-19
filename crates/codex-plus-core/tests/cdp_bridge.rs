@@ -6,6 +6,7 @@ use codex_plus_core::cdp::{
     is_quick_chat_page_target, list_targets, pick_injectable_codex_page_target, pick_page_target,
     validate_cdp_websocket_url,
 };
+use codex_plus_core::settings::BackendSettings;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -46,11 +47,9 @@ fn bridge_script_defines_expected_globals_and_binding() {
 fn deferred_runtime_scripts_are_only_scheduled_for_initial_bridge_install() {
     let source = include_str!("../src/bridge.rs");
 
-    assert!(source.contains("if !replacing_active_pump && !deferred_runtime_scripts.is_empty()"));
-    assert!(
-        !source
-            .contains("if replacing_active_pump {\n        for script in deferred_runtime_scripts")
-    );
+    assert!(source.contains("if !deferred_runtime_scripts.is_empty()"));
+    assert!(source.contains("bridge_generation_is_current(&deferred_generation)"));
+    assert!(!source.contains("replacing_active_pump"));
 }
 
 #[test]
@@ -391,6 +390,25 @@ async function flushTimers() {{
             .as_str()
             .is_some_and(|style| !style.contains("70vh"))
     );
+}
+
+#[test]
+fn injection_script_omits_stepwise_runtime_when_disabled() {
+    let script = assets::injection_script_with_settings(57321, &BackendSettings::default());
+
+    assert!(!script.contains("const API_KEY = \"__codexStepwisePanel\";"));
+    assert!(script.contains("data-codex-plus-setting=\"stepwise\""));
+}
+
+#[test]
+fn injection_script_includes_stepwise_runtime_when_enabled() {
+    let settings = BackendSettings {
+        codex_app_stepwise_enabled: true,
+        ..Default::default()
+    };
+    let script = assets::injection_script_with_settings(57321, &settings);
+
+    assert!(script.contains("const API_KEY = \"__codexStepwisePanel\";"));
 }
 
 #[test]
@@ -1076,7 +1094,11 @@ fn injection_script_menu_exposes_marketplace_plugin_switch_only() {
 
 #[test]
 fn injection_script_menu_exposes_stepwise_switch_and_syncs_panel() {
-    let script = assets::injection_script(57321);
+    let settings = BackendSettings {
+        codex_app_stepwise_enabled: true,
+        ..Default::default()
+    };
+    let script = assets::injection_script_with_settings(57321, &settings);
 
     assert!(script.contains("stepwise: false"));
     assert!(script.contains("stepwise: \"codexAppStepwiseEnabled\""));
@@ -1087,6 +1109,18 @@ fn injection_script_menu_exposes_stepwise_switch_and_syncs_panel() {
     assert!(script.contains("if (key === \"stepwise\") syncStepwisePanel(value)"));
     assert!(script.contains("if (patch?.enabled === true)"));
     assert!(script.contains("activateRuntime();"));
+}
+
+#[test]
+fn stepwise_runtime_stops_work_when_disabled() {
+    let script = assets::stepwise_script().replace("\r\n", "\n");
+
+    assert!(script.contains("function stepwiseEnabled()"));
+    assert!(script.contains("if (!stepwiseEnabled()) {"));
+    assert!(script.contains("stopRuntime();"));
+    assert!(script.contains(
+        "function requestBridgeStepwise(key, userText, assistantText) {\n    if (!stepwiseEnabled()) return;"
+    ));
 }
 
 #[test]
@@ -1197,6 +1231,7 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
 fn injection_script_omits_plugin_auto_expand() {
     let script = assets::injection_script(57321);
 
+    assert!(!script.contains("schedulePluginAutoExpand"));
     assert!(!script.contains("pluginAutoExpand"));
     assert!(!script.contains("codexPluginAutoExpand"));
     assert!(!script.contains("plugin_auto_expand"));
@@ -3705,6 +3740,31 @@ fn pick_injectable_codex_page_target_ignores_embedded_browser_page_named_codex()
 }
 
 #[test]
+fn pick_injectable_codex_page_target_ignores_standalone_manager() {
+    let targets = vec![
+        target(
+            "manager",
+            "page",
+            "Codex++ 管理工具",
+            "http://127.0.0.1:1420/",
+            Some("ws://manager"),
+        ),
+        target(
+            "main",
+            "page",
+            "Codex",
+            "app://-/index.html",
+            Some("ws://main"),
+        ),
+    ];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("native Codex app page should win over the standalone manager");
+
+    assert_eq!(picked.id, "main");
+}
+
+#[test]
 fn pick_injectable_codex_page_target_rejects_embedded_browser_only_page() {
     let targets = vec![target(
         "browser-pr",
@@ -3754,6 +3814,31 @@ fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_error_page() {
         .expect("ChatGPT desktop error page should be selected");
 
     assert_eq!(picked.id, "chatgpt-error");
+}
+
+#[test]
+fn pick_injectable_codex_page_target_prefers_app_main_over_incidental_codex_page() {
+    let targets = vec![
+        target(
+            "help",
+            "page",
+            "Using Codex with your ChatGPT plan",
+            "https://help.openai.com/en/articles/using-codex",
+            Some("ws://help"),
+        ),
+        target(
+            "main",
+            "page",
+            "Codex",
+            "app://-/index.html",
+            Some("ws://main"),
+        ),
+    ];
+
+    let picked = pick_injectable_codex_page_target(&targets)
+        .expect("the exact app main renderer should win regardless of target order");
+
+    assert_eq!(picked.id, "main");
 }
 
 #[test]
@@ -4037,7 +4122,677 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
 }
 
+#[tokio::test]
+async fn install_bridge_immediately_evaluates_new_document_scripts() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        let add_main = recv_json(&mut socket).await;
+        assert_eq!(add_main["method"], "Page.addScriptToEvaluateOnNewDocument");
+        assert_eq!(add_main["params"]["source"], "window.mainInjected = true;");
+        send_json(&mut socket, json!({ "id": add_main["id"], "result": {} })).await;
+
+        let eval_main = recv_json(&mut socket).await;
+        assert_eq!(eval_main["method"], "Runtime.evaluate");
+        assert_eq!(
+            eval_main["params"]["expression"],
+            "window.mainInjected = true;"
+        );
+        send_json(&mut socket, json!({ "id": eval_main["id"], "result": {} })).await;
+
+        let add_user = recv_json(&mut socket).await;
+        assert_eq!(add_user["method"], "Page.addScriptToEvaluateOnNewDocument");
+        assert_eq!(add_user["params"]["source"], "window.userInjected = true;");
+        send_json(&mut socket, json!({ "id": add_user["id"], "result": {} })).await;
+
+        let eval_user = recv_json(&mut socket).await;
+        assert_eq!(eval_user["method"], "Runtime.evaluate");
+        assert_eq!(
+            eval_user["params"]["expression"],
+            "window.userInjected = true;"
+        );
+        send_json(&mut socket, json!({ "id": eval_user["id"], "result": {} })).await;
+
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(
+            &url,
+            BRIDGE_BINDING_NAME,
+            noop_handler(),
+            &[
+                "window.mainInjected = true;".to_string(),
+                "window.userInjected = true;".to_string(),
+            ],
+        ),
+    )
+    .await
+    .expect("bridge should not hang while evaluating new document scripts")
+    .expect("bridge should evaluate new document scripts immediately");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        let add_script = recv_json(&mut socket).await;
+        assert_eq!(
+            add_script["method"],
+            "Page.addScriptToEvaluateOnNewDocument"
+        );
+        send_json(&mut socket, json!({ "id": add_script["id"], "result": {} })).await;
+
+        let eval_script = recv_json(&mut socket).await;
+        assert_eq!(eval_script["method"], "Runtime.evaluate");
+        send_json(
+            &mut socket,
+            json!({ "id": eval_script["id"], "result": {} }),
+        )
+        .await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "after-return",
+                        "path": "status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let resolve = recv_json(&mut socket).await;
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("after-return")
+        );
+        send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handled = Arc::new(AtomicBool::new(false));
+    let handler = {
+        let handled = Arc::clone(&handled);
+        Arc::new(move |_path: String, _payload: serde_json::Value| {
+            let handled = Arc::clone(&handled);
+            Box::pin(async move {
+                handled.store(true, Ordering::SeqCst);
+                Ok(json!({ "status": "ok" }))
+            })
+                as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(
+            &url,
+            BRIDGE_BINDING_NAME,
+            handler,
+            &["window.ready = true;".to_string()],
+        ),
+    )
+    .await
+    .expect("bridge install should return after setup")
+    .expect("bridge install should succeed");
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(handled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn install_bridge_command_error_mentions_method_and_id() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        let command = recv_json(&mut socket).await;
+        assert_eq!(command["method"], "Runtime.enable");
+        send_json(
+            &mut socket,
+            json!({
+                "id": command["id"],
+                "error": { "code": -32000, "message": "Runtime disabled" },
+            }),
+        )
+        .await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = noop_handler();
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang on CDP error response")
+    .expect_err("CDP error response should fail install");
+    let message = error.to_string();
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(message.contains("Runtime.enable"), "{message}");
+    assert!(message.contains("id 1"), "{message}");
+    assert!(message.contains("Runtime disabled"), "{message}");
+}
+
+#[tokio::test]
+async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparseable_payload() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": { "payload": "{\"id\":\"bad-1\",\"payload\":{}" },
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": { "payload": "not json" },
+            }),
+        )
+        .await;
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "ok-1",
+                        "path": "delete",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let reject = recv_json(&mut socket).await;
+        assert!(
+            reject["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("__codexSessionDeleteReject")
+        );
+        assert!(
+            reject["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("bad-1")
+        );
+        send_json(&mut socket, json!({ "id": reject["id"], "result": {} })).await;
+
+        let resolve = recv_json(&mut socket).await;
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("__codexSessionDeleteResolve")
+        );
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("ok-1")
+        );
+        send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
+    )
+    .await
+    .expect("bridge should not hang after bad payload")
+    .expect("bad payloads should not terminate the bridge loop");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn install_bridge_queues_consecutive_bindings_without_recursive_dispatch() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        for request_id in ["first", "second", "third"] {
+            send_json(
+                &mut socket,
+                json!({
+                    "method": "Runtime.bindingCalled",
+                    "params": {
+                        "payload": serde_json::to_string(&json!({
+                            "id": request_id,
+                            "path": "delete",
+                            "payload": { "request": request_id },
+                        })).unwrap(),
+                    },
+                }),
+            )
+            .await;
+        }
+
+        let first = recv_json(&mut socket).await;
+        assert_eq!(first["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&first, "first");
+        let second = recv_json(&mut socket).await;
+        assert_eq!(second["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&second, "second");
+        assert_ne!(second["id"], first["id"]);
+
+        let third = recv_json(&mut socket).await;
+        assert_eq!(third["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&third, "third");
+        assert_ne!(third["id"], first["id"]);
+        assert_ne!(third["id"], second["id"]);
+
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = Arc::new(|_path: String, payload: serde_json::Value| {
+        Box::pin(async move { Ok(json!({ "status": "ok", "request": payload["request"] })) })
+            as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang while draining queued binding calls")
+    .expect("bridge should process queued binding calls");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "first",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        let first_resolve = recv_json(&mut socket).await;
+        assert_eq!(first_resolve["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&first_resolve, "first");
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "second",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        let second_resolve =
+            tokio::time::timeout(Duration::from_millis(500), recv_json(&mut socket))
+                .await
+                .expect(
+                    "second resolve should be sent without waiting for first Runtime.evaluate ack",
+                );
+        assert_eq!(second_resolve["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&second_resolve, "second");
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = Arc::new(|_path: String, _payload: serde_json::Value| {
+        Box::pin(async { Ok(json!({ "status": "ok" })) })
+            as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge install should not wait for resolve ack")
+    .expect("bridge install should survive missing resolve ack");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
+    let generate_started = Arc::new(Notify::new());
+    let release_generate = Arc::new(Notify::new());
+    let server_generate_started = Arc::clone(&generate_started);
+    let server_release_generate = Arc::clone(&release_generate);
+    let (url, request_rx) = spawn_cdp_server(move |mut socket| async move {
+        acknowledge_bridge_install(&mut socket).await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "generate",
+                        "path": "/stepwise/generate",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            server_generate_started.notified(),
+        )
+        .await
+        .expect("generate handler should start before the status probe");
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "status",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let status_resolve =
+            tokio::time::timeout(Duration::from_millis(500), recv_json(&mut socket))
+                .await
+                .expect("status should resolve while generate remains pending");
+        assert_eq!(status_resolve["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&status_resolve, "status");
+
+        server_release_generate.notify_one();
+        let generate_resolve = recv_json(&mut socket).await;
+        assert_eq!(generate_resolve["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&generate_resolve, "generate");
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler_generate_started = Arc::clone(&generate_started);
+    let handler_release_generate = Arc::clone(&release_generate);
+    let handler = Arc::new(move |path: String, _payload: serde_json::Value| {
+        let generate_started = Arc::clone(&handler_generate_started);
+        let release_generate = Arc::clone(&handler_release_generate);
+        Box::pin(async move {
+            if path == "/stepwise/generate" {
+                generate_started.notify_one();
+                release_generate.notified().await;
+            }
+            Ok(json!({ "status": "ok", "path": path }))
+        }) as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge install should return while generate is pending")
+    .expect("bridge install should start the concurrent message pump");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn superseded_bridge_session_stops_answering_binding_calls() {
+    let (url, stale_rx, fresh_rx) = spawn_two_session_cdp_server().await;
+
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("first bridge install should succeed");
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("second bridge install should succeed");
+
+    let stale_resolved = stale_rx
+        .await
+        .expect("stale server task should finish without panicking");
+    assert!(
+        !stale_resolved,
+        "superseded session must not resolve bridge requests"
+    );
+    fresh_rx
+        .await
+        .expect("fresh server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn failed_bridge_reinstall_keeps_existing_session_current() {
+    let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
+
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("first bridge install should succeed");
+    let error = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect_err("second bridge install should fail");
+    assert!(error.to_string().contains("Runtime.addBinding"));
+
+    assert!(
+        active_rx
+            .await
+            .expect("active server task should finish without panicking"),
+        "failed reinstall must not supersede the existing bridge session"
+    );
+    failed_rx
+        .await
+        .expect("failed reinstall server task should finish without panicking");
+}
+
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+async fn spawn_two_session_cdp_server() -> (String, oneshot::Receiver<bool>, oneshot::Receiver<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let (stale_tx, stale_rx) = oneshot::channel();
+    let (fresh_tx, fresh_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (stale_stream, _) = listener
+            .accept()
+            .await
+            .expect("stale client should connect");
+        let mut stale = accept_async(stale_stream)
+            .await
+            .expect("stale websocket should upgrade");
+        acknowledge_bridge_install(&mut stale).await;
+
+        let (fresh_stream, _) = listener
+            .accept()
+            .await
+            .expect("fresh client should connect");
+        let mut fresh = accept_async(fresh_stream)
+            .await
+            .expect("fresh websocket should upgrade");
+        acknowledge_bridge_install(&mut fresh).await;
+
+        send_json(
+            &mut stale,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "stale",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let stale_resolved =
+            tokio::time::timeout(Duration::from_millis(500), recv_text_message(&mut stale))
+                .await
+                .is_ok_and(|message| message.is_some_and(|text| text.contains("Runtime.evaluate")));
+        let _ = stale_tx.send(stale_resolved);
+        close_socket(&mut fresh).await;
+        let _ = fresh_tx.send(());
+    });
+
+    (websocket_url(address), stale_rx, fresh_rx)
+}
+
+async fn spawn_failed_reinstall_cdp_server()
+-> (String, oneshot::Receiver<bool>, oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let (active_tx, active_rx) = oneshot::channel();
+    let (failed_tx, failed_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (active_stream, _) = listener
+            .accept()
+            .await
+            .expect("active client should connect");
+        let mut active = accept_async(active_stream)
+            .await
+            .expect("active websocket should upgrade");
+        acknowledge_bridge_install(&mut active).await;
+
+        let (failed_stream, _) = listener
+            .accept()
+            .await
+            .expect("failed client should connect");
+        let mut failed = accept_async(failed_stream)
+            .await
+            .expect("failed websocket should upgrade");
+        for expected_id in 1..=2 {
+            let command = recv_json(&mut failed).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut failed, json!({ "id": expected_id, "result": {} })).await;
+        }
+        let add_binding = recv_json(&mut failed).await;
+        assert_eq!(add_binding["id"], 3);
+        assert_eq!(add_binding["method"], "Runtime.addBinding");
+        send_json(
+            &mut failed,
+            json!({
+                "id": 3,
+                "error": { "code": -32000, "message": "binding install failed" }
+            }),
+        )
+        .await;
+        close_socket(&mut failed).await;
+        let _ = failed_tx.send(());
+
+        send_json(
+            &mut active,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "active",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        let active_resolved =
+            tokio::time::timeout(Duration::from_millis(500), recv_json(&mut active))
+                .await
+                .is_ok_and(|message| {
+                    message["method"] == "Runtime.evaluate"
+                        && message["params"]["expression"]
+                            .as_str()
+                            .is_some_and(|expression| expression.contains("active"))
+                });
+        let _ = active_tx.send(active_resolved);
+        close_socket(&mut active).await;
+    });
+
+    (websocket_url(address), active_rx, failed_rx)
+}
+
+async fn acknowledge_bridge_install(socket: &mut TestSocket) {
+    for expected_id in 1..=5 {
+        let command = recv_json(socket).await;
+        assert_eq!(command["id"], expected_id);
+        send_json(socket, json!({ "id": expected_id, "result": {} })).await;
+    }
+}
+
+async fn recv_text_message(socket: &mut TestSocket) -> Option<String> {
+    match socket.next().await {
+        Some(Ok(Message::Text(text))) => Some(text.to_string()),
+        _ => None,
+    }
+}
 
 async fn spawn_cdp_server<F, Fut>(handler: F) -> (String, oneshot::Receiver<()>)
 where

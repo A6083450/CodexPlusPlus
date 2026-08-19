@@ -191,6 +191,7 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
 
 async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
     let hooks = LauncherHooks::default();
+    let helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let has_pending_recovery = hooks.has_pending_remote_control_session_recoveries();
@@ -216,25 +217,42 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &settings.codex_extra_args,
         )
         .await;
+    if settings.enhancements_enabled {
+        hooks.start_helper(helper_port).await?;
+    }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
-    let mut activated = false;
     #[cfg(windows)]
-    {
-        for process_id in &process_ids {
-            if codex_plus_core::windows_activate_process_window(*process_id) {
-                activated = true;
-                break;
-            }
-        }
+    let activated = process_ids
+        .iter()
+        .copied()
+        .any(codex_plus_core::windows_activate_process_window);
+    #[cfg(not(windows))]
+    let activated = false;
+    let injection_ready = if settings.enhancements_enabled {
+        hooks
+            .ensure_injection(options.debug_port, helper_port, &app_dir)
+            .await
+    } else {
+        false
+    };
+    if injection_ready {
+        hooks
+            .start_bridge_watchdog(options.debug_port, helper_port)
+            .await?;
+        hooks.write_status("running").await;
+    } else if settings.enhancements_enabled {
+        hooks.write_status("running_degraded").await;
     }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "launcher.activate_existing_codex",
         json!({
             "app_dir": app_dir.to_string_lossy(),
             "debug_port": options.debug_port,
+            "helper_port": helper_port,
             "requested_helper_port": options.helper_port,
             "process_ids": process_ids,
             "activated": activated,
+            "injection_ready": injection_ready,
             "runtime_reused": true,
             "launch_ok": launch_result.is_ok(),
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
@@ -385,6 +403,7 @@ impl LaunchHooks for LauncherHooks {
                             sqlite_user_event_rows_updated: 0,
                             sqlite_cwd_rows_updated: 0,
                             sqlite_catalog_rows_inserted: 0,
+                            sqlite_catalog_rows_removed: 0,
                             updated_workspace_roots: 0,
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
@@ -447,13 +466,6 @@ impl LaunchHooks for LauncherHooks {
         settings: &codex_plus_core::settings::BackendSettings,
     ) -> anyhow::Result<()> {
         self.core.apply_active_relay_profile(settings).await
-    }
-
-    async fn ensure_computer_use_config(
-        &self,
-        settings: &codex_plus_core::settings::BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.core.ensure_computer_use_config(settings).await
     }
 
     async fn ensure_plugin_marketplace_config(
@@ -524,13 +536,6 @@ impl LaunchHooks for LauncherHooks {
         self.core
             .start_bridge_watchdog(debug_port, helper_port)
             .await
-    }
-
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        settings: &codex_plus_core::settings::BackendSettings,
-    ) -> anyhow::Result<()> {
-        self.core.start_computer_use_guard_watchdog(settings).await
     }
 
     async fn write_status(&self, status: &str) {
@@ -1242,8 +1247,8 @@ mod tests {
         let body = &production_source[start..end];
 
         assert!(body.contains("\"runtime_reused\": true"));
-        assert!(!body.contains("hooks.start_helper(helper_port)"));
-        assert!(!body.contains("ensure_injection("));
+        assert!(body.contains("hooks.start_helper(helper_port)"));
+        assert!(body.contains("ensure_injection("));
     }
 
     #[test]
@@ -1290,20 +1295,15 @@ mod tests {
     }
 
     #[test]
-    fn launcher_hooks_forward_runtime_watchdogs_and_computer_use_guard_methods() {
+    fn launcher_hooks_forward_runtime_watchdog_and_marketplace_methods() {
         let source = include_str!("main.rs");
 
         assert!(source.contains("async fn start_bridge_watchdog"));
         assert!(source.contains("self.watchdog_bridge_context()?"));
         assert!(source.contains("set_bridge_reinjector(reinjector)"));
         assert!(source.contains("inject_with_context(debug_port, helper_port, ctx, runtime)"));
-        assert!(source.contains("async fn ensure_computer_use_config"));
-        assert!(source.contains("self.core.ensure_computer_use_config(settings).await"));
         assert!(source.contains("async fn ensure_plugin_marketplace_config"));
         assert!(source.contains("self.core.ensure_plugin_marketplace_config(settings).await"));
-        assert!(source.contains("async fn start_computer_use_guard_watchdog"));
-        assert!(source.contains("self.core"));
-        assert!(source.contains(".start_computer_use_guard_watchdog(settings)"));
     }
 
     #[tokio::test]
@@ -1331,17 +1331,20 @@ mod tests {
 
         hooks.bridge_context(9229, &test_dir).await.unwrap();
         let ctx = hooks.watchdog_bridge_context().unwrap();
-        let result = codex_plus_core::routes::handle_bridge_request(
-            ctx,
+        let move_result = codex_plus_core::routes::handle_bridge_request(
+            ctx.clone(),
             "/move-thread-workspace",
             json!({"session_id": "missing", "title": "Missing", "target_cwd": "/new"}),
         )
         .await;
+        let status_result =
+            codex_plus_core::routes::handle_bridge_request(ctx, "/backend/status", json!({})).await;
 
         assert_ne!(
-            result["message"],
+            move_result["message"],
             "Move workspace service is not wired in core launcher hooks"
         );
+        assert_eq!(status_result["status"], "ok");
     }
 }
 

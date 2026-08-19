@@ -33,6 +33,150 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
 
 首次使用建议先打开管理工具，确认应用路径和运行状态，再配置供应商与增强功能，最后从 `Codex++` 入口启动。Windows 安装包会创建桌面和开始菜单快捷方式；macOS DMG 会安装 `/Applications/Codex++.app` 和 `/Applications/Codex++ 管理工具.app`。
 
+## 赞助商
+
+<p align="center">
+  <a href="https://jojocode.com/">
+    <img src="docs/images/sponsor-jojocode.png" alt="JOJO Code" height="110">
+  </a>
+</p>
+<p align="center">
+  <a href="https://jojocode.com/"><strong>JOJO Code</strong></a><br>
+  JOJO Code 提供稳定、价格合理的 API 中转服务，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力，适合日常开发、团队协作和长期项目工作流。
+</p>
+
+<a href="mailto:1727532@qq.com">想显示在下方？</a>
+<p align="center">
+</p>
+<table>
+  <tr>
+    <th width="180">🏆 赞助商 🏆</th>
+    <th>介绍</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://jojocode.com/">
+        <img src="docs/images/sponsor-jojocode.png" alt="JOJO Code" height="80">
+      </a>
+    </td>
+    <td><a href="https://jojocode.com/"><strong>JOJO Code</strong></a><br>JOJO Code 提供稳定、价格合理且易于接入的 API 中转服务，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力，适合日常开发、快速配置、团队协作和长期使用。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://aigocode.com/invite/CodexPlusPlus">
+        <img src="docs/images/sponsor-aigocode.png" alt="AIGoCode" height="80">
+      </a>
+    </td>
+    <td><a href="https://aigocode.com/invite/CodexPlusPlus"><strong>AIGoCode</strong></a><br>感谢 AIGoCode 赞助了本项目！AIGoCode 是一个集成了 Claude Code、Codex 以及 Gemini 最新模型的一站式平台，为你提供稳定、高效且高性价比的AI编程服务。本站提供灵活的订阅计划，支持多风险，国内直连，无需魔法，极速响应。AIGoCode 为 CodexPlusPlus 的用户提供了特别福利，通过<a href="https://aigocode.com/invite/CodexPlusPlus">此链接注册</a>的用户首次充值可以获得额外10%奖励额度！</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://apikey.fun/register?aff=CODEX">
+        <img src="docs/images/sponsor-apikey-fun.png" alt="APIKEY.FUN" height="80">
+      </a>
+    </td>
+    <td><a href="https://apikey.fun/register?aff=CODEX"><strong>APIKEY.FUN</strong></a><br>感谢 APIKEY.FUN 赞助了本项目！APIKEY.FUN 是一家致力于提供开放、稳定、高性价比的全球主流大模型的 AI 中转站。平台支持 Claude、OpenAI、Gemini 等热门模型的 API 中转服务，价格低至官方原价的 7%。通过专属链接<a href="https://apikey.fun/register?aff=CODEX">注册 APIKEY</a>，可享受最高充值永久 95 折优惠。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://cubence.com?source=codexplusplus">
+        <img src="docs/images/sponsor-cubence.png" alt="Cubence" height="80">
+      </a>
+    </td>
+    <td><a href="https://cubence.com?source=codexplusplus"><strong>Cubence</strong></a><br>感谢 Cubence 对本项目的支持。Cubence 是一家致力为客户提供稳定、高效的 API 中转服务商。从 25 年 9 月运营至今，提供了 Claude Code、Codex、Gemini 等多种模型支持。Cubence 为本开源项目多用户提供了特别的专属优惠 <code>CODEXPLUSPLUS</code>，在首次购买时享受 8.8 折优惠！</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://www.quya.org/?promo=CODEX">
+        <img src="docs/images/sponsor-0029.svg" alt="quya.org 云桥" height="80">
+      </a>
+    </td>
+    <td><a href="https://www.quya.org/?promo=CODEX"><strong>quya.org 云桥｜一站式 AI 中转平台</strong></a><br>quya.org 云桥（原 0029.org）是一个集成 Claude Code、Codex 以及 Gemini 最新模型的一站式中转平台，为你提供稳定、高效且高性价比的 AI 中转服务。本站提供灵活的包月套餐/按量计费计划，国内直连，无需魔法，极速响应。支持个人和企业接入，价格最低为官方 0.12 折。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://app.everyapi.ai/signin?aff=imP7QQfaZm&amp;utm_source=referral&amp;utm_medium=codexplusplus">
+        <img src="docs/images/sponsor-everyapi.png" alt="EveryAPI" height="80">
+      </a>
+    </td>
+    <td><a href="https://app.everyapi.ai/signin?aff=imP7QQfaZm&amp;utm_source=referral&amp;utm_medium=codexplusplus"><strong>EveryAPI</strong></a><br>EveryAPI 自带桌面客户端，可为 Claude Code、Codex、Cursor 等 20 多款 AI 工具自动完成配置。一把密钥即可调用 Claude、GPT、DeepSeek、GLM、MiniMax、Kimi、豆包等模型，并支持自建节点直连和渠道供货。通过专属链接注册即送 14 元额度，首充额外赠送 20%；付款时使用优惠码 <code>codexplusplus</code> 再享长期 8 折。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://xc.y1yun.net/">
+        <img src="docs/images/sponsor-yiyun-tech.jpg" alt="屹芸科技" height="80">
+      </a>
+    </td>
+    <td><a href="https://xc.y1yun.net/"><strong>屹芸科技</strong></a><br>屹芸科技旗下拥有九五云商发卡网、屹芸付支付系统等面向 AI 聚合赛道的收付产品，支持微信、支付宝、银联、云闪付等通道，提供低费率、D1/D0 结算、7×24 小时技术支持和企微客户专属服务群。平台通道费率稳定、结算准时，并提供高强度网站防护，帮助商户稳定开展线上销售。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://sui-xiang.com/">
+        <img src="docs/images/sponsor-sui-xiang-ai-gateway.jpg" alt="随想AI网关" width="150">
+      </a>
+    </td>
+    <td><a href="https://sui-xiang.com/"><strong>随想AI网关</strong></a><br>感谢随想AI网关对本项目的赞助！随想AI网关是一家可靠高效的 API 中继服务提供商，提供 Claude、Codex、Gemini 等中继服务，注重隐私，承诺无数据倒卖、无模型掺水，并提供透明、快速的售后支持。新账户注册每日签到送 0.5 元测试额度，充值额度 1:1，无需订阅，按量付费。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://dis.chatdesks.cn/chatdesk/hsyqCodexPlusPlus.html">
+        <img src="docs/images/sponsor-volcengine.png" alt="火山引擎" height="80">
+      </a>
+    </td>
+    <td><a href="https://dis.chatdesks.cn/chatdesk/hsyqCodexPlusPlus.html"><strong>火山引擎｜方舟 Agent Plan</strong></a><br>感谢火山引擎赞助本项目！方舟 Agent Plan 模型订阅套餐集成了 Doubao-Seed、Doubao-Seedance、Doubao-Seedream 等字节跳动自研 SOTA 级模型，覆盖文本、代码、图像、视频等多模态任务。最新支持 MiniMax-M3、DeepSeek-V4 系列、GLM-5.2、Doubao-Seed-2.0 系列、Kimi-K2.7 等模型，工具不限。超全模态模型与 Harness 升级一步到位，深度支持 Agent 框架与 AI 编程工具。一次订阅，可以为不同任务切换合适的 AI 引擎。方舟 Agent Plan 限时 2.5 折订阅，<a href="https://dis.chatdesks.cn/chatdesk/hsyqCodexPlusPlus.html">点击链接抢购</a>，名额有限，先到先得。<a href="https://www.byteplus.com/en/product/modelark?utm_campaign=hw&amp;utm_content=CodexPlusPlus&amp;utm_medium=devrel_tool_web&amp;utm_source=OWO&amp;utm_term=CodexPlusPlus">For developers outside Mainland China, please click here</a>。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://ergouapi.com/r/gh-codexplusplus">
+        <img src="docs/images/sponsor-ergou-api.png" alt="二狗 API" height="80">
+      </a>
+    </td>
+    <td><a href="https://ergouapi.com/r/gh-codexplusplus"><strong>二狗 API</strong></a><br>二狗，稳如老狗的 AI API 中转站。全站 0.1x~0.2x 超低倍率，提供 Claude/GPT/Gemini 等多个国内外 100% 纯血大模型接口，顶级 IPLC 线路 + 住宅双 ISP 冗余，确保全国范围稳定低延迟访问。欢迎各位开发者、工作室注册使用。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://aihub.top/register?aff=ZYD8UJV274HD">
+        <img src="docs/images/sponsor-aihub.jpg" alt="AIHub" height="80">
+      </a>
+    </td>
+    <td><a href="https://aihub.top/register?aff=ZYD8UJV274HD"><strong>AIHub</strong></a><br>AIHub 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex / ClaudeCode，价格约为官方 1 折不到。我们不生产 Token，我们是 Token 搬运工！通过<a href="https://aihub.top/register?aff=ZYD8UJV274HD">此链接注册</a>并使用优惠码 <code>CODEXPLUSPLUS</code>，即可获得 3$ 测试额度。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8">
+        <img src="docs/images/sponsor-baikewei-ai.jpg" alt="百可为AI" height="80">
+      </a>
+    </td>
+    <td><a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8"><strong>百可为AI</strong></a><br>百可为AI 是面向开发者、团队和 AI 工具用户的一站式大模型 API 服务平台，支持 Claude、OpenAI、Gemini、Codex 等主流模型能力接入。平台提供稳定中转、灵活计费、用量统计、余额管理和多场景 API 调用能力，适合 Claude Code、Codex、AI 生图、自动化脚本和各类智能应用长期使用。新用户注册可领取免费额度，开发者可快速接入、即开即用，让 AI 能力更稳定、更高效、更省心。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://api.sublyx.org/register?aff=JMNUFYR8XAH6">
+        <img src="docs/images/sponsor-sublyx.png" alt="Sublyx" width="220">
+      </a>
+    </td>
+    <td><a href="https://api.sublyx.org/register?aff=JMNUFYR8XAH6"><strong>Sublyx｜AI API Gateway</strong></a><br>感谢 Sublyx 赞助本项目！Sublyx 是面向开发者与团队的 AI API 聚合网关，一个 API Key 即可统一接入 OpenAI、Claude、Gemini 等主流模型服务，支持 OpenAI compatible 和 Anthropic Messages 等兼容接口，可用于 Codex、Claude Code、Cherry Studio、OpenAI SDK 等常见开发工具。平台提供统一控制台、用量管理、稳定线路与按需付费能力，适合个人开发、团队协作和 Agent 工作流。Codex++ 用户通过<a href="https://api.sublyx.org/register?aff=JMNUFYR8XAH6">此链接注册 Sublyx</a>并使用优惠码 <code>CDXPP</code>，可额外领取 $10 使用额度。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://deepkey.top/register?aff=DNVc">
+        <img src="docs/images/sponsor-deepkey.png" alt="deepkey" height="90">
+      </a>
+    </td>
+    <td><a href="https://deepkey.top/register?aff=DNVc"><strong>deepkey｜API KEY</strong></a><br>感谢 deepkey 赞助本项目！deepkey 起初只是连接顶级算力的上游供应商，凭借稳定低价的接口被学生群体发现并口口相传。随着开发者与学子的涌入，这里不再只是 API 的搬运工，而是共同探讨提示词工程、分享创新应用的温暖社区。从工具到伙伴，deepkey 见证了无数灵感的诞生与落地。通过<a href="https://deepkey.top/register?aff=DNVc">此链接注册</a>进入群聊，可享受福利并与小伙伴们一起探讨。</td>
+  </tr>
+</table>
+
+## 交流与支持
+
+欢迎加入 Codex++ 交流 3 群（QQ群：619480492），反馈问题、交流使用体验或提出新功能建议。<a href="https://qm.qq.com/q/Erf1F1zwqs">点击链接加入群聊</a>。
+
+<img src="docs/images/discussion-group-qr.jpg" alt="Codex++ 微信群二维码" width="260">
+
+Telegram 频道：<https://t.me/CodexPlusPlus>
+
+友情链接：<a href="https://linux.do">LINUX DO</a>
+
 ## 当前功能
 
 | 模块 | 功能 |
