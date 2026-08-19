@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.8.16
-// @description  在 Codex 输入框上方显示 Token 与金额，并提供本地个人资料与统计；点击资料入口进入官方个人资料页。
+// @version      0.8.17
+// @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
 // ==/UserScript==
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.8.16";
+const VERSION = "0.8.17";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -43,7 +43,6 @@ const VERSION = "0.8.16";
   const PROFILE_LEDGER_STORE_DAILY_ROLLUPS = "profileDailyRollups";
   const PROFILE_LEDGER_WRITE_COALESCE_MS = 500;
   const PROFILE_UI_AUTH_GATE_TTL_MS = 500;
-  const PROFILE_NAVIGATION_AUTH_TTL_MS = 10000;
   let profileUnlockEnabledRuntime;
   const PROJECT_CONTEXT_ROW_SELECTOR =
     "[data-codex-composer-root] [data-composer-utility-bar-scroll-area] [data-composer-navigation-target='workspace-project']";
@@ -287,6 +286,7 @@ const VERSION = "0.8.16";
     legacySessionMigrations: new Set(),
     sessionAliases: new Map(),
     localMessageHandler: null,
+    profileUnlockInstallScheduled: false,
     profileRequestIds: new Map(),
     codexModulePromises: new Map(),
     detectedModel: "",
@@ -321,7 +321,6 @@ const VERSION = "0.8.16";
     profileIdentityObserver: null,
     profileIdentitySyncTimer: 0,
     profileNavigationTimer: 0,
-    profileNavigationAuthUntil: 0,
     profileIdentityButtons: new Set(),
     profileIdentityMenuItems: new Set(),
     profileAccountsRefreshPromise: null,
@@ -1643,11 +1642,6 @@ const VERSION = "0.8.16";
     };
   }
 
-  function spoofProfileAccountSettingsPayload(value) {
-    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-    return { ...source, member_profiles_enabled: true };
-  }
-
   function localProfileAccountsCheckResponse() {
     const account = localProfileAccount();
     return { account_ordering: [account.id], accounts: [account] };
@@ -1699,15 +1693,12 @@ const VERSION = "0.8.16";
   function profileUiComponentNamesFromSource(source) {
     const text = String(source || "");
     const names = [];
-    const addNearestDeclaration = (marker, lookback) => {
-      const markerOffset = text.indexOf(marker);
-      if (markerOffset < 0) return;
-      const prefix = text.slice(Math.max(0, markerOffset - lookback), markerOffset);
+    const footerMarker = text.indexOf("codex.profileFooter.settingsFallback");
+    if (footerMarker >= 0) {
+      const prefix = text.slice(Math.max(0, footerMarker - 20000), footerMarker);
       const declarations = Array.from(prefix.matchAll(/function\s+([A-Za-z_$][\w$]*)\s*\(/g));
       if (declarations.length) names.push(declarations.at(-1)[1]);
-    };
-    addNearestDeclaration("member_profiles_enabled", 30000);
-    addNearestDeclaration("codex.profileFooter.settingsFallback", 20000);
+    }
     return Array.from(new Set(names));
   }
 
@@ -1734,10 +1725,6 @@ const VERSION = "0.8.16";
       state.profileUiAuthGateActive = false;
     }
     return state.profileUiAuthGateActive;
-  }
-
-  function profileNavigationAuthActive() {
-    return state.profileNavigationAuthUntil > Date.now();
   }
 
   function isProfileQueryClient(value) {
@@ -1869,10 +1856,8 @@ const VERSION = "0.8.16";
             const value = descriptor?.get ? descriptor.get.call(this) : currentValue;
             if (
               profileUnlockEnabled() &&
-              ((profileNavigationAuthActive() &&
-                isProfileUiAuthRead(new Error().stack, authContext.__codexLiveTokenCostProfileUiComponents)) ||
-                (profileUiAuthReadGateActive() &&
-                  isProfileUiAuthRead(new Error().stack, authContext.__codexLiveTokenCostProfileUiComponents)))
+              profileUiAuthReadGateActive() &&
+              isProfileUiAuthRead(new Error().stack, authContext.__codexLiveTokenCostProfileUiComponents)
             ) {
               return profileUiAuthContextValue(value);
             }
@@ -1892,24 +1877,6 @@ const VERSION = "0.8.16";
         if (descriptor) Object.defineProperty(authContext, field, descriptor);
         else delete authContext[field];
       }
-      return false;
-    }
-  }
-
-  async function activateProfileNavigationAuth(doc = document) {
-    if (!profileUnlockEnabled()) return false;
-    state.profileNavigationAuthUntil = Date.now() + PROFILE_NAVIGATION_AUTH_TTL_MS;
-    const authContext = profileAuthContextFromDocument(doc);
-    if (!authContext) return false;
-    try {
-      const appUrl = await codexAppAssetUrl("app-initial-");
-      const appSource = appUrl ? await fetch(appUrl).then((response) => (response.ok ? response.text() : "")) : "";
-      const componentNames = profileUiComponentNamesFromSource(appSource);
-      if (!componentNames.length) return false;
-      const patched = patchProfileReactAuthContext(authContext, componentNames);
-      if (patched) state.profileSyntheticAuth = true;
-      return patched;
-    } catch {
       return false;
     }
   }
@@ -3236,10 +3203,6 @@ const VERSION = "0.8.16";
 
   function isProfileAccountsCheckUrl(url) {
     return /\/wham\/accounts\/check(?:[?#].*)?$/i.test(String(url || ""));
-  }
-
-  function isProfileAccountSettingsUrl(url) {
-    return /\/accounts\/[^/]+\/settings(?:[/?#]|$)/i.test(String(url || ""));
   }
 
   function requestUrl(input) {
@@ -5892,9 +5855,6 @@ const VERSION = "0.8.16";
     if (rememberNewConversationClick(event)) return;
     rememberSidebarThreadClick(event);
     rememberPendingInput(event);
-    if (event.target?.closest?.("button[aria-label='打开个人资料菜单'], button[aria-label='Open profile menu'], button[aria-label='Open profile menu and settings']")) {
-      scheduleSidebarProfileIdentitySync(0);
-    }
   }
 
   function liveSnapshot() {
@@ -6105,7 +6065,9 @@ const VERSION = "0.8.16";
     }
     if (options.profileEditor) saveProfileDefaultEmail(next.email);
     state.profilePrefs = next;
+    syncProfileUsageQueryCache();
     scheduleSidebarProfileIdentitySync(0);
+    void scheduleProfileAccountsCheckRefresh();
     return next;
   }
 
@@ -6273,49 +6235,19 @@ const VERSION = "0.8.16";
 
     if (state.profileNavigationTimer) window.clearTimeout(state.profileNavigationTimer);
     state.profileNavigationTimer = 0;
-    const navigationAuthPromise = activateProfileNavigationAuth(doc);
-    patchProfileStatsigGate();
-    const requestPatchPromise = installProfileRequestClientPatch();
+    settingsItem.click();
     let attempts = 0;
-    let opened = false;
-    let navigationStarted = false;
     const openProfile = () => {
       state.profileNavigationTimer = 0;
-      if (opened) return;
       const profile = findOfficialProfileSettingsControl(doc);
       if (profile && typeof profile.click === "function") {
-        opened = true;
         profile.click();
         return;
       }
       attempts += 1;
-      if (attempts < 60) state.profileNavigationTimer = window.setTimeout(openProfile, 50);
+      if (attempts < 20) state.profileNavigationTimer = window.setTimeout(openProfile, 50);
     };
-    const startNavigation = () => {
-      if (navigationStarted) return;
-      navigationStarted = true;
-      if (state.profileNavigationTimer) window.clearTimeout(state.profileNavigationTimer);
-      state.profileNavigationTimer = 0;
-      settingsItem.click();
-      state.profileNavigationTimer = window.setTimeout(openProfile, 0);
-    };
-    state.profileNavigationTimer = window.setTimeout(startNavigation, 400);
-    void navigationAuthPromise.then(() => {
-      startNavigation();
-    });
-    void requestPatchPromise.then(async (patched) => {
-      if (!patched || !navigationStarted) return;
-      const queryClient = state.profileQueryClient || profileQueryClientFromDocument(doc);
-      if (!isProfileQueryClient(queryClient) || typeof queryClient.invalidateQueries !== "function") return;
-      state.profileQueryClient = queryClient;
-      try {
-        await queryClient.invalidateQueries({ queryKey: ["accounts", "settings"] });
-      } catch {
-        // The settings page can still render from the next request.
-      }
-    }).then(() => {
-      if (navigationStarted && !opened && !state.profileNavigationTimer) openProfile();
-    });
+    openProfile();
     return true;
   }
 
@@ -6433,6 +6365,14 @@ const VERSION = "0.8.16";
 
   function installSidebarProfileIdentitySync() {
     syncSidebarProfileIdentity();
+    if (state.profileIdentityObserver || window.__CODEX_LIVE_TOKEN_COST_TEST__ || typeof MutationObserver !== "function") return;
+    const target = document.body || document.documentElement;
+    if (!target) return;
+    state.profileIdentityObserver = new MutationObserver((mutations) => {
+      if (mutations.some(mutationTouchesProfileIdentity)) scheduleSidebarProfileIdentitySync(80);
+    });
+    // 不监听 characterData：同步回调会写回 label.textContent，若页面随后重渲染会互相触发形成循环
+    state.profileIdentityObserver.observe(target, { childList: true, subtree: true });
   }
 
   function stopSidebarProfileIdentitySync() {
@@ -6440,10 +6380,6 @@ const VERSION = "0.8.16";
     if (state.profileNavigationTimer) window.clearTimeout(state.profileNavigationTimer);
     state.profileIdentitySyncTimer = 0;
     state.profileNavigationTimer = 0;
-    state.profileNavigationAuthUntil = 0;
-    state.profileSyntheticAuth = false;
-    state.profileUiAuthGateAt = 0;
-    state.profileUiAuthGateActive = false;
     state.profileIdentityObserver?.disconnect?.();
     state.profileIdentityObserver = null;
     restoreSidebarProfileIdentity();
@@ -6681,6 +6617,18 @@ const VERSION = "0.8.16";
     statsigClients().forEach(patchProfileStatsigClient);
   }
 
+  function installProfileUsernameUppercaseUnlock() {
+    const originalTest = RegExp.prototype.__codexLiveTokenCostOriginalTest || RegExp.prototype.test;
+    if (RegExp.prototype.test.__codexLiveTokenCostProfileUnlock === VERSION) return;
+    const patchedTest = function codexLiveTokenCostProfileUsernameTest(value) {
+      if (profileUnlockEnabled() && this?.source === "^[a-z0-9._-]+$" && this?.flags === "") return /^[A-Za-z0-9._-]+$/.test(String(value || ""));
+      return originalTest.call(this, value);
+    };
+    patchedTest.__codexLiveTokenCostProfileUnlock = VERSION;
+    RegExp.prototype.__codexLiveTokenCostOriginalTest = originalTest;
+    RegExp.prototype.test = patchedTest;
+  }
+
   function profileFetchBody(method, body, url) {
     if (method === "PATCH") applyLocalProfilePatch(body);
     if (method === "POST") {
@@ -6692,6 +6640,8 @@ const VERSION = "0.8.16";
   }
 
   function profileFetchBodyWithHelperRefresh(method, body, url) {
+    if (String(method || "GET").toUpperCase() !== "GET" || typeof window.fetch !== "function") return profileFetchBody(method, body, url);
+    void refreshProfileData();
     return profileFetchBody(method, body, url);
   }
 
@@ -6808,9 +6758,15 @@ const VERSION = "0.8.16";
     return state.profileAccountsRefreshPromise;
   }
 
-  function scheduleProfileUsageRefresh() {
+  function scheduleProfileUsageRefresh(delay = 1000) {
     if (!profileUnlockEnabled()) return;
     state.profileUsageRefreshRequests += 1;
+    if (window.__CODEX_LIVE_TOKEN_COST_TEST__ || state.profileUsageRefreshTimer || typeof window.setTimeout !== "function") return;
+    state.profileUsageRefreshTimer = window.setTimeout(() => {
+      state.profileUsageRefreshTimer = 0;
+      syncProfileUsageQueryCache();
+      void invalidateProfileUsageQuery().finally(() => syncProfileUsageQueryCache());
+    }, delay);
   }
 
   function patchProfileRequestClient(client) {
@@ -6823,7 +6779,6 @@ const VERSION = "0.8.16";
       client.safeGet = async function codexLiveTokenCostProfileSafeGet(url, ...args) {
         if (profileUnlockEnabled() && isProfileUsageUrl(url)) return profileFetchBodyAsync("GET", null, url);
         const response = await originalSafeGet(url, ...args);
-        if (profileUnlockEnabled() && isProfileAccountSettingsUrl(url)) return spoofProfileAccountSettingsPayload(response);
         return profileUnlockEnabled() && isProfileAccountsCheckUrl(url) ? spoofProfileAccountsCheckPayload(response) : response;
       };
       client.__codexLiveTokenCostOriginalSafeGet = originalSafeGet;
@@ -6858,25 +6813,24 @@ const VERSION = "0.8.16";
     return true;
   }
 
-  async function installProfileRequestClientPatch(delays = [0, 200, 700, 1500]) {
-    if (!profileUnlockEnabled() || window.__CODEX_LIVE_TOKEN_COST_TEST__) return false;
+  async function installProfileRequestClientPatch() {
+    if (!profileUnlockEnabled() || window.__CODEX_LIVE_TOKEN_COST_TEST__) return;
     try {
       let patched = 0;
-      for (const delay of delays) {
+      for (const delay of [0, 200, 700, 1500]) {
         if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
-        if (!profileUnlockEnabled()) return false;
-        const appInitialModule = await loadCodexAppModule("app-initial-");
-        for (const value of Object.values(appInitialModule || {})) {
+        if (!profileUnlockEnabled()) return;
+        const module = await loadCodexAppModule("request-");
+        for (const value of module?.Fct ? [module.Fct] : Object.values(module || {})) {
           if (patchProfileRequestClient(value)) patched += 1;
         }
         if (patched > 0) break;
       }
       window.__codexLiveTokenCostProfileRequestPatch = patched > 0 ? VERSION : "not-found";
-      return patched > 0;
+      if (patched > 0) syncProfileUsageQueryCache();
     } catch (error) {
       window.__codexLiveTokenCostProfileRequestPatch = "error";
       window.__codexLiveTokenCostProfileRequestPatchError = error?.message || String(error);
-      return false;
     }
   }
 
@@ -7130,12 +7084,108 @@ const VERSION = "0.8.16";
     window.__codexLiveTokenCostProfileMessageIntercept = VERSION;
   }
 
+  function installOfficialProfileUnlock() {
+    if (!profileUnlockEnabled()) return;
+    const originalFilter = Array.prototype.__codexLiveTokenCostOriginalFilter || Array.prototype.filter;
+    if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock !== VERSION) {
+      const patchedFilter = function codexLiveTokenCostProfileFilter(callback, thisArg) {
+        const visible = originalFilter.call(this, callback, thisArg);
+        return isSettingsSectionsArray(this) ? profileUnlockedSettingsSections(this, visible) : visible;
+      };
+      patchedFilter.__codexLiveTokenCostProfileUnlock = VERSION;
+      Array.prototype.__codexLiveTokenCostOriginalFilter = originalFilter;
+      Array.prototype.filter = patchedFilter;
+    }
+
+    installProfileUsernameUppercaseUnlock();
+    installProfileMessageIntercept();
+    installElectronBridgeHook();
+    void installProfileRequestClientPatch();
+    void installProfilePhotoUploadPatch();
+    void installProfileAuthContextPatch();
+    installSidebarProfileIdentitySync();
+    patchProfileElectronBridge();
+    patchProfileStatsigGate();
+  }
+
+  // 新版应用引导期对全局原型/桥补丁敏感，document-start 直接安装会卡死启动页。
+  // 改为等应用外壳渲染出第一个可交互元素后再安装完整解锁，并保留 15s 兜底。
+  function appShellRendered() {
+    return Boolean(document.querySelector?.("button, [role='button'], main, nav"));
+  }
+
+  function scheduleProfileUnlockInstall() {
+    if (!profileUnlockEnabled() || state.profileUnlockInstallScheduled) return;
+    state.profileUnlockInstallScheduled = true;
+    let installed = false;
+    const install = () => {
+      if (installed) return;
+      installed = true;
+      if (!profileUnlockEnabled()) return;
+      installOfficialProfileUnlock();
+      scheduleProfileUsageRefresh(0);
+    };
+    if (appShellRendered()) {
+      install();
+      return;
+    }
+    let observer = null;
+    if (typeof MutationObserver === "function" && document.documentElement) {
+      observer = new MutationObserver(() => {
+        if (!appShellRendered()) return;
+        observer.disconnect();
+        install();
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    window.setTimeout(() => {
+      observer?.disconnect?.();
+      install();
+    }, 15000);
+  }
+
+  function uninstallOfficialProfileUnlock() {
+    stopProfileUiReadinessCoordinator();
+    stopProfileQueryCacheObserver();
+    stopSidebarProfileIdentitySync();
+    if (state.profileUsageRefreshTimer) window.clearTimeout(state.profileUsageRefreshTimer);
+    state.profileUsageRefreshTimer = 0;
+    state.profileAccountsRefreshPromise = null;
+    state.profileSyntheticAuth = false;
+    state.profileUiAuthGateAt = 0;
+    state.profileUiAuthGateActive = false;
+    state.profileRequestIds.clear();
+    if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock === VERSION) {
+      Array.prototype.filter = Array.prototype.__codexLiveTokenCostOriginalFilter;
+    }
+    if (Promise.prototype.then.__codexLiveTokenCostProfileUnlock === VERSION) {
+      Promise.prototype.then = Promise.prototype.__codexLiveTokenCostOriginalThen;
+    }
+    if (RegExp.prototype.test.__codexLiveTokenCostProfileUnlock === VERSION) {
+      RegExp.prototype.test = RegExp.prototype.__codexLiveTokenCostOriginalTest;
+    }
+    if (window.electronBridge?.sendMessageFromView?.__codexLiveTokenCostProfileUnlock === VERSION) {
+      try {
+        window.electronBridge.sendMessageFromView = window.electronBridge.__codexLiveTokenCostOriginalSendMessageFromView;
+      } catch {
+        // Read-only preload bridges remain wrapped but pass through while disabled.
+      }
+    }
+    if (window.__codexLiveTokenCostProfileMessageIntercept === VERSION) {
+      window.removeEventListener("codex-message-from-view", handleProfileFetchEvent, true);
+      window.removeEventListener("message", handleProfileFetchResponseEvent, true);
+      delete window.__codexLiveTokenCostProfileMessageIntercept;
+    }
+    patchProfileStatsigGate();
+  }
+
   function setProfileUnlockEnabled(value) {
     const enabled = saveProfileUnlockEnabled(Boolean(value));
     if (enabled) {
-      installSidebarProfileIdentitySync();
+      installOfficialProfileUnlock();
+      scheduleProfileUsageRefresh(0);
     } else {
-      stopSidebarProfileIdentitySync();
+      uninstallOfficialProfileUnlock();
       if (state.settingsPanel === "profile") state.settingsPanel = "general";
     }
     return enabled;
@@ -8882,7 +8932,7 @@ const VERSION = "0.8.16";
         <label class="cltc-toggle-field">
           <span>
             <strong>启用本地 Profile 解锁</strong>
-            <small>关闭后停止本地资料覆盖；如界面未完全恢复，请重启 Codex。</small>
+            <small>关闭后停止资料伪装与 Profile 补丁；如界面未完全恢复，请重启 Codex。</small>
           </span>
           <input type="checkbox" data-misc-field="profileUnlockEnabled"${profileUnlockEnabled() ? " checked" : ""}>
         </label>
@@ -9746,22 +9796,6 @@ const VERSION = "0.8.16";
     async function wrappedFetch(input, init) {
       const url = requestUrl(input);
       const method = requestMethod(input, init);
-      if (profileUnlockEnabled() && isProfileAccountSettingsUrl(url)) {
-        const response = await originalFetch.call(this, input, init);
-        if (!response?.ok || !response.clone || typeof Response !== "function") return response;
-        try {
-          const payload = spoofProfileAccountSettingsPayload(await response.clone().json());
-          const headers = typeof Headers === "function" ? new Headers(response.headers) : response.headers;
-          headers?.delete?.("content-length");
-          return new Response(JSON.stringify(payload), {
-            status: response.status,
-            statusText: response.statusText,
-            headers,
-          });
-        } catch {
-          return response;
-        }
-      }
       if (profileUnlockEnabled() && (isProfileUsageUrl(url) || isProfilePhotoUrl(url))) {
         return new Response(JSON.stringify(await profileFetchBodyAsync(method, init?.body)), {
           status: 200,
@@ -10088,7 +10122,7 @@ const VERSION = "0.8.16";
     document.addEventListener("pointerdown", handleDocumentPointerDown, true);
     installOfficialModelObserver();
     installTaskRunningObserver();
-    if (profileUnlockEnabled()) installSidebarProfileIdentitySync();
+    scheduleProfileUnlockInstall();
     installHubVisibilityObserver();
     refreshLocalHelperStatsOnStart();
     startCcSwitchStartupSync();
@@ -10146,6 +10180,15 @@ const VERSION = "0.8.16";
     state.ccSwitchSyncGeneration += 1;
     state.ccSwitchSyncInFlight = false;
     state.ccSwitchSyncPromise = null;
+    if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock === VERSION) {
+      Array.prototype.filter = Array.prototype.__codexLiveTokenCostOriginalFilter;
+    }
+    if (Promise.prototype.then.__codexLiveTokenCostProfileUnlock === VERSION) {
+      Promise.prototype.then = Promise.prototype.__codexLiveTokenCostOriginalThen;
+    }
+    if (RegExp.prototype.test.__codexLiveTokenCostProfileUnlock === VERSION) {
+      RegExp.prototype.test = RegExp.prototype.__codexLiveTokenCostOriginalTest;
+    }
     if (window.electronBridge?.sendMessageFromView?.__codexLiveTokenCostProfileUnlock === VERSION) {
       try {
         window.electronBridge.sendMessageFromView = window.electronBridge.__codexLiveTokenCostOriginalSendMessageFromView;
@@ -10435,7 +10478,7 @@ const VERSION = "0.8.16";
     };
   }
 
-  if (profileUnlockEnabled()) installSidebarProfileIdentitySync();
+  scheduleProfileUnlockInstall();
 
   scheduleStart();
 })();
