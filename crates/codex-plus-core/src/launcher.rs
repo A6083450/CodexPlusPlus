@@ -2418,6 +2418,19 @@ fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool 
     is_windows && !has_codex_process
 }
 
+fn should_reinject_after_bridge_health_check(
+    browser_identity_changed: bool,
+    health_check: Option<bool>,
+) -> bool {
+    browser_identity_changed || health_check == Some(false)
+}
+
+fn bridge_health_check_timed_out(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("timed out waiting for CDP command")
+}
+
 async fn check_and_reinject_bridge_inner(
     debug_port: u16,
     helper_port: u16,
@@ -2434,11 +2447,11 @@ async fn check_and_reinject_bridge_inner(
             return false;
         }
     }
-    let healthy = if browser_identity_changed {
-        false
+    let health_check = if browser_identity_changed {
+        None
     } else {
         match bridge_health_ok(debug_port).await {
-            Ok(healthy) => healthy,
+            Ok(healthy) => Some(healthy),
             Err(error) => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "bridge.health_check_failed",
@@ -2448,12 +2461,22 @@ async fn check_and_reinject_bridge_inner(
                         "message": error.to_string()
                     }),
                 );
-                false
+                if bridge_health_check_timed_out(&error) {
+                    reinject_throttle()
+                        .lock()
+                        .await
+                        .backoff_after_failure(Instant::now());
+                    return false;
+                }
+                Some(false)
             }
         }
     };
-    if healthy {
+    if health_check == Some(true) {
         reinject_throttle().lock().await.reset();
+        return false;
+    }
+    if !should_reinject_after_bridge_health_check(browser_identity_changed, health_check) {
         return false;
     }
 
@@ -3267,6 +3290,16 @@ mod tests {
         assert!(!throttle.should_check(now + REINJECT_SUCCESS_GRACE - Duration::from_secs(1)));
         assert!(throttle.should_check(now + REINJECT_SUCCESS_GRACE + Duration::from_secs(1)));
         assert_eq!(throttle.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn bridge_watchdog_does_not_reinject_after_cdp_timeout() {
+        assert!(!should_reinject_after_bridge_health_check(false, None));
+        assert!(should_reinject_after_bridge_health_check(
+            false,
+            Some(false)
+        ));
+        assert!(should_reinject_after_bridge_health_check(true, None));
     }
 
     #[test]

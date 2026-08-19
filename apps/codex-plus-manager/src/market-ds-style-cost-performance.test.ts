@@ -144,12 +144,16 @@ test("profile auth stack inspection is gated to visible profile UI", async () =>
   assert.match(authPatch, /profileUiAuthReadGateActive\(\)\s*&&\s*isProfileUiAuthRead\(new Error\(\)\.stack/);
 });
 
-test("profile unlock is opt-in and does not patch the renderer by default", async () => {
+test("profile unlock defaults on without eagerly patching the renderer", async () => {
   const source = await readScript();
   const profileToggle = functionBody(source, "profileUnlockEnabled", "saveProfileUnlockEnabled");
+  const startup = functionBody(source, "start", "scheduleStart");
 
-  assert.match(profileToggle, /localStorage\.getItem\(PROFILE_UNLOCK_ENABLED_KEY\) === "true"/);
-  assert.match(profileToggle, /catch \{\s*return false;/);
+  assert.match(profileToggle, /localStorage\.getItem\(PROFILE_UNLOCK_ENABLED_KEY\) !== "false"/);
+  assert.match(profileToggle, /catch \{\s*return true;/);
+  assert.match(source, /function installProfileUnlockOnDemand\(\)/);
+  assert.match(startup, /if \(profileUnlockEnabled\(\)\) installProfileUnlockOnDemand\(\);/);
+  assert.doesNotMatch(source, /if \(profileUnlockEnabled\(\)\) installOfficialProfileUnlock\(\);/);
 });
 
 test("the optional CC Switch helper is bundled with a matching launcher", async () => {

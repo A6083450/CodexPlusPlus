@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.8.11
+// @version      0.8.12
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.8.11";
+const VERSION = "0.8.12";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -286,6 +286,7 @@ const VERSION = "0.8.11";
     legacySessionMigrations: new Set(),
     sessionAliases: new Map(),
     localMessageHandler: null,
+    profileUnlockDemandHandler: null,
     profileRequestIds: new Map(),
     codexModulePromises: new Map(),
     detectedModel: "",
@@ -1222,9 +1223,9 @@ const VERSION = "0.8.11";
   function profileUnlockEnabled() {
     if (typeof profileUnlockEnabledRuntime === "boolean") return profileUnlockEnabledRuntime;
     try {
-      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) === "true";
+      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false";
     } catch {
-      return false;
+      return true;
     }
   }
 
@@ -7102,7 +7103,35 @@ const VERSION = "0.8.11";
     patchProfileStatsigGate();
   }
 
+  function profileUnlockRequestedByEvent(event) {
+    const target = event?.target?.closest?.(
+      "[aria-label*='profile' i], [aria-label*='个人资料'], [data-settings-section='profile'], [href*='profile']",
+    );
+    return Boolean(target);
+  }
+
+  function removeProfileUnlockOnDemand() {
+    if (state.profileUnlockDemandHandler) {
+      document.removeEventListener("pointerdown", state.profileUnlockDemandHandler, true);
+    }
+    state.profileUnlockDemandHandler = null;
+  }
+
+  function installProfileUnlockOnDemand() {
+    if (!profileUnlockEnabled() || state.profileUnlockDemandHandler) return;
+    const handler = (event) => {
+      if (!profileUnlockRequestedByEvent(event)) return;
+      removeProfileUnlockOnDemand();
+      installOfficialProfileUnlock();
+      scheduleProfileUsageRefresh(0);
+    };
+    state.profileUnlockDemandHandler = handler;
+    document.addEventListener("pointerdown", handler, true);
+    patchProfileStatsigGate();
+  }
+
   function uninstallOfficialProfileUnlock() {
+    removeProfileUnlockOnDemand();
     stopProfileUiReadinessCoordinator();
     stopProfileQueryCacheObserver();
     stopSidebarProfileIdentitySync();
@@ -7140,8 +7169,7 @@ const VERSION = "0.8.11";
   function setProfileUnlockEnabled(value) {
     const enabled = saveProfileUnlockEnabled(Boolean(value));
     if (enabled) {
-      installOfficialProfileUnlock();
-      scheduleProfileUsageRefresh(0);
+      installProfileUnlockOnDemand();
     } else {
       uninstallOfficialProfileUnlock();
       if (state.settingsPanel === "profile") state.settingsPanel = "general";
@@ -10077,9 +10105,8 @@ const VERSION = "0.8.11";
     document.addEventListener("pointerdown", handleDocumentPointerDown, true);
     installOfficialModelObserver();
     installTaskRunningObserver();
-    if (profileUnlockEnabled()) installOfficialProfileUnlock();
+    if (profileUnlockEnabled()) installProfileUnlockOnDemand();
     installHubVisibilityObserver();
-    if (profileUnlockEnabled()) scheduleProfileUsageRefresh(0);
     refreshLocalHelperStatsOnStart();
     startCcSwitchStartupSync();
     render();
@@ -10093,6 +10120,7 @@ const VERSION = "0.8.11";
 
   function destroy() {
     state.started = false;
+    removeProfileUnlockOnDemand();
     flushProfileLedgerWrites();
     stopProfileUiReadinessCoordinator();
     stopSidebarProfileIdentitySync();
@@ -10434,7 +10462,7 @@ const VERSION = "0.8.11";
     };
   }
 
-  if (profileUnlockEnabled()) installOfficialProfileUnlock();
+  if (profileUnlockEnabled()) installProfileUnlockOnDemand();
 
   scheduleStart();
 })();
