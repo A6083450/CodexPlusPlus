@@ -12,11 +12,20 @@ async function readScript() {
 }
 
 function functionBody(source: string, name: string, nextName: string) {
-  const start = source.indexOf(`  function ${name}(`);
-  const end = source.indexOf(`\n\n  function ${nextName}(`, start);
+  const normalizedSource = source.replace(/\r\n/g, "\n");
+  const start = normalizedSource.indexOf(`  function ${name}(`);
+  const end = normalizedSource.indexOf(`\n\n  function ${nextName}(`, start);
   assert.ok(start >= 0 && end > start, `${name} should be present before ${nextName}`);
-  return source.slice(start, end);
+  return normalizedSource.slice(start, end);
 }
+
+test("function body extraction accepts CRLF source", async () => {
+  const source = await readScript();
+  const crlfSource = source.replace(/\r?\n/g, "\r\n");
+  const style = functionBody(crlfSource, "ensureStyle", "ensureRoot");
+
+  assert.match(style, /function ensureStyle\(\)/);
+});
 
 test("HUD keeps a fixed non-scrolling layout with wider LLM and tool columns", async () => {
   const source = await readScript();
