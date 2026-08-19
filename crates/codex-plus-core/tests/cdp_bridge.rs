@@ -2236,6 +2236,24 @@ fn injection_script_bounds_service_tier_state_read_time() {
 }
 
 #[test]
+fn native_service_tier_selection_does_not_reload_inherited_default() {
+    let script = assets::injection_script(57321);
+    let sync = script
+        .find("function syncCodexServiceTierFromNativeSelection")
+        .expect("script should synchronize native service-tier selections");
+    let sync_body = &script[sync..script[sync..]
+        .find("function installCodexNativeServiceTierSelectionSync")
+        .map(|offset| sync + offset)
+        .expect("native selection synchronization should end before its listener")];
+
+    assert!(sync_body.contains("writeThreadServiceTierState(state)"));
+    assert!(
+        !sync_body.contains("loadCodexServiceTierState"),
+        "a native Standard selection must not be overwritten by the inherited Fast default"
+    );
+}
+
+#[test]
 fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash() {
     let script = assets::injection_script(57321);
 

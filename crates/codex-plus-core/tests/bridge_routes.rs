@@ -828,7 +828,7 @@ fn user_script_manager_installs_ds_style_cost_script_name() {
     assert!(
         std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
             .unwrap()
-            .contains("@version      0.8.10")
+            .contains("@version      0.8.11")
     );
 }
 
@@ -846,13 +846,13 @@ fn user_script_manager_preserves_newer_scripts_and_upgrades_older_scripts() {
 
     std::fs::write(
         &script_path,
-        "// ==UserScript==\n// @version      0.8.11\n// ==/UserScript==\nwindow.customNewer = true;",
+        "// ==UserScript==\n// @version      0.8.12\n// ==/UserScript==\nwindow.customNewer = true;",
     )
     .unwrap();
     manager.install_missing_bundled_market_scripts().unwrap();
     assert_eq!(
         std::fs::read_to_string(&script_path).unwrap(),
-        "// ==UserScript==\n// @version      0.8.11\n// ==/UserScript==\nwindow.customNewer = true;"
+        "// ==UserScript==\n// @version      0.8.12\n// ==/UserScript==\nwindow.customNewer = true;"
     );
 
     std::fs::write(
@@ -864,6 +864,65 @@ fn user_script_manager_preserves_newer_scripts_and_upgrades_older_scripts() {
     assert_eq!(
         std::fs::read_to_string(&script_path).unwrap(),
         include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js")
+    );
+}
+
+#[test]
+fn user_script_manager_repairs_previous_renderer_bundle_with_same_release_bug() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    let script_path = user_dir.join("market-codex-ds-style-cost.js");
+    let bundled_source = include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js");
+    let bundled_version = bundled_source
+        .lines()
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("// @version")
+                .and_then(|value| value.split_whitespace().next())
+        })
+        .unwrap();
+    let stale_source = bundled_source
+        .replace(
+            &format!("// @version      {bundled_version}"),
+            "// @version      0.8.10",
+        )
+        .replace(
+            &format!("const VERSION = \"{bundled_version}\""),
+            "const VERSION = \"0.8.10\"",
+        )
+        .replace(
+            r#"localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) === "true""#,
+            r#"localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false""#,
+        )
+        .replace(
+            "    } catch {\n      return false;\n    }\n  }\n\n  function saveProfileUnlockEnabled",
+            "    } catch {\n      return true;\n    }\n  }\n\n  function saveProfileUnlockEnabled",
+        );
+    assert_ne!(stale_source, bundled_source);
+    assert!(
+        stale_source.contains("localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== \"false\"")
+    );
+    std::fs::write(&script_path, stale_source).unwrap();
+
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir,
+        temp.path().join("user_scripts.json"),
+    );
+    manager
+        .set_script_enabled("user:market-codex-ds-style-cost.js", false)
+        .unwrap();
+
+    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+
+    assert_eq!(
+        installed.scripts.get("user:market-codex-ds-style-cost.js"),
+        Some(&false)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&script_path).unwrap(),
+        bundled_source
     );
 }
 

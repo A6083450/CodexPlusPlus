@@ -9567,8 +9567,6 @@
       writeThreadServiceTierState(state);
       refreshCodexServiceTierControls();
     }
-    setTimeout(() => void loadCodexServiceTierState(), 0);
-    setTimeout(() => void loadCodexServiceTierState(), 180);
   }
 
   function installCodexNativeServiceTierSelectionSync() {
