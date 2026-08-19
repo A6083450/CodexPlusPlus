@@ -828,7 +828,7 @@ fn user_script_manager_installs_ds_style_cost_script_name() {
     assert!(
         std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
             .unwrap()
-            .contains("@version      0.8.16")
+            .contains("@version      0.8.17")
     );
 }
 
