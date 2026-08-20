@@ -7,6 +7,6 @@ mod tests {
     #[test]
     fn exposes_workspace_version() {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
-        assert_eq!(VERSION, "1.2.49+15");
+        assert_eq!(VERSION, "1.2.50+16");
     }
 }

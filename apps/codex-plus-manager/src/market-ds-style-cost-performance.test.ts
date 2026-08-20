@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
 
 const scriptPath = new URL("../../../assets/user_scripts/market-codex-ds-style-cost.js", import.meta.url);
 const zhcnScriptPath = new URL("../../../assets/user_scripts/market-codex-zhcn-translate.js", import.meta.url);
@@ -253,6 +254,49 @@ test("local ledger persist strips invocation payloads but keeps skill counts", a
   assert.match(source, /slim\.invocationSummary = summary;/);
   assert.match(activity, /turn\?\.invocationSummary/);
   assert.match(activity, /item\.count \+= count;/);
+});
+
+test("usage updates do not self-merge existing invocations", async () => {
+  const source = await readScript();
+  const normalizeContext = vm.runInNewContext(
+    `(${functionBody(source, "normalizeProfileContext", "hasProfileContext")})`,
+    {
+      normalizeReasoningEffort: (value: unknown) => String(value || ""),
+      normalizeProfileInvocationRecord: (value: unknown) => value,
+    },
+  ) as (context?: Record<string, unknown>) => Record<string, unknown> & { invocations: unknown[] };
+  const invocation = { type: "skill", skill_id: "superpowers", skill_name: "superpowers" };
+  const turn: { context: Record<string, unknown> & { invocations: unknown[] } } = {
+    context: { effort: "high", fastMode: false, invocations: [invocation] },
+  };
+  const context = {
+    normalizeProfileContext: normalizeContext,
+    normalizeReasoningEffort: (value: unknown) => String(value || ""),
+  };
+  const mergeContext = vm.runInNewContext(
+    `(${functionBody(source, "mergeProfileContext", "performanceTimestampMs")})`,
+    context,
+  ) as (
+    base?: Record<string, unknown>,
+    next?: Record<string, unknown>,
+  ) => Record<string, unknown> & { invocations: unknown[] };
+
+  for (const usage of [
+    { input: 100, output: 20, total: 120 },
+    { input: 200, output: 40, total: 240 },
+  ]) {
+    const invocations: unknown[] = [];
+    const turnContext = turn.context;
+    const context = normalizeContext({
+      effort: turnContext.effort,
+      fastMode: turnContext.fastMode,
+      invocations,
+    });
+    turn.context = mergeContext(turn.context, context);
+    assert.ok(usage.total > 0);
+  }
+
+  assert.equal(turn.context.invocations.length, 1);
 });
 
 test("profile menu sync supports Radix portal menus without aria-controls", async () => {

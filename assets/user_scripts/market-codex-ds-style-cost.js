@@ -5278,7 +5278,9 @@ const VERSION = "0.8.18";
     const context = normalizeProfileContext({
       effort: info.effort || turnContext.effort || state.detectedEffort || activeModelInfo().effort,
       fastMode: typeof fastMode === "boolean" ? fastMode : turnContext.fastMode,
-      invocations: invocations.length ? invocations : turnContext.invocations,
+      // 没有新 invocation 时保持空 context；回填旧数组会让 mergeProfileContext
+      // 把同一批 invocations 再次追加，并随 usage 更新指数翻倍。
+      invocations,
     });
     let changed = false;
     const persistUsage = shouldPersistUsagePayload(inspectedPayload, source);
