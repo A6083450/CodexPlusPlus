@@ -13,19 +13,6 @@ function loadCodexPlusTriggerClassNormalizer(renderer: string) {
   return vm.runInNewContext(`(${source})`) as (className: string) => string;
 }
 
-function loadNativeMenuInsertionBefore(renderer: string) {
-  const normalizedRenderer = renderer.replace(/\r\n/g, "\n");
-  const start = normalizedRenderer.indexOf("  function nativeMenuInsertionBefore(");
-  const end = normalizedRenderer.indexOf("\n\n  function findNativeMenuInsertionPoint", start);
-  assert.ok(start >= 0 && end > start, "native menu insertion anchor helper should exist");
-
-  const source = normalizedRenderer.slice(start, end).trim();
-  return vm.runInNewContext(`(${source})`) as (
-    children: Array<{ id?: string }>,
-    menu: { id?: string },
-  ) => { id?: string } | null;
-}
-
 type FakeElementOptions = {
   className?: string;
   dismissLabel?: string;
@@ -139,21 +126,24 @@ function installRendererStyle(renderer: string) {
 }
 
 describe("renderer injection header compatibility", () => {
-  it("keeps the native menu after Today without competing insertion anchors", async () => {
+  it("does not install the legacy Codex++ top-bar entry", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const insertionBefore = loadNativeMenuInsertionBefore(renderer);
-    const today = { id: "codex-live-token-cost-settings" };
-    const menu = { id: "codex-plus-menu" };
-    const nativeButton = { id: "native-header-button" };
 
-    assert.equal(insertionBefore([today, menu], menu), null);
-    assert.equal(insertionBefore([menu, today], menu), null);
-    assert.equal(insertionBefore([today, menu, nativeButton], menu), nativeButton);
-    assert.equal(insertionBefore([menu, today, nativeButton], menu), nativeButton);
-    assert.match(renderer, /nativeMenuInsertionBefore\(Array\.from\(headerActionSlot\.children/);
-    assert.match(renderer, /const todayButton = menuBarChildren\.find/);
-    assert.match(renderer, /function setCodexPlusTriggerLabel\(trigger\)/);
-    assert.match(renderer, /function ensureCodexPlusTriggerIndicator\(trigger\)/);
+    assert.doesNotMatch(renderer, /^\s*installCodexPlusMenu\(\);/m);
+  });
+
+  it("places Codex++ in the native sidebar and opens a main-content page", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /codexPlusSidebarNavId\s*=\s*"codex-plus-sidebar-nav"/);
+    assert.match(renderer, /function installCodexPlusSidebarNavigation\(\)/);
+    assert.match(renderer, /aside\.app-shell-left-panel nav\[role="navigation"\]/);
+    assert.match(renderer, /function openCodexPlusPage\(\)/);
+    assert.match(renderer, /openCodexPlusPage\(\)/);
+    assert.match(renderer, /codex-plus-page-overlay/);
+    assert.match(renderer, /positionCodexPlusPage/);
+    assert.match(renderer, /function closeCodexPlusPage\(\)/);
+    assert.match(renderer, /installCodexPlusSidebarNavigation\(\);/);
   });
 
   it("adds the session copy shortcut through the native fork action", async () => {
@@ -229,6 +219,9 @@ describe("renderer injection header compatibility", () => {
     assert.match(css, /html\.dark[\s\S]*--codex-plus-bg-primary:[^;]*#202020/);
     assert.match(css, /@media \(prefers-color-scheme: dark\)[\s\S]*html:not\(\.light\):not\(\[data-theme="light"\]\)/);
     assert.match(css, /\.codex-plus-modal-content[\s\S]*background: var\(--codex-plus-bg-primary\)/);
+    assert.match(css, /\.codex-plus-page-overlay\s*\{[^}]*background: var\(--codex-plus-bg-primary\)/);
+    assert.match(css, /\.codex-plus-page-overlay \.codex-plus-modal-content\s*\{[^}]*background: var\(--codex-plus-bg-primary\)/);
+    assert.match(css, /\.codex-plus-page-overlay \.codex-plus-modal-close\s*\{[^}]*border: 1px solid var\(--codex-plus-border\)/);
     assert.match(css, /\.codex-plus-row-description[\s\S]*color: var\(--codex-plus-text-secondary\)/);
   });
 

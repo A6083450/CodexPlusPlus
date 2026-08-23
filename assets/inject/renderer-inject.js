@@ -1136,7 +1136,7 @@
         inset: 0;
         z-index: 2147483644;
         display: block;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary);
         pointer-events: auto;
         -webkit-app-region: no-drag;
       }
@@ -1146,7 +1146,7 @@
         max-height: none;
         border: 0;
         border-radius: 0;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary);
         box-shadow: none;
       }
       .${codexPlusPageClass} .codex-plus-modal-header {
@@ -1166,7 +1166,7 @@
       .${codexPlusPageClass} .codex-plus-modal-close {
         min-width: 56px;
         padding: 5px 12px;
-        border: 1px solid rgba(255,255,255,.14);
+        border: 1px solid var(--codex-plus-border);
         border-radius: 8px;
         font-size: 13px;
       }
@@ -4361,11 +4361,71 @@
     loadUserScripts();
   }
 
-  function nativeMenuInsertionBefore(children, menu) {
-    const nodes = Array.from(children || []);
-    const todayIndex = nodes.findIndex((node) => node?.id === "codex-live-token-cost-settings");
-    const startIndex = todayIndex >= 0 ? todayIndex + 1 : 0;
-    return nodes.slice(startIndex).find((node) => node && node !== menu) || null;
+  function openCodexPlusPage() {
+    openCodexPlusModal({ page: true });
+  }
+
+  function closeCodexPlusPage() {
+    document.querySelectorAll(`.${codexPlusPageClass}`).forEach((node) => node.remove());
+    setCodexPlusSidebarNavActive(false);
+  }
+
+  function installCodexPlusSidebarNavigation() {
+    document.querySelectorAll(`#${codexPlusMenuId}, [data-codex-plus-menu="true"]`).forEach((node) => node.remove());
+    const navigation = document.querySelector('aside.app-shell-left-panel nav[role="navigation"], nav[role="navigation"]');
+    if (!navigation) return;
+    const navButtons = Array.from(navigation.querySelectorAll("button"));
+    const pluginButton = navButtons.find((button) => {
+      if (button.querySelector(selectors.pluginSvgPath)) return true;
+      const label = (button.getAttribute("aria-label") || button.textContent || "").trim();
+      return /^(插件|Plugins)$/i.test(label);
+    });
+    const insertionButton = pluginButton || navButtons.find((button) => {
+      const label = (button.getAttribute("aria-label") || button.textContent || "").replace(/\s+/g, " ").trim();
+      return /^(已安排|Scheduled|拉取请求|Pull requests|新对话|New chat)$/i.test(label);
+    });
+    if (navigation.dataset.codexPlusSidebarNavigationListener !== "true") {
+      navigation.dataset.codexPlusSidebarNavigationListener = "true";
+      navigation.addEventListener("click", (event) => {
+        const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+        if (target?.closest(`#${codexPlusSidebarNavId}`)) return;
+        if (target?.closest("button, a")) closeCodexPlusPage();
+      }, true);
+    }
+    let wrapper = document.getElementById(codexPlusSidebarNavId);
+    const parent = insertionButton?.parentElement || navigation;
+    if (!wrapper || wrapper.parentElement !== parent) {
+      wrapper?.remove();
+      wrapper = document.createElement("div");
+      wrapper.id = codexPlusSidebarNavId;
+      wrapper.dataset.codexPlusSidebarNav = "true";
+      const button = (insertionButton || document.createElement("button")).cloneNode(true);
+      if (!(button instanceof HTMLElement)) return;
+      if (!button.className) button.className = "h-token-nav-row w-full flex items-center gap-2 px-3 py-2 text-sm";
+      button.type = "button";
+      button.removeAttribute("data-state");
+      button.removeAttribute("aria-current");
+      button.removeAttribute("disabled");
+      button.removeAttribute("aria-disabled");
+      button.setAttribute("aria-label", "Codex++");
+      button.textContent = "";
+      button.innerHTML = `<span class="codex-plus-sidebar-nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18M5.5 5.5l13 13M18.5 5.5l-13 13"/></svg></span><span class="truncate">Codex++</span><span class="codex-plus-sidebar-nav-status" data-status="${codexPlusBackendStatus.status || "checking"}" aria-hidden="true"></span>`;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openCodexPlusPage();
+      }, true);
+      wrapper.appendChild(button);
+      if (insertionButton?.nextSibling) {
+        parent.insertBefore(wrapper, insertionButton.nextSibling);
+      } else {
+        parent.appendChild(wrapper);
+      }
+    }
+    const status = wrapper.querySelector(".codex-plus-sidebar-nav-status");
+    if (status) status.dataset.status = codexPlusBackendStatus.status || "checking";
+    const active = !!document.querySelector(`.${codexPlusPageClass}`);
+    setCodexPlusSidebarNavActive(active);
   }
 
   function findNativeMenuInsertionPoint() {
@@ -4391,7 +4451,7 @@
         return headerActionSlot
           ? {
             parent: headerActionSlot,
-            before: nativeMenuInsertionBefore(Array.from(headerActionSlot.children || []), document.getElementById(codexPlusMenuId)),
+            before: headerActionSlot.firstChild,
             nativeButtonClass: headerIconTextButtonClass,
           }
           : null;
@@ -4404,14 +4464,9 @@
         : buttons[buttons.length - 1]?.className || "";
       if (openLocationGroup?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup, nativeButtonClass };
       if (openLocationGroup?.parentElement?.parentElement === menuBar) return { parent: menuBar, before: openLocationGroup.parentElement, nativeButtonClass };
-      const menu = document.getElementById(codexPlusMenuId);
-      const menuBarChildren = Array.from(menuBar.children || []);
-      const todayButton = menuBarChildren.find((node) => node?.id === "codex-live-token-cost-settings");
       return {
         parent: menuBar,
-        before: todayButton
-          ? nativeMenuInsertionBefore(menuBarChildren, menu)
-          : buttons[buttons.length - 1]?.nextSibling || null,
+        before: buttons[buttons.length - 1]?.nextSibling || null,
         nativeButtonClass: buttons[buttons.length - 1]?.className || "",
       };
     }
@@ -4628,11 +4683,6 @@
   function placeCodexPlusMenuNative(menu, insertionPoint) {
     if (!menu || !insertionPoint?.parent) return false;
     const safeBefore = insertionPoint.before?.parentElement === insertionPoint.parent ? insertionPoint.before : null;
-    const alreadyNative = menu.parentElement === insertionPoint.parent
-      && menu.nextSibling === safeBefore
-      && menu.hidden !== true
-      && menu.dataset?.codexPlusNativePlacement !== "waiting"
-      && !menu.classList?.contains(codexPlusMenuFloatingClass);
     cancelNativeMenuPlacementRetry();
     configureCodexPlusTrigger(menu, menu.querySelector("button"), insertionPoint.nativeButtonClass);
     prepareCodexPlusMenuNative(menu);
@@ -4640,7 +4690,6 @@
       insertionPoint.parent.insertBefore(menu, safeBefore);
     }
     removeDuplicateCodexPlusMenus(menu);
-    if (!alreadyNative) window.__codexLiveTokenCost?.render?.();
     return true;
   }
 
@@ -11057,7 +11106,7 @@
         "existing-renderer"
       );
     }
-    installCodexPlusMenu();
+    installCodexPlusSidebarNavigation();
     installSessionShareImportListener();
     localizeCodexMenus();
     scheduleBackendHeartbeat();
@@ -12035,7 +12084,7 @@
   }
 
   function isExtensionUiNode(node) {
-    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, [data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"], .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu, #codex-live-token-cost, #codex-live-token-cost-settings, .cltc-settings-overlay`);
+    return !!node?.closest?.(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, .${projectMoveOverlayClass}, .${codexServiceTierBadgeClass}, [data-codex-service-tier-menu-trigger="true"], [data-codex-service-tier-menu-content="true"], .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu`);
   }
 
   function scanRelevantSelector() {

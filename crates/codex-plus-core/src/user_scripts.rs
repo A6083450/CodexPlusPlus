@@ -44,18 +44,10 @@ fn parse_live_runtime_status_response(response: &Value) -> anyhow::Result<Value>
     Ok(status)
 }
 
-const DS_STYLE_COST_SCRIPT_FILE_NAME: &str = "market-codex-ds-style-cost.js";
-const LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME: &str = "market-codex-live-token-cost.js";
-const BUNDLED_MARKET_SCRIPTS: [(&str, &str); 2] = [
-    (
-        DS_STYLE_COST_SCRIPT_FILE_NAME,
-        include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js"),
-    ),
-    (
-        "market-codex-zhcn-translate.js",
-        include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js"),
-    ),
-];
+const BUNDLED_MARKET_SCRIPTS: [(&str, &str); 1] = [(
+    "market-codex-zhcn-translate.js",
+    include_str!("../../../assets/user_scripts/market-codex-zhcn-translate.js"),
+)];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UserScriptConfig {
@@ -175,7 +167,6 @@ impl UserScriptManager {
     ) -> anyhow::Result<UserScriptConfig> {
         let _guard = self.config_lock.lock().unwrap();
         let mut config = self.load_config_unlocked();
-        let migrated_legacy_name = self.migrate_legacy_cost_script_name(&mut config)?;
         let scripts_to_install = BUNDLED_MARKET_SCRIPTS
             .iter()
             .filter(|(file_name, source)| {
@@ -184,9 +175,6 @@ impl UserScriptManager {
             })
             .collect::<Vec<_>>();
         if scripts_to_install.is_empty() {
-            if migrated_legacy_name {
-                self.save_config_unlocked(&config)?;
-            }
             return Ok(config);
         }
         fs::create_dir_all(&self.user_dir).with_context(|| {
@@ -209,46 +197,6 @@ impl UserScriptManager {
         }
         self.save_config_unlocked(&config)?;
         Ok(config)
-    }
-
-    fn migrate_legacy_cost_script_name(
-        &self,
-        config: &mut UserScriptConfig,
-    ) -> anyhow::Result<bool> {
-        let legacy_path = self.user_dir.join(LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME);
-        if !legacy_path.is_file() {
-            return Ok(false);
-        }
-
-        let replacement_path = self.user_dir.join(DS_STYLE_COST_SCRIPT_FILE_NAME);
-        let legacy_key = format!("user:{LEGACY_LIVE_TOKEN_COST_SCRIPT_FILE_NAME}");
-        let replacement_key = format!("user:{DS_STYLE_COST_SCRIPT_FILE_NAME}");
-        let legacy_enabled = config.scripts.remove(&legacy_key).unwrap_or(true);
-
-        if replacement_path.exists() {
-            config
-                .scripts
-                .entry(replacement_key)
-                .or_insert(legacy_enabled);
-            config.scripts.insert(legacy_key, false);
-            return Ok(true);
-        }
-
-        fs::rename(&legacy_path, &replacement_path).with_context(|| {
-            format!(
-                "failed to rename bundled script {} to {}",
-                legacy_path.display(),
-                replacement_path.display()
-            )
-        })?;
-        config
-            .scripts
-            .entry(replacement_key.clone())
-            .or_insert(legacy_enabled);
-        if let Some(market) = config.market.remove(&legacy_key) {
-            config.market.entry(replacement_key).or_insert(market);
-        }
-        Ok(true)
     }
 
     pub fn delete_user_script(&self, key: &str) -> anyhow::Result<UserScriptConfig> {

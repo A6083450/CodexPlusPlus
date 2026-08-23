@@ -2421,8 +2421,6 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["delayedNativeMenuRetryPersists"], true);
     assert_eq!(cases["delayedNativeMenuRetryMigrated"], true);
     assert_eq!(cases["delayedNativeMenuRetryStopped"], true);
-    assert_eq!(cases["nativePlacementNotifiesStatusRender"], true);
-    assert_eq!(cases["statusUiMutationIgnored"], true);
     assert_eq!(cases["conversationViewFirstOffset"], 96.0);
     assert_eq!(cases["conversationViewRepeatedOffset"], 96.0);
     assert_eq!(cases["conversationViewInitialFrameBudget"], 2);
@@ -2999,17 +2997,6 @@ const composerFastIconReplacementSchedulesScan = api.shouldScheduleScan([{{
   addedNodes: [],
   removedNodes: [],
 }}]);
-const statusUiNode = {{
-  nodeType: 1,
-  closest: (selector) => selector.includes('#codex-live-token-cost') ? statusUiNode : null,
-  matches: () => true,
-  querySelector: () => null,
-}};
-const statusUiMutationIgnored = !api.shouldScheduleScan([{{
-  target: statusUiNode,
-  addedNodes: [],
-  removedNodes: [],
-}}]);
 api.scheduleScan([]);
 const irrelevantMutationScanSucceeded = true;
 const delayedNativeMenuRetryAvailable = typeof api.scheduleNativeMenuPlacementRetry === "function"
@@ -3020,7 +3007,6 @@ let delayedNativeMenuRetryUsesLowFrequencyDelay = false;
 let delayedNativeMenuRetryPersists = false;
 let delayedNativeMenuRetryMigrated = false;
 let delayedNativeMenuRetryStopped = false;
-let nativePlacementNotifiesStatusRender = false;
 if (delayedNativeMenuRetryAvailable) {{
   const originalSetTimeout = window.setTimeout;
   const originalClearTimeout = window.clearTimeout;
@@ -3048,8 +3034,6 @@ if (delayedNativeMenuRetryAvailable) {{
     }},
   }};
   let delayedHeaderMounted = false;
-  let statusRenderCalls = 0;
-  window.__codexLiveTokenCost = {{ render: () => {{ statusRenderCalls += 1; }} }};
   nativeMenuBar.insertBefore = (candidate) => {{
     candidate.parentElement = nativeMenuBar;
     candidate.className = "";
@@ -3095,14 +3079,11 @@ if (delayedNativeMenuRetryAvailable) {{
     && retryMenu.hidden === false;
   delayedNativeMenuRetryStopped = retryState.timerActive === false
     && retryState.attempt === 0;
-  nativePlacementNotifiesStatusRender = statusRenderCalls === 1;
-
   window.setTimeout = originalSetTimeout;
   window.clearTimeout = originalClearTimeout;
   document.getElementById = originalDocumentGetElementById;
   document.querySelector = originalDocumentQuerySelector;
   document.querySelectorAll = originalDocumentQuerySelectorAll;
-  delete window.__codexLiveTokenCost;
 }}
 const conversationBounds = rect(300, 0, 1192, 900);
 const conversationViewFirstOffset = api.conversationViewOffset(
@@ -3495,7 +3476,6 @@ process.stdout.write(JSON.stringify({{
   logicalDirectionGroupClassesNormalized,
   currentHeaderMountSchedulesScan,
   composerFastIconReplacementSchedulesScan,
-  statusUiMutationIgnored,
   irrelevantMutationScanSucceeded,
   delayedNativeMenuRetryAvailable,
   delayedNativeMenuRetryScheduled,
@@ -3504,7 +3484,6 @@ process.stdout.write(JSON.stringify({{
   delayedNativeMenuRetryPersists,
   delayedNativeMenuRetryMigrated,
   delayedNativeMenuRetryStopped,
-  nativePlacementNotifiesStatusRender,
   conversationViewFirstOffset,
   conversationViewRepeatedOffset,
   conversationViewInitialFrameBudget,

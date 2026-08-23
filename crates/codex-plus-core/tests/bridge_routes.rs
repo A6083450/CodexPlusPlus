@@ -862,7 +862,7 @@ fn user_script_manager_installs_missing_bundled_market_scripts_and_reinstalls_on
 }
 
 #[test]
-fn user_script_manager_installs_ds_style_cost_script_name() {
+fn user_script_manager_does_not_install_ds_style_cost_script() {
     let temp = tempfile::tempdir().unwrap();
     let user_dir = temp.path().join("user");
     let manager = UserScriptManager::new(
@@ -873,20 +873,16 @@ fn user_script_manager_installs_ds_style_cost_script_name() {
 
     let installed = manager.install_missing_bundled_market_scripts().unwrap();
 
-    assert_eq!(
-        installed.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&true)
-    );
-    assert!(user_dir.join("market-codex-ds-style-cost.js").is_file());
     assert!(
-        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js"))
-            .unwrap()
-            .contains("@version      0.8.18")
+        !installed
+            .scripts
+            .contains_key("user:market-codex-ds-style-cost.js")
     );
+    assert!(!user_dir.join("market-codex-ds-style-cost.js").exists());
 }
 
 #[test]
-fn user_script_manager_preserves_newer_scripts_and_upgrades_older_scripts() {
+fn user_script_manager_does_not_modify_existing_ds_style_cost_script() {
     let temp = tempfile::tempdir().unwrap();
     let user_dir = temp.path().join("user");
     std::fs::create_dir_all(&user_dir).unwrap();
@@ -897,120 +893,55 @@ fn user_script_manager_preserves_newer_scripts_and_upgrades_older_scripts() {
         temp.path().join("user_scripts.json"),
     );
 
-    std::fs::write(
-        &script_path,
-        "// ==UserScript==\n// @version      0.8.19\n// ==/UserScript==\nwindow.customNewer = true;",
-    )
-    .unwrap();
-    manager.install_missing_bundled_market_scripts().unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&script_path).unwrap(),
-        "// ==UserScript==\n// @version      0.8.19\n// ==/UserScript==\nwindow.customNewer = true;"
-    );
-
-    std::fs::write(
-        &script_path,
-        "// ==UserScript==\n// @version      0.8.9\n// ==/UserScript==\nwindow.oldBundle = true;",
-    )
-    .unwrap();
-    manager.install_missing_bundled_market_scripts().unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&script_path).unwrap(),
-        include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js")
-    );
-}
-
-#[test]
-fn user_script_manager_repairs_previous_renderer_bundle_with_same_release_bug() {
-    let temp = tempfile::tempdir().unwrap();
-    let user_dir = temp.path().join("user");
-    std::fs::create_dir_all(&user_dir).unwrap();
-    let script_path = user_dir.join("market-codex-ds-style-cost.js");
-    let bundled_source = include_str!("../../../assets/user_scripts/market-codex-ds-style-cost.js");
-    let bundled_version = bundled_source
-        .lines()
-        .find_map(|line| {
-            line.trim_start()
-                .strip_prefix("// @version")
-                .and_then(|value| value.split_whitespace().next())
-        })
-        .unwrap();
-    let stale_source = bundled_source
-        .replace(
-            &format!("// @version      {bundled_version}"),
-            "// @version      0.8.10",
-        )
-        .replace(
-            &format!("const VERSION = \"{bundled_version}\""),
-            "const VERSION = \"0.8.10\"",
-        )
-        .replace(
-            r#"localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) === "true""#,
-            r#"localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false""#,
-        )
-        .replace(
-            "    } catch {\n      return false;\n    }\n  }\n\n  function saveProfileUnlockEnabled",
-            "    } catch {\n      return true;\n    }\n  }\n\n  function saveProfileUnlockEnabled",
-        );
-    assert_ne!(stale_source, bundled_source);
-    assert!(
-        stale_source.contains("localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== \"false\"")
-    );
-    std::fs::write(&script_path, stale_source).unwrap();
-
-    let manager = UserScriptManager::new(
-        temp.path().join("builtin"),
-        user_dir,
-        temp.path().join("user_scripts.json"),
-    );
+    std::fs::write(&script_path, "window.localOverride = true;").unwrap();
     manager
         .set_script_enabled("user:market-codex-ds-style-cost.js", false)
         .unwrap();
 
-    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+    let reinstalled = manager.reinstall_bundled_market_scripts().unwrap();
 
     assert_eq!(
-        installed.scripts.get("user:market-codex-ds-style-cost.js"),
+        reinstalled
+            .scripts
+            .get("user:market-codex-ds-style-cost.js"),
         Some(&false)
     );
     assert_eq!(
         std::fs::read_to_string(&script_path).unwrap(),
-        bundled_source
+        "window.localOverride = true;"
     );
 }
 
 #[test]
-fn user_script_manager_migrates_legacy_cost_script_name() {
+fn user_script_manager_does_not_migrate_existing_legacy_cost_script() {
     let temp = tempfile::tempdir().unwrap();
     let user_dir = temp.path().join("user");
     std::fs::create_dir_all(&user_dir).unwrap();
-    std::fs::write(
-        user_dir.join("market-codex-live-token-cost.js"),
-        "window.localOverride = true;",
-    )
-    .unwrap();
+    let legacy_path = user_dir.join("market-codex-live-token-cost.js");
+    std::fs::write(&legacy_path, "window.legacyOverride = true;").unwrap();
     let manager = UserScriptManager::new(
         temp.path().join("builtin"),
         user_dir.clone(),
         temp.path().join("user_scripts.json"),
     );
 
-    let migrated = manager.install_missing_bundled_market_scripts().unwrap();
+    manager
+        .set_script_enabled("user:market-codex-live-token-cost.js", false)
+        .unwrap();
 
-    assert!(!user_dir.join("market-codex-live-token-cost.js").exists());
+    let installed = manager.install_missing_bundled_market_scripts().unwrap();
+
     assert_eq!(
-        std::fs::read_to_string(user_dir.join("market-codex-ds-style-cost.js")).unwrap(),
-        "window.localOverride = true;"
-    );
-    assert_eq!(
-        migrated.scripts.get("user:market-codex-ds-style-cost.js"),
-        Some(&true)
-    );
-    assert!(
-        !migrated
+        installed
             .scripts
-            .contains_key("user:market-codex-live-token-cost.js")
+            .get("user:market-codex-live-token-cost.js"),
+        Some(&false)
     );
+    assert_eq!(
+        std::fs::read_to_string(&legacy_path).unwrap(),
+        "window.legacyOverride = true;"
+    );
+    assert!(!user_dir.join("market-codex-ds-style-cost.js").exists());
 }
 
 #[test]
