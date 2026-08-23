@@ -152,6 +152,8 @@ describe("renderer injection header compatibility", () => {
     assert.equal(insertionBefore([menu, today, nativeButton], menu), nativeButton);
     assert.match(renderer, /nativeMenuInsertionBefore\(Array\.from\(headerActionSlot\.children/);
     assert.match(renderer, /const todayButton = menuBarChildren\.find/);
+    assert.match(renderer, /function setCodexPlusTriggerLabel\(trigger\)/);
+    assert.match(renderer, /function ensureCodexPlusTriggerIndicator\(trigger\)/);
   });
 
   it("adds the session copy shortcut through the native fork action", async () => {
@@ -166,6 +168,29 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(renderer, /\n\s*refreshSessionCopyMenuItems\(\);/);
   });
 
+  it("adds an encrypted session sharing button to the active Codex conversation", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /sessionShareButtonClass\s*=\s*"codex-session-share-button"/);
+    assert.match(renderer, /function installSessionShareButton\(\)/);
+    assert.match(renderer, /function sessionShareMarkdown\(\)/);
+    assert.match(renderer, /crypto\.subtle\.generateKey\(\{ name: "AES-GCM", length: 256 \}/);
+    assert.match(renderer, /https:\/\/share\.codexpp\.cc/);
+    assert.match(renderer, /postJson\("\/share\/create", payload\)/);
+    assert.match(renderer, /postJson\("\/session\/export"/);
+    assert.match(renderer, /postJson\("\/session\/import"/);
+    assert.match(renderer, /codex-rollout/);
+    assert.match(renderer, /function sessionImportMarkdown\(session\)/);
+    assert.match(renderer, /codexpp-import-session/);
+    assert.match(renderer, /nativeShare\?\.closest\?\.\("\.ms-auto"\)/);
+    assert.match(renderer, /#k=\$\{encrypted\.key\}/);
+    assert.match(renderer, /navigator\.clipboard\.writeText\(shareUrl\)/);
+    assert.match(renderer, /data-testid\*=\"message\"/);
+    assert.match(renderer, /function sessionActionTrigger\(row\)/);
+    assert.match(renderer, /const sessionMenuEnabled = codexPlusBackendSettings\.enhancementsEnabled !== false/);
+    assert.doesNotMatch(renderer, /window\.location\.(?:href|assign)\s*=\s*[^;]*markdown/);
+  });
+
   it("automatically renames a session through the native title suggestion", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
@@ -175,15 +200,6 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /button\.classList\.contains\("text-info"\)/);
     assert.match(renderer, /\^\(保存\|Save\)\$/);
     assert.match(renderer, /Codex 未能生成新名称/);
-  });
-
-  it("anchors the Codex++ menu to current and legacy application top bars only", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
-    assert.match(renderer, /appHeader:\s*'[^"]*\[class\*="ApplicationMenuTopBar"\][^']*\.app-header-tint'/);
-    assert.doesNotMatch(renderer, /document\.querySelector\(["']header["']\)/);
-    assert.match(renderer, /isApplicationMenuTopBar\s*\?\s*Math\.max\(4, headerRect\.top\)/);
-    assert.match(renderer, /isApplicationMenuTopBar\s*\?\s*28\s*:\s*headerRect\.height/);
   });
 
   it("does not install Codex++ UI in embedded browser documents", async () => {
@@ -201,7 +217,19 @@ describe("renderer injection header compatibility", () => {
     const appended = installRendererStyle(renderer);
 
     assert.equal(appended.length, 1);
-    assert.match(appended[0].textContent ?? "", /#codex-plus-menu/);
+    assert.match(appended[0].textContent ?? "", /\.codex-plus-modal-overlay/);
+  });
+
+  it("keeps the settings modal readable in explicit light and dark host themes", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const [style] = installRendererStyle(renderer);
+    const css = style.textContent ?? "";
+
+    assert.match(css, /html\.light[\s\S]*--codex-plus-bg-primary:[^;]*#fff/);
+    assert.match(css, /html\.dark[\s\S]*--codex-plus-bg-primary:[^;]*#202020/);
+    assert.match(css, /@media \(prefers-color-scheme: dark\)[\s\S]*html:not\(\.light\):not\(\[data-theme="light"\]\)/);
+    assert.match(css, /\.codex-plus-modal-content[\s\S]*background: var\(--codex-plus-bg-primary\)/);
+    assert.match(css, /\.codex-plus-row-description[\s\S]*color: var\(--codex-plus-text-secondary\)/);
   });
 
   it("hides only the official usage alert and restores it without changing upstream styles", async () => {
