@@ -343,6 +343,13 @@ impl LaunchHooks for LauncherHooks {
         self.core.cleanup_unsupported_config()
     }
 
+    fn sync_service_tier_catalog(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.core.sync_service_tier_catalog(settings)
+    }
+
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         let _ = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None))
             .await

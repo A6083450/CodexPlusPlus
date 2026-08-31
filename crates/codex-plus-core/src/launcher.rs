@@ -219,6 +219,9 @@ pub trait LaunchHooks: Send + Sync {
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
         Ok(())
     }
+    fn sync_service_tier_catalog(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
     fn has_pending_remote_control_session_recoveries(&self) -> bool {
         false
@@ -428,6 +431,17 @@ where
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.remote_control_session_finalization_deferred",
                 serde_json::json!({"reason": "desktop_writer_active"}),
+            );
+        }
+        if settings.enhancements_enabled
+            && settings.codex_app_service_tier_controls
+            && let Err(error) = hooks.sync_service_tier_catalog(&settings)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.service_tier_catalog_sync_failed_nonfatal",
+                serde_json::json!({
+                    "message": error.to_string()
+                }),
             );
         }
         crate::dream_skin::sync_default_dream_skin_base_theme(
@@ -712,6 +726,15 @@ impl LaunchHooks for DefaultLaunchHooks {
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
         crate::relay_config::cleanup_unsupported_approval_policies_in_home(&home)?;
+        Ok(())
+    }
+
+    fn sync_service_tier_catalog(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        if !settings.enhancements_enabled || !settings.codex_app_service_tier_controls {
+            return Ok(());
+        }
+        let home = crate::relay_config::default_codex_home_dir();
+        crate::service_tier_catalog::sync_service_tier_catalog_in_home(&home)?;
         Ok(())
     }
 

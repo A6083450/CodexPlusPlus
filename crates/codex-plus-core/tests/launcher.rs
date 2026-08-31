@@ -998,6 +998,43 @@ async fn launch_lifecycle_passes_configured_extra_args_to_codex_launch() {
 }
 
 #[tokio::test]
+async fn launch_lifecycle_syncs_service_tier_catalog_before_codex_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+        codex_app_service_tier_controls: true,
+        ..BackendSettings::default()
+    });
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap();
+    let sync_index = events
+        .iter()
+        .position(|event| event == "sync-service-tier-catalog")
+        .expect("service tier catalog should be synced");
+    let launch_index = events
+        .iter()
+        .position(|event| event.starts_with("launch:"))
+        .expect("Codex should launch");
+    assert!(sync_index < launch_index);
+}
+
+#[tokio::test]
 async fn launch_lifecycle_passes_native_menu_localization_switch_to_codex_launch() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
@@ -1979,6 +2016,13 @@ impl LaunchHooks for FakeHooks {
     async fn load_settings(&self) -> anyhow::Result<BackendSettings> {
         self.event("load-settings");
         Ok(self.settings.clone())
+    }
+
+    fn sync_service_tier_catalog(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        if settings.enhancements_enabled && settings.codex_app_service_tier_controls {
+            self.event("sync-service-tier-catalog");
+        }
+        Ok(())
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {

@@ -2547,6 +2547,15 @@ fn injection_script_handles_irrelevant_mutations_without_runtime_errors() {
 }
 
 #[test]
+fn injected_service_tier_submenu_uses_an_opaque_background() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("px-1 py-1 bg-token-dropdown-background text-token-foreground"));
+    assert!(!script.contains("px-1 py-1 bg-token-dropdown-background/90 text-token-foreground"));
+    assert!(!script.contains("shadow-xl-spread backdrop-blur-sm w-[233px]"));
+}
+
+#[test]
 fn injection_script_places_menu_in_home_header_action_slot() {
     let cases = run_service_tier_contract_harness();
 

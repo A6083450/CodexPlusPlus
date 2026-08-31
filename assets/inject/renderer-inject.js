@@ -10748,7 +10748,7 @@
     const disabled = codexPlusBackendStatus.status === "failed";
 
     const content = document.createElement("div");
-    content.className = "z-50 flex min-w-[180px] select-none flex-col overflow-y-auto m-px px-1 py-1 bg-token-dropdown-background/90 text-token-foreground ring-token-border rounded-xl ring-[0.5px] shadow-xl-spread backdrop-blur-sm w-[233px]";
+    content.className = "z-50 flex min-w-[180px] select-none flex-col overflow-y-auto m-px px-1 py-1 bg-token-dropdown-background text-token-foreground ring-token-border rounded-xl ring-[0.5px] shadow-xl-spread w-[233px]";
     content.dataset.codexServiceTierMenuContent = "true";
     content.id = "codex-plus-service-tier-menu-content";
     content.dataset.codexServiceTierBackendStatus = codexPlusBackendStatus.status || "";
