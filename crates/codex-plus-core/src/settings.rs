@@ -19,27 +19,6 @@ pub enum LaunchMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RelayContextSelection {
-    #[serde(default)]
-    pub mcp_servers: Vec<String>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub plugins: Vec<String>,
-}
-
-impl Default for RelayContextSelection {
-    fn default() -> Self {
-        Self {
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            plugins: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RelayProfile {
     pub id: String,
     pub name: String,
@@ -61,6 +40,8 @@ pub struct RelayProfile {
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
+    #[serde(rename = "noAuth", default)]
+    pub no_auth: bool,
     #[serde(rename = "hideOfficialUsageAlert", default)]
     pub hide_official_usage_alert: bool,
     #[serde(rename = "testModel", default)]
@@ -71,10 +52,6 @@ pub struct RelayProfile {
     pub auth_contents: String,
     #[serde(rename = "useCommonConfig", default = "default_true")]
     pub use_common_config: bool,
-    #[serde(rename = "contextSelection", default)]
-    pub context_selection: RelayContextSelection,
-    #[serde(rename = "contextSelectionInitialized", default)]
-    pub context_selection_initialized: bool,
     #[serde(rename = "contextWindow", default)]
     pub context_window: String,
     #[serde(rename = "autoCompactLimit", default)]
@@ -194,13 +171,12 @@ impl Default for RelayProfile {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            no_auth: false,
             hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
             use_common_config: true,
-            context_selection: RelayContextSelection::default(),
-            context_selection_initialized: false,
             context_window: String::new(),
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
@@ -219,6 +195,10 @@ impl Default for RelayProfile {
 }
 
 impl RelayProfile {
+    pub fn uses_no_auth(&self) -> bool {
+        self.relay_mode == RelayMode::PureApi && self.no_auth
+    }
+
     pub fn has_model_routes(&self) -> bool {
         self.model_routes
             .iter()
@@ -387,6 +367,8 @@ pub struct BackendSettings {
     pub provider_sync_manual_providers: Vec<String>,
     #[serde(rename = "providerSyncLastSelectedProvider", default)]
     pub provider_sync_last_selected_provider: String,
+    #[serde(rename = "ccsDbPath", default)]
+    pub ccs_db_path: String,
     #[serde(rename = "relayProfilesEnabled", default = "default_true")]
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
@@ -566,6 +548,7 @@ impl Default for BackendSettings {
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
+            ccs_db_path: String::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_plugin_marketplace_unlock: true,
@@ -658,13 +641,12 @@ impl BackendSettings {
                 protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
+                no_auth: false,
                 hide_official_usage_alert: false,
                 test_model: String::new(),
                 config_contents: String::new(),
                 auth_contents: String::new(),
                 use_common_config: true,
-                context_selection: RelayContextSelection::default(),
-                context_selection_initialized: false,
                 context_window: String::new(),
                 auto_compact_limit: String::new(),
                 model_insert_mode: RelayModelInsertMode::Patch,
@@ -711,13 +693,12 @@ impl BackendSettings {
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
+            no_auth: false,
             hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
             use_common_config: true,
-            context_selection: RelayContextSelection::default(),
-            context_selection_initialized: false,
             context_window: String::new(),
             auto_compact_limit: String::new(),
             model_insert_mode: RelayModelInsertMode::Patch,
@@ -785,6 +766,7 @@ impl BackendSettings {
         self.active_aggregate_relay_profile().is_some()
             || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
             || self.active_relay_profile().has_model_routes()
+            || self.active_relay_profile().uses_no_auth()
             || self.active_relay_session_provider() == RelaySessionProvider::Openai
     }
 }
@@ -1196,6 +1178,12 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("providerSyncEnabled").and_then(Value::as_bool) {
         target.insert("providerSyncEnabled".to_string(), Value::Bool(value));
     }
+    if let Some(value) = source.get("ccsDbPath").and_then(Value::as_str) {
+        target.insert(
+            "ccsDbPath".to_string(),
+            Value::String(value.trim().to_string()),
+        );
+    }
     if let Some(value) = source.get("relayProfilesEnabled").and_then(Value::as_bool) {
         target.insert("relayProfilesEnabled".to_string(), Value::Bool(value));
     }
@@ -1570,6 +1558,7 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
 }
 
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
+    settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
     let (common, extracted_context) =
         split_context_config_sections(&settings.relay_common_config_contents);
     let context = join_config_sections(&[
@@ -1577,7 +1566,9 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         extracted_context.as_str(),
     ]);
     settings.relay_common_config_contents = crate::relay_config::normalize_config_text(&common);
-    settings.relay_context_config_contents = crate::relay_config::normalize_config_text(&context);
+    settings.relay_context_config_contents = crate::relay_config::strip_legacy_skill_tables(
+        &crate::relay_config::normalize_config_text(&context),
+    );
     for profile in &mut settings.relay_profiles {
         let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
     }
@@ -1933,17 +1924,28 @@ mod tests {
     fn relay_profile_context_fields_default_to_empty() {
         let profile = RelayProfile::default();
 
-        assert!(profile.context_selection.mcp_servers.is_empty());
-        assert!(profile.context_selection.skills.is_empty());
-        assert!(profile.context_selection.plugins.is_empty());
         assert!(profile.use_common_config);
-        assert!(!profile.context_selection_initialized);
         assert!(profile.context_window.is_empty());
         assert!(profile.auto_compact_limit.is_empty());
         assert_eq!(profile.model_insert_mode, RelayModelInsertMode::Patch);
         assert!(profile.model_list.is_empty());
         assert!(profile.model_routes.is_empty());
         assert!(!profile.has_model_routes());
+    }
+
+    #[test]
+    fn no_auth_relay_requires_protocol_proxy() {
+        let settings = BackendSettings {
+            relay_profiles: vec![RelayProfile {
+                relay_mode: RelayMode::PureApi,
+                no_auth: true,
+                base_url: "https://relay.example.test/v1".to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+
+        assert!(settings.active_relay_uses_protocol_proxy());
     }
 
     #[test]
@@ -1971,6 +1973,9 @@ mod tests {
         assert_eq!(saved["modelRoutes"][0]["targetModel"], "provider-luna");
     }
 
+    /// 旧版按供应商勾选上下文条目的 `contextSelection` / `contextSelectionInitialized`
+    /// 已被上下文条目自身的 `enabled` 开关取代。历史 settings.json 里仍会带着这两个键，
+    /// 反序列化必须容忍它们，否则老用户一升级配置就读不出来。
     #[test]
     fn relay_profile_context_fields_deserialize_from_camel_case() {
         let profile: RelayProfile = serde_json::from_str(
@@ -1992,11 +1997,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(profile.context_selection.mcp_servers, vec!["context7"]);
-        assert_eq!(profile.context_selection.skills, vec!["writer"]);
-        assert_eq!(profile.context_selection.plugins, vec!["local"]);
         assert!(!profile.use_common_config);
-        assert!(profile.context_selection_initialized);
         assert_eq!(profile.context_window, "200000");
         assert_eq!(profile.auto_compact_limit, "160000");
         assert_eq!(profile.model_insert_mode, RelayModelInsertMode::Patch);
@@ -2323,6 +2324,7 @@ experimental_bearer_token = "sk-existing""#
         let settings = BackendSettings {
             provider_sync_enabled: true,
             codex_extra_args: vec!["--force_high_performance_gpu".to_string()],
+            ccs_db_path: dir.join("cc-switch.db").to_string_lossy().to_string(),
             ..BackendSettings::default()
         };
 

@@ -11,6 +11,7 @@ use codex_plus_core::protocol_proxy::{
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
     upstream_stream_header_timeout,
 };
+use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
     RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
@@ -467,6 +468,188 @@ fn responses_request_preserves_reasoning_content_for_thinking_followup() {
     );
     assert_eq!(converted["messages"][1]["tool_calls"][0]["id"], "call_1");
     assert_eq!(converted["messages"][2]["role"], "tool");
+}
+
+// #1860 错误 1：孤立的 function_call（后面没有 function_call_output）不能变成
+// assistant.tool_calls，否则 DeepSeek 报 "must be followed by tool messages"。
+#[test]
+fn responses_request_drops_orphaned_function_call_without_output() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "stream": false,
+        "max_output_tokens": 8,
+        "input": [
+            { "role": "user", "content": "ping" },
+            { "role": "assistant", "content": [{ "type": "output_text", "text": "ok" }] },
+            {
+                "type": "function_call",
+                "call_id": "call_t1",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo hi\"}"
+            },
+            { "role": "user", "content": "ping" }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        // 每个 tool_call 后面都必须紧跟对应的 tool 消息
+        for (offset, tool_call) in tool_calls.iter().enumerate() {
+            let id = tool_call["id"].as_str().unwrap();
+            let follower = messages.get(index + 1 + offset);
+            assert_eq!(
+                follower
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str()),
+                Some("tool"),
+                "tool_call {id} 后面没有 tool 消息：{converted:#}"
+            );
+            assert_eq!(
+                follower
+                    .and_then(|m| m.get("tool_call_id"))
+                    .and_then(|r| r.as_str()),
+                Some(id),
+                "tool_call {id} 没有匹配的 tool_call_id：{converted:#}"
+            );
+        }
+    }
+}
+
+// #1860 错误 2：thinking 模式下带 tool_calls 的 assistant 消息必须回传 reasoning_content。
+#[test]
+fn responses_request_attaches_reasoning_content_to_tool_call_message() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "stream": false,
+        "max_output_tokens": 8,
+        "input": [
+            { "role": "user", "content": "ping" },
+            {
+                "type": "function_call",
+                "call_id": "call_t1",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo hi\"}"
+            },
+            { "type": "function_call_output", "call_id": "call_t1", "output": "hi" }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+    let tool_call_message = messages
+        .iter()
+        .find(|m| m.get("tool_calls").is_some())
+        .unwrap_or_else(|| panic!("没有 tool_calls 消息：{converted:#}"));
+    let has_content = tool_call_message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.is_empty());
+    let has_reasoning = tool_call_message
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.is_empty());
+    assert!(
+        has_content || has_reasoning,
+        "带 tool_calls 且 content 为空的 assistant 消息必须有 reasoning_content：{converted:#}"
+    );
+}
+
+// 历史尾部的 tool_call 是「output 还没回来」的正常形态，必须保留。
+#[test]
+fn responses_request_keeps_trailing_unanswered_tool_call() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "role": "user", "content": "ping" },
+            {
+                "type": "function_call",
+                "call_id": "call_tail",
+                "name": "shell_command",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let last = converted["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["tool_calls"][0]["id"], "call_tail");
+}
+
+// 部分应答：只摘掉没被应答的那个，已应答的保留。
+#[test]
+fn responses_request_strips_only_unanswered_parallel_tool_calls() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "role": "user", "content": "ping" },
+            {
+                "type": "function_call",
+                "call_id": "call_ok",
+                "name": "answered_tool",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_lost",
+                "name": "abandoned_tool",
+                "arguments": "{}"
+            },
+            { "type": "function_call_output", "call_id": "call_ok", "output": "done" },
+            { "role": "user", "content": "continue" }
+        ]
+    }))
+    .unwrap();
+
+    let assistant = converted["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message.get("tool_calls").is_some())
+        .unwrap();
+    let calls = assistant["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1, "只应保留被应答的 tool_call：{converted:#}");
+    assert_eq!(calls[0]["id"], "call_ok");
+    // 被摘掉的调用降级成文本保留，不静默丢失
+    let content = assistant["content"].as_str().unwrap();
+    assert!(
+        content.contains("call_lost") && content.contains("abandoned_tool"),
+        "被摘掉的调用应降级为文本：{content}"
+    );
+}
+
+// 已有真实 reasoning 时不能被占位文本覆盖。
+#[test]
+fn responses_request_keeps_real_reasoning_content_over_placeholder() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "role": "user", "content": "ping" },
+            {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "Need to run echo." }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_t1",
+                "name": "shell_command",
+                "arguments": "{}"
+            },
+            { "type": "function_call_output", "call_id": "call_t1", "output": "hi" }
+        ]
+    }))
+    .unwrap();
+
+    let assistant = converted["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message.get("tool_calls").is_some())
+        .unwrap();
+    assert_eq!(assistant["reasoning_content"], "Need to run echo.");
 }
 
 #[test]
@@ -1439,9 +1622,36 @@ data: [DONE]
         1
     );
     assert!(converted.contains("\"type\":\"custom_tool_call\""));
+    assert!(converted.contains("\"id\":\"ctc_call_custom\""));
+    assert!(converted.contains("\"item_id\":\"ctc_call_custom\""));
+    assert!(!converted.contains("\"id\":\"fc_call_custom\""));
+    assert!(!converted.contains("\"item_id\":\"fc_call_custom\""));
     assert!(converted.contains("\"name\":\"exec\""));
     assert!(converted.contains("\"input\":\"ls -la\""));
     assert!(converted.contains("data: [DONE]"));
+}
+
+#[test]
+fn chat_sse_waits_for_custom_tool_name_before_assigning_item_id() {
+    let converted = chat_sse_to_responses_sse_with_request(
+        r#"data: {"id":"chatcmpl_custom_split","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_custom_split","type":"function"}]}}]}
+
+data: {"id":"chatcmpl_custom_split","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec","arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        &json!({
+            "model": "gpt-5.4",
+            "tools": [{ "type": "custom", "name": "exec" }]
+        }),
+    );
+
+    assert!(converted.contains("\"type\":\"custom_tool_call\""));
+    assert!(converted.contains("\"id\":\"ctc_call_custom_split\""));
+    assert!(converted.contains("\"item_id\":\"ctc_call_custom_split\""));
+    assert!(!converted.contains("fc_call_custom_split"));
+    assert!(converted.contains("\"input\":\"pwd\""));
 }
 
 #[test]
@@ -1603,19 +1813,24 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
         .await
         .unwrap();
     let second_addr = second.local_addr().unwrap();
-    let first_server = tokio::spawn(respond_once(
+    let first_server = tokio::spawn(capture_request_and_respond_once(
         first,
         "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\n\r\n{\"error\":1}",
     ));
-    let second_server = tokio::spawn(respond_once(
+    let second_server = tokio::spawn(capture_request_and_respond_once(
         second,
         "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
     ));
-    let settings = aggregate_proxy_settings(
+    let mut settings = aggregate_proxy_settings(
         "failover",
         format!("http://{first_addr}/v1"),
         format!("http://{second_addr}/v1"),
     );
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
 
     let result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
@@ -1627,8 +1842,18 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 
     assert_eq!(result.status_code, 200);
     assert_eq!(body.as_ref(), br#"{"id":"resp_1","object":"response"}"#);
-    first_server.await.unwrap();
-    second_server.await.unwrap();
+    let first_request = first_server.await.unwrap();
+    let second_request = second_server.await.unwrap();
+    assert!(
+        !first_request
+            .to_ascii_lowercase()
+            .contains("authorization:")
+    );
+    assert!(
+        !second_request
+            .to_ascii_lowercase()
+            .contains("authorization:")
+    );
 }
 
 #[tokio::test]
@@ -1678,6 +1903,33 @@ async fn model_route_uses_target_responses_provider_without_mutating_request() {
 }
 
 #[tokio::test]
+async fn model_route_supports_no_auth_target_without_authorization_header() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": "hello",
+        "stream": false
+    });
+    let mut settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+    settings.relay_profiles[1].relay_mode = RelayMode::PureApi;
+    settings.relay_profiles[1].no_auth = true;
+    settings.relay_profiles[1].api_key.clear();
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    let (headers, upstream_body) = target_server.await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+    assert_eq!(upstream_body, request);
+}
+
+#[tokio::test]
 async fn model_route_can_rewrite_only_the_target_model_name() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1706,6 +1958,44 @@ async fn model_route_can_rewrite_only_the_target_model_name() {
     let mut expected = request;
     expected["model"] = json!("provider-luna-v2");
     assert_eq!(upstream_body, expected);
+}
+
+#[tokio::test]
+async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
+    let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_server = tokio::spawn(capture_json_request_once(target));
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "id": "fc_legacy_custom_item",
+                "call_id": "call_legacy_custom",
+                "name": "exec",
+                "input": "pwd"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "continue"
+            }
+        ],
+        "stream": false
+    });
+    let settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, upstream_body) = target_server.await.unwrap();
+
+    assert_eq!(upstream_body["input"][0]["id"], "ctc_legacy_custom_item");
+    assert_eq!(upstream_body["input"][0]["call_id"], "call_legacy_custom");
+    assert_eq!(upstream_body["input"][1]["type"], "message");
 }
 
 #[tokio::test]
@@ -1849,6 +2139,18 @@ async fn respond_once(listener: tokio::net::TcpListener, response: &'static str)
     let mut buffer = [0; 1024];
     let _ = stream.read(&mut buffer).await.unwrap();
     stream.write_all(response.as_bytes()).await.unwrap();
+}
+
+async fn capture_request_and_respond_once(
+    listener: tokio::net::TcpListener,
+    response: &'static str,
+) -> String {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut buffer = [0; 4096];
+    let read = stream.read(&mut buffer).await.unwrap();
+    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+    stream.write_all(response.as_bytes()).await.unwrap();
+    request
 }
 
 async fn capture_json_request_once(
@@ -2127,6 +2429,67 @@ async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
     assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
 }
 
+#[tokio::test]
+async fn no_auth_proxy_endpoints_omit_authorization_header() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let server = spawn_chat_server();
+    write_no_auth_relay_settings(temp.path(), &server.base_url, "responses");
+    let upstream = open_responses_proxy_request(
+        r#"{"model":"gpt-5.5","input":"hello","stream":false}"#,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(server.finish().authorization, None);
+
+    let server = spawn_chat_server();
+    write_no_auth_relay_settings(temp.path(), &server.base_url, "chatCompletions");
+    let upstream = open_chat_completions_proxy_request(
+        r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}"#,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(server.finish().authorization, None);
+
+    let server = spawn_chat_server();
+    write_no_auth_relay_settings(temp.path(), &server.base_url, "responses");
+    let upstream = open_models_proxy_request(None).await.unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(server.finish().authorization, None);
+
+    let server = spawn_chat_server();
+    write_no_auth_relay_settings(temp.path(), &server.base_url, "responses");
+    let upstream = open_audio_transcriptions_proxy_request(b"audio", "audio/wav", None)
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(server.finish().authorization, None);
+}
+
+#[tokio::test]
+async fn no_auth_profile_test_omits_authorization_header() {
+    let server = spawn_chat_server();
+    let profile = RelayProfile {
+        base_url: server.base_url.clone(),
+        upstream_base_url: server.base_url.clone(),
+        relay_mode: RelayMode::PureApi,
+        no_auth: true,
+        api_key: String::new(),
+        ..RelayProfile::default()
+    };
+
+    let result = test_relay_profile(&profile, "gpt-5.5").await.unwrap();
+
+    assert_eq!(result.http_status, 200);
+    assert_eq!(server.finish().authorization, None);
+}
+
 fn write_chat_relay_settings(settings_dir: &Path, base_url: &str, user_agent: &str) {
     let settings = json!({
         "relayProfiles": [{
@@ -2140,6 +2503,27 @@ fn write_chat_relay_settings(settings_dir: &Path, base_url: &str, user_agent: &s
             "userAgent": user_agent
         }],
         "activeRelayId": "chat"
+    });
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_no_auth_relay_settings(settings_dir: &Path, base_url: &str, protocol: &str) {
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "no-auth",
+            "name": "No Auth",
+            "baseUrl": base_url,
+            "upstreamBaseUrl": base_url,
+            "apiKey": "",
+            "protocol": protocol,
+            "relayMode": "pureApi",
+            "noAuth": true
+        }],
+        "activeRelayId": "no-auth"
     });
     std::fs::write(
         settings_dir.join("settings.json"),
@@ -2183,6 +2567,7 @@ impl ChatServer {
 
 struct ChatRequest {
     user_agent: String,
+    authorization: Option<String>,
 }
 
 fn spawn_chat_server() -> ChatServer {
@@ -2226,6 +2611,12 @@ fn spawn_chat_server() -> ChatServer {
                 })
             })
             .unwrap_or_default();
+        let authorization = request.lines().find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            })
+        });
         let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -2233,7 +2624,288 @@ fn spawn_chat_server() -> ChatServer {
             body
         );
         stream.write_all(response.as_bytes()).unwrap();
-        ChatRequest { user_agent }
+        ChatRequest {
+            user_agent,
+            authorization,
+        }
     });
     ChatServer { base_url, handle }
+}
+
+// ── tool 输出中的图片（issue #1996）────────────────────────────────────
+//
+// `view_image` 的结果以 `function_call_output.output[].input_image` 回来。这个数组
+// 曾被整体 JSON 序列化成 tool 消息的字符串 content，于是 base64 被当普通文本送进上游
+// tokenizer —— 一张 2MB 的 PNG 膨胀到约 200 万 token 并撑爆上下文窗口。
+
+const TEST_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+
+/// 收集 JSON 里所有**不在** `image_url` 子树下的字符串，即会被上游当文本 tokenize 的部分。
+fn tokenizable_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "image_url" {
+                    continue;
+                }
+                tokenizable_strings(child, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                tokenizable_strings(item, out);
+            }
+        }
+        serde_json::Value::String(text) => out.push(text.clone()),
+        _ => {}
+    }
+}
+
+fn assert_no_base64_in_text(converted: &serde_json::Value) {
+    let mut strings = Vec::new();
+    tokenizable_strings(converted, &mut strings);
+    for text in strings {
+        assert!(
+            !text.contains("data:image/"),
+            "base64 图片泄漏进文本字段: {text}"
+        );
+    }
+}
+
+fn image_tool_call_input(output: serde_json::Value) -> serde_json::Value {
+    json!({
+        "model": "deepseek-v4-flash-vision-exp",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "look at this" }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "view_image",
+                "arguments": "{\"path\":\"shot.png\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": output
+            }
+        ]
+    })
+}
+
+#[test]
+fn tool_output_image_becomes_image_url_part_not_text() {
+    let converted = responses_to_chat_completions(image_tool_call_input(json!([
+        { "type": "input_image", "image_url": TEST_PNG_DATA_URL }
+    ])))
+    .unwrap();
+
+    // tool 消息降级成字符串占位符——多数上游不接受 tool 消息带 multi-part 图片。
+    let tool = &converted["messages"][2];
+    assert_eq!(tool["role"], "tool");
+    assert_eq!(tool["tool_call_id"], "call_1");
+    assert_eq!(tool["content"], "[image]");
+
+    // 图片改由紧随其后的 user 消息承载，且是结构化的 image_url。
+    let carrier = &converted["messages"][3];
+    assert_eq!(carrier["role"], "user");
+    assert_eq!(carrier["content"][1]["type"], "image_url");
+    assert_eq!(carrier["content"][1]["image_url"]["url"], TEST_PNG_DATA_URL);
+
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn tool_output_image_accepts_object_shaped_image_url() {
+    let converted = responses_to_chat_completions(image_tool_call_input(json!([
+        { "type": "input_image", "image_url": { "url": TEST_PNG_DATA_URL, "detail": "high" } }
+    ])))
+    .unwrap();
+
+    let image = &converted["messages"][3]["content"][1];
+    assert_eq!(image["type"], "image_url");
+    assert_eq!(image["image_url"]["url"], TEST_PNG_DATA_URL);
+    assert_eq!(image["image_url"]["detail"], "high");
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn tool_output_mixed_text_and_image_keeps_both() {
+    let converted = responses_to_chat_completions(image_tool_call_input(json!([
+        { "type": "output_text", "text": "screenshot captured" },
+        { "type": "input_image", "image_url": TEST_PNG_DATA_URL }
+    ])))
+    .unwrap();
+
+    assert_eq!(
+        converted["messages"][2]["content"],
+        "screenshot captured\n[image]"
+    );
+    assert_eq!(
+        converted["messages"][3]["content"][1]["image_url"]["url"],
+        TEST_PNG_DATA_URL
+    );
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn tool_output_without_image_keeps_previous_string_shape() {
+    // 回归护栏：无图路径必须与修复前逐字节一致。
+    let plain = responses_to_chat_completions(image_tool_call_input(json!("result"))).unwrap();
+    assert_eq!(plain["messages"][2]["content"], "result");
+    assert_eq!(plain["messages"].as_array().unwrap().len(), 3);
+
+    let structured = responses_to_chat_completions(image_tool_call_input(
+        json!([{ "type": "output_text", "text": "hi" }]),
+    ))
+    .unwrap();
+    assert_eq!(
+        structured["messages"][2]["content"],
+        "[{\"text\":\"hi\",\"type\":\"output_text\"}]"
+    );
+    assert_eq!(structured["messages"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn tool_output_images_do_not_break_tool_call_pairing() {
+    // 两个并行 tool call 各返回一张图。图片消息若插在两条 tool 消息之间，
+    // enforce_tool_call_pairing 的 take_while(role=="tool") 会漏掉第二条，
+    // 导致 call_2 被误判成 orphaned 而摘掉。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash-vision-exp",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "compare these" }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "view_image",
+                "arguments": "{\"path\":\"a.png\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "view_image",
+                "arguments": "{\"path\":\"b.png\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [{ "type": "input_image", "image_url": TEST_PNG_DATA_URL }]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_2",
+                "output": [{ "type": "input_image", "image_url": TEST_PNG_DATA_URL }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "well?" }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+
+    // 两个 tool_call 都保住了，没有被当成 orphaned 摘掉。
+    let tool_calls = messages[1]["tool_calls"].as_array().unwrap();
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["id"], "call_1");
+    assert_eq!(tool_calls[1]["id"], "call_2");
+
+    // 两条 tool 消息紧邻，中间没有被图片消息割开。
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_1");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call_2");
+
+    // 两张图汇总到连续 tool 区之后的一条 user 消息里。
+    assert_eq!(messages[4]["role"], "user");
+    let parts = messages[4]["content"].as_array().unwrap();
+    let images = parts
+        .iter()
+        .filter(|part| part["type"] == "image_url")
+        .count();
+    assert_eq!(images, 2);
+
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn orphan_tool_output_image_stays_inline_in_user_message() {
+    // 没有配对 function_call 的 output 会降级成 user 消息；它本就是 user 角色，
+    // 图片可以直接内联，不必再搬一次。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash-vision-exp",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_orphan",
+                "output": [{ "type": "input_image", "image_url": TEST_PNG_DATA_URL }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let message = &converted["messages"][0];
+    assert_eq!(message["role"], "user");
+    assert!(
+        message["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("call_orphan")
+    );
+    assert_eq!(message["content"][1]["type"], "image_url");
+    assert_eq!(message["content"][1]["image_url"]["url"], TEST_PNG_DATA_URL);
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn custom_tool_call_output_image_is_also_converted() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash-vision-exp",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "snap",
+                "input": "{}"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": [{ "type": "input_image", "image_url": TEST_PNG_DATA_URL }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(converted["messages"][1]["role"], "tool");
+    assert_eq!(converted["messages"][1]["content"], "[image]");
+    assert_eq!(
+        converted["messages"][2]["content"][1]["image_url"]["url"],
+        TEST_PNG_DATA_URL
+    );
+    assert_no_base64_in_text(&converted);
+}
+
+#[test]
+fn empty_image_url_is_dropped_rather_than_forwarded() {
+    let converted = responses_to_chat_completions(image_tool_call_input(json!([
+        { "type": "input_image", "image_url": "" }
+    ])))
+    .unwrap();
+
+    // 空 url 不值得转发，也不该留下空的 image_url part。
+    let messages = converted["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[2]["role"], "tool");
 }

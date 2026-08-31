@@ -1492,6 +1492,12 @@
       .codex-plus-modal-close { border-color: var(--codex-plus-border); color: var(--codex-plus-text-secondary); border-radius: var(--border-radius-lg, 8px); }
       .codex-plus-modal-close:hover,
       .codex-plus-modal-close:focus-visible { background: var(--codex-plus-bg-hover); color: var(--codex-plus-text); outline: none; }
+      .${codexPlusPageClass},
+      .${codexPlusPageClass} .codex-plus-modal-content {
+        background: var(--codex-plus-bg-primary) !important;
+        color: var(--codex-plus-text) !important;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content { border-color: transparent; }
       .codex-plus-modal-body { scrollbar-color: var(--codex-plus-text-tertiary) transparent; }
       .codex-plus-modal-body::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--codex-plus-text-tertiary) 45%, transparent); background-clip: padding-box; }
       .codex-plus-modal-body::-webkit-scrollbar-thumb:hover { background: var(--codex-plus-text-tertiary); background-clip: padding-box; }
@@ -2552,11 +2558,19 @@
   const codexNativeServiceTierSelectionGuardMs = 750;
   let codexNativeServiceTierSelectionGuard = { mode: "", until: 0 };
   const codexServiceTierModulePromises = new Map();
+  // namePart -> { at, attempts, error }，见 loadCodexAppModule 里的说明。
+  const codexAppModuleFailures = new Map();
+  const codexAppModuleRetryCooldownMs = 30000;
+  const codexAppModuleMaxAttempts = 8;
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
   const codexNativeFastOutlinePathPrefix = "M9.80999 17.8302";
   const codexNativeFastSolidPath = "M11.9125 21.4125C11.5292 21.8625 11.0292 22.0958 10.4125 22.1125C9.79586 22.1291 9.29586 21.9208 8.91252 21.4875C8.53752 21.0541 8.45836 20.4541 8.67503 19.6875L9.68752 16H4.57502C4.00836 16 3.56669 15.8375 3.25002 15.5125C2.93336 15.1791 2.77502 14.7791 2.77502 14.3125C2.77502 13.8375 2.92919 13.4125 3.23752 13.0375L12.1375 2.47497C12.5209 2.02497 13.0209 1.79164 13.6375 1.77497C14.2542 1.75831 14.75 1.96664 15.125 2.39997C15.5084 2.83331 15.5917 3.43331 15.375 4.19997L14.3125 7.99998H19.425C19.9917 7.99998 20.4334 8.16664 20.75 8.49997C21.075 8.83331 21.2375 9.23748 21.2375 9.71247C21.2375 10.1791 21.0792 10.5958 20.7625 10.9625L11.9125 21.4125Z";
   const codexThreadServiceTierModes = new Set(["inherit", "standard", "fast"]);
   const codexServiceTierControlModes = new Set(["inherit", "global-standard", "global-fast", "custom"]);
+  // 这里只放确认支持 priority service tier 的官方模型——这个集合同时用于生成
+  // 「Fast 仅支持 …」的提示文案，塞进没验证过的模型等于对用户做出错误承诺。
+  // 第三方模型（deepseek 等）走下面 codexServiceTierFastSupportedForModel 里的
+  // 模型元数据判定：上游自己声明了 priority 才认。
   ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
   function uniqueCodexAppAssetUrls(urls) {
@@ -2604,14 +2618,37 @@
     return "";
   }
 
+  // issue #1960：失败必须被记住。之前失败只是把 promise 从 map 里删掉，
+  // 于是任何调用方下一次重试都会重新走 codexAppAssetUrlFromScriptText()，
+  // 把全部 app asset（实测 121 个）重新 fetch 一遍再跑三条正则。
+  // 这个 loader 有四个调用方，其中 installCodexServiceTierDispatcherPatch()
+  // 挂在 scanLightweight() 里、每轮 scan 都试三个前缀，Codex 侧改名后就成了永不停止的重扫：
+  // 实测空闲时 301 次请求/秒，主线程 TaskOtherDuration 占满一半 CPU，JS 堆每秒涨约 1MB，
+  // Sentry 又给每个请求记一条 breadcrumb 并回同步一次 scope，把量再翻一倍推给 browser 进程。
+  // 记住失败 + 冷却重试，让下游即便还在轮询也只会周期性地试一次。
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
+      const failure = codexAppModuleFailures.get(namePart);
+      if (failure
+          && (failure.attempts >= codexAppModuleMaxAttempts
+            || Date.now() - failure.at < codexAppModuleRetryCooldownMs)) {
+        throw failure.error;
+      }
       const promise = Promise.resolve().then(async () => {
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
         if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
         return await import(url);
+      }).then((module) => {
+        // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
+        codexAppModuleFailures.delete(namePart);
+        return module;
       }).catch((error) => {
         codexServiceTierModulePromises.delete(namePart);
+        codexAppModuleFailures.set(namePart, {
+          at: Date.now(),
+          attempts: (codexAppModuleFailures.get(namePart)?.attempts || 0) + 1,
+          error,
+        });
         throw error;
       });
       codexServiceTierModulePromises.set(namePart, promise);
@@ -2824,7 +2861,17 @@
   }
 
   function codexServiceTierFastSupportedForModel(modelName) {
-    return codexServiceTierSupportedFastModels.has(normalizeCodexServiceTierModelName(modelName));
+    const normalized = normalizeCodexServiceTierModelName(modelName);
+    if (!normalized) return false;
+    if (codexServiceTierSupportedFastModels.has(normalized)) return true;
+    // 不按名字猜：模型叫 deepseek 不代表它的中转站支持 priority tier。
+    // 只认上游模型元数据里明确声明的 priority。
+    try {
+      const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(modelName) : null;
+      if (metadata && Array.isArray(metadata.serviceTiers) && metadata.serviceTiers.some((t) => String(t.id || t).toLowerCase() === "priority")) return true;
+    } catch {}
+    // removed blanket apikey fallback to keep test contract (FAST only for known models)
+    return false;
   }
 
   function codexServiceTierFastUnsupportedMessage(modelName = codexServiceTierCurrentModelName()) {
@@ -3438,9 +3485,27 @@
     return codexRemoteSessionProviderNormalizationEnabled();
   }
 
+  function codexRelayConfigModelProvider(configContents) {
+    const text = String(configContents || "");
+    const match = /(?:^|\n)\s*model_provider\s*=\s*["']([^"'\n]+)["']/m.exec(text);
+    return match ? String(match[1]).trim() : "";
+  }
+
   function codexRemoteSessionTargetProvider() {
     const profile = codexRemoteSessionActiveProfile();
-    if (String(profile?.relayMode || "") === "pureApi") return "custom";
+    const relayMode = String(profile?.relayMode || "");
+    // 解析中继实际写进 config.toml 的 model_provider（比如
+    // `model_provider = "deepseek"` 配 [model_providers.deepseek]），而不是
+    // 假定每个 pureApi 中继都叫 "custom"——那会让恢复会话报
+    // "Model provider `custom` not found"。
+    //
+    // 顺序上先看 profile.configContents 再看 activeRelayCodexProvider：后者是
+    // 全局缓存，切换供应商后可能还是上一个的值；profile 是当前这次调用现取的，
+    // 更可信。反过来会让 pureApi 恢复会话拿到陈旧 provider。
+    const fromConfig = codexRelayConfigModelProvider(profile?.configContents || "");
+    if (fromConfig) return fromConfig;
+    // pureApi 且 profile 自己没声明供应方时回到 "custom"，不去读可能陈旧的全局缓存。
+    if (relayMode === "pureApi") return "custom";
     return String(
       codexPlusBackendSettings.activeRelayCodexProvider
       || codexModelCatalog?.codex_model_provider
@@ -3804,8 +3869,21 @@
     throw new Error("dispatcher export unavailable in loaded assets");
   }
 
+  const serviceTierDispatcherPatchMaxMisses = 8;
+  let serviceTierDispatcherPatchMissCount = 0;
+  let serviceTierDispatcherPatchDisabled = false;
+  let serviceTierDispatcherPatchPromise = null;
+
+  // issue #1960：这是 installAppServerModelRequestPatch（#1324）和插件市场那两层的同一个缺陷。
+  // 补丁挂在 scanLightweight() 里每轮都跑，而早退守卫只在装上之后才写入，
+  // Codex 侧 asset 改名后就永远装不上，于是每轮 scan 重新拉一遍全部 app asset，
+  // 而且每轮都发一条相同的诊断。首次失败仍上报以便定位，之后噤声，连续失败够多次就停掉这一层。
   function installCodexServiceTierDispatcherPatch() {
     if (window.__codexServiceTierRequestOverrideInstalled === codexServiceTierRequestOverrideVersion) return;
+    if (serviceTierDispatcherPatchDisabled) return;
+    // 上一轮没跑完就不要再起一轮：loadDispatcher() 会依次试三个前缀，
+    // 没有这道去重时 scan 的频率就直接变成并发全量扫描的频率。
+    if (serviceTierDispatcherPatchPromise) return;
     const loadDispatcher = async () => {
       const errors = [];
       for (const assetPrefix of ["setting-storage-", "vscode-api-", "app-initial-"]) {
@@ -3836,15 +3914,94 @@
         };
         installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix);
         window.__codexServiceTierRequestOverrideInstalled = codexServiceTierRequestOverrideVersion;
+        serviceTierDispatcherPatchMissCount = 0;
         sendCodexPlusDiagnostic("service_tier_dispatcher_patch_installed", { assetPrefix });
       } catch (error) {
-        sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
-          errorName: error?.name || "",
-          errorMessage: error?.message || String(error),
-        });
+        serviceTierDispatcherPatchMissCount += 1;
+        if (serviceTierDispatcherPatchMissCount === 1) {
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_failed", {
+            errorName: error?.name || "",
+            errorMessage: error?.message || String(error),
+          });
+        }
+        if (serviceTierDispatcherPatchMissCount >= serviceTierDispatcherPatchMaxMisses
+            && !serviceTierDispatcherPatchDisabled) {
+          serviceTierDispatcherPatchDisabled = true;
+          sendCodexPlusDiagnostic("service_tier_dispatcher_patch_skipped", {
+            misses: serviceTierDispatcherPatchMissCount,
+          });
+        }
+      } finally {
+        serviceTierDispatcherPatchPromise = null;
       }
     };
-    void patch();
+    serviceTierDispatcherPatchPromise = patch();
+  }
+
+  // --- Dictation / Voice patch for apikey (ported from v1.2.34 preload) ---
+  const codexDictationSupportVersion = "1";
+  function codexDictationSupportModuleCandidates() {
+    const prefixes = ["use-is-dictation-supported-", "use-dictation-", "app-initial-", "setting-storage-", "vscode-api-"];
+    return prefixes;
+  }
+  async function installDictationSupportPatch() {
+    if (window.__codexDictationSupportPatched === codexDictationSupportVersion) return;
+    for (const prefix of codexDictationSupportModuleCandidates()) {
+      try {
+        const module = await loadOptionalCodexAppModule(prefix);
+        if (!module) continue;
+        for (const key of Object.keys(module)) {
+          const fn = module[key];
+          if (typeof fn !== "function") continue;
+          let src = "";
+          try { src = String(fn); } catch {}
+          if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
+          if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
+          const original = fn;
+          const wrapped = function(...args) {
+            try {
+              const result = original.apply(this, args);
+              if (result === false) {
+                const hasApikey = args.some(arg => arg && typeof arg === "object" && (arg.authMethod === "apikey" || arg.authMethod === "apiKey"));
+                if (hasApikey) return true;
+                if (typeof codexPlusSettings === "function" && codexPlusSettings().serviceTierControls) return true;
+              }
+              return result;
+            } catch (e) {
+              return original.apply(this, args);
+            }
+          };
+          wrapped.__codexDictationPatched = codexDictationSupportVersion;
+          try { module[key] = wrapped; } catch {}
+          sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
+          window.__codexDictationSupportPatched = codexDictationSupportVersion;
+          return;
+        }
+      } catch {}
+    }
+    // Fallback: DOM enforcement for voice button when module patch not found
+    try {
+      if (!window.__codexDictationDomPatched) {
+        window.__codexDictationDomPatched = true;
+        const enforceVoice = () => {
+          const selectors = ['button[aria-label*="Voice"]','button[aria-label*="Dictation"]','button[aria-label*="voice"]','[data-testid*="voice"]','[data-testid*="dictation"]','button:has(svg)'];
+          // generic: find buttons with microphone icon
+          document.querySelectorAll('button').forEach(btn => {
+            const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
+            if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
+              if (btn.hasAttribute("disabled")) {
+                btn.removeAttribute("disabled");
+                btn.setAttribute("aria-disabled","false");
+                btn.style.opacity = "";
+                btn.style.pointerEvents = "";
+              }
+            }
+          });
+        };
+        setInterval(enforceVoice, 1500);
+        enforceVoice();
+      }
+    } catch {}
   }
 
   async function loadBackendSettingsState() {
@@ -4075,6 +4232,70 @@
     overlay.style.top = "0px";
   }
 
+  function codexPlusHostUsesLightTheme() {
+    const root = document.documentElement;
+    const body = document.body;
+    const explicitTheme = [
+      root?.getAttribute("data-theme"),
+      body?.getAttribute("data-theme"),
+      root?.getAttribute("data-color-scheme"),
+      body?.getAttribute("data-color-scheme"),
+    ].filter(Boolean).join(" ").toLowerCase();
+    if (/\b(light|light-mode|theme-light)\b/.test(explicitTheme)) return true;
+    if (/\b(dark|dark-mode|theme-dark)\b/.test(explicitTheme)) return false;
+
+    const themeClasses = [root?.className, body?.className]
+      .filter((value) => typeof value === "string")
+      .join(" ")
+      .toLowerCase();
+    if (/(^|\s)(light|light-mode|theme-light)(\s|$)/.test(themeClasses)) return true;
+    if (/(^|\s)(dark|dark-mode|theme-dark)(\s|$)/.test(themeClasses)) return false;
+
+    return !window.matchMedia?.("(prefers-color-scheme: dark)")?.matches;
+  }
+
+  function applyCodexPlusTheme(overlay) {
+    if (!overlay?.style) return;
+    const light = codexPlusHostUsesLightTheme();
+    const palette = light ? {
+      bgPrimary: "#ffffff",
+      bgSecondary: "#f7f7f7",
+      bgElevated: "#ffffff",
+      bgHover: "rgba(0,0,0,.06)",
+      bgSelected: "rgba(0,0,0,.08)",
+      text: "#171717",
+      textSecondary: "#5d5d5d",
+      textTertiary: "#8a8a8a",
+      border: "rgba(0,0,0,.12)",
+      borderSubtle: "rgba(0,0,0,.08)",
+    } : {
+      bgPrimary: "#212121",
+      bgSecondary: "#2f2f2f",
+      bgElevated: "#2f2f2f",
+      bgHover: "rgba(255,255,255,.08)",
+      bgSelected: "rgba(255,255,255,.12)",
+      text: "#f3f4f6",
+      textSecondary: "#d1d5db",
+      textTertiary: "#a1a1aa",
+      border: "rgba(255,255,255,.14)",
+      borderSubtle: "rgba(255,255,255,.08)",
+    };
+    const variables = {
+      "--codex-plus-bg-primary": palette.bgPrimary,
+      "--codex-plus-bg-secondary": palette.bgSecondary,
+      "--codex-plus-bg-elevated": palette.bgElevated,
+      "--codex-plus-bg-hover": palette.bgHover,
+      "--codex-plus-bg-selected": palette.bgSelected,
+      "--codex-plus-text": palette.text,
+      "--codex-plus-text-secondary": palette.textSecondary,
+      "--codex-plus-text-tertiary": palette.textTertiary,
+      "--codex-plus-border": palette.border,
+      "--codex-plus-border-subtle": palette.borderSubtle,
+    };
+    Object.entries(variables).forEach(([name, value]) => overlay.style.setProperty(name, value));
+    overlay.dataset.codexPlusTheme = light ? "light" : "dark";
+  }
+
   function openCodexPlusModal(options = {}) {
     const pageMode = options.page === true;
     document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
@@ -4082,6 +4303,7 @@
     const overlay = document.createElement("div");
     overlay.className = pageMode ? codexPlusPageClass : "codex-plus-modal-overlay";
     overlay.dataset.codexPlusPage = String(pageMode);
+    applyCodexPlusTheme(overlay);
     overlay.innerHTML = `
       <div class="codex-plus-modal-content" role="dialog" aria-modal="true" aria-label="Codex++">
         <div class="codex-plus-modal-header">
@@ -4846,7 +5068,10 @@
     if (name === "openai-curated") return "OpenAI插件2(Codex++)";
     if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
     if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    if (name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
+    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
+    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
+    // 尚未升级的配置。
+    if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
     return fallback;
   }
 
@@ -5382,10 +5607,44 @@
     window.__codexPluginMarketplaceWindowEventPatch = codexPluginMarketplaceUnlockVersion;
   }
 
+  const pluginMarketplaceRequestPatchMaxMisses = 8;
+  let pluginMarketplaceRequestPatchMissCount = 0;
+  let pluginMarketplaceRequestPatchDisabled = false;
+  let pluginMarketplaceRequestPatchPromise = null;
+
+  function notePluginMarketplaceRequestPatchMiss(event, detail) {
+    pluginMarketplaceRequestPatchMissCount += 1;
+    // 和 installAppServerModelRequestPatch 里那段(issue #1324)是同一类问题,当时只修了 model 那一层。
+    // 这个补丁在 scanDeferred() 里每轮都会跑,而早退守卫 __codexPluginMarketplaceUnlockInstalled
+    // 只在 patchedCount > 0 时才写入。Codex 侧改名/移除对应 asset 后这层永远成功不了,
+    // 守卫就永远不设,于是每轮 scan 都重新把全部 app asset fetch 一遍再跑正则匹配,
+    // 而且没有 in-flight 去重,尝试之间还会并发堆叠。
+    // 实测空闲状态下 530 次 fetch/秒(单个 asset 最高 265 次/秒),渲染进程 CPU 40%~60% 且持续爬升(issue #1960)。
+    // 首次 miss 仍然上报,保证 telemetry 能定位原因,之后噤声;连续失败够多次就停掉这一层。
+    // 这是优雅降级:插件市场解锁还有 bridge / window-event 两层补丁各自独立工作。
+    if (pluginMarketplaceRequestPatchMissCount === 1) {
+      sendCodexPlusDiagnostic(event, detail);
+    }
+    if (
+      pluginMarketplaceRequestPatchMissCount >= pluginMarketplaceRequestPatchMaxMisses
+      && !pluginMarketplaceRequestPatchDisabled
+    ) {
+      pluginMarketplaceRequestPatchDisabled = true;
+      sendCodexPlusDiagnostic("plugin_marketplace_request_patch_skipped", {
+        misses: pluginMarketplaceRequestPatchMissCount,
+        lastEvent: event,
+      });
+    }
+  }
+
   function installPluginMarketplaceRequestPatch() {
     if (window.__codexPluginMarketplaceUnlockInstalled === codexPluginMarketplaceUnlockVersion) return;
     if (pluginPatchDisabledInRelayMode()) return;
     if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (pluginMarketplaceRequestPatchDisabled) return;
+    // 上一轮还没跑完就不要再起一轮:loadAppServerRequestCandidates() 会把所有 app asset 拉一遍,
+    // 没有这道去重时 scan 的频率直接变成并发 fetch 的频率。
+    if (pluginMarketplaceRequestPatchPromise) return;
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
@@ -5395,6 +5654,7 @@
         }
         if (patchedCount > 0) {
           window.__codexPluginMarketplaceUnlockInstalled = codexPluginMarketplaceUnlockVersion;
+          pluginMarketplaceRequestPatchMissCount = 0;
           sendCodexPlusDiagnostic("plugin_marketplace_request_patch_installed", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
@@ -5403,7 +5663,7 @@
             discovery,
           });
         } else {
-          sendCodexPlusDiagnostic("plugin_marketplace_request_patch_not_found", {
+          notePluginMarketplaceRequestPatchMiss("plugin_marketplace_request_patch_not_found", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
             sources,
@@ -5411,13 +5671,15 @@
           });
         }
       } catch (error) {
-        sendCodexPlusDiagnostic("plugin_marketplace_request_patch_failed", {
+        notePluginMarketplaceRequestPatchMiss("plugin_marketplace_request_patch_failed", {
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
         });
+      } finally {
+        pluginMarketplaceRequestPatchPromise = null;
       }
     };
-    void patch();
+    pluginMarketplaceRequestPatchPromise = patch();
   }
 
   function pluginPatchDisabledInRelayMode() {
@@ -6671,9 +6933,17 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      return supported.map((entry) => ({ ...entry }));
+      const efforts = supported.map((entry) => ({ ...entry }));
+      const hasMax = efforts.some((e) => e.reasoningEffort === "max");
+      const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
+      if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
+      if (!hasUltra) {
+        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek/i.test(String(modelName || ""));
+        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
+      }
+      return efforts;
     }
-    return ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+    return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
 
   function applyCodexPlusModelMetadata(descriptor, modelName) {
@@ -7157,6 +7427,7 @@
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
       installAppServerModelRequestPatch();
     }
+    void installDictationSupportPatch();
     if (!codexPlusModelUnlockEnabled()) return;
     installModelJsonResponsePatch();
     patchAppServerModelMessages();
@@ -8243,7 +8514,10 @@
       button.style.position = "static";
       button.style.pointerEvents = "auto";
       button.style.webkitAppRegion = "no-drag";
-      if (button.parentElement !== actionGroup || button !== actionGroup.lastElementChild) {
+      // 只在按钮还不在操作栏里时才搬动它。过去还要求它必须排在最后，
+      // 一旦 Codex 在它后面挂了别的节点，这个条件就永远成立，
+      // 于是每轮 scan 都 appendChild 一次，反过来又触发下一轮 scan（issue #1960）。
+      if (button.parentElement !== actionGroup) {
         actionGroup.appendChild(button);
       }
       return;
@@ -12079,6 +12353,7 @@
   }
 
   function scan() {
+    void installDictationSupportPatch();
     runScanStep(scanLightweight);
     requestAnimationFrame(() => runScanStep(scanDeferred));
   }
@@ -12142,9 +12417,15 @@
       if (isChatContentMutation(mutation)) return false;
       const target = mutation.target;
       if (isExtensionUiNode(target)) return false;
-      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
       const changedNodes = [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)];
-      return changedNodes.some((node) => node.nodeType === 1 && isScanRelevantNode(node));
+      const changedElements = changedNodes.filter((node) => node.nodeType === 1);
+      // 我们自己插入的节点挂在 Codex 的容器里，而容器本身是 scan-relevant，
+      // 于是「写入 → 观察到自己的写入 → 200ms 后再 scan → 再写入」形成自喂循环，
+      // 空闲时也每秒全量扫描五次，macOS 上足以吃满一个核（issue #1960）。
+      // 一次变更如果只动了我们自己的 UI，就不该再排一次 scan。
+      if (changedElements.length && changedElements.every(isExtensionUiNode)) return false;
+      if (target?.nodeType === 1 && nodeSelfOrAncestorMatchesScanRelevance(target)) return true;
+      return changedElements.some((node) => isScanRelevantNode(node));
     });
   }
 
@@ -12164,6 +12445,36 @@
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
   }
 
+  /**
+   * 侧边栏入口的启动补扫。
+   *
+   * 注入永远早于 Codex 把左侧面板渲染出来：注入那一刻 readyState 已是 complete，
+   * 但 aside.app-shell-left-panel 还不存在（实测 anyNav: 0），所以首次 scan 里的
+   * installCodexPlusSidebarNavigation 必然走 `if (!navigation) return`。
+   *
+   * 之后全靠 MutationObserver 观察到侧边栏挂载再补一次，实测要 2.6~3.1 秒。
+   * 但那把入口的出现押在了单次 DOM 变更上——那次变更若被 shouldScheduleScan
+   * 过滤掉，就没有下一次触发，入口会一直缺失到用户手动操作产生新的变更为止。
+   *
+   * 这里加一个不依赖 DOM 事件的有界重试作为兜底：插上就停，超时就放弃，
+   * 不留常驻定时器，也不影响 observer 那条正常路径。
+   */
+  function scheduleSidebarNavStartupRetry() {
+    clearInterval(window.__codexPlusSidebarNavRetryTimer);
+    let attempts = 0;
+    window.__codexPlusSidebarNavRetryTimer = setInterval(() => {
+      attempts += 1;
+      if (document.getElementById(codexPlusSidebarNavId) || attempts > 20) {
+        clearInterval(window.__codexPlusSidebarNavRetryTimer);
+        window.__codexPlusSidebarNavRetryTimer = null;
+        return;
+      }
+      try {
+        installCodexPlusSidebarNavigation();
+      } catch {}
+    }, 300);
+  }
+
   void loadBackendSettingsForStartup();
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
@@ -12172,6 +12483,7 @@
   window.__codexProjectMoveReadProjection = readProjectMoveProjection;
   window.__codexProjectMoveTargets = projectMoveTargets;
   window.__codexProjectMoveSortChats = applyChatsSortCorrection;
+  scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
