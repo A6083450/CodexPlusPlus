@@ -22,6 +22,7 @@ pub mod http_client;
 pub mod imagegen_skill;
 pub mod install;
 pub mod launcher;
+pub mod manager_navigation;
 pub mod mcp_config;
 pub mod model_catalog;
 pub mod model_suffix;

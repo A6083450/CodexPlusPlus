@@ -1615,6 +1615,8 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             model_insert_mode: codex_plus_core::settings::RelayModelInsertMode::default(),
             model_list: String::new(),
             model_windows: String::new(),
+            model_auto_compact: String::new(),
+            model_metadata: String::new(),
             model_vlm: String::new(),
             vlm_api_key: String::new(),
             vlm_model: String::new(),
@@ -1702,7 +1704,17 @@ async fn launch_starts_helper_when_model_routing_is_enabled() {
 
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"select-helper:58000".to_string()));
+    assert!(before_stop.contains(&"ensure-protocol-proxy-config".to_string()));
     assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    let ensure = before_stop
+        .iter()
+        .position(|event| event == "ensure-protocol-proxy-config")
+        .unwrap();
+    let start = before_stop
+        .iter()
+        .position(|event| event == "start-helper:57321")
+        .unwrap();
+    assert!(ensure < start);
     assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
 
     handle.wait_for_codex_exit().await.unwrap();
@@ -2047,6 +2059,14 @@ impl LaunchHooks for FakeHooks {
             return Ok(());
         }
         self.event("apply-relay");
+        Ok(())
+    }
+
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.event("ensure-protocol-proxy-config");
         Ok(())
     }
 
