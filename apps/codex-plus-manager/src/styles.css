@@ -2671,10 +2671,6 @@ body {
   white-space: nowrap;
 }
 
-.enhance-maintenance-row {
-  margin: 0 0 12px;
-}
-
 .dream-skin-image-row {
   grid-column: 1 / -1;
   display: grid;

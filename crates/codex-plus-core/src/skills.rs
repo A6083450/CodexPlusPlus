@@ -1408,19 +1408,22 @@ mod tests {
         let bundled = manager
             .linked_dir()
             .join(BUNDLED_SKILLS_DIR)
-            .join("imagegen");
+            .join("bundled-demo");
         std::fs::create_dir_all(&bundled).unwrap();
         std::fs::write(
             bundled.join(SKILL_MANIFEST_FILE),
-            "---\nname: imagegen\ndescription: 内置\n---\n",
+            "---\nname: bundled-demo\ndescription: 内置\n---\n",
         )
         .unwrap();
 
         let entries = manager.merge_entries(&[]);
 
-        let imagegen = entries.iter().find(|entry| entry.id == "imagegen").unwrap();
-        assert!(imagegen.bundled);
-        assert_eq!(imagegen.description, "内置");
+        let bundled_demo = entries
+            .iter()
+            .find(|entry| entry.id == "bundled-demo")
+            .unwrap();
+        assert!(bundled_demo.bundled);
+        assert_eq!(bundled_demo.description, "内置");
     }
 
     /// #1989：四个仓库全部「文件树返回错误状态」，看不出是限流、网络还是仓库没了。

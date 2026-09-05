@@ -7,10 +7,7 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::models::{
-    DeleteResult, DeleteStatus, ExportResult, ExportStatus, GeneratedImagesResult,
-    GeneratedImagesStatus, SessionRef,
-};
+use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
 use crate::user_scripts::UserScriptManager;
@@ -92,6 +89,9 @@ pub trait BridgeRuntimeService: Send + Sync {
     }
     async fn backend_status(&self) -> anyhow::Result<Value>;
     async fn codex_model_catalog(&self) -> anyhow::Result<Value>;
+    async fn sync_codex_model_cache(&self, _payload: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status": "unavailable"}))
+    }
     async fn ads(&self) -> anyhow::Result<Value>;
     async fn create_share(&self, payload: Value) -> anyhow::Result<Value> {
         crate::share::create_share(payload).await
@@ -114,7 +114,6 @@ pub trait BridgeDataService: Send + Sync {
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult>;
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult>;
     async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult>;
-    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult>;
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value>;
     async fn find_archived_thread_by_title(
         &self,
@@ -200,6 +199,13 @@ pub async fn handle_bridge_request(
             ctx.settings.get_settings().await,
         ),
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
+        "/codex-model-cache/sync" => {
+            match ctx.settings.get_settings().await {
+                Ok(settings) if settings.enhancements_enabled => ctx.runtime.sync_codex_model_cache(payload.clone()).await,
+                Ok(_) => Ok(json!({"status": "disabled"})),
+                Err(error) => Err(error),
+            }
+        }
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
         "/llm-proxy" => llm_proxy_value(payload.clone()).await,
         "/ads" => ctx.runtime.ads().await,
@@ -250,11 +256,6 @@ pub async fn handle_bridge_request(
         "/export-markdown" => result_value(
             ctx.data
                 .export_markdown(session_from_payload(&payload))
-                .await,
-        ),
-        "/thread-generated-images" => result_value(
-            ctx.data
-                .generated_images(session_from_payload(&payload))
                 .await,
         ),
         "/thread-usage-history" => {
@@ -548,6 +549,13 @@ impl BridgeRuntimeService for CoreRuntimeService {
         Ok(crate::model_catalog::read_codex_model_catalog().await)
     }
 
+    async fn sync_codex_model_cache(&self, payload: Value) -> anyhow::Result<Value> {
+        crate::service_tier_catalog::sync_native_model_cache_in_home(
+            &crate::relay_config::default_codex_home_dir(),
+            payload.get("model").and_then(Value::as_str),
+        )
+    }
+
     async fn ads(&self) -> anyhow::Result<Value> {
         crate::ads::fetch_ad_list().await
     }
@@ -634,15 +642,6 @@ impl BridgeDataService for UnavailableDataService {
             message: "Markdown export service is not wired in core launcher hooks".to_string(),
             filename: None,
             markdown: None,
-        })
-    }
-
-    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
-        Ok(GeneratedImagesResult {
-            status: GeneratedImagesStatus::Failed,
-            session_id: session.session_id,
-            message: "Generated image service is not wired in core launcher hooks".to_string(),
-            images: Vec::new(),
         })
     }
 

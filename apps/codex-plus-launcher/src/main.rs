@@ -4,15 +4,14 @@ use anyhow::{Context, Result};
 use codex_plus_core::launcher::{
     BridgeReinjector, DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
 };
-use codex_plus_core::models::{DeleteResult, ExportResult, GeneratedImagesResult, SessionRef};
+use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
 use codex_plus_core::status::LaunchStatus;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct LauncherHooks {
@@ -101,7 +100,6 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
         let _ = notify_manager_when_update_available().await;
     });
     let hooks = LauncherHooks::default();
-    start_generated_image_materializer(hooks.data.clone());
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
     Ok(())
@@ -666,15 +664,6 @@ impl BridgeDataService for LauncherDataService {
         .map_err(|error| anyhow::anyhow!("export markdown task failed: {error}"))
     }
 
-    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
-        let db_paths = self.candidate_db_paths();
-        tokio::task::spawn_blocking(move || {
-            codex_plus_data::generated_images_from_paths(db_paths, &session)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("generated images task failed: {error}"))
-    }
-
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
         let adapter = self.storage_adapter();
         tokio::task::spawn_blocking(move || adapter.codex_thread_usage_history(&session))
@@ -844,81 +833,6 @@ impl LauncherDataService {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RolloutFingerprint {
-    length: u64,
-    modified: Option<SystemTime>,
-}
-
-fn start_generated_image_materializer(data: Arc<LauncherDataService>) {
-    let spawn = std::thread::Builder::new()
-        .name("codex-plus-image-materializer".to_string())
-        .spawn(move || {
-            let mut fingerprints = HashMap::new();
-            let mut scan_limit = 64;
-            loop {
-                materialize_recent_generated_images(&data, scan_limit, &mut fingerprints);
-                scan_limit = 16;
-                std::thread::sleep(Duration::from_millis(1500));
-            }
-        });
-    if let Err(error) = spawn {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "launcher.generated_image_materializer_start_failed",
-            json!({ "error": error.to_string() }),
-        );
-    }
-}
-
-fn materialize_recent_generated_images(
-    data: &LauncherDataService,
-    limit: usize,
-    fingerprints: &mut HashMap<PathBuf, RolloutFingerprint>,
-) {
-    for db_path in data.candidate_db_paths() {
-        let adapter = codex_plus_data::SQLiteStorageAdapter::new(
-            db_path.clone(),
-            codex_plus_data::BackupStore::new(data.backup_dir.clone()),
-        );
-        let Ok(sessions) = adapter.list_local_sessions_limited(limit) else {
-            continue;
-        };
-        for session in sessions {
-            let rollout_path = PathBuf::from(&session.rollout_path);
-            let Ok(metadata) = rollout_path.metadata() else {
-                continue;
-            };
-            let fingerprint = RolloutFingerprint {
-                length: metadata.len(),
-                modified: metadata.modified().ok(),
-            };
-            if fingerprints.get(&rollout_path) == Some(&fingerprint) {
-                continue;
-            }
-            fingerprints.insert(rollout_path, fingerprint);
-            let Ok(session_ref) = SessionRef::new(session.id, session.title) else {
-                continue;
-            };
-            let result = codex_plus_data::generated_images_from_paths(
-                [PathBuf::from(&session.db_path)],
-                &session_ref,
-            );
-            if matches!(
-                result.status,
-                codex_plus_core::models::GeneratedImagesStatus::Failed
-            ) {
-                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                    "launcher.generated_image_materialization_failed",
-                    json!({
-                        "session_id": result.session_id,
-                        "message": result.message,
-                    }),
-                );
-            }
-        }
-    }
-}
-
 struct LauncherRuntimeService {
     debug_port: Mutex<u16>,
     websocket_url: Mutex<Option<String>>,
@@ -1045,6 +959,13 @@ impl BridgeRuntimeService for LauncherRuntimeService {
 
     async fn codex_model_catalog(&self) -> anyhow::Result<Value> {
         Ok(codex_plus_core::model_catalog::read_codex_model_catalog().await)
+    }
+
+    async fn sync_codex_model_cache(&self, payload: Value) -> anyhow::Result<Value> {
+        codex_plus_core::service_tier_catalog::sync_native_model_cache_in_home(
+            &codex_plus_core::relay_config::default_codex_home_dir(),
+            payload.get("model").and_then(Value::as_str),
+        )
     }
 
     async fn ads(&self) -> anyhow::Result<Value> {
@@ -1299,31 +1220,6 @@ mod tests {
         assert!(source.contains("launcher.already_running"));
         assert!(source.contains("Existing Codex instance activated"));
         assert!(source.contains("status: \"failed\".to_string()"));
-    }
-
-    #[test]
-    fn launcher_does_not_overwrite_bundled_imagegen_skill_on_startup() {
-        let source = include_str!("main.rs");
-        let production_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("launcher source should contain production code");
-
-        assert!(!production_source.contains("install_bundled_imagegen_skill"));
-        assert!(!production_source.contains("launcher.imagegen_skill_installed"));
-    }
-
-    #[test]
-    fn launcher_starts_generated_image_materializer_before_codex_launch() {
-        let source = include_str!("main.rs");
-        let materializer = source
-            .find("start_generated_image_materializer(hooks.data.clone())")
-            .expect("launcher should start generated image materialization");
-        let launch = source
-            .find("launch_and_inject_with_hooks(options, &hooks)")
-            .expect("launcher should start Codex");
-
-        assert!(materializer < launch);
     }
 
     #[test]

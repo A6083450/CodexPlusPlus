@@ -133,298 +133,14 @@ fn injection_script_omits_sponsorship_and_recommendation_ui() {
 }
 
 #[test]
-fn injection_script_recovers_generated_images_through_the_bridge() {
+fn injection_script_omits_generated_images_runtime() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("/thread-generated-images"));
-    assert!(script.contains("data-codex-generated-images"));
-    assert!(script.contains("window.__codexPlusPostJson"));
-    assert!(script.contains("window.__codexPlusCurrentSessionRef"));
-}
-
-#[test]
-fn generated_image_waits_for_its_exact_assistant_message_target() {
-    let temp = tempfile::tempdir().expect("temp dir should be created");
-    let script_path = temp.path().join("generated-images-inject.js");
-    let harness_path = temp.path().join("generated-images-target-harness.cjs");
-    std::fs::write(&script_path, assets::generated_images_script())
-        .expect("generated images script should be written");
-    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
-    write!(
-        harness,
-        r#"
-const scriptPath = {script_path};
-let timers = [];
-let observer = null;
-
-function element(tagName = "div") {{
-  const attributes = new Map();
-  const listeners = new Map();
-  return {{
-    tagName, attributes, children: [], style: {{}}, className: "", parentElement: null,
-    setAttribute(name, value) {{ attributes.set(name, String(value)); }},
-    getAttribute(name) {{ return attributes.get(name) ?? null; }},
-    appendChild(child) {{ child.parentElement = this; this.children.push(child); return child; }},
-    addEventListener(name, callback) {{ listeners.set(name, callback); }},
-    click() {{ listeners.get("click")?.({{ target: this }}); }},
-    showModal() {{ this.setAttribute("open", ""); }},
-    close() {{ listeners.get("close")?.({{ target: this }}); }},
-    remove() {{
-      if (!this.parentElement) return;
-      this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
-      this.parentElement = null;
-    }},
-    querySelector(selector) {{
-      if (selector === ':scope > [data-codex-generated-images]') {{
-        return this.children.find((child) => child.getAttribute?.("data-codex-generated-images") !== null) || null;
-      }}
-      return null;
-    }},
-  }};
-}}
-
-function responseTarget(messageId) {{
-  const target = element();
-  target.setAttribute("data-response-annotation-target", messageId);
-  const markdown = element();
-  markdown.setAttribute("data-selected-text-overlay-target", "markdown");
-  const actions = element();
-  actions.setAttribute("data-test-actions", "true");
-  target.appendChild(markdown);
-  target.appendChild(actions);
-  target.markdown = markdown;
-  return target;
-}}
-
-function descendants(root) {{
-  return root.children.flatMap((child) => [child, ...descendants(child)]);
-}}
-
-function imageCount(root) {{
-  return descendants(root).filter((child) => child.getAttribute?.("data-codex-generated-image-id") !== null).length;
-}}
-
-const targets = [responseTarget("msg-last")];
-globalThis.window = globalThis;
-window.innerWidth = 1800;
-window.innerHeight = 1130;
-globalThis.document = {{
-  body: element("body"), documentElement: element("html"),
-  createElement: (tagName) => element(tagName),
-  querySelectorAll(selector) {{
-    if (selector === "[data-response-annotation-target]") return targets;
-    if (selector === "[data-codex-generated-image-id]") {{
-      return targets.flatMap((target) => descendants(target)).filter(
-        (child) => child.getAttribute?.("data-codex-generated-image-id") !== null,
-      );
-    }}
-    return [];
-  }},
-}};
-globalThis.MutationObserver = class MutationObserver {{
-  constructor(callback) {{ this.callback = callback; observer = this; }}
-  observe() {{}}
-  disconnect() {{}}
-}};
-globalThis.setTimeout = (callback) => {{ timers.push(callback); return timers.length; }};
-globalThis.clearTimeout = () => {{}};
-window.__codexPlusCurrentSessionRef = () => ({{ session_id: "thread-1" }});
-window.__codexPlusPostJson = async () => ({{
-  status: "found",
-  images: [{{
-    id: "image-1", assistant_message_id: "msg-final", media_type: "image/png",
-    assistant_response_index: 1,
-    base64_data: "aW1hZ2U=",
-    revised_prompt: "Use case: historical-scene Asset type: scenic travel image Primary request: a serene landmark",
-  }}],
-}});
-
-async function flushTimers() {{
-  while (timers.length) {{
-    const callbacks = timers.splice(0);
-    callbacks.forEach((callback) => callback());
-    await Promise.resolve();
-    await new Promise((resolve) => setImmediate(resolve));
-  }}
-}}
-
-(async () => {{
-  require(scriptPath);
-  await flushTimers();
-  const beforeExactTarget = imageCount(targets[0]);
-
-  const exactTarget = responseTarget("msg-final");
-  targets.push(exactTarget);
-  observer.callback();
-  await flushTimers();
-  const afterExactTarget = {{ old: imageCount(targets[0]), exact: imageCount(exactTarget) }};
-  const renderedImage = descendants(exactTarget).find(
-    (child) => child.getAttribute?.("data-codex-generated-image-id") === "image-1",
-  );
-  const renderedContainer = descendants(exactTarget).find(
-    (child) => child.getAttribute?.("data-codex-generated-images") !== null,
-  );
-  renderedImage.naturalWidth = 1536;
-  renderedImage.naturalHeight = 1024;
-  renderedImage?.parentElement?.click();
-  const previewDialog = descendants(document.body).find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview") !== null,
-  );
-  const previewDescendants = previewDialog ? descendants(previewDialog) : [];
-  const zoomLevel = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-zoom-level") !== null,
-  );
-  const zoomIn = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "放大图片");
-  const zoomOut = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "缩小图片");
-  const download = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "下载图片");
-  const close = previewDescendants.find(
-    (child) => child.getAttribute?.("aria-label") === "关闭图片预览",
-  );
-  const previewTitle = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview-title") !== null,
-  );
-  const imageViewport = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview-viewport") !== null,
-  );
-  const initialZoom = zoomLevel?.textContent || "";
-  zoomIn?.click();
-  const zoomedIn = zoomLevel?.textContent || "";
-  zoomOut?.click();
-  const zoomedBackOut = zoomLevel?.textContent || "";
-  const nativePreview = {{
-    containerInMarkdown: renderedContainer?.parentElement === exactTarget.markdown,
-    targetChildren: exactTarget.children.length,
-    imageParentTag: renderedImage?.parentElement?.tagName || "",
-    imageClass: renderedImage?.className || "",
-    imageStyle: renderedImage?.style?.cssText || "",
-    previewDialogTag: previewDialog?.tagName || "",
-    previewDialogClass: previewDialog?.className || "",
-    previewDialogOpen: previewDialog?.getAttribute?.("open") !== null,
-    previewTitle: previewTitle?.textContent || "",
-    imageViewportClass: imageViewport?.className || "",
-    downloadTag: download?.tagName || "",
-    downloadHref: download?.getAttribute?.("href") || "",
-    downloadName: download?.getAttribute?.("download") || "",
-    hasZoomOut: Boolean(zoomOut),
-    hasZoomIn: Boolean(zoomIn),
-    initialZoom,
-    zoomedIn,
-    zoomedBackOut,
-    hasClose: Boolean(close),
-  }};
-  close?.click();
-  nativePreview.previewRemovedAfterClose = !descendants(document.body).includes(previewDialog);
-
-  delete require.cache[require.resolve(scriptPath)];
-  require(scriptPath);
-  await flushTimers();
-  const afterReinjection = {{ old: imageCount(targets[0]), exact: imageCount(exactTarget) }};
-
-  targets.splice(
-    0,
-    targets.length,
-    responseTarget("item-4"),
-    responseTarget("item-5"),
-    responseTarget("item-6"),
-  );
-  delete window.__codexPlusGeneratedImagesState;
-  window.__codexPlusPostJson = async () => ({{
-    status: "found",
-    images: [{{
-      id: "image-cold-start", assistant_message_id: "msg-stable", media_type: "image/png",
-      assistant_response_index: 1,
-      base64_data: "aW1hZ2U=", revised_prompt: "A restored image",
-    }}],
-  }});
-  delete require.cache[require.resolve(scriptPath)];
-  require(scriptPath);
-  await flushTimers();
-  const coldStartFallback = {{
-    first: imageCount(targets[0]),
-    middle: imageCount(targets[1]),
-    last: imageCount(targets[2]),
-  }};
-
-  process.stdout.write(JSON.stringify({{
-    beforeExactTarget, afterExactTarget, afterReinjection, coldStartFallback, nativePreview,
-  }}));
-}})().catch((error) => {{ console.error(error); process.exit(1); }});
-"#,
-        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
-            .expect("script path should serialize")
-    )
-    .expect("harness should be written");
-    drop(harness);
-
-    let output = Command::new("node")
-        .arg(&harness_path)
-        .output()
-        .expect("node should run generated image target harness");
-    assert!(
-        output.status.success(),
-        "node harness failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON");
-    assert_eq!(result["beforeExactTarget"], 0);
-    assert_eq!(result["afterExactTarget"], json!({ "old": 0, "exact": 1 }));
-    assert_eq!(result["afterReinjection"], json!({ "old": 0, "exact": 1 }));
-    assert_eq!(
-        result["coldStartFallback"],
-        json!({ "first": 0, "middle": 1, "last": 0 })
-    );
-    assert_eq!(result["nativePreview"]["containerInMarkdown"], true);
-    assert_eq!(result["nativePreview"]["targetChildren"], 2);
-    assert_eq!(result["nativePreview"]["imageParentTag"], "button");
-    assert_eq!(result["nativePreview"]["previewDialogTag"], "dialog");
-    assert_eq!(result["nativePreview"]["previewDialogOpen"], true);
-    assert!(
-        result["nativePreview"]["previewDialogClass"]
-            .as_str()
-            .is_some_and(|classes| classes.contains("codex-dialog")
-                && classes.contains("h-[100dvh]")
-                && classes.contains("w-screen"))
-    );
-    assert_eq!(result["nativePreview"]["previewTitle"], "生成的图片");
-    assert!(
-        result["nativePreview"]["imageViewportClass"]
-            .as_str()
-            .is_some_and(|classes| classes.contains("flex-1")
-                && classes.contains("touch-none")
-                && classes.contains("overflow-auto"))
-    );
-    assert_eq!(result["nativePreview"]["downloadTag"], "a");
-    assert!(
-        result["nativePreview"]["downloadHref"]
-            .as_str()
-            .is_some_and(|href| href.starts_with("data:image/png;base64,"))
-    );
-    assert_eq!(result["nativePreview"]["downloadName"], "生成的图片");
-    assert_eq!(result["nativePreview"]["hasZoomOut"], true);
-    assert_eq!(result["nativePreview"]["hasZoomIn"], true);
-    assert_ne!(
-        result["nativePreview"]["initialZoom"],
-        result["nativePreview"]["zoomedIn"]
-    );
-    assert_eq!(
-        result["nativePreview"]["initialZoom"],
-        result["nativePreview"]["zoomedBackOut"]
-    );
-    assert_eq!(result["nativePreview"]["hasClose"], true);
-    assert_eq!(result["nativePreview"]["previewRemovedAfterClose"], true);
-    assert!(
-        result["nativePreview"]["imageClass"]
-            .as_str()
-            .is_some_and(|classes| classes.contains("max-h-[10rem]")
-                && classes.contains("border-token-border"))
-    );
-    assert!(
-        result["nativePreview"]["imageStyle"]
-            .as_str()
-            .is_some_and(|style| !style.contains("70vh"))
-    );
+    assert!(!script.contains("/thread-generated-images"));
+    assert!(!script.contains("data-codex-generated-images"));
+    assert!(!script.contains("__codexPlusGeneratedImages"));
+    assert!(!script.contains("__codexPlusCurrentSessionRef"));
+    assert!(!script.contains("__codexPlusPostJson"));
 }
 
 #[test]
@@ -3106,7 +2822,10 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"7\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"11\""));
+    assert!(script.contains("collectCodexReactRuntimeCandidates"));
+    assert!(script.contains("patchCodexModelQueryClient"));
+    assert!(script.contains("[role=\"menuitemcheckbox\"][data-fast-mode-enabled]"));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3526,6 +3245,37 @@ fn native_service_tier_selection_does_not_reload_inherited_default() {
 }
 
 #[test]
+fn native_fast_toggle_survives_settings_update_and_turn_start() {
+    let cases = run_service_tier_contract_harness();
+    assert_eq!(cases["nativeCheckboxEnable"], "fast");
+    assert_eq!(cases["nativeCheckboxDisable"], "standard");
+    assert_eq!(cases["nativeFastSettings"]["serviceTier"], "priority");
+    assert_eq!(cases["nativeFastTurn"]["serviceTierForTurn"], "priority");
+    assert_eq!(cases["nativeStandardTurn"]["serviceTierForTurn"], "default");
+    assert_eq!(cases["nativeCapturedSelection"]["mode"], "global-fast");
+    assert_eq!(cases["nativeKeyboardSelection"]["mode"], "global-standard");
+    let script = assets::injection_script(57321);
+    let listener = script.split("function installCodexNativeServiceTierSelectionSync").nth(1).unwrap();
+    assert!(listener.split("const codexServiceTierMenuVersion").next().unwrap().contains("[role=\"menuitemcheckbox\"]"));
+}
+
+#[test]
+fn native_context_reload_precedes_requests_and_restores_only_idle_usage() {
+    let cases = run_service_tier_contract_harness();
+    assert_eq!(cases["nativeContextCalls"], json!(["cache/sync", "model/list", "turn/start", "cache/sync", "model/list", "thread/settings/update"]));
+    assert_eq!(cases["restoredContextWindow"], 1_000_000);
+    assert_eq!(cases["restoredUsedTokens"], 226_307);
+    assert_eq!(cases["streamingContextWindow"], 258_400);
+    assert_eq!(cases["resumedContextWindow"], 1_000_000);
+    assert_eq!(cases["bootContextWindow"], 1_000_000);
+    assert_eq!(cases["bootListenerRemoved"], true);
+    assert_eq!(cases["otherModelContext"]["model"], "deepseek-v4-pro");
+    assert_eq!(cases["otherModelContext"]["contextWindow"], 512000);
+    assert_eq!(cases["otherModelContextCalls"], json!(["cache/sync:deepseek-v4-pro", "model/list", "turn/start"]));
+    assert_eq!(cases["remoteContextCalls"], json!(["turn/start"]));
+}
+
+#[test]
 fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash() {
     let script = assets::injection_script(57321);
 
@@ -3672,6 +3422,50 @@ fn injection_script_applies_fast_service_tier_contract() {
         cases["solDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
         "ultra"
     );
+    assert_eq!(cases["astraFastAvailability"]["supported"], true);
+    assert_eq!(cases["astraDescriptor"]["defaultReasoningEffort"], "medium");
+    assert_eq!(
+        cases["astraDescriptor"]["supportedReasoningEfforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["reasoningEffort"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(
+        cases["astraDescriptor"]["serviceTiers"][0]["id"],
+        "priority"
+    );
+    assert_eq!(
+        cases["astraDescriptor"]["inputModalities"],
+        json!(["text", "image"])
+    );
+    assert_eq!(cases["astraQueryPatchCount"], 1);
+    assert_eq!(
+        cases["astraQueryDescriptor"]["defaultReasoningEffort"],
+        "medium"
+    );
+    assert_eq!(
+        cases["astraQueryDescriptor"]["supportedReasoningEfforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["reasoningEffort"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(
+        cases["astraQueryDescriptor"]["serviceTiers"][0]["id"],
+        "priority"
+    );
+    assert_eq!(
+        cases["astraQueryDescriptor"]["inputModalities"],
+        json!(["text", "image"])
+    );
+    assert_eq!(cases["reactRuntimeQueryClientFound"], true);
+    assert_eq!(cases["reactRuntimeRequestClientFound"], true);
+    assert_eq!(cases["nativeFastRowDetected"], true);
     assert_eq!(cases["dispatcherFromSingleton"], true);
     assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
     assert_eq!(cases["dispatcherFromClass"], true);
@@ -3684,6 +3478,7 @@ fn injection_script_applies_fast_service_tier_contract() {
         json!(["__reactFiber$test", "__reactProps$test"])
     );
     assert_eq!(cases["semanticModelMenuRowFound"], true);
+    assert_eq!(cases["currentModelMenuRowFound"], true);
     assert_eq!(cases["solidFastIcon"]["patched"], true);
     assert_eq!(cases["solidFastIcon"]["viewBox"], "0 0 24 24");
     assert_eq!(cases["solidFastIcon"]["marker"], "solid");
@@ -3916,6 +3711,11 @@ document.querySelectorAll = (selector) => selector.includes('[aria-label^="模�
   ? [semanticModelMenuRow]
   : [];
 const semanticModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(semanticModelMenuRow);
+const currentModelMenuRow = {{ current: true }};
+document.querySelectorAll = (selector) => selector.includes('[data-model-picker-view-toggle="true"]')
+  ? [currentModelMenuRow]
+  : [];
+const currentModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(currentModelMenuRow);
 document.querySelectorAll = () => [];
 const svgNode = (pathData) => {{
   const attributes = new Map([["viewBox", "0 0 20 20"]]);
@@ -4101,6 +3901,69 @@ api.setModelCatalog({{
   }},
 }});
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-6-astra",
+  default_model: "gpt-6-astra",
+  models: ["gpt-6-astra"],
+  modelMetadata: {{
+    "gpt-6-astra": {{
+      displayName: "GPT-6-Astra",
+      description: "Frontier coding model.",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map((reasoningEffort) => ({{ reasoningEffort }})),
+      inputModalities: ["text", "image"],
+      supportsImageDetailOriginal: true,
+      additionalSpeedTiers: [],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+  }},
+}});
+const astraFastAvailability = api.fastAvailability("gpt-6-astra");
+const astraDescriptor = api.modelDescriptor("gpt-6-astra");
+let staleAstraQuery = {{
+  data: [{{
+    model: "gpt-6-astra",
+    defaultReasoningEffort: "none",
+    supportedReasoningEfforts: [{{ reasoningEffort: "none" }}],
+    inputModalities: ["text"],
+    supportsImageDetailOriginal: false,
+    additionalSpeedTiers: [],
+    serviceTiers: [],
+  }}],
+}};
+const modelQueryClient = {{
+  setQueriesData(filters, updater) {{
+    if (!filters.predicate({{ queryKey: ["models", "list", "local", "chatgpt"] }})) return;
+    staleAstraQuery = updater(staleAstraQuery);
+  }},
+}};
+const astraQueryPatchCount = api.patchModelQueryClient(modelQueryClient);
+const astraQueryDescriptor = staleAstraQuery.data[0];
+const appServerRuntimeClient = {{
+  hostId: "local",
+  requestPromises: new Map(),
+  sendRequest() {{}},
+  onResult() {{}},
+  onError() {{}},
+}};
+const reactRuntimeCandidates = api.reactRuntimeCandidates([{{
+  memoizedProps: {{ queryClient: modelQueryClient }},
+  pendingProps: null,
+  memoizedState: {{
+    memoizedState: {{ requestClient: appServerRuntimeClient }},
+    next: null,
+  }},
+  updateQueue: null,
+  child: null,
+  sibling: null,
+}}]);
+const nativeFastRow = {{ native: true }};
+const nativeFastRowDetected = api.nativeSpeedRow({{
+  querySelector: (selector) => selector === '[role="menuitemcheckbox"][data-fast-mode-enabled]'
+    ? nativeFastRow
+    : null,
+}}, []) === nativeFastRow;
 const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
 const dispatcherFromSingleton = api.dispatcherFromModule({{ current: singletonDispatcher }}) === singletonDispatcher;
 const currentSingletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
@@ -4168,6 +4031,29 @@ const nativeMenuItem = (label) => ({{
 }});
 const nestedNativeMenuStandard = api.nativeModeFromMenuItem(nativeMenuItem("标准默认速度"));
 const nestedNativeMenuFast = api.nativeModeFromMenuItem(nativeMenuItem("快速1.5 倍速度，用量更多"));
+const nativeCheckbox = (enabled) => ({{
+  closest: () => null,
+  getAttribute: (name) => ({{ role: "menuitemcheckbox", "data-fast-mode-enabled": String(enabled), "aria-checked": String(enabled) }})[name] ?? null,
+}});
+const nativeCheckboxEnable = api.nativeModeFromMenuItem(nativeCheckbox(false));
+const nativeCheckboxDisable = api.nativeModeFromMenuItem(nativeCheckbox(true));
+const nativeFastSettings = api.applyServiceTierOverride("thread/settings/update", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTier: null }});
+const nativeFastTurn = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTier: null, serviceTierForTurn: "default" }});
+api.syncNativeSelection("standard");
+const nativeStandardTurn = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTierForTurn: "priority" }});
+api.syncNativeSelection("fast");
+api.installNativeSelectionSync();
+const nativeCaptureTarget = nativeCheckbox(false);
+const nativeCaptureEvent = {{ type: "click", target: {{ closest: () => nativeCaptureTarget }} }};
+api.syncNativeSelection("standard");
+window.__codexNativeServiceTierSelectionSyncHandler(nativeCaptureEvent);
+const nativeCapturedSelection = api.threadState();
+const nativeKeyboardTarget = nativeCheckbox(true);
+window.__codexNativeServiceTierSelectionSyncHandler({{ type: "keydown", key: "Enter", target: {{ closest: () => nativeKeyboardTarget }} }});
+nativeKeyboardTarget.getAttribute = nativeCheckbox(false).getAttribute;
+window.__codexNativeServiceTierSelectionSyncHandler({{ type: "click", target: {{ closest: () => nativeKeyboardTarget }} }});
+const nativeKeyboardSelection = api.threadState();
+api.syncNativeSelection("fast");
 const legacyGetSetting = async () => "legacy-get";
 const legacySetSetting = async () => "legacy-set";
 const legacySettingStorageValue = api.settingStorageFromModule({{
@@ -4856,6 +4742,68 @@ await failedModelSwitchClient.sendRequest("turn/start", {{
 }});
 const failedModelSwitchResumeAttempts = failedModelSwitchCalls.filter((call) => call.method === "thread/resume").length;
 const failedModelSwitchTurnAttempts = failedModelSwitchCalls.filter((call) => call.method === "turn/start").length;
+api.setBackendSettings({{ relayProfilesEnabled: false }});
+const nativeContextCalls = [];
+window.__codexSessionDeleteBridge = async (route) => {{
+  if (route === "/codex-model-cache/sync") {{
+    nativeContextCalls.push("cache/sync");
+    return {{ status: "ok", model: "gpt-6-astra", contextWindow: 1000000 }};
+  }}
+  return {{ status: "ok" }};
+}};
+const nativeContextClient = {{ hostId: "local", async sendRequest(method) {{ nativeContextCalls.push(method); return {{}}; }} }};
+api.patchAppServerClient(nativeContextClient);
+await nativeContextClient.sendRequest("turn/start", {{ threadId: "thread-native-context", model: "gpt-6-astra" }});
+await nativeContextClient.sendRequest("thread/settings/update", {{ threadId: "thread-native-context", model: "gpt-6-astra", serviceTier: "priority" }});
+const nativeContextCallOrder = [...nativeContextCalls];
+const usageConversation = {{ latestModel: "gpt-6-astra", resumeState: "resumed", latestTokenUsageInfo: {{ modelContextWindow: 258400, last: {{ totalTokens: 226307 }}, total: {{ totalTokens: 300000 }} }} }};
+let usageStreaming = false;
+const usageManager = {{ requestClient: nativeContextClient, getConversation: (id) => id === "thread-native-context" ? usageConversation : null, isConversationStreaming: () => usageStreaming, updateConversationState: (_, update) => update(usageConversation), async resumeConversation() {{ usageConversation.latestTokenUsageInfo = {{ ...usageConversation.latestTokenUsageInfo, modelContextWindow: 258400 }}; return {{ status: "ready" }}; }} }};
+api.restoreContextUsage?.(usageManager, "thread-native-context");
+const restoredContextWindow = usageConversation.latestTokenUsageInfo.modelContextWindow;
+const restoredUsedTokens = usageConversation.latestTokenUsageInfo.last.totalTokens;
+usageConversation.latestTokenUsageInfo = {{ ...usageConversation.latestTokenUsageInfo, modelContextWindow: 258400 }};
+usageStreaming = true;
+api.restoreContextUsage?.(usageManager, "thread-native-context");
+const streamingContextWindow = usageConversation.latestTokenUsageInfo.modelContextWindow;
+usageStreaming = false;
+api.patchContextUsageManager?.(usageManager);
+await usageManager.resumeConversation({{ conversationId: "thread-native-context" }});
+const resumedContextWindow = usageConversation.latestTokenUsageInfo.modelContextWindow;
+const bootConversation = {{ latestModel: "gpt-6-astra", resumeState: "needs_resume", latestTokenUsageInfo: null }};
+let bootListener = null;
+let bootListenerRemoved = false;
+const bootManager = {{
+  requestClient: nativeContextClient,
+  getConversation: () => bootConversation,
+  isConversationStreaming: () => false,
+  updateConversationState: (_, update) => update(bootConversation),
+  async resumeConversation() {{ return {{ status: "ready" }}; }},
+  addAnyConversationCallback(listener) {{ bootListener = listener; return () => {{ bootListenerRemoved = true; }}; }},
+}};
+api.patchContextUsageManager(bootManager);
+bootConversation.resumeState = "resumed";
+bootConversation.latestTokenUsageInfo = {{ modelContextWindow: 258400, last: {{ totalTokens: 226307 }} }};
+bootListener?.();
+await new Promise(resolve => setImmediate(resolve));
+const bootContextWindow = bootConversation.latestTokenUsageInfo.modelContextWindow;
+const remoteContextCalls = [];
+const remoteContextClient = {{ hostId: "remote", async sendRequest(method) {{ remoteContextCalls.push(method); return {{}}; }} }};
+api.patchAppServerClient(remoteContextClient);
+await remoteContextClient.sendRequest("turn/start", {{ model: "gpt-6-astra" }});
+const otherModelContextCalls = [];
+window.__codexSessionDeleteBridge = async (route, payload) => {{
+  if (route === "/codex-model-cache/sync") {{
+    otherModelContextCalls.push(`cache/sync:${{payload.model}}`);
+    return {{ status: "ok", model: payload.model, contextWindow: 512000 }};
+  }}
+  return {{ status: "ok" }};
+}};
+const otherModelClient = {{ hostId: "local", async sendRequest(method) {{ otherModelContextCalls.push(method); return {{}}; }} }};
+api.patchAppServerClient(otherModelClient);
+await otherModelClient.sendRequest("turn/start", {{ threadId: "thread-other-model", model: "deepseek-v4-pro" }});
+const otherModelContext = otherModelClient.__codexPlusNativeModelContext || {{}};
+delete window.__codexSessionDeleteBridge;
 process.stdout.write(JSON.stringify({{
   supportedFast,
   unsupportedModel,
@@ -4879,12 +4827,20 @@ process.stdout.write(JSON.stringify({{
   existingSolDescriptor,
   modelListResult,
   solDescriptor,
+  astraFastAvailability,
+  astraDescriptor,
+  astraQueryPatchCount,
+  astraQueryDescriptor,
+  reactRuntimeQueryClientFound: reactRuntimeCandidates.queryClients.includes(modelQueryClient),
+  reactRuntimeRequestClientFound: reactRuntimeCandidates.requestClients.includes(appServerRuntimeClient),
+  nativeFastRowDetected,
   dispatcherFromSingleton,
   dispatcherFromCurrentSingleton,
   dispatcherFromClass,
   nativeAuthRefresh,
   reactFiberKeys,
   semanticModelMenuRowFound,
+  currentModelMenuRowFound,
   solidFastIcon,
   unrelatedFastIconPatched,
   nativeSelectionStandard,
@@ -4892,6 +4848,23 @@ process.stdout.write(JSON.stringify({{
   nativeSelectionFast,
   nestedNativeMenuStandard,
   nestedNativeMenuFast,
+  nativeCheckboxEnable,
+  nativeCheckboxDisable,
+  nativeFastSettings,
+  nativeFastTurn,
+  nativeStandardTurn,
+  nativeCapturedSelection,
+  nativeKeyboardSelection,
+  nativeContextCalls: nativeContextCallOrder,
+  restoredContextWindow,
+  restoredUsedTokens,
+  streamingContextWindow,
+  resumedContextWindow,
+  bootContextWindow,
+  bootListenerRemoved,
+  remoteContextCalls,
+  otherModelContext,
+  otherModelContextCalls,
   legacySettingStorage,
   currentSettingStorage,
   capabilitySettingStorage,

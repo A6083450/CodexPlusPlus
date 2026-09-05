@@ -725,6 +725,24 @@ fn launcher_plugin_marketplace_unlock_repairs_role_specific_plugins() {
 }
 
 #[test]
+fn bridge_watchdog_repairs_native_model_cache_after_codex_refresh() {
+    let source = include_str!("../src/launcher.rs");
+    let implementation = source
+        .split("impl LaunchHooks for DefaultLaunchHooks")
+        .nth(1)
+        .unwrap();
+    let watchdog = implementation
+        .split("async fn start_bridge_watchdog")
+        .nth(1)
+        .unwrap()
+        .split("async fn write_status")
+        .next()
+        .unwrap();
+
+    assert!(watchdog.contains("sync_service_tier_catalog_in_home"));
+}
+
+#[test]
 fn app_paths_uses_native_windows_package_api_without_powershell() {
     let source =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/app_paths.rs")).unwrap();
@@ -941,6 +959,7 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
             "select-helper:57321",
             "load-settings",
             "provider-sync",
+            "sync-service-tier-catalog",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -998,16 +1017,13 @@ async fn launch_lifecycle_passes_configured_extra_args_to_codex_launch() {
 }
 
 #[tokio::test]
-async fn launch_lifecycle_syncs_service_tier_catalog_before_codex_launch() {
+async fn launch_lifecycle_syncs_model_capabilities_when_fast_button_is_disabled() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        codex_app_service_tier_controls: true,
-        ..BackendSettings::default()
-    });
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings::default());
 
     let handle = launch_and_inject_with_hooks(
         LaunchOptions {
@@ -1098,6 +1114,7 @@ async fn launch_lifecycle_keeps_js_injection_in_relay_mode() {
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "sync-service-tier-catalog",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -1532,6 +1549,7 @@ async fn launch_lifecycle_enters_degraded_mode_and_retries_when_injection_fails(
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "sync-service-tier-catalog",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -1577,6 +1595,7 @@ async fn launch_lifecycle_cleans_helper_when_launch_fails_after_helper_started()
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "sync-service-tier-catalog",
             "start-helper:57321",
             "launch:9229",
             "shutdown-helper:57321",
@@ -1760,6 +1779,7 @@ async fn launch_lifecycle_cleans_helper_and_codex_when_status_save_fails() {
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "sync-service-tier-catalog",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -1847,6 +1867,7 @@ async fn launch_continues_when_plugin_marketplace_config_fails() {
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "sync-service-tier-catalog",
             "plugin-marketplace",
             "start-helper:57321",
             "launch:9229",
@@ -2031,7 +2052,7 @@ impl LaunchHooks for FakeHooks {
     }
 
     fn sync_service_tier_catalog(&self, settings: &BackendSettings) -> anyhow::Result<()> {
-        if settings.enhancements_enabled && settings.codex_app_service_tier_controls {
+        if settings.enhancements_enabled {
             self.event("sync-service-tier-catalog");
         }
         Ok(())

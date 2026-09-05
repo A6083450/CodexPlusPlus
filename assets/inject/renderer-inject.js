@@ -601,8 +601,9 @@
   const codexThreadServiceTierKey = "codexThreadServiceTierOverrides";
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
-  const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "7";
+  const codexServiceTierRequestOverrideVersion = "10";
+  const codexAppServerModelRequestPatchVersion = "11";
+  const codexNativeServiceTierSelectionSyncVersion = "3";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
   const codexThreadScrollMaxEntries = 120;
@@ -2580,7 +2581,7 @@
   // 「Fast 仅支持 …」的提示文案，塞进没验证过的模型等于对用户做出错误承诺。
   // 第三方模型（deepseek 等）走下面 codexServiceTierFastSupportedForModel 里的
   // 模型元数据判定：上游自己声明了 priority 才认。
-  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
+  ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"].forEach((model) => codexServiceTierSupportedFastModels.add(model));
 
   function uniqueCodexAppAssetUrls(urls) {
     return Array.from(new Set((urls || []).filter((url) => typeof url === "string" && url.includes("/assets/") && url.split("?")[0].endsWith(".js"))));
@@ -2748,7 +2749,88 @@
     return { modules, sources };
   }
 
+  function codexReactFiberRoots() {
+    const roots = [];
+    const nodes = [
+      document.getElementById("root"),
+      document.querySelector("button, [role='button']"),
+      document.body,
+      document.documentElement,
+    ].filter(Boolean);
+    for (const node of nodes) {
+      for (const key of Object.getOwnPropertyNames(node)) {
+        if (!key.startsWith("__reactFiber$") && !key.startsWith("__reactContainer$")) continue;
+        let fiber = node[key];
+        while (fiber?.return) fiber = fiber.return;
+        if (fiber && !roots.includes(fiber)) roots.push(fiber);
+      }
+    }
+    return roots;
+  }
+
+  function collectCodexReactRuntimeCandidates(rootFibers = codexReactFiberRoots()) {
+    const queryClients = [];
+    const requestClients = [];
+    const conversationManagers = [];
+    const seenFibers = new Set();
+    const pushQueryClient = (value) => {
+      if (!value || typeof value.setQueriesData !== "function" || queryClients.includes(value)) return;
+      queryClients.push(value);
+    };
+    const pushRequestClient = (value) => {
+      if (!value
+          || typeof value.sendRequest !== "function"
+          || typeof value.hostId !== "string"
+          || !(value.requestPromises instanceof Map)
+          || typeof value.onResult !== "function"
+          || typeof value.onError !== "function"
+          || requestClients.includes(value)) return;
+      requestClients.push(value);
+    };
+    const inspect = (value) => {
+      if (!value || typeof value !== "object") return;
+      pushQueryClient(value);
+      pushQueryClient(value.queryClient);
+      pushRequestClient(value);
+      pushRequestClient(value.requestClient);
+      if (value.requestClient && typeof value.getConversation === "function"
+          && typeof value.updateConversationState === "function"
+          && !conversationManagers.includes(value)) conversationManagers.push(value);
+    };
+    const inspectMemo = (value, depth = 0) => {
+      inspect(value);
+      if (!Array.isArray(value) || depth >= 2) return;
+      value.slice(0, 40).forEach((item) => inspectMemo(item, depth + 1));
+    };
+    const queue = Array.isArray(rootFibers) ? [...rootFibers] : [];
+    while (queue.length && seenFibers.size < 5000) {
+      const fiber = queue.shift();
+      if (!fiber || seenFibers.has(fiber)) continue;
+      seenFibers.add(fiber);
+      inspect(fiber.memoizedProps);
+      inspect(fiber.pendingProps);
+      let hook = fiber.memoizedState;
+      for (let index = 0; hook && typeof hook === "object" && index < 40; index += 1) {
+        inspectMemo(hook.memoizedState);
+        hook = hook.next;
+      }
+      inspectMemo(fiber.updateQueue?.memoCache?.data);
+      if (fiber.child) queue.push(fiber.child);
+      if (fiber.sibling) queue.push(fiber.sibling);
+    }
+    return { queryClients, requestClients, conversationManagers, fiberCount: seenFibers.size };
+  }
+
   async function loadAppServerRequestCandidates() {
+    const runtime = collectCodexReactRuntimeCandidates();
+    if (runtime.requestClients.length) {
+      return {
+        modules: [],
+        candidates: runtime.requestClients,
+        sources: ["react-runtime"],
+        discovery: "react-runtime",
+      };
+    }
     const { modules, sources } = await loadAppServerRequestModules();
     const candidates = [];
     const seen = new Set();
@@ -3380,7 +3462,7 @@
   }
 
   function codexServiceTierRequestMethods() {
-    return new Set(["thread/start", "thread/resume", "turn/start"]);
+    return new Set(["thread/start", "thread/resume", "thread/settings/update", "turn/start"]);
   }
 
   function codexServiceTierThreadIdForRequest(method, params, threadIdHint = "") {
@@ -3444,6 +3526,9 @@
     const override = codexServiceTierOverrideForRequest(method, params, threadIdHint);
     if (!override) return providerParams;
     const nextParams = { ...(providerParams || {}), serviceTier: override.serviceTier };
+    if (Object.prototype.hasOwnProperty.call(nextParams, "serviceTierForTurn")) {
+      nextParams.serviceTierForTurn = override.serviceTier || "default";
+    }
     if (Object.prototype.hasOwnProperty.call(nextParams, "service_tier") || override.fastBlocked) {
       nextParams.service_tier = override.serviceTier;
     }
@@ -5995,8 +6080,6 @@
     return { session_id: locationThreadId(), title: "" };
   }
 
-  window.__codexPlusCurrentSessionRef = currentSessionRef;
-
   function readThreadScrollEntries() {
     if (window.__codexThreadScrollEntries && typeof window.__codexThreadScrollEntries === "object") {
       return { ...window.__codexThreadScrollEntries };
@@ -6667,8 +6750,6 @@
     }
   }
 
-  window.__codexPlusPostJson = postJson;
-
   function downloadMarkdownFallback(filename, markdown) {
     if (!filename || typeof markdown !== "string") {
       throw new Error("导出结果不完整");
@@ -6813,6 +6894,9 @@
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
       applyModelMetadata: (descriptor, modelName) => applyCodexPlusModelMetadata(descriptor, modelName),
       patchAppServerResult: (method, result) => patchAppServerModelResult(method, result),
+      patchModelQueryClient: (queryClient) => patchCodexModelQueryClient(queryClient),
+      reactRuntimeCandidates: (rootFibers) => collectCodexReactRuntimeCandidates(rootFibers),
+      nativeSpeedRow: (container, rows = []) => codexServiceTierNativeSpeedRow(container, rows, codexServiceTierMenuStrings()),
       nativeAuthRefreshDispatch: (fiber) => codexServiceTierNativeAuthRefreshDispatch(fiber),
       nativeAuthRefreshAction: codexServiceTierNativeAuthRefreshAction,
       reactFiberKeys,
@@ -6858,6 +6942,9 @@
         active: codexNativeServiceTierSelectionGuardActive(),
       }),
       nativeModeFromMenuItem: (item) => codexNativeServiceTierModeFromMenuItem(item),
+      installNativeSelectionSync: installCodexNativeServiceTierSelectionSync,
+      restoreContextUsage: restoreCodexContextWindowUsage,
+      patchContextUsageManager: patchCodexContextUsageManager,
       findAppHeader: (root) => findCodexAppHeader(root),
       isOpenLocationButton: (button) => isCodexHeaderOpenLocationButton(button),
       findNativeMenuInsertionPoint: () => findNativeMenuInsertionPoint(),
@@ -6953,7 +7040,7 @@
       if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
       if (!hasUltra) {
         const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek/i.test(String(modelName || ""));
-        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
+        if (shouldAddUltra) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
       }
       return efforts;
     }
@@ -6977,13 +7064,18 @@
         changed = true;
       }
     }
-    for (const key of ["additionalSpeedTiers", "serviceTiers"]) {
+    for (const key of ["inputModalities", "additionalSpeedTiers", "serviceTiers"]) {
       if (!Array.isArray(metadata[key])) continue;
       const nextValues = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
       if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValues)) {
         descriptor[key] = nextValues;
         changed = true;
       }
+    }
+    if (typeof metadata.supportsImageDetailOriginal === "boolean"
+        && descriptor.supportsImageDetailOriginal !== metadata.supportsImageDetailOriginal) {
+      descriptor.supportsImageDetailOriginal = metadata.supportsImageDetailOriginal;
+      changed = true;
     }
     return changed;
   }
@@ -7001,6 +7093,8 @@
       isDefault: false,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
+      inputModalities: Array.isArray(metadata?.inputModalities) ? [...metadata.inputModalities] : ["text"],
+      supportsImageDetailOriginal: metadata?.supportsImageDetailOriginal === true,
       additionalSpeedTiers: Array.isArray(metadata?.additionalSpeedTiers) ? [...metadata.additionalSpeedTiers] : [],
       serviceTiers: Array.isArray(metadata?.serviceTiers)
         ? metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry)
@@ -7112,6 +7206,34 @@
       if (value.hidden_models.length !== before) changed = true;
     }
     return changed;
+  }
+
+  function patchCodexModelQueryClient(queryClient) {
+    if (!queryClient || typeof queryClient.setQueriesData !== "function") return 0;
+    let changed = 0;
+    try {
+      queryClient.setQueriesData({
+        predicate: (query) => {
+          const key = query?.queryKey || query?.options?.queryKey;
+          return Array.isArray(key) && key[0] === "models" && key[1] === "list";
+        },
+      }, (current) => {
+        if (!current || typeof current !== "object" || typeof structuredClone !== "function") return current;
+        const next = structuredClone(current);
+        if (!patchModelContainer(next)) return current;
+        changed += 1;
+        return next;
+      });
+    } catch (error) {
+      window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
+      window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+    }
+    return changed;
+  }
+
+  function patchCodexModelQueryCaches() {
+    return collectCodexReactRuntimeCandidates().queryClients
+      .reduce((count, queryClient) => count + patchCodexModelQueryClient(queryClient), 0);
   }
 
   function modelJsonResponseLooksPatchable(payload) {
@@ -7308,6 +7430,84 @@
     return { requestMethod, threadId, model };
   }
 
+  async function refreshCodexNativeModelCache(client, sendRequest, params, options) {
+    if (client.hostId !== "local" || !window.__codexSessionDeleteBridge) return;
+    const model = String(params?.collaborationMode?.settings?.model || params?.model
+      || client.__codexPlusThreadModels?.get(params?.threadId) || codexServiceTierCurrentModelName()).trim();
+    if (!model) return;
+    client.__codexPlusNativeModelContext = null;
+    try {
+      const context = await withBackendTimeout(postJson("/codex-model-cache/sync", { model }));
+      if (context?.status !== "ok" || context.model !== model
+          || !Number.isSafeInteger(context.contextWindow) || context.contextWindow <= 0) return;
+      // model/list also reloads the native app-server's in-memory model metadata.
+      await sendRequest("model/list", { includeHidden: true, limit: 100 }, options);
+      client.__codexPlusNativeModelContext = context;
+    } catch (error) {
+      sendCodexPlusDiagnostic("native_model_cache_refresh_failed", { message: String(error?.message || error) });
+    }
+  }
+
+  function restoreCodexContextWindowUsage(manager, threadId) {
+    const context = manager.requestClient?.__codexPlusNativeModelContext;
+    const conversation = manager.getConversation(threadId);
+    const usage = conversation?.latestTokenUsageInfo;
+    if (!context || !usage || conversation.resumeState !== "resumed"
+        || conversation.latestModel !== context.model
+        || typeof manager.isConversationStreaming !== "function"
+        || manager.isConversationStreaming(threadId)
+        || usage.modelContextWindow === context.contextWindow) return false;
+    manager.updateConversationState(threadId, (state) => {
+      state.latestTokenUsageInfo = { ...usage, modelContextWindow: context.contextWindow };
+    });
+    return true;
+  }
+
+  function patchCodexContextUsageManager(manager) {
+    if (manager.requestClient?.hostId !== "local" || typeof manager.resumeConversation !== "function"
+        || manager.__codexPlusContextUsagePatch === codexAppServerModelRequestPatchVersion) return;
+    const resume = manager.__codexPlusOriginalResumeConversation || manager.resumeConversation;
+    manager.__codexPlusOriginalResumeConversation = resume;
+    manager.resumeConversation = async function (...args) {
+      const result = await resume.apply(this, args);
+      const threadId = typeof args[0] === "string" ? args[0] : args[0]?.conversationId;
+      if (threadId) restoreCodexContextWindowUsage(this, threadId);
+      return result;
+    };
+    manager.__codexPlusContextUsagePatch = codexAppServerModelRequestPatchVersion;
+    bootstrapCodexContextWindowUsage(manager);
+  }
+
+  function bootstrapCodexContextWindowUsage(manager) {
+    const threadId = currentSessionRef().session_id;
+    manager.__codexPlusContextUsageUnsubscribe?.();
+    if (!threadId) return;
+    const stop = () => {
+      manager.__codexPlusContextUsageUnsubscribe?.();
+      manager.__codexPlusContextUsageUnsubscribe = null;
+    };
+    const onReady = () => {
+      if (currentSessionRef().session_id !== threadId || manager.isConversationStreaming?.(threadId)) {
+        stop();
+        return;
+      }
+      const conversation = manager.getConversation(threadId);
+      const snapshot = conversation?.latestTokenUsageInfo;
+      if (!snapshot || conversation.resumeState !== "resumed") return;
+      stop();
+      const client = manager.requestClient;
+      void refreshCodexNativeModelCache(client, client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client), {
+        threadId, model: conversation.latestModel,
+      }).then(() => {
+        if (manager.getConversation(threadId)?.latestTokenUsageInfo === snapshot) {
+          restoreCodexContextWindowUsage(manager, threadId);
+        }
+      });
+    };
+    manager.__codexPlusContextUsageUnsubscribe = manager.addAnyConversationCallback?.(onReady);
+    onReady();
+  }
+
   async function refreshCodexThreadModelBeforeTurn(client, originalSendRequest, method, params, options) {
     if (String(method || "") !== "turn/start" || !codexPerModelContextEnabled()) return null;
     const { threadId, model } = codexThreadModelRequestState(method, params);
@@ -7359,9 +7559,15 @@
           && !codexRemoteSessionTargetProvider()) {
         await loadCodexModelCatalog();
       }
-      const nextParams = providerRefreshFailed
+      let nextParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+      if (["turn/start", "thread/settings/update"].includes(requestMethod)) {
+        nextParams = applyCodexServiceTierRequestOverride(requestMethod, nextParams);
+      }
+      if (codexServiceTierRequestMethods().has(requestMethod)) {
+        await refreshCodexNativeModelCache(client, originalSendRequest, nextParams, options);
+      }
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
         client,
         originalSendRequest,
@@ -7444,7 +7650,7 @@
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
-        if (modules.length === 0) {
+        if (candidates.length === 0) {
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_not_found", {
             reason: "app_server_request_assets_missing",
           });
@@ -7491,6 +7697,7 @@
     if (codexPlusModelUnlockEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
       installAppServerModelRequestPatch();
+      collectCodexReactRuntimeCandidates().conversationManagers.forEach(patchCodexContextUsageManager);
     }
     void installDictationSupportPatch();
     if (!codexPlusModelUnlockEnabled()) return;
@@ -7500,14 +7707,16 @@
 
   function runCodexModelWhitelistRefreshPass() {
     if (!codexPlusModelUnlockEnabled() || !codexPlusModelNames().length) return false;
+    let changed = false;
     try {
       patchStatsigModelWhitelist();
+      changed = patchCodexModelQueryCaches() > 0;
       installAppServerModelRequestPatch();
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
       window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
     }
-    return false;
+    return changed;
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
@@ -10317,7 +10526,6 @@
   }
 
   const codexNativeServiceTierPickerVersion = "2";
-  const codexNativeServiceTierSelectionSyncVersion = "2";
   const codexNativeServiceTierPendingRefreshes = new WeakSet();
 
   function codexServiceTierNativeTrigger() {
@@ -10500,6 +10708,10 @@
 
   function codexNativeServiceTierModeFromMenuItem(item) {
     if (!item || item.closest?.(`[data-codex-service-tier-menu-content="true"]`)) return "";
+    if (item.getAttribute?.("role") === "menuitemcheckbox"
+        && item.getAttribute?.("data-fast-mode-enabled") != null) {
+      return item.getAttribute("aria-checked") === "true" ? "standard" : "fast";
+    }
     const menu = item.closest?.(`[role="menu"]`);
     if (!menu) return "";
     const strings = codexServiceTierMenuStrings();
@@ -10528,15 +10740,14 @@
     const controlMode = normalizeCodexServiceTierControlMode(state.mode);
     if (controlMode === "custom") {
       setCodexThreadServiceTierOverride(codexServiceTierMenuContext().threadId, normalizedMode);
-      refreshCodexServiceTierControls();
     } else {
       state.mode = normalizedMode === "fast" ? "global-fast" : "global-standard";
       state.defaultMode = normalizedMode;
       state.entries = Object.create(null);
       state.draft = null;
       writeThreadServiceTierState(state);
-      refreshCodexServiceTierControls();
     }
+    queueMicrotask(refreshCodexServiceTierControls);
   }
 
   function installCodexNativeServiceTierSelectionSync() {
@@ -10546,17 +10757,21 @@
       document.removeEventListener("keydown", window.__codexNativeServiceTierSelectionSyncHandler, true);
     }
     const handler = (event) => {
+      if (!codexPlusSettings().serviceTierControls) return;
       if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") return;
-      const item = event.target?.closest?.(`[role="menuitem"], [role="menuitemradio"]`);
+      const item = event.target?.closest?.(`[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]`);
+      if (item?.getAttribute?.("aria-disabled") === "true" || item?.hasAttribute?.("inert")) return;
       const mode = codexNativeServiceTierModeFromMenuItem(item);
       if (!mode) return;
-      const signature = `${mode}:${String(item?.textContent || "")}`;
       const now = Date.now();
-      if (window.__codexNativeServiceTierSelectionSignature === signature
-        && now - Number(window.__codexNativeServiceTierSelectionAt || 0) < 100) return;
-      window.__codexNativeServiceTierSelectionSignature = signature;
+      if (event.repeat || (event.type === "click"
+        && window.__codexNativeServiceTierSelectionType === "keydown"
+        && window.__codexNativeServiceTierSelectionItem === item
+        && now - Number(window.__codexNativeServiceTierSelectionAt || 0) < 100)) return;
+      window.__codexNativeServiceTierSelectionItem = item;
+      window.__codexNativeServiceTierSelectionType = event.type;
       window.__codexNativeServiceTierSelectionAt = now;
-      queueMicrotask(() => syncCodexServiceTierFromNativeSelection(mode));
+      syncCodexServiceTierFromNativeSelection(mode);
     };
     window.__codexNativeServiceTierSelectionSyncHandler = handler;
     window.__codexNativeServiceTierSelectionSyncVersion = codexNativeServiceTierSelectionSyncVersion;
@@ -10883,7 +11098,7 @@
   }
 
   function codexServiceTierSemanticModelMenuRowSelector() {
-    return `[role="menuitem"][aria-label^="模型 "], [role="menuitem"][aria-label^="Model "]`;
+    return `[data-model-picker-view-toggle="true"], [role="menuitem"][aria-label^="模型 "], [role="menuitem"][aria-label^="Model "]`;
   }
 
   function codexServiceTierMenuModelCandidates() {
@@ -10891,6 +11106,23 @@
       ...document.querySelectorAll(`[data-model-picker-model-row]`),
       ...document.querySelectorAll(codexServiceTierSemanticModelMenuRowSelector()),
     ])];
+  }
+
+  function codexServiceTierNativeSpeedRow(container, rows, strings) {
+    const nativeFastToggle = container?.querySelector?.(`[role="menuitemcheckbox"][data-fast-mode-enabled]`);
+    if (nativeFastToggle) return nativeFastToggle;
+    return rows.find((row) => {
+      if (row.dataset.codexServiceTierMenuTrigger === "true") return false;
+      const firstLabel = row.querySelector("span")?.textContent?.trim() || "";
+      const ariaLabel = row.getAttribute("aria-label")?.trim() || "";
+      const rowText = String(row.textContent || "").replace(/\s+/g, " ").trim();
+      return [firstLabel, ariaLabel].includes(strings.speed)
+        || [firstLabel, ariaLabel].includes("Speed")
+        || [firstLabel, ariaLabel].includes("速度")
+        || rowText.startsWith(strings.speed)
+        || rowText.startsWith("Speed")
+        || rowText.startsWith("速度");
+    });
   }
 
   function installCodexServiceTierMenu() {
@@ -10910,18 +11142,11 @@
     }
     const strings = codexServiceTierMenuStrings();
     const rows = Array.from(container.children).filter((node) => node.matches?.(`[role="menuitem"]`));
-    const nativeSpeedRow = rows.find((row) => {
-      if (row.dataset.codexServiceTierMenuTrigger === "true" || row === modelRow) return false;
-      const firstLabel = row.querySelector("span")?.textContent?.trim() || "";
-      const ariaLabel = row.getAttribute("aria-label")?.trim() || "";
-      const rowText = String(row.textContent || "").replace(/\s+/g, " ").trim();
-      return [firstLabel, ariaLabel].includes(strings.speed)
-        || [firstLabel, ariaLabel].includes("Speed")
-        || [firstLabel, ariaLabel].includes("速度")
-        || rowText.startsWith(strings.speed)
-        || rowText.startsWith("Speed")
-        || rowText.startsWith("速度");
-    });
+    const nativeSpeedRow = codexServiceTierNativeSpeedRow(
+      container,
+      rows.filter((row) => row !== modelRow),
+      strings
+    );
     if (nativeSpeedRow) {
       removeCodexServiceTierMenu();
       return;

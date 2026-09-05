@@ -4,10 +4,7 @@ use async_trait::async_trait;
 use codex_plus_core::launcher::{
     CodexLaunch, LaunchHooks, LaunchOptions, ProcessWaitStrategy, launch_and_inject_with_hooks,
 };
-use codex_plus_core::models::{
-    DeleteResult, DeleteStatus, ExportResult, ExportStatus, GeneratedImage, GeneratedImagesResult,
-    GeneratedImagesStatus, SessionRef,
-};
+use codex_plus_core::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
 use codex_plus_core::routes::{
     BridgeContext, BridgeDataService, BridgeRuntimeService, BridgeSettingsService,
     CoreRuntimeService, handle_bridge_request,
@@ -16,6 +13,16 @@ use codex_plus_core::settings::BackendSettings;
 use codex_plus_core::status::StatusStore;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
+
+#[tokio::test]
+async fn native_cache_sync_forwards_the_selected_model() {
+    let result = handle_bridge_request(
+        test_context(),
+        "/codex-model-cache/sync",
+        json!({"model": "deepseek-v4-pro"}),
+    ).await;
+    assert_eq!(result["model"], "deepseek-v4-pro");
+}
 
 #[tokio::test]
 async fn bridge_routes_cover_all_current_paths() {
@@ -38,6 +45,7 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/backend/status", json!({})),
         ("/codex-model-catalog", json!({})),
         ("/codex-config-model", json!({})),
+        ("/codex-model-cache/sync", json!({})),
         (
             "/llm-proxy",
             json!({"url": "http://example.com", "method": "POST"}),
@@ -85,10 +93,6 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/undo", json!({"undo_token": "undo-1"})),
         (
             "/export-markdown",
-            json!({"session_id": "s1", "title": "First"}),
-        ),
-        (
-            "/thread-generated-images",
             json!({"session_id": "s1", "title": "First"}),
         ),
         (
@@ -654,27 +658,6 @@ async fn data_routes_forward_payloads_to_data_service() {
         )
         .await["filename"],
         "First.md"
-    );
-    assert_eq!(
-        handle_bridge_request(
-            ctx.clone(),
-            "/thread-generated-images",
-            json!({"session_id": "s1", "title": "First"}),
-        )
-        .await,
-        json!({
-            "status": "found",
-            "session_id": "s1",
-            "message": "found 1 generated image",
-            "images": [{
-                "id": "ig-1",
-                "assistant_message_id": "msg-final",
-                "assistant_response_index": 0,
-                "media_type": "image/png",
-                "base64_data": "iVBORw0KGgo=",
-                "revised_prompt": "A tower at sunset"
-            }]
-        })
     );
     assert_eq!(
         handle_bridge_request(
@@ -1551,6 +1534,10 @@ impl BridgeRuntimeService for FakeRuntime {
         }))
     }
 
+    async fn sync_codex_model_cache(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "model": payload["model"]}))
+    }
+
     async fn ads(&self) -> anyhow::Result<Value> {
         Ok(json!({"version": 1, "ads": [{"id": "runtime-ad"}]}))
     }
@@ -1706,22 +1693,6 @@ impl BridgeDataService for FakeData {
             message: "exported".to_string(),
             filename: Some("First.md".to_string()),
             markdown: Some("# First\n".to_string()),
-        })
-    }
-
-    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
-        Ok(GeneratedImagesResult {
-            status: GeneratedImagesStatus::Found,
-            session_id: session.session_id,
-            message: "found 1 generated image".to_string(),
-            images: vec![GeneratedImage {
-                id: "ig-1".to_string(),
-                assistant_message_id: "msg-final".to_string(),
-                assistant_response_index: Some(0),
-                media_type: "image/png".to_string(),
-                base64_data: "iVBORw0KGgo=".to_string(),
-                revised_prompt: Some("A tower at sunset".to_string()),
-            }],
         })
     }
 

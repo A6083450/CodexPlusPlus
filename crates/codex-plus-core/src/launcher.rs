@@ -440,7 +440,6 @@ where
             );
         }
         if settings.enhancements_enabled
-            && settings.codex_app_service_tier_controls
             && let Err(error) = hooks.sync_service_tier_catalog(&settings)
         {
             let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -737,7 +736,7 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     fn sync_service_tier_catalog(&self, settings: &BackendSettings) -> anyhow::Result<()> {
-        if !settings.enhancements_enabled || !settings.codex_app_service_tier_controls {
+        if !settings.enhancements_enabled {
             return Ok(());
         }
         let home = crate::relay_config::default_codex_home_dir();
@@ -1052,6 +1051,13 @@ impl LaunchHooks for DefaultLaunchHooks {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = interval.tick() => {
+                        let home = crate::relay_config::default_codex_home_dir();
+                        if let Err(error) = crate::service_tier_catalog::sync_service_tier_catalog_in_home(&home) {
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "launcher.model_cache_watchdog_sync_failed",
+                                serde_json::json!({ "message": error.to_string() }),
+                            );
+                        }
                         let current_browser_id = match crate::cdp::browser_identity(debug_port).await {
                             Ok(identity) => identity.browser_id().ok(),
                             Err(_) => None,

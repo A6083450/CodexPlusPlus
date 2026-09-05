@@ -197,6 +197,23 @@ fn model_ui_metadata_exposes_fast_service_tier_capability() {
 }
 
 #[test]
+fn model_ui_metadata_exposes_gpt6_reasoning_and_fast_capabilities() {
+    let metadata = model_ui_metadata("gpt-6-astra").expect("Astra metadata should exist");
+    let efforts = metadata["supportedReasoningEfforts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["reasoningEffort"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(metadata["defaultReasoningEffort"], "medium");
+    assert_eq!(efforts, ["low", "medium", "high", "xhigh", "max"]);
+    assert_eq!(metadata["serviceTiers"][0]["id"], "priority");
+    assert_eq!(metadata["inputModalities"], serde_json::json!(["text", "image"]));
+    assert_eq!(metadata["supportsImageDetailOriginal"], true);
+}
+
+#[test]
 fn collect_entries_adopts_suffix_for_current_model_from_list() {
     // 当前 model 本身无后缀，但 model_list 中靠后位置有同名带后缀条目。
     let mut windows = HashMap::new();

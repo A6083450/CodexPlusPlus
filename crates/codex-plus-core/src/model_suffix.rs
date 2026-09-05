@@ -184,6 +184,11 @@ const GPT56_METADATA_JSON: &str = include_str!(concat!(
     "/../../assets/gpt56-model-metadata-compat.json"
 ));
 
+const GPT6_METADATA_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/gpt6-model-metadata-compat.json"
+));
+
 const DEEPSEEK_METADATA_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/deepseek-model-metadata.json"
@@ -194,7 +199,7 @@ pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata = gpt56_metadata_entry(slug)?;
+    let metadata = runtime_model_metadata_entry(slug)?;
     let levels = metadata
         .get("supported_reasoning_levels")?
         .as_array()?
@@ -227,6 +232,14 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
             .and_then(Value::as_str)
             .unwrap_or("medium"),
         "supportedReasoningEfforts": levels,
+        "inputModalities": metadata
+            .get("input_modalities")
+            .cloned()
+            .unwrap_or_else(|| json!(["text"])),
+        "supportsImageDetailOriginal": metadata
+            .get("supports_image_detail_original")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         "additionalSpeedTiers": metadata
             .get("additional_speed_tiers")
             .cloned()
@@ -378,6 +391,10 @@ fn first_bundled_template_entry() -> Option<Value> {
 
 fn gpt56_metadata_entry(slug: &str) -> Option<Value> {
     catalog_metadata_entry(GPT56_METADATA_JSON, slug)
+}
+
+pub(crate) fn runtime_model_metadata_entry(slug: &str) -> Option<Value> {
+    gpt56_metadata_entry(slug).or_else(|| catalog_metadata_entry(GPT6_METADATA_JSON, slug))
 }
 
 fn catalog_metadata_entry(catalog_json: &str, slug: &str) -> Option<Value> {
