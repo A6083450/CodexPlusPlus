@@ -100,7 +100,12 @@ fn patch_native_model_cache(home: &Path, config: &DocumentMut) -> anyhow::Result
         let mut metadata = context.clone();
         if model.get("slug").and_then(Value::as_str) == Some("gpt-6-astra") {
             for (key, value) in &gpt6 {
-                metadata.entry(key.clone()).or_insert_with(|| value.clone());
+                let value = if key == "supported_reasoning_levels" {
+                    merge_gpt6_reasoning_levels(model.get(key), value)
+                } else {
+                    value.clone()
+                };
+                metadata.entry(key.clone()).or_insert(value);
             }
         }
         for (key, value) in metadata {
@@ -117,6 +122,25 @@ fn patch_native_model_cache(home: &Path, config: &DocumentMut) -> anyhow::Result
     updated.push(b'\n');
     crate::settings::atomic_write(&cache_path, &updated)?;
     Ok(true)
+}
+
+fn merge_gpt6_reasoning_levels(native: Option<&Value>, fallback: &Value) -> Value {
+    let mut levels = fallback.as_array().cloned().unwrap_or_default();
+    for level in native.and_then(Value::as_array).into_iter().flatten() {
+        let Some(effort) = level
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|effort| !effort.trim().is_empty() && *effort != "none")
+        else {
+            continue;
+        };
+        if let Some(existing) = levels.iter_mut().find(|entry| entry["effort"] == effort) {
+            *existing = level.clone();
+        } else {
+            levels.push(level.clone());
+        }
+    }
+    Value::Array(levels)
 }
 
 fn context_metadata_from_config(config: &DocumentMut) -> Map<String, Value> {

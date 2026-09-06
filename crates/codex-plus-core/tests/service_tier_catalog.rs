@@ -126,7 +126,7 @@ fn sync_service_tier_catalog_patches_gpt6_in_default_model_cache() {
             .iter()
             .map(|level| level["effort"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["low", "medium", "high", "xhigh", "max"]
+        ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(gpt6["default_reasoning_level"], "medium");
     assert_eq!(gpt6["service_tiers"][0]["id"], "priority");
@@ -182,6 +182,47 @@ fn sync_service_tier_catalog_replaces_invalid_gpt6_none_reasoning() {
         patched["models"][0]["input_modalities"],
         serde_json::json!(["text", "image"])
     );
+}
+
+#[test]
+fn gpt6_cache_preserves_native_ultra_and_the_selected_effort() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = "model=\"gpt-6-astra\"\nmodel_reasoning_effort=\"ultra\"\n";
+    let cache = serde_json::json!({"models":[{
+        "slug":"gpt-6-astra", "multi_agent_version":"v2", "multi_agent_reasoning_effort":"xhigh",
+        "supported_reasoning_levels":[
+            {"effort":"none"},
+            {"effort":"low","description":"Native low"},
+            {"effort":"ultra","description":"Native automatic delegation"}
+        ]
+    }]});
+    std::fs::write(temp.path().join("config.toml"), config).unwrap();
+    std::fs::write(
+        temp.path().join("models_cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
+    let patched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("models_cache.json")).unwrap())
+            .unwrap();
+    let levels = patched["models"][0]["supported_reasoning_levels"]
+        .as_array()
+        .unwrap();
+    assert_eq!(levels[0]["description"], "Native low");
+    assert_eq!(levels.last().unwrap()["effort"], "ultra");
+    assert_eq!(
+        levels.last().unwrap()["description"],
+        "Native automatic delegation"
+    );
+    assert!(!levels.iter().any(|level| level["effort"] == "none"));
+    assert_eq!(patched["models"][0]["multi_agent_version"], "v2");
+    assert_eq!(patched["models"][0]["multi_agent_reasoning_effort"], "xhigh");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        config
+    );
+    assert!(!sync_service_tier_catalog_in_home(temp.path()).unwrap());
 }
 
 #[test]

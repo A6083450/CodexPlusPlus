@@ -2822,7 +2822,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"11\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"12\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
     assert!(script.contains("[role=\"menuitemcheckbox\"][data-fast-mode-enabled]"));
@@ -3431,7 +3431,7 @@ fn injection_script_applies_fast_service_tier_contract() {
             .iter()
             .map(|entry| entry["reasoningEffort"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["low", "medium", "high", "xhigh", "max"]
+        ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(
         cases["astraDescriptor"]["serviceTiers"][0]["id"],
@@ -3442,6 +3442,9 @@ fn injection_script_applies_fast_service_tier_contract() {
         json!(["text", "image"])
     );
     assert_eq!(cases["astraQueryPatchCount"], 1);
+    assert_eq!(cases["nativeAstraDescriptor"]["supportedReasoningEfforts"][0]["description"], "Native low");
+    assert_eq!(cases["nativeAstraDescriptor"]["supportedReasoningEfforts"][5]["description"], "Native automatic delegation");
+    assert_eq!(cases["nativeAstraDescriptor"]["multiAgentVersion"], "v2");
     assert_eq!(
         cases["astraQueryDescriptor"]["defaultReasoningEffort"],
         "medium"
@@ -3453,7 +3456,7 @@ fn injection_script_applies_fast_service_tier_contract() {
             .iter()
             .map(|entry| entry["reasoningEffort"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["low", "medium", "high", "xhigh", "max"]
+        ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(
         cases["astraQueryDescriptor"]["serviceTiers"][0]["id"],
@@ -3921,6 +3924,15 @@ api.setModelCatalog({{
 }});
 const astraFastAvailability = api.fastAvailability("gpt-6-astra");
 const astraDescriptor = api.modelDescriptor("gpt-6-astra");
+const nativeAstraDescriptor = {{
+  model: "gpt-6-astra", multiAgentVersion: "v2",
+  supportedReasoningEfforts: [
+    {{ reasoningEffort: "none" }},
+    {{ reasoningEffort: "low", description: "Native low" }},
+    {{ reasoningEffort: "ultra", description: "Native automatic delegation" }},
+  ],
+}};
+api.applyModelMetadata(nativeAstraDescriptor, "gpt-6-astra");
 let staleAstraQuery = {{
   data: [{{
     model: "gpt-6-astra",
@@ -4829,6 +4841,7 @@ process.stdout.write(JSON.stringify({{
   solDescriptor,
   astraFastAvailability,
   astraDescriptor,
+  nativeAstraDescriptor,
   astraQueryPatchCount,
   astraQueryDescriptor,
   reactRuntimeQueryClientFound: reactRuntimeCandidates.queryClients.includes(modelQueryClient),

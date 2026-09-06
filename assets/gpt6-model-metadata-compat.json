@@ -16,7 +16,8 @@
         { "effort": "medium", "description": "Balanced reasoning for most coding tasks" },
         { "effort": "high", "description": "Greater reasoning depth for coding and agent tasks" },
         { "effort": "xhigh", "description": "Extra-high reasoning depth for difficult tasks" },
-        { "effort": "max", "description": "Maximum reasoning depth for complex tasks" }
+        { "effort": "max", "description": "Maximum reasoning depth for complex tasks" },
+        { "effort": "ultra", "description": "Maximum reasoning with automatic task delegation" }
       ],
       "additional_speed_tiers": [],
       "service_tiers": [

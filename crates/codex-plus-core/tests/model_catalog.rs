@@ -40,7 +40,7 @@ experimental_bearer_token = "relay-key"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
     assert_eq!(result["status"], "ok");
@@ -96,7 +96,7 @@ experimental_bearer_token = "ark-key"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -139,7 +139,7 @@ experimental_bearer_token = "relay-key"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -175,7 +175,7 @@ experimental_bearer_token = "relay-key"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -294,7 +294,7 @@ base_url = "{}/v1"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -351,7 +351,7 @@ experimental_bearer_token = "relay-key"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -443,7 +443,7 @@ base_url = "{}"
     let result = read_codex_model_catalog_from_home(
         temp.path(),
         &HashMap::new(),
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.client.clone(),
     )
     .await;
 
@@ -461,6 +461,7 @@ fn write_config(home: &Path, contents: &str) {
 
 struct ModelsServer {
     base_url: String,
+    client: reqwest::Client,
     handle: thread::JoinHandle<Vec<ModelsRequest>>,
 }
 
@@ -476,6 +477,8 @@ struct ModelsRequest {
 }
 
 fn spawn_models_server(payload: serde_json::Value) -> ModelsServer {
+    // 客户端冷启动可能超过服务端等待连接的时间，必须先完成初始化。
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let base_url = format!("http://{address}");
@@ -533,5 +536,5 @@ fn spawn_models_server(payload: serde_json::Value) -> ModelsServer {
         }
         requests
     });
-    ModelsServer { base_url, handle }
+    ModelsServer { base_url, client, handle }
 }

@@ -602,7 +602,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "11";
+  const codexAppServerModelRequestPatchVersion = "12";
   const codexNativeServiceTierSelectionSyncVersion = "3";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
@@ -7039,7 +7039,7 @@
       const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
       if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
       if (!hasUltra) {
-        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek/i.test(String(modelName || ""));
+        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4|deepseek|^gpt-6-astra$/i.test(String(modelName || ""));
         if (shouldAddUltra) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
       }
       return efforts;
@@ -7059,6 +7059,14 @@
     }
     if (Array.isArray(metadata.supportedReasoningEfforts) && metadata.supportedReasoningEfforts.length > 0) {
       const nextEfforts = modelReasoningEfforts(modelName);
+      if (normalizeCodexServiceTierModelName(modelName) === "gpt-6-astra") {
+        for (const entry of Array.isArray(descriptor.supportedReasoningEfforts) ? descriptor.supportedReasoningEfforts : []) {
+          if (typeof entry?.reasoningEffort !== "string" || !entry.reasoningEffort.trim() || entry.reasoningEffort === "none") continue;
+          const index = nextEfforts.findIndex((level) => level.reasoningEffort === entry.reasoningEffort);
+          if (index < 0) nextEfforts.push({ ...entry });
+          else nextEfforts[index] = { ...entry };
+        }
+      }
       if (JSON.stringify(descriptor.supportedReasoningEfforts || []) !== JSON.stringify(nextEfforts)) {
         descriptor.supportedReasoningEfforts = nextEfforts;
         changed = true;
