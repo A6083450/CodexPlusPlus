@@ -118,6 +118,17 @@ test("the first active model route transitions from no helper to a required help
   assert.equal(modelRouteSaveRequiresRestart(before, after, source.baseUrl), true);
 });
 
+test("adding an image model starts the helper even with enhancements disabled", () => {
+  const before = settings([profile("source")]);
+  const after = settings([profile("source", { modelList: "gpt-6\ngpt-image-2" })]);
+  assert.equal(settingsRequireLocalHelper(before), false);
+  assert.equal(settingsRequireLocalHelper(after), true);
+  assert.equal(modelRouteSaveRequiresRestart(before, after, "https://images.example.test"), true);
+  assert.equal(settingsRequireLocalHelper(settings([profile("source", {
+    modelList: "gpt-image-2", relayMode: "official", officialMixApiKey: false,
+  })])), false);
+});
+
 test("enabling no-auth upstream restarts into the local helper", () => {
   const source = profile("source");
   const before = settings([source]);

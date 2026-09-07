@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use codex_plus_core::launcher::{
     BridgeReinjector, DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
 };
-use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
+use codex_plus_core::models::{DeleteResult, ExportResult, GeneratedImagesResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
 use codex_plus_core::status::LaunchStatus;
 use codex_plus_core::user_scripts::UserScriptManager;
@@ -664,6 +664,15 @@ impl BridgeDataService for LauncherDataService {
         .map_err(|error| anyhow::anyhow!("export markdown task failed: {error}"))
     }
 
+    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
+        let db_paths = self.candidate_db_paths();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::generated_images_from_paths(db_paths, &session)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("generated images task failed: {error}"))
+    }
+
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
         let adapter = self.storage_adapter();
         tokio::task::spawn_blocking(move || adapter.codex_thread_usage_history(&session))
@@ -805,7 +814,10 @@ impl LauncherDataService {
     }
 
     fn storage_adapter(&self) -> codex_plus_data::SQLiteStorageAdapter {
-        let allowed_db_paths = self.candidate_db_paths();
+        let mut allowed_db_paths = self.candidate_db_paths();
+        allowed_db_paths.extend(codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(
+            &codex_plus_core::codex_home::default_codex_home_dir(),
+        ));
         codex_plus_data::SQLiteStorageAdapter::new(
             self.db_path.clone(),
             codex_plus_data::BackupStore::new(self.backup_dir.clone()),

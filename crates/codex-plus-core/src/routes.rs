@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::models::{DeleteResult, DeleteStatus, ExportResult, ExportStatus, SessionRef};
+use crate::models::{
+    DeleteResult, DeleteStatus, ExportResult, ExportStatus, GeneratedImagesResult,
+    GeneratedImagesStatus, SessionRef,
+};
 use crate::settings::{BackendSettings, SettingsStore};
 use crate::status::StatusStore;
 use crate::user_scripts::UserScriptManager;
@@ -114,6 +117,7 @@ pub trait BridgeDataService: Send + Sync {
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult>;
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult>;
     async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult>;
+    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult>;
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value>;
     async fn find_archived_thread_by_title(
         &self,
@@ -256,6 +260,11 @@ pub async fn handle_bridge_request(
         "/export-markdown" => result_value(
             ctx.data
                 .export_markdown(session_from_payload(&payload))
+                .await,
+        ),
+        "/thread-generated-images" => result_value(
+            ctx.data
+                .generated_images(session_from_payload(&payload))
                 .await,
         ),
         "/thread-usage-history" => {
@@ -642,6 +651,15 @@ impl BridgeDataService for UnavailableDataService {
             message: "Markdown export service is not wired in core launcher hooks".to_string(),
             filename: None,
             markdown: None,
+        })
+    }
+
+    async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult> {
+        Ok(GeneratedImagesResult {
+            status: GeneratedImagesStatus::Failed,
+            session_id: session.session_id,
+            message: "Generated image service is not wired in core launcher hooks".to_string(),
+            images: Vec::new(),
         })
     }
 

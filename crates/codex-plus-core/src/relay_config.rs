@@ -2778,7 +2778,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         );
     }
-    if profile.has_model_routes() {
+    if profile.has_model_routes() || profile.image_generation_uses_protocol_proxy() {
         if !profile.upstream_base_url.trim().is_empty() {
             return profile.upstream_base_url.trim().to_string();
         }
@@ -2926,7 +2926,8 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
+    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth()
+        || profile.image_generation_uses_protocol_proxy() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         )

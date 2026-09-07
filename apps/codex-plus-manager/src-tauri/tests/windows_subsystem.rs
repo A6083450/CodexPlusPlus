@@ -367,17 +367,17 @@ fn manager_no_longer_exposes_mobile_control() {
 }
 
 #[test]
-fn manager_no_longer_exposes_local_imagegen() {
+fn manager_exposes_local_imagegen() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let app_tsx = manifest_dir.parent().unwrap().join("src/App.tsx");
     let app_tsx = std::fs::read_to_string(&app_tsx).expect("read manager App.tsx");
     let commands = std::fs::read_to_string(manifest_dir.join("src/commands.rs"))
         .expect("read manager commands.rs");
 
-    assert!(!app_tsx.contains("本地 imagegen"));
-    assert!(!app_tsx.contains("overwriteImagegenSkill"));
-    assert!(!commands.contains("overwrite_imagegen_skill"));
-    assert!(!commands.contains("imagegen_skill_status"));
+    assert!(app_tsx.contains("本地 imagegen"));
+    assert!(app_tsx.contains("overwriteImagegenSkill"));
+    assert!(commands.contains("overwrite_imagegen_skill"));
+    assert!(commands.contains("imagegen_skill_status"));
 }
 
 #[test]

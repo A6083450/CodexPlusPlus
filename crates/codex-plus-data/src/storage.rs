@@ -16,12 +16,21 @@ pub fn delete_local_from_paths(
     session: &SessionRef,
     codex_home: Option<&Path>,
 ) -> DeleteResult {
+    let mut db_paths: Vec<PathBuf> = db_paths.into_iter().collect();
+    if let Some(home) = codex_home {
+        for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(home) {
+            if !db_paths.contains(&path) {
+                db_paths.push(path);
+            }
+        }
+    }
     let mut result = failed(
         &session.session_id,
         "Thread not found in local storage".to_string(),
     );
     let mut deleted_count = 0usize;
     let mut backup_tokens = Vec::new();
+    let mut partial_failure = None;
     for db_path in db_paths {
         let adapter = match codex_home {
             Some(home) => {
@@ -30,6 +39,14 @@ pub fn delete_local_from_paths(
             None => SQLiteStorageAdapter::new(db_path, backup_store.clone()),
         };
         let candidate_result = adapter.delete_local(session);
+        if matches!(candidate_result.status, DeleteStatus::Failed)
+            && candidate_result.undo_token.is_some()
+        {
+            if let Some(token) = candidate_result.undo_token.as_ref() {
+                backup_tokens.push(token.clone());
+            }
+            partial_failure = Some(candidate_result.clone());
+        }
         if matches!(candidate_result.status, DeleteStatus::LocalDeleted) {
             deleted_count += 1;
             if let Some(token) = candidate_result.undo_token.as_ref() {
@@ -44,6 +61,12 @@ pub fn delete_local_from_paths(
         result.message = format!("已从 {deleted_count} 个本地存储删除");
         result.undo_token = Some(json!(backup_tokens).to_string());
         result.backup_path = None;
+    }
+    if let Some(mut failure) = partial_failure {
+        if backup_tokens.len() > 1 {
+            failure.undo_token = Some(json!(backup_tokens).to_string());
+        }
+        return failure;
     }
     // 纯 API 模式（model_provider = "custom"）下 threads 表是空的，上面每个库都查不到
     // 记录，于是直接返回「Thread not found in local storage」而会话行仍留在列表里
@@ -102,6 +125,7 @@ enum SchemaKind {
     GenericSessions,
     CodexThreads,
     CodexAutomationRuns,
+    LocalThreadCatalog,
 }
 
 fn codex_thread_filter(db: &Connection) -> anyhow::Result<String> {
@@ -191,11 +215,22 @@ impl SQLiteStorageAdapter {
         }
         let result = (|| -> anyhow::Result<DeleteResult> {
             let mut db = Connection::open(&self.db_path)?;
+            if has_columns(&db, "local_thread_catalog", &["host_id", "thread_id"])? {
+                let catalog_result = self.delete_catalog_thread(&mut db, session)?;
+                if matches!(catalog_result.status, DeleteStatus::LocalDeleted)
+                    || catalog_result.undo_token.is_some()
+                {
+                    return Ok(catalog_result);
+                }
+            }
             match schema_kind(&db)? {
                 Some(SchemaKind::GenericSessions) => self.delete_generic_session(&mut db, session),
                 Some(SchemaKind::CodexThreads) => self.delete_codex_thread(&mut db, session),
                 Some(SchemaKind::CodexAutomationRuns) => {
                     self.delete_codex_automation_run(&mut db, session)
+                }
+                Some(SchemaKind::LocalThreadCatalog) => {
+                    self.delete_catalog_thread(&mut db, session)
                 }
                 None => Ok(failed(
                     &session.session_id,
@@ -608,6 +643,63 @@ impl SQLiteStorageAdapter {
         })
     }
 
+    fn delete_catalog_thread(
+        &self,
+        db: &mut Connection,
+        session: &SessionRef,
+    ) -> anyhow::Result<DeleteResult> {
+        let thread_id = normalize_codex_thread_id(&session.session_id);
+        let Some(host_id) = crate::provider_sync::local_catalog_host_id(db)? else {
+            return Ok(failed(
+                &thread_id,
+                "Local catalog host not found".to_string(),
+            ));
+        };
+        let rows = select_dicts(
+            db,
+            "SELECT * FROM local_thread_catalog WHERE host_id = ?1 AND thread_id = ?2",
+            &[&host_id, &thread_id],
+        )?;
+        if rows.is_empty() {
+            return Ok(failed(
+                &thread_id,
+                "Thread not found in local catalog".to_string(),
+            ));
+        }
+        let token = self.backup_store.write_backup(
+            &thread_id,
+            &self.db_path,
+            json!({"local_thread_catalog": rows}),
+        )?;
+        let backup_path = self.backup_store.path_for(&token);
+        let deleted = (|| -> anyhow::Result<()> {
+            let tx = db.transaction()?;
+            if has_columns(
+                &tx,
+                "local_thread_catalog_scan_entries",
+                &["host_id", "thread_id", "removed"],
+            )? {
+                tx.execute("INSERT INTO local_thread_catalog_scan_entries(host_id,thread_id,removed) VALUES (?1,?2,1) ON CONFLICT(host_id,thread_id) DO UPDATE SET removed=1", [&host_id, &thread_id])?;
+            }
+            tx.execute(
+                "DELETE FROM local_thread_catalog WHERE host_id=?1 AND thread_id=?2",
+                [&host_id, &thread_id],
+            )?;
+            bump_catalog_revision(&tx)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = deleted {
+            return Ok(failed_with_undo(
+                &thread_id,
+                error.to_string(),
+                &token,
+                Some(&backup_path),
+            ));
+        }
+        Ok(local_deleted(&thread_id, &token, &backup_path))
+    }
+
     fn delete_generic_session(
         &self,
         db: &mut Connection,
@@ -712,7 +804,11 @@ impl SQLiteStorageAdapter {
             "assigned_thread_id = ?1",
             &[&thread_id],
         )?;
-        let file_backups = rollout_file_backups(tables.get("threads").and_then(Value::as_array));
+        let file_backups = rollout_file_backups(
+            tables.get("threads").and_then(Value::as_array),
+            self.codex_home.as_deref(),
+            &thread_id,
+        )?;
         if !file_backups.is_empty() {
             tables.insert("__files".to_string(), Value::Array(file_backups.clone()));
         }
@@ -1042,7 +1138,7 @@ fn restore_backups(
         let db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         validate_restore_tables(tables)?;
         detect_restore_conflicts(&db, tables)?;
-        detect_file_restore_conflicts(tables)?;
+        detect_file_restore_conflicts(tables, codex_home)?;
         preflight_restore_rows(&db, tables)?;
     }
 
@@ -1108,6 +1204,16 @@ fn restore_rows(db: &Connection, tables: &Map<String, Value>) -> anyhow::Result<
         };
         for row in rows {
             if let Some(row) = row.as_object() {
+                if table == "local_thread_catalog" {
+                    if has_columns(
+                        db,
+                        "local_thread_catalog_scan_entries",
+                        &["host_id", "thread_id", "removed"],
+                    )? {
+                        db.execute("DELETE FROM local_thread_catalog_scan_entries WHERE host_id=?1 AND thread_id=?2 AND removed=1", [row["host_id"].as_str().unwrap_or_default(), row["thread_id"].as_str().unwrap_or_default()])?;
+                    }
+                    bump_catalog_revision(db)?;
+                }
                 if table == "agent_job_items" && update_existing_agent_job_item(db, row)? {
                     continue;
                 }
@@ -1158,7 +1264,21 @@ fn schema_kind(db: &Connection) -> anyhow::Result<Option<SchemaKind>> {
     if has_table(db, "automation_runs")? && has_columns(db, "automation_runs", &["thread_id"])? {
         return Ok(Some(SchemaKind::CodexAutomationRuns));
     }
+    if has_columns(db, "local_thread_catalog", &["host_id", "thread_id"])? {
+        return Ok(Some(SchemaKind::LocalThreadCatalog));
+    }
     Ok(None)
+}
+
+fn bump_catalog_revision(db: &Connection) -> anyhow::Result<()> {
+    if has_columns(
+        db,
+        "local_thread_catalog_metadata",
+        &["id", "catalog_revision"],
+    )? {
+        db.execute("UPDATE local_thread_catalog_metadata SET catalog_revision=catalog_revision+1 WHERE id=1", [])?;
+    }
+    Ok(())
 }
 
 fn has_table(db: &Connection, table: &str) -> anyhow::Result<bool> {
@@ -1216,6 +1336,7 @@ fn validate_restore_tables(tables: &Map<String, Value>) -> anyhow::Result<()> {
         "inbox_items",
         "__files",
         "__session_index",
+        "local_thread_catalog",
     ];
     for table in tables.keys() {
         if !allowed.contains(&table.as_str()) {
@@ -1279,6 +1400,7 @@ fn restore_row_conflicts(
 
 fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) -> Vec<&'a String> {
     let wanted: &[&str] = match table {
+        "local_thread_catalog" => &["host_id", "thread_id"],
         "sessions" | "threads" => &["id"],
         "messages" => &["id"],
         "automation_runs" | "inbox_items" => &["thread_id"],
@@ -1301,14 +1423,19 @@ fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) ->
     }
 }
 
-fn detect_file_restore_conflicts(tables: &Map<String, Value>) -> anyhow::Result<()> {
+fn detect_file_restore_conflicts(
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> anyhow::Result<()> {
     let Some(files) = tables.get("__files").and_then(Value::as_array) else {
         return Ok(());
     };
     let allowed_paths = allowed_backup_file_paths(tables);
     for file in files {
         if let Some(path) = file.get("path").and_then(Value::as_str) {
-            if !allowed_paths.contains(path) {
+            if !allowed_paths.contains(path)
+                && !is_additional_rollout_backup(file, tables, codex_home)
+            {
                 anyhow::bail!("unexpected backup file path: {path}");
             }
             if Path::new(path).exists() {
@@ -1428,19 +1555,119 @@ fn delete_related_rows(
     Ok(())
 }
 
-fn rollout_file_backups(thread_rows: Option<&Vec<Value>>) -> Vec<Value> {
-    thread_rows
+fn rollout_file_backups(
+    thread_rows: Option<&Vec<Value>>,
+    codex_home: Option<&Path>,
+    thread_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut paths: Vec<PathBuf> = thread_rows
         .into_iter()
         .flatten()
         .filter_map(|row| row.get("rollout_path").and_then(Value::as_str))
-        .filter_map(|path| {
-            let bytes = fs::read(path).ok()?;
-            Some(json!({
-                "path": path,
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = codex_home {
+        for root in [home.join("sessions"), home.join("archived_sessions")] {
+            collect_thread_rollouts(&root, thread_id, &mut paths)?;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let mut backups = Vec::new();
+    for path in paths {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        backups.push(json!({
+                "path": path.to_string_lossy(),
                 "content_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
-            }))
+        }));
+    }
+    Ok(backups)
+}
+
+fn collect_thread_rollouts(
+    root: &Path,
+    thread_id: &str,
+    paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    if fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_thread_rollouts(&entry.path(), thread_id, paths)?;
+        } else if kind.is_file()
+            && entry.path().extension().is_some_and(|ext| ext == "jsonl")
+            && entry.file_name().to_string_lossy().contains(thread_id)
+        {
+            let mut first_line = String::new();
+            BufReader::new(File::open(entry.path())?).read_line(&mut first_line)?;
+            if rollout_meta_thread_id(first_line.as_bytes()).as_deref() == Some(thread_id) {
+                paths.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollout_meta_thread_id(bytes: &[u8]) -> Option<String> {
+    let first = bytes.split(|byte| *byte == b'\n').next()?;
+    let event: Value = serde_json::from_slice(first).ok()?;
+    if event["type"] != "session_meta" {
+        return None;
+    }
+    event["payload"]["id"].as_str().map(ToString::to_string)
+}
+
+fn is_additional_rollout_backup(
+    file: &Value,
+    tables: &Map<String, Value>,
+    codex_home: Option<&Path>,
+) -> bool {
+    let Some(home) = codex_home else {
+        return false;
+    };
+    let Some(path) = file["path"].as_str().map(Path::new) else {
+        return false;
+    };
+    if path.extension().is_none_or(|ext| ext != "jsonl") {
+        return false;
+    }
+    let Some(parent) = path.parent().and_then(|parent| parent.canonicalize().ok()) else {
+        return false;
+    };
+    if ![home.join("sessions"), home.join("archived_sessions")]
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| parent.starts_with(root))
+    {
+        return false;
+    }
+    let Some(encoded) = file["content_b64"].as_str() else {
+        return false;
+    };
+    let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+    else {
+        return false;
+    };
+    let Some(id) = rollout_meta_thread_id(&bytes) else {
+        return false;
+    };
+    tables
+        .get("threads")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["id"].as_str() == Some(id.as_str()))
         })
-        .collect()
 }
 
 fn update_rollout_session_meta_cwd(

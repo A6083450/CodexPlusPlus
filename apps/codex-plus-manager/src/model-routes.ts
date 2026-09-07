@@ -14,6 +14,8 @@ export type RelayModelRouteProfile = {
   officialMixApiKey: boolean;
   noAuth?: boolean;
   modelRoutes?: RelayModelRoute[];
+  model?: string;
+  modelList?: string;
 };
 
 export type RelayModelRouteSettings = {
@@ -80,6 +82,10 @@ export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): b
     || active.protocol === "chatCompletions"
     || (active.relayMode === "pureApi" && active.noAuth === true)
     || (active.relayMode === "official" && active.officialMixApiKey)
+    || (active.protocol === "responses"
+      && (active.relayMode !== "official" || active.officialMixApiKey)
+      && `${active.model ?? ""}\n${active.modelList ?? ""}`.split("\n")
+        .some(model => model.trim().toLowerCase().startsWith("gpt-image-")))
     || normalizeRelayModelRoutes(active.modelRoutes).some(
       (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
     );

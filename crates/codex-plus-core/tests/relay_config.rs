@@ -697,6 +697,38 @@ experimental_bearer_token = "sk-test-redacted"
 }
 
 #[test]
+fn image_generation_profile_routes_through_proxy_and_preserves_upstream() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = RelayProfile {
+        id: "source".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        config_contents: "model = \"gpt-image-2\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://images.example.test/v1\"\n".to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"test-key"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    let settings = BackendSettings {
+        active_relay_id: profile.id.clone(), relay_profiles: vec![profile.clone()],
+        ..BackendSettings::default()
+    };
+    assert!(settings.active_relay_transport_uses_protocol_proxy());
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let config_path = temp.path().join("config.toml");
+    let live = std::fs::read_to_string(&config_path).unwrap();
+    assert!(live.contains("http://127.0.0.1:57321/v1"));
+    let legacy = live.replace("http://127.0.0.1:57321/v1", "https://images.example.test/v1");
+    std::fs::write(&config_path, legacy).unwrap();
+    assert!(codex_plus_core::relay_config::ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let mut common = String::new();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    assert_eq!("https://images.example.test/v1", codex_plus_core::relay_config::relay_profile_base_url(&profile));
+    profile.relay_mode = RelayMode::Official;
+    profile.official_mix_api_key = false;
+    assert!(!profile.image_generation_uses_protocol_proxy());
+}
+
+#[test]
 fn responses_profile_with_model_routes_uses_local_proxy_and_preserves_upstream() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {

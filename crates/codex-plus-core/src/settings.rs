@@ -212,6 +212,14 @@ impl Default for RelayProfile {
 }
 
 impl RelayProfile {
+    pub fn image_generation_uses_protocol_proxy(&self) -> bool {
+        self.protocol == RelayProtocol::Responses
+            && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && self.model_list.lines()
+                .chain(std::iter::once(crate::relay_config::relay_profile_model(self).as_str()))
+                .any(|model| model.trim().to_ascii_lowercase().starts_with("gpt-image-"))
+    }
+
     pub fn uses_no_auth(&self) -> bool {
         self.relay_mode == RelayMode::PureApi && self.no_auth
     }
@@ -798,6 +806,7 @@ impl BackendSettings {
             || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
+            || self.active_relay_profile().image_generation_uses_protocol_proxy()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {

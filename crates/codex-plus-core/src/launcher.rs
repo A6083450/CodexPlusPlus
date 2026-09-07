@@ -1701,14 +1701,16 @@ async fn handle_protocol_proxy_connection(
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+            let mut delivery = crate::image_delivery::ImageDeliveryStream::new(crate::codex_home::default_codex_home_dir());
             let mut bytes_stream = upstream.response.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
+                    stream.write_all(&delivery.push(&bytes)?).await?;
                 } else {
                     break;
                 }
             }
+            stream.write_all(&delivery.finish()).await?;
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
                 method,
@@ -1764,6 +1766,12 @@ async fn handle_protocol_proxy_connection(
     }
     let upstream_body = upstream.response.bytes().await?;
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let mut delivered_body = upstream_body.to_vec();
+        if let Ok(mut response) = serde_json::from_slice::<serde_json::Value>(&upstream_body) {
+            if crate::image_delivery::attach_images(&mut response, &crate::codex_home::default_codex_home_dir())?.is_some() {
+                delivered_body = serde_json::to_vec(&response)?;
+            }
+        }
         write_http_response(
             stream,
             "200 OK",
@@ -1772,7 +1780,7 @@ async fn handle_protocol_proxy_connection(
             } else {
                 &upstream.content_type
             },
-            &upstream_body,
+            &delivered_body,
         )
         .await?;
         log_helper_response(

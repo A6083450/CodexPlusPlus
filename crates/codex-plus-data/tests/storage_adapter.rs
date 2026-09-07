@@ -13,6 +13,116 @@ fn session(id: &str, title: &str) -> SessionRef {
     SessionRef::new(id, title).unwrap()
 }
 
+#[test]
+fn deletion_clears_catalog_only_ghosts_and_undo_restores_only_local_host() {
+    let tmp = tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("sqlite")).unwrap();
+    let catalog = tmp.path().join("sqlite/codex-dev.db");
+    let db = Connection::open(&catalog).unwrap();
+    db.execute_batch("CREATE TABLE local_thread_catalog(host_id TEXT, thread_id TEXT, display_title TEXT, PRIMARY KEY(host_id,thread_id));
+        CREATE TABLE automation_runs(thread_id TEXT);
+        CREATE TABLE inbox_items(thread_id TEXT);
+        CREATE TABLE local_thread_catalog_scan_entries(host_id TEXT, thread_id TEXT, removed INTEGER, PRIMARY KEY(host_id,thread_id));
+        CREATE TABLE local_thread_catalog_metadata(id INTEGER PRIMARY KEY, catalog_revision INTEGER);
+        INSERT INTO local_thread_catalog_metadata VALUES(1,0);
+        INSERT INTO local_thread_catalog VALUES('local','ghost','old'),('remote','ghost','remote'),('local','keep','keep');").unwrap();
+    let backups = BackupStore::new(tmp.path().join("backups"));
+    let result = delete_local_from_paths(
+        [tmp.path().join("state_5.sqlite")],
+        backups.clone(),
+        &session("ghost", "old"),
+        Some(tmp.path()),
+    );
+    assert_eq!(DeleteStatus::LocalDeleted, result.status);
+    assert_eq!(
+        0,
+        db.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id='local' AND thread_id='ghost'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        2,
+        db.query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap()
+    );
+    assert_eq!(1, db.query_row("SELECT removed FROM local_thread_catalog_scan_entries WHERE host_id='local' AND thread_id='ghost'", [], |r| r.get::<_,i64>(0)).unwrap());
+    let restored = SQLiteStorageAdapter::new(&catalog, backups)
+        .with_codex_home(tmp.path())
+        .undo(result.undo_token.as_ref().unwrap());
+    assert_eq!(DeleteStatus::Undone, restored.status);
+    assert_eq!(
+        3,
+        db.query_row("SELECT COUNT(*) FROM local_thread_catalog", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap()
+    );
+    assert_eq!(
+        0,
+        db.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog_scan_entries",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn delete_removes_all_rollout_generations_and_undo_restores_them() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let sessions = home.join("sessions/2026/09/07");
+    let archived = home.join("archived_sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+    let paths = [
+        sessions.join("rollout-t1.jsonl"),
+        sessions.join("rollout-t1_generation2.jsonl"),
+        archived.join("rollout-t1_generation3.jsonl"),
+    ];
+    let content = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t1\"}}\n";
+    for path in &paths {
+        fs::write(path, content).unwrap();
+    }
+    let fork = sessions.join("rollout-t1_independent-fork.jsonl");
+    fs::write(
+        &fork,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other-thread\"}}\n",
+    )
+    .unwrap();
+    let db_path = home.join("state_5.sqlite");
+    create_codex_thread_db(&db_path, &paths[1]);
+    let backups = BackupStore::new(home.join("backups"));
+    let result = delete_local_from_paths(
+        [db_path.clone()],
+        backups.clone(),
+        &session("t1", "Thread"),
+        Some(home),
+    );
+    assert_eq!(DeleteStatus::LocalDeleted, result.status);
+    assert!(paths.iter().all(|path| !path.exists()));
+    assert!(fork.exists());
+    // 重启扫描会从旧 rollout 重建会话，因此删除后不能剩下同 ID 的文件。
+    let reopened = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        0,
+        reopened
+            .query_row("SELECT COUNT(*) FROM threads WHERE id='t1'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap()
+    );
+    let adapter = SQLiteStorageAdapter::new(db_path, backups).with_codex_home(home);
+    let restored = adapter.undo(result.undo_token.as_ref().unwrap());
+    assert_ne!(DeleteStatus::Failed, restored.status);
+    for path in &paths {
+        assert_eq!(content, fs::read_to_string(path).unwrap());
+    }
+}
+
 fn create_supported_db(path: &Path) {
     let db = Connection::open(path).unwrap();
     db.execute(

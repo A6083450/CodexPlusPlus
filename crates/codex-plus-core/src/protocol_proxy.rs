@@ -923,6 +923,8 @@ async fn upstream_request_parts(
     };
     if relay.protocol == RelayProtocol::Responses {
         normalize_responses_custom_tool_call_ids(&mut body);
+        crate::image_delivery::normalize_history_ids(&mut body);
+        normalize_image_generation_tools(&mut body);
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -2074,6 +2076,42 @@ fn upstream_error_parts(
 
 fn truncate_error_preview(input: &str) -> String {
     input.chars().take(ERROR_BODY_PREVIEW_LIMIT).collect()
+}
+
+fn normalize_image_generation_tools(body: &mut Value) {
+    let image_model = body.get("model").and_then(Value::as_str)
+        .is_some_and(|model| model.trim().to_ascii_lowercase().starts_with("gpt-image-"));
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if !tools.iter().any(|tool| tool["type"] == "image_generation") {
+        if !image_model {
+            return;
+        }
+        tools.push(json!({"type": "image_generation"}));
+    }
+    // 原生生图工具占用 image_gen.imagegen；只清理同名声明，保留其他工具。
+    for tool in tools.iter_mut() {
+        if tool["type"] == "namespace" && tool["name"] == "image_gen" {
+            if let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                children
+                    .retain(|child| !(child["type"] == "function" && child["name"] == "imagegen"));
+            }
+        }
+    }
+    tools.retain(|tool| {
+        !(tool["type"] == "function" && tool["name"] == "image_gen.imagegen")
+            && !(tool["type"] == "namespace"
+                && tool["name"] == "image_gen"
+                && tool["tools"].as_array().is_some_and(Vec::is_empty))
+    });
+    if body["tool_choice"]["type"] == "function"
+        && (body["tool_choice"]["name"] == "image_gen.imagegen"
+            || (body["tool_choice"]["namespace"] == "image_gen"
+                && body["tool_choice"]["name"] == "imagegen"))
+    {
+        body["tool_choice"] = json!({"type": "image_generation"});
+    }
 }
 
 fn normalize_responses_custom_tool_call_ids(body: &mut Value) {

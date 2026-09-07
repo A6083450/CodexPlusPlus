@@ -6080,6 +6080,8 @@
     return { session_id: locationThreadId(), title: "" };
   }
 
+  window.__codexPlusCurrentSessionRef = currentSessionRef;
+
   function readThreadScrollEntries() {
     if (window.__codexThreadScrollEntries && typeof window.__codexThreadScrollEntries === "object") {
       return { ...window.__codexThreadScrollEntries };
@@ -6749,6 +6751,8 @@
       throw error;
     }
   }
+
+  window.__codexPlusPostJson = postJson;
 
   function downloadMarkdownFallback(filename, markdown) {
     if (!filename || typeof markdown !== "string") {
@@ -7472,17 +7476,21 @@
   }
 
   function patchCodexContextUsageManager(manager) {
-    if (manager.requestClient?.hostId !== "local" || typeof manager.resumeConversation !== "function"
-        || manager.__codexPlusContextUsagePatch === codexAppServerModelRequestPatchVersion) return;
-    const resume = manager.__codexPlusOriginalResumeConversation || manager.resumeConversation;
-    manager.__codexPlusOriginalResumeConversation = resume;
-    manager.resumeConversation = async function (...args) {
-      const result = await resume.apply(this, args);
-      const threadId = typeof args[0] === "string" ? args[0] : args[0]?.conversationId;
-      if (threadId) restoreCodexContextWindowUsage(this, threadId);
-      return result;
-    };
-    manager.__codexPlusContextUsagePatch = codexAppServerModelRequestPatchVersion;
+    if (manager.requestClient?.hostId !== "local") return;
+    // 修复旧注入留下的实例方法，RpcTarget 只允许通过原型公开的方法。
+    if (manager.__codexPlusOriginalResumeConversation
+        && Object.hasOwn(manager, "resumeConversation")
+        && typeof Object.getPrototypeOf(manager)?.resumeConversation === "function") {
+      delete manager.resumeConversation;
+    }
+    const revision = `${codexAppServerModelRequestPatchVersion}:observer`;
+    if (manager.__codexPlusContextUsagePatch === revision) return;
+    manager.__codexPlusContextUsageObserver?.();
+    manager.__codexPlusContextUsageObserver = manager.addAnyConversationCallback?.((id) => {
+      const threadId = typeof id === "string" ? id : currentSessionRef().session_id;
+      if (threadId) restoreCodexContextWindowUsage(manager, threadId);
+    });
+    manager.__codexPlusContextUsagePatch = revision;
     bootstrapCodexContextWindowUsage(manager);
   }
 
@@ -9880,6 +9888,7 @@
       const result = await postJson("/delete", ref);
       if (result.status === "server_deleted" || result.status === "local_deleted") {
         removeDeletedRow(row, button, ref);
+        if (!await refreshRecentConversationsForHost()) window.location.reload();
         showToast(result.message || "删除成功", result.undo_token);
       } else {
         showToast(result.message || "删除失败", null);
@@ -11113,7 +11122,13 @@
     return [...new Set([
       ...document.querySelectorAll(`[data-model-picker-model-row]`),
       ...document.querySelectorAll(codexServiceTierSemanticModelMenuRowSelector()),
-    ])];
+    ])].filter((node) => !codexServiceTierImageModelRow(node));
+  }
+
+  function codexServiceTierImageModelRow(node) {
+    const labels = [node.textContent, node.getAttribute?.("aria-label"),
+      node.getAttribute?.("data-model-picker-model-row")];
+    return labels.some((label) => /\b(?:gpt[-\s]?)?image[-\s]?\d\b/i.test(label || ""));
   }
 
   function codexServiceTierNativeSpeedRow(container, rows, strings) {
@@ -11145,7 +11160,7 @@
     const parentMenu = modelRow?.closest?.(`[role="menu"]`);
     const container = modelRow?.parentElement;
     if (!modelRow || !parentMenu || !container) {
-      closeCodexServiceTierMenu();
+      removeCodexServiceTierMenu();
       return;
     }
     const strings = codexServiceTierMenuStrings();
@@ -11169,7 +11184,8 @@
     if (!trigger) {
       trigger = modelRow.cloneNode(false);
       for (const attribute of Array.from(trigger.attributes)) {
-        if (attribute.name === "id" || attribute.name.startsWith("data-radix-")) {
+        if (attribute.name === "id" || attribute.name.startsWith("data-radix-")
+          || attribute.name.startsWith("data-model-picker-")) {
           trigger.removeAttribute(attribute.name);
         }
       }

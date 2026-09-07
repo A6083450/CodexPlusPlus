@@ -1961,6 +1961,48 @@ async fn model_route_can_rewrite_only_the_target_model_name() {
 }
 
 #[tokio::test]
+async fn responses_proxy_resolves_image_tool_collision_only_with_hosted_tool() {
+    for (hosted, model) in [(false, "gpt-6"), (true, "gpt-6"), (false, "gpt-image-2")] {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let target_server = tokio::spawn(capture_json_request_once(target));
+        let unrelated = json!({"type": "function", "name": "inspect_image"});
+        let mut tools = vec![
+            json!({"type": "function", "name": "image_gen.imagegen"}),
+            json!({"type": "namespace", "name": "image_gen", "tools": [
+                {"type": "function", "name": "imagegen"}, unrelated.clone()
+            ]}),
+            unrelated.clone(),
+        ];
+        if hosted {
+            tools.push(json!({"type": "image_generation"}));
+        }
+        let request = json!({"model": model, "input": "draw", "tools": tools,
+            "tool_choice": {"type": "function", "name": "image_gen.imagegen"}});
+        let settings = model_route_settings(model, "", format!("http://{target_addr}/v1"));
+        let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+            .await
+            .unwrap();
+        assert_eq!(200, result.status_code);
+        let (_, actual) = target_server.await.unwrap();
+        if hosted || model == "gpt-image-2" {
+            assert_eq!(
+                json!([
+                    {"type": "namespace", "name": "image_gen", "tools": [unrelated.clone()]},
+                    unrelated, {"type": "image_generation"}
+                ]),
+                actual["tools"]
+            );
+            assert_eq!(json!({"type": "image_generation"}), actual["tool_choice"]);
+        } else {
+            assert_eq!(request, actual);
+        }
+    }
+}
+
+#[tokio::test]
 async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1981,7 +2023,9 @@ async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
                 "type": "message",
                 "role": "user",
                 "content": "continue"
-            }
+            },
+            {"type":"message","role":"assistant","id":format!("msg_cpp_images_{}", "a".repeat(64)),"content":[{"type":"output_text","text":"![image](</tmp/image.png>)"}]},
+            {"type":"message","role":"assistant","id":"msg_original","content":[]}
         ],
         "stream": false
     });
@@ -1996,6 +2040,9 @@ async fn responses_proxy_normalizes_legacy_custom_tool_item_ids_only() {
     assert_eq!(upstream_body["input"][0]["id"], "ctc_legacy_custom_item");
     assert_eq!(upstream_body["input"][0]["call_id"], "call_legacy_custom");
     assert_eq!(upstream_body["input"][1]["type"], "message");
+    assert_eq!(format!("msg_cpp_images_{}", "a".repeat(32)), upstream_body["input"][2]["id"]);
+    assert_eq!(request["input"][2]["content"], upstream_body["input"][2]["content"]);
+    assert_eq!("msg_original", upstream_body["input"][3]["id"]);
 }
 
 #[tokio::test]
