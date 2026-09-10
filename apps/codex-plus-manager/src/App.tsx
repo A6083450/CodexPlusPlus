@@ -110,8 +110,10 @@ import {
   type ModelWindowRowsValidationIssue,
   type ModelWindowRow,
 } from "./model-windows";
+import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { resolveProviderSyncCompletion } from "./provider-sync-flow";
+import { isProviderSyncTargetSelectable, preferredProviderSyncTarget } from "./provider-sync-target";
 import { resolveLaunchStatus } from "./launch-status";
 import {
   defaultDreamSkinTheme,
@@ -356,9 +358,15 @@ type RelayAggregateMember = {
   profileId: string;
   weight: number;
 };
+type RelayAggregateRoute = {
+  pattern: string;
+  profileId: string;
+  priority: number;
+};
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
   members: RelayAggregateMember[];
+  routes?: RelayAggregateRoute[];
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -370,6 +378,7 @@ type AggregateRelayProfile = {
   sessionProvider?: RelaySessionProvider;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
+  routes?: { pattern: string; relayId: string; priority: number }[];
 };
 
 type RelayContextSelection = {
@@ -725,6 +734,8 @@ type ProviderSyncTargetOption = {
   isCurrentProvider: boolean;
   isManual: boolean;
   isSaved: boolean;
+  isResolvable: boolean;
+  unavailableReason: string | null;
 };
 
 type ProviderSyncTargetsPayload = {
@@ -885,7 +896,8 @@ const providerSyncSourceLabels: Record<ProviderSyncTargetSource, string> = {
 function providerSyncTargetLabel(target: ProviderSyncTargetOption): string {
   const labels = target.sources.map((source) => providerSyncSourceLabels[source]).filter(Boolean);
   const current = target.isCurrentProvider ? [t("当前")] : [];
-  return [...labels, ...current].join(" / ") || t("发现");
+  const unavailable = isProviderSyncTargetSelectable(target) ? [] : [t("供应商切换不可用")];
+  return [...labels, ...current, ...unavailable].join(" / ") || t("发现");
 }
 
 function syncMarketInstalledState(current: ScriptMarketResult | null, userScripts: UserScriptInventory): ScriptMarketResult | null {
@@ -2550,12 +2562,8 @@ export function App() {
       setProviderSyncTargets(result);
       const targets = result.targets ?? [];
       const saved = settingsForm.providerSyncLastSelectedProvider;
-      const preferred =
-        targets.find((target) => target.id === saved)?.id ||
-        targets.find((target) => target.isCurrentProvider)?.id ||
-        targets[0]?.id ||
-        "openai";
-      setSelectedProviderSyncTarget((current) => (targets.some((target) => target.id === current) ? current : preferred));
+      const preferred = preferredProviderSyncTarget(targets, result.currentProvider, saved);
+      setSelectedProviderSyncTarget(preferred);
       if (!silent && !isSuccessStatus(result.status)) showNotice(t("Provider 同步目标"), result.message, result.status);
     }
     return result;
@@ -3333,7 +3341,6 @@ export function App() {
       refreshProviderSyncTargets,
       setProviderSyncTarget: (provider: string) => {
         setSelectedProviderSyncTarget(provider);
-        setSettingsForm((current) => ({ ...current, providerSyncLastSelectedProvider: provider }));
       },
       setLaunchMode: async (launchMode: LaunchMode) => {
         await saveLaunchMode(launchMode);
@@ -6418,6 +6425,13 @@ function SessionsScreen({
   const selectedSessions = useMemo(() => items.filter((session) => selectedSessionIds.has(session.id)), [items, selectedSessionIds]);
   const selectedCount = selectedSessions.length;
   const allSelected = items.length > 0 && selectedCount === items.length;
+  const providerTargets = providerSyncTargets?.targets ?? [];
+  const selectedProviderTarget = providerTargets.find(
+    (target) => target.id === selectedProviderSyncTarget,
+  );
+  const canRepairProviderSessions = selectedProviderTarget
+    ? isProviderSyncTargetSelectable(selectedProviderTarget)
+    : false;
 
   useEffect(() => {
     const itemIds = new Set(items.map((session) => session.id));
@@ -6490,15 +6504,22 @@ function SessionsScreen({
           <div className="session-repair-tools">
             <Field className="session-sync-target" label={t("同步目标")}>
               <AppSelect
-                disabled={providerSyncProgress.active || !(providerSyncTargets?.targets ?? []).length}
+                disabled={providerSyncProgress.active || !providerTargets.length}
                 value={selectedProviderSyncTarget}
                 onChange={(value) => actions.setProviderSyncTarget(value)}
                 options={
-                  (providerSyncTargets?.targets ?? []).length
-                    ? (providerSyncTargets?.targets ?? []).map((target) => ({
-                        value: target.id,
-                        label: `${target.id}${t("（")}${providerSyncTargetLabel(target)}${t("）")}`,
-                      }))
+                  providerTargets.length
+                    ? [
+                        ...(!selectedProviderSyncTarget
+                          ? [{ value: "", label: t("当前配置 provider"), disabled: true }]
+                          : []),
+                        ...providerTargets.map((target) => ({
+                          value: target.id,
+                          label: `${target.id}${t("（")}${providerSyncTargetLabel(target)}${t("）")}`,
+                          disabled: !isProviderSyncTargetSelectable(target),
+                          title: target.unavailableReason ?? undefined,
+                        })),
+                      ]
                     : [{ value: "", label: t("当前配置 provider"), disabled: true }]
                 }
               />
@@ -6526,7 +6547,11 @@ function SessionsScreen({
                 <PackageOpen className="h-4 w-4" />
                 {t("导入文件")}
               </Button>
-              <Button disabled={providerSyncProgress.active} onClick={() => void actions.syncProvidersNow()} variant="outline">
+              <Button
+                disabled={providerSyncProgress.active || !canRepairProviderSessions}
+                onClick={() => void actions.syncProvidersNow()}
+                variant="outline"
+              >
                 <Wrench className="h-4 w-4" />
                 {providerSyncProgress.active ? t("正在修复…") : t("修复历史会话")}
               </Button>
@@ -8661,6 +8686,28 @@ function AggregateRelayProfileEditor({
     });
   };
   const totalWeight = aggregate.members.reduce((total, member) => total + clampAggregateWeight(member.weight), 0);
+  const routes = aggregate.routes ?? [];
+  const routeTargetOptions = aggregate.members
+    .map((member) => {
+      const candidate = candidates.find((item) => item.id === member.profileId);
+      return { value: member.profileId, label: candidate?.name || t("未命名供应商") };
+    })
+    .filter((option) => option.value.trim() !== "");
+  const updateRoute = (index: number, patch: Partial<RelayAggregateRoute>) => {
+    updateAggregate({
+      ...aggregate,
+      routes: routes.map((route, routeIndex) => (routeIndex === index ? { ...route, ...patch } : route)),
+    });
+  };
+  const removeRoute = (index: number) => {
+    updateAggregate({ ...aggregate, routes: routes.filter((_, routeIndex) => routeIndex !== index) });
+  };
+  const addRoute = () => {
+    updateAggregate({
+      ...aggregate,
+      routes: [...routes, { pattern: "", profileId: aggregate.members[0]?.profileId ?? "", priority: 0 }],
+    });
+  };
 
   return (
     <div className="relay-profile-editor aggregate-editor">
@@ -8755,11 +8802,68 @@ function AggregateRelayProfileEditor({
           <div className="empty">{t("先添加至少 1 个已填写 Base URL / Key 的 API 供应商，再创建聚合供应商。")}</div>
         )}
       </div>
+      <div className="aggregate-routes">
+        <div className="aggregate-routes-head">
+          <div>
+            <strong>{t("路由规则")}</strong>
+            <span>{t("按模型名自动路由到指定成员；仅支持 * 通配符，chat/completions 协议不走路由。")}</span>
+          </div>
+          <UiBadge variant="outline">{routes.length}</UiBadge>
+        </div>
+        {routes.length ? (
+          <div className="aggregate-route-list">
+            {routes.map((route, index) => (
+              <div className="aggregate-route-row" key={index}>
+                <Input
+                  onChange={(event) => updateRoute(index, { pattern: event.currentTarget.value })}
+                  placeholder={t("例如 deepseek-*")}
+                  value={route.pattern}
+                />
+                <AppSelect
+                  onChange={(value) => updateRoute(index, { profileId: value })}
+                  options={routeTargetOptions}
+                  value={route.profileId}
+                />
+                {!routeTargetOptions.some((option) => option.value === route.profileId) ? (
+                  <span className="aggregate-route-target-error">{t("路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。")}</span>
+                ) : null}
+                <div className="aggregate-route-priority">
+                  <span>{t("优先级")}</span>
+                  <Input
+                    min={0}
+                    onChange={(event) =>
+                      updateRoute(index, { priority: clampAggregateRoutePriority(Number.parseInt(event.currentTarget.value, 10)) })
+                    }
+                    type="number"
+                    value={String(route.priority)}
+                  />
+                </div>
+                <button
+                  className="aggregate-route-remove"
+                  onClick={() => removeRoute(index)}
+                  title={t("删除规则")}
+                  type="button"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">{t("暂无路由规则，未匹配的模型会按聚合策略选择成员。")}</div>
+        )}
+        <div>
+          <Button disabled={!aggregate.members.length} onClick={addRoute} size="sm" variant="secondary">
+            <Plus className="h-4 w-4" />
+            {t("添加规则")}
+          </Button>
+        </div>
+      </div>
       <div className="relay-grid compact aggregate-preview">
         <Metric label={t("策略")} value={aggregateStrategyLabel(aggregate.strategy)} />
         <Metric label={t("成员数量")} value={tf("{0} 个", [aggregate.members.length])} />
         <Metric label={t("总权重")} value={`${totalWeight}`} />
-        <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members" />
+        <Metric label={t("序列化字段")} value="aggregate.strategy / aggregate.members / aggregate.routes" />
       </div>
       <div className="hint-line relay-protocol-hint">
         <ShieldCheck className="h-4 w-4" />
@@ -10717,6 +10821,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
         profileId: member.relayId,
         weight: clampAggregateWeight(member.weight),
       })),
+      routes: normalizeAggregateRoutes(aggregate.routes ?? []),
     },
   };
 }
@@ -11434,6 +11539,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
   const candidates = profiles.filter((profile) => !isAggregateRelayProfile(profile));
   return profiles.filter(isAggregateRelayProfile).map((profile) => {
     const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+    const memberIds = new Set(aggregate.members.map((member) => member.profileId));
     return {
       id: profile.id,
       name: profile.name || t("聚合供应商"),
@@ -11442,6 +11548,11 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
       members: aggregate.members.map((member) => ({
         relayId: member.profileId,
         weight: clampAggregateWeight(member.weight),
+      })),
+      routes: normalizeAggregateRoutes(aggregate.routes ?? [], { dropEmptyPattern: true, memberIds }).map((route) => ({
+        pattern: route.pattern,
+        relayId: route.profileId,
+        priority: route.priority,
       })),
     };
   });
@@ -11607,6 +11718,7 @@ function removeRelayProfile(settings: BackendSettings, id: string): BackendSetti
             aggregate: {
               ...normalizeAggregateConfig(profile.aggregate, []),
               members: normalizeAggregateConfig(profile.aggregate, []).members.filter((member) => member.profileId !== id),
+              routes: normalizeAggregateConfig(profile.aggregate, []).routes ?? [],
             },
           },
           { ...settings, relayProfiles: profiles },
@@ -11688,7 +11800,14 @@ function normalizeAggregateConfig(
       seen.add(member.profileId);
       return { profileId: member.profileId, weight: clampAggregateWeight(member.weight) };
     });
-  return { strategy, members };
+  const routes = (aggregate?.routes ?? [])
+    .filter((route) => route.pattern.trim() !== "" || route.profileId.trim() !== "")
+    .map((route) => ({
+      pattern: route.pattern.trim(),
+      profileId: route.profileId,
+      priority: clampAggregateRoutePriority(route.priority),
+    }));
+  return { strategy, members, routes };
 }
 
 function aggregateMemberCandidates(settings: BackendSettings, aggregateId: string): RelayProfile[] {
@@ -11719,7 +11838,22 @@ function aggregateStrategyHelp(strategy: RelayAggregateStrategy): string {
 
 function aggregateRelayProfileValidation(profile: RelayProfile): string | null {
   const aggregate = normalizeAggregateConfig(profile.aggregate, []);
-  return aggregate.members.length >= 1 ? null : t("聚合供应商至少需要勾选 1 个已填写 Base URL / Key 的 API 供应商。");
+  if (aggregate.members.length < 1) {
+    return t("聚合供应商至少需要勾选 1 个已填写 Base URL / Key 的 API 供应商。");
+  }
+  const issues = validateAggregateRoutes(
+    aggregate.routes ?? [],
+    new Set(aggregate.members.map((member) => member.profileId)),
+  );
+  if (!issues) return null;
+  const first = issues[0];
+  if (first.code === "emptyPattern") {
+    return t("路由规则的模型匹配模式不能为空。");
+  }
+  if (first.code === "invalidPriority") {
+    return tf("路由规则「{0}」的优先级必须是大于等于 0 的整数。", [first.pattern]);
+  }
+  return tf("路由规则「{0}」的目标供应商必须是聚合成员，请先将其勾选为成员。", [first.pattern]);
 }
 
 function numberOrDefault(value: string, fallback: number) {

@@ -987,8 +987,33 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
 
     assert!(result.configured);
     assert!(updated.contains(r#"wire_api = "responses""#));
+    assert!(updated.contains("requires_openai_auth = false"));
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+}
+
+#[test]
+fn relay_config_status_treats_aggregate_provider_as_configured_without_openai_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = false
+base_url = "http://127.0.0.1:57321/v1"
+experimental_bearer_token = "codex-plus-aggregate"
+"#,
+    )
+    .unwrap();
+
+    let status = relay_config_status_from_home(temp.path());
+
+    assert!(status.configured);
+    assert!(!status.requires_openai_auth);
+    assert!(status.has_bearer_token);
 }
 
 #[test]
@@ -4298,6 +4323,49 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
+fn apply_relay_profile_generates_astra_catalog_without_suffix() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = RelayProfile {
+        id: "relay-astra".to_string(),
+        model: "gpt-6-astra".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "gpt-6-astra"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://relay.example/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(r#"model_catalog_json = "model-catalogs/relay-astra.json""#));
+    let catalog: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(temp.path().join("model-catalogs/relay-astra.json")).unwrap(),
+    )
+    .unwrap();
+    let astra = &catalog["models"][0];
+    assert_eq!(astra["slug"], "gpt-6-astra");
+    assert_eq!(astra["context_window"], 272_000);
+    assert_eq!(astra["use_responses_lite"], false);
+    assert_eq!(astra["additional_speed_tiers"], serde_json::json!(["fast"]));
+    assert_eq!(astra["service_tiers"][0]["id"], "priority");
+    let efforts: Vec<_> = astra["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|level| level["effort"].as_str().unwrap())
+        .collect();
+    assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max", "ultra"]);
+}
+
+#[test]
 fn apply_deepseek_responses_official_mix_writes_official_tool_compatibility() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
@@ -5042,6 +5110,57 @@ experimental_bearer_token = "sk-new"
         std::fs::read_to_string(temp.path().join("model-catalogs").join("relay-a.json")).unwrap();
     assert!(catalog.contains(r#""context_window": 1000000"#));
     assert!(!catalog.contains(r#""context_window": 200000"#));
+}
+
+#[test]
+fn apply_relay_profile_replaces_catalog_generated_for_another_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("model-catalogs")).unwrap();
+    std::fs::write(
+        temp.path().join("model-catalogs/relay-a6.json"),
+        r#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-5.6-luna"},{"slug":"gpt-image-2"}]}"#,
+    )
+    .unwrap();
+
+    let profile = RelayProfile {
+        id: "relay-fusheng".to_string(),
+        name: "Fusheng".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "gpt-5.6-sol"
+model_provider = "custom"
+model_catalog_json = "model-catalogs/relay-a6.json"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_list: "gpt-5.6-sol\ngpt-5.6-terra\ngpt-6-astra".to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains(
+        r#"model_catalog_json = "model-catalogs/relay-fusheng.json""#
+    ));
+    assert!(!config.contains("model-catalogs/relay-a6.json"));
+
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs/relay-fusheng.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""slug": "gpt-5.6-sol""#));
+    assert!(catalog.contains(r#""slug": "gpt-5.6-terra""#));
+    assert!(catalog.contains(r#""slug": "gpt-6-astra""#));
+    assert!(!catalog.contains("gpt-5.6-luna"));
+    assert!(!catalog.contains("gpt-image-2"));
 }
 
 #[test]

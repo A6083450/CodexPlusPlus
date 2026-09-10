@@ -166,12 +166,21 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /codexPlusSidebarNavId\s*=\s*"codex-plus-sidebar-nav"/);
     assert.match(renderer, /function installCodexPlusSidebarNavigation\(\)/);
     assert.match(renderer, /aside\.app-shell-left-panel nav\[role="navigation"\]/);
-    assert.match(renderer, /function openCodexPlusPage\(\)/);
+    assert.match(renderer, /const insertionButton = pluginButton \|\| navButtons\.find/);
+    assert.match(renderer, /selectors\.pluginNavButton/);
+    assert.match(renderer, /button\.querySelector\(selectors\.pluginSvgPath\)/);
+    assert.match(renderer, /\^\(插件\|Plugins\)\$/);
     assert.match(renderer, /openCodexPlusPage\(\)/);
     assert.match(renderer, /codex-plus-page-overlay/);
     assert.match(renderer, /positionCodexPlusPage/);
+    assert.match(renderer, /overlay\.remove\(\);\s*if \(pageMode\) setCodexPlusSidebarNavActive\(false\);/);
     assert.match(renderer, /function closeCodexPlusPage\(\)/);
+    assert.match(renderer, /function installCodexPlusPageNavigationCloseHandler\(\)/);
+    assert.match(renderer, /target\?\.closest\(selectors\.sidebarThread\)/);
+    assert.match(renderer, /closeCodexPlusPageAfterNativeNavigation\(\)/);
+    assert.match(renderer, /setTimeout\(\(\) => \{\s*window\.__codexPlusPageNavigationCloseTimer = null;\s*closeCodexPlusPage\(\);/);
     assert.match(renderer, /installCodexPlusSidebarNavigation\(\);/);
+    assert.match(renderer, /document\.querySelectorAll\(`#\$\{codexPlusMenuId\}/);
   });
 
   it("纯 API 会话使用当前真实 provider，不强行改成 custom", async () => {
@@ -327,16 +336,21 @@ describe("renderer injection header compatibility", () => {
   });
 
   it("keeps Windows Dream Skin compatible with the modern Codex main surface", async () => {
-    const windowsRenderers = await Promise.all([
-      readFile(new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url), "utf8"),
-      readFile(new URL("../../../assets/inject/upstream/cidala-tiger/windows/renderer-inject.js", import.meta.url), "utf8"),
-    ]);
+    const dreamSkinRenderer = await readFile(
+      new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const cidalaRenderer = await readFile(
+      new URL("../../../assets/inject/upstream/cidala-tiger/windows/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
 
-    for (const renderer of windowsRenderers) {
-      assert.match(renderer, /MainContentSurface/);
-      assert.match(renderer, /data-codex-plus-dream-surface/);
-      assert.match(renderer, /ensureShellMain/);
-    }
+    assert.match(dreamSkinRenderer, /codex-dream-skin-selectors\/1/);
+    assert.match(dreamSkinRenderer, /MainContentSurface/);
+    assert.match(dreamSkinRenderer, /data-ds-part/);
+    assert.match(cidalaRenderer, /MainContentSurface/);
+    assert.match(cidalaRenderer, /data-codex-plus-dream-surface/);
+    assert.match(cidalaRenderer, /ensureShellMain/);
   });
 });
 

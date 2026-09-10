@@ -194,12 +194,18 @@ const DEEPSEEK_METADATA_JSON: &str = include_str!(concat!(
     "/../../assets/deepseek-model-metadata.json"
 ));
 
+const ASTRA_METADATA_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/astra-model-metadata-compat.json"
+));
+
 pub fn requires_bundled_metadata_catalog(slug: &str) -> bool {
-    gpt56_metadata_entry(slug).is_some()
+    compatibility_metadata_entry(slug).is_some()
 }
 
 pub fn model_ui_metadata(slug: &str) -> Option<Value> {
-    let metadata = runtime_model_metadata_entry(slug)?;
+    let metadata = compatibility_metadata_entry(slug)
+        .or_else(|| runtime_model_metadata_entry(slug))?;
     let levels = metadata
         .get("supported_reasoning_levels")?
         .as_array()?
@@ -358,7 +364,7 @@ fn model_template_entry(slug: &str) -> (Value, bool) {
     if let Some(entry) = bundled_template_entry(slug) {
         return (entry, true);
     }
-    if let Some(compatibility) = gpt56_metadata_entry(slug) {
+    if let Some(compatibility) = compatibility_metadata_entry(slug) {
         let mut template = first_bundled_template_entry().unwrap_or_else(|| json!({}));
         if let (Some(target), Some(source)) = (template.as_object_mut(), compatibility.as_object())
         {
@@ -389,12 +395,14 @@ fn first_bundled_template_entry() -> Option<Value> {
     catalog.get("models")?.as_array()?.first().cloned()
 }
 
-fn gpt56_metadata_entry(slug: &str) -> Option<Value> {
+fn compatibility_metadata_entry(slug: &str) -> Option<Value> {
     catalog_metadata_entry(GPT56_METADATA_JSON, slug)
+        .or_else(|| catalog_metadata_entry(ASTRA_METADATA_JSON, slug))
 }
 
 pub(crate) fn runtime_model_metadata_entry(slug: &str) -> Option<Value> {
-    gpt56_metadata_entry(slug).or_else(|| catalog_metadata_entry(GPT6_METADATA_JSON, slug))
+    catalog_metadata_entry(GPT6_METADATA_JSON, slug)
+        .or_else(|| compatibility_metadata_entry(slug))
 }
 
 fn catalog_metadata_entry(catalog_json: &str, slug: &str) -> Option<Value> {
