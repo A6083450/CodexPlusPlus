@@ -1,8 +1,28 @@
-(() => {
+(function installCodexPlusRenderer() {
   // The launcher targets the Codex app page, but keep a renderer-side guard
   // so this bundle cannot create UI in embedded browser documents.
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
+  // CDP 和 document.complete 都可能早于原生入口的异步模块初始化。
+  // 等 React 接管页面后再扫描模块和修改 DOM，避免冷启动时抢跑。
+  const nativePageMounted = () => {
+    const root = document.getElementById("root");
+    return !!document.body && !!root
+      && Object.getOwnPropertyNames(root).some((key) => key.startsWith("__reactContainer$"));
+  };
+  if (!codexPlusIsNodeTestHarness && !nativePageMounted()) {
+    if (window.__codexPlusRendererStartupTimer) return;
+    const startedAt = Date.now();
+    window.__codexPlusRendererStartupTimer = window.setInterval(() => {
+      const mounted = nativePageMounted();
+      if (!mounted && Date.now() - startedAt < 30000) return;
+      window.clearInterval(window.__codexPlusRendererStartupTimer);
+      delete window.__codexPlusRendererStartupTimer;
+      if (mounted) installCodexPlusRenderer();
+      else console.warn("[Codex++] Native page did not mount; renderer enhancements skipped.");
+    }, 50);
+    return;
+  }
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
   function installCodexPlusFastStartup() {
