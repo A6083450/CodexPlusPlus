@@ -3542,6 +3542,44 @@ fn injection_script_places_service_tier_control_in_native_model_menu() {
 }
 
 #[test]
+fn desktop_image_feature_defaults_respect_direct_image_profile() {
+    let script = assets::injection_script(57321);
+    let start = script.find("  function patchCodexImageGenerationManager(");
+    assert!(start.is_some(), "desktop feature defaults must respect the direct image profile");
+    let start = start.unwrap();
+    let end = script[start..].find("  function patchCodexContextUsageManager(").unwrap() + start;
+    let harness = format!(r#"
+const assert = require('node:assert/strict');
+let profile = {{ relayMode: 'pureApi', protocol: 'responses', imageGenerationProxy: false,
+  modelList: 'gpt-6\ngpt-image-2.5-flare' }};
+const codexRemoteSessionActiveProfile = () => profile;
+const defaults = {{ image_generation: true, other_feature: true }};
+const manager = {{ requestClient: {{ hostId: 'local' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
+{}
+patchCodexImageGenerationManager(manager);
+const reader = manager.settings.readDefaultFeatureOverrides;
+patchCodexImageGenerationManager(manager);
+assert.equal(manager.settings.readDefaultFeatureOverrides, reader);
+assert.deepEqual(reader(), {{ image_generation: false, other_feature: true }});
+assert.equal(defaults.image_generation, true);
+profile.imageGenerationProxy = true;
+assert.equal(reader(), defaults);
+profile.imageGenerationProxy = false;
+profile.relayMode = 'official';
+assert.equal(reader(), defaults);
+profile.relayMode = 'pureApi';
+profile.modelList = 'gpt-6';
+assert.equal(reader(), defaults);
+const remote = {{ requestClient: {{ hostId: 'remote' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
+profile.modelList = 'gpt-image-2';
+patchCodexImageGenerationManager(remote);
+assert.equal(remote.settings.readDefaultFeatureOverrides(), defaults);
+"#, &script[start..end]);
+    let output = std::process::Command::new("node").args(["-e", &harness]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn injection_script_excludes_chat_reasoning_only_speed_menu() {
     let script = assets::injection_script(57321);
     let start = script

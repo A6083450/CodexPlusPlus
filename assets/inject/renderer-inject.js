@@ -7550,6 +7550,25 @@
     return true;
   }
 
+  function patchCodexImageGenerationManager(manager) {
+    if (manager.requestClient?.hostId !== "local") return;
+    const settings = manager.settings;
+    if (typeof settings?.readDefaultFeatureOverrides !== "function"
+        || settings.__codexPlusImageGenerationDefaults) return;
+    const original = settings.readDefaultFeatureOverrides.bind(settings);
+    settings.readDefaultFeatureOverrides = (...args) => {
+      const defaults = original(...args);
+      const profile = codexRemoteSessionActiveProfile();
+      const directImages = profile?.imageGenerationProxy === false && profile.protocol === "responses"
+        && (profile.relayMode !== "official" || profile.officialMixApiKey)
+        && `${profile.model || ""}\n${profile.modelList || ""}`.split("\n")
+          .some((model) => model.trim().toLowerCase().startsWith("gpt-image-"));
+      // 桌面实验开关会覆盖 config.toml；新建和恢复会话共用此配置入口。
+      return directImages ? { ...defaults, image_generation: false } : defaults;
+    };
+    settings.__codexPlusImageGenerationDefaults = true;
+  }
+
   function patchCodexContextUsageManager(manager) {
     if (manager.requestClient?.hostId !== "local") return;
     // 修复旧注入留下的实例方法，RpcTarget 只允许通过原型公开的方法。
@@ -7788,7 +7807,10 @@
     if (codexPlusModelUnlockEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
       installAppServerModelRequestPatch();
-      collectCodexReactRuntimeCandidates().conversationManagers.forEach(patchCodexContextUsageManager);
+      collectCodexReactRuntimeCandidates().conversationManagers.forEach((manager) => {
+        patchCodexImageGenerationManager(manager);
+        patchCodexContextUsageManager(manager);
+      });
     }
     void installDictationSupportPatch();
     if (!codexPlusModelUnlockEnabled()) return;
