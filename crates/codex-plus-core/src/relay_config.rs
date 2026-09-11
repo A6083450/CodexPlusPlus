@@ -511,7 +511,7 @@ pub fn apply_relay_profile_files_to_home_with_context(
         let config_with_catalog =
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
-            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+            apply_relay_responses_compatibility(profile, &config_with_catalog)?;
         apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
     })
 }
@@ -539,7 +539,7 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
         let config_with_catalog =
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
-            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+            apply_relay_responses_compatibility(profile, &config_with_catalog)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
             apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
@@ -571,7 +571,7 @@ pub fn apply_relay_profile_config_to_home_with_context(
         let config_with_catalog =
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
-            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+            apply_relay_responses_compatibility(profile, &config_with_catalog)?;
         apply_relay_config_file_to_home(home, &compatible_config)
     })
 }
@@ -1732,6 +1732,16 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     }
     remove_unsupported_approval_policies(&mut target_doc);
     preserve_live_hook_state(&mut target_doc, &live_doc);
+    // Computer Use is machine-local: stale provider snapshots must not replace its runtime or proxy.
+    for server in ["cua_repl", "cua_repl_proxy"] {
+        if let Some(config) = live_doc
+            .get("mcp_servers")
+            .and_then(Item::as_table_like)
+            .and_then(|servers| servers.get(server))
+        {
+            table_mut_or_insert(&mut target_doc, "mcp_servers")?[server] = config.clone();
+        }
+    }
     let context_usage_configured = target_doc
         .get("desktop")
         .and_then(Item::as_table)
@@ -2130,6 +2140,25 @@ fn deepseek_api_base_url(base_url: &str) -> bool {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     host == "deepseek.com" || host.ends_with(".deepseek.com")
+}
+
+fn apply_relay_responses_compatibility(
+    profile: &RelayProfile,
+    config_text: &str,
+) -> anyhow::Result<String> {
+    let config_text = apply_deepseek_responses_compatibility(profile, config_text)?;
+    if profile.image_generation_proxy
+        || profile.protocol != RelayProtocol::Responses
+        || (profile.relay_mode == crate::settings::RelayMode::Official && !profile.official_mix_api_key)
+        || !profile.has_image_generation_models()
+    {
+        return Ok(config_text);
+    }
+    // 直连图片模型由上游提供托管生图；关闭客户端同名函数，避免 image_gen.imagegen 冲突。
+    // 必须在公共配置合并后执行，否则 image_generation = true 会重新开启重复声明。
+    let mut doc = parse_toml_document(&config_text)?;
+    table_mut_or_insert(&mut doc, "features")?["image_generation"] = toml_edit::value(false);
+    Ok(normalize_optional_toml(doc))
 }
 
 pub fn apply_deepseek_responses_compatibility(
@@ -2766,7 +2795,11 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         );
     }
-    if profile.has_model_routes() || profile.image_generation_uses_protocol_proxy() {
+    // 关闭接管时，旧配置可能仍指向本地代理，优先恢复已保存的真实上游。
+    if profile.has_model_routes()
+        || profile.image_generation_uses_protocol_proxy()
+        || !profile.image_generation_proxy
+    {
         if !profile.upstream_base_url.trim().is_empty() {
             return profile.upstream_base_url.trim().to_string();
         }

@@ -697,6 +697,39 @@ experimental_bearer_token = "sk-test-redacted"
 }
 
 #[test]
+fn direct_image_profiles_disable_native_image_tool_after_common_config_merge() {
+    for (mode, proxy, models, expected) in [
+        (RelayMode::PureApi, false, "gpt-image-2.5-flare", false),
+        (RelayMode::PureApi, true, "gpt-image-2.5-flare", true),
+        (RelayMode::PureApi, false, "gpt-6", true),
+        (RelayMode::Official, false, "gpt-image-2.5-flare", true),
+    ] {
+        let profile = RelayProfile {
+            relay_mode: mode,
+            image_generation_proxy: proxy,
+            model_list: models.to_string(),
+            config_contents: "model = \"gpt-6\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://images.example.test/v1\"\n".to_string(),
+            auth_contents: r#"{"OPENAI_API_KEY":"test-key"}"#.to_string(),
+            ..RelayProfile::default()
+        };
+        for apply in [
+            apply_relay_profile_files_to_home_with_context,
+            apply_relay_profile_to_home_with_switch_rules,
+            codex_plus_core::relay_config::apply_relay_profile_config_to_home_with_context,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            apply(temp.path(), &profile, "[features]\nimage_generation = true\n").unwrap();
+            let text = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+            let doc: toml_edit::DocumentMut = text.parse().unwrap();
+            assert_eq!(doc["features"]["image_generation"].as_bool(), Some(expected), "{mode:?} proxy={proxy} models={models}");
+            if !expected {
+                assert_eq!(doc["model_providers"]["custom"]["base_url"].as_str(), Some("https://images.example.test/v1"));
+            }
+        }
+    }
+}
+
+#[test]
 fn image_generation_profile_routes_through_proxy_and_preserves_upstream() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {
@@ -723,6 +756,31 @@ fn image_generation_profile_routes_through_proxy_and_preserves_upstream() {
     let mut common = String::new();
     backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
     assert_eq!("https://images.example.test/v1", codex_plus_core::relay_config::relay_profile_base_url(&profile));
+    // 旧配置默认保持接管，关闭后恢复上游，重启也不得再次改写。
+    let mut stored = serde_json::to_value(&profile).unwrap();
+    stored.as_object_mut().unwrap().remove("imageGenerationProxy");
+    let legacy_profile: RelayProfile = serde_json::from_value(stored).unwrap();
+    assert!(legacy_profile.image_generation_proxy);
+    profile.image_generation_proxy = false;
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    assert!(!profile.image_generation_uses_protocol_proxy());
+    assert_eq!("https://images.example.test/v1", codex_plus_core::relay_config::relay_profile_base_url(&profile));
+    let stored = serde_json::to_value(&profile).unwrap();
+    profile = serde_json::from_value(stored).unwrap();
+    assert!(!profile.image_generation_proxy);
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let settings = BackendSettings {
+        active_relay_id: profile.id.clone(), relay_profiles: vec![profile.clone()],
+        ..BackendSettings::default()
+    };
+    assert!(!settings.active_relay_transport_uses_protocol_proxy());
+    assert!(!codex_plus_core::relay_config::ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    let direct = std::fs::read_to_string(&config_path).unwrap();
+    assert!(direct.contains("https://images.example.test/v1"));
+    assert!(!direct.contains("127.0.0.1:57321"));
+    profile.image_generation_proxy = true;
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    assert!(profile.config_contents.contains("127.0.0.1:57321"));
     profile.relay_mode = RelayMode::Official;
     profile.official_mix_api_key = false;
     assert!(!profile.image_generation_uses_protocol_proxy());
@@ -1336,6 +1394,53 @@ experimental_bearer_token = "sk-a"
     );
     assert!(config.contains(r#"base_url = "https://relay-a.example/v1""#));
     assert_eq!(auth, r#"{"OPENAI_API_KEY":"sk-a"}"#);
+}
+
+#[test]
+fn config_rewrites_preserve_live_cua_repl_settings() {
+    let live = r#"model = "old"
+[mcp_servers.cua_repl]
+command = "/local/node"
+args = ["/local/launch.mjs"]
+enabled = false
+startup_timeout_sec = 120
+[mcp_servers.cua_repl.env]
+HTTPS_PROXY = "http://127.0.0.1:1080"
+NO_PROXY = "localhost,127.0.0.1,::1"
+"#;
+    for server in ["cua_repl", "cua_repl_proxy"] {
+        let live = live.replace("cua_repl", server);
+        let expected: toml::Value = live.parse().unwrap();
+        for with_auth in [false, true] {
+            for stale_cua in [
+                "",
+                "[mcp_servers.cua_repl]\ncommand = \"stale-node\"\nenabled = true\n",
+            ] {
+                let stale_cua = stale_cua.replace("cua_repl", server);
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::write(temp.path().join("config.toml"), &live).unwrap();
+                let target = format!("model = \"new\"\n[mcp_servers.other]\ncommand = \"other-node\"\n{stale_cua}");
+                if with_auth {
+                    apply_relay_files_to_home(temp.path(), &target, "{}").unwrap();
+                } else {
+                    apply_relay_config_file_to_home(temp.path(), &target).unwrap();
+                }
+                let actual: toml::Value = std::fs::read_to_string(temp.path().join("config.toml"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(
+                    actual["mcp_servers"].get(server),
+                    expected["mcp_servers"].get(server)
+                );
+                assert_eq!(actual["model"].as_str(), Some("new"));
+                assert_eq!(
+                    actual["mcp_servers"]["other"]["command"].as_str(),
+                    Some("other-node")
+                );
+            }
+        }
+    }
 }
 
 #[test]

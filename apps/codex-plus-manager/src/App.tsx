@@ -96,6 +96,7 @@ import {
 } from "./model-metadata";
 import {
   findRelayModelRouteIssue,
+  imageGenerationUsesProxy,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
   PROTOCOL_PROXY_BASE_URL,
@@ -319,6 +320,7 @@ type LaunchMode = "patch" | "relay";
 type ImageOverlayFitMode = "fill" | "fit" | "stretch" | "tile" | "center";
 
 export type RelayProfile = {
+  imageGenerationProxy?: boolean;
   id: string;
   name: string;
   model: string;
@@ -8025,6 +8027,19 @@ function RelayProfileEditor({
                 </button>
               </div>
             </Field>
+            {profile.protocol === "responses" ? (
+              <Field label={t("图片生成代理接管")}>
+                <label className="inline-check">
+                  <input
+                    type="checkbox"
+                    checked={profile.imageGenerationProxy !== false}
+                    onChange={(event) => updateDraft({ imageGenerationProxy: event.currentTarget.checked })}
+                  />
+                  <span>{t("由 Codex++ 接管图片生成请求")}</span>
+                </label>
+                <p className="field-hint">{t("关闭后，图片模型不再触发本地代理；上游需支持直接生图。模型分流、免认证及官方会话身份仍可能需要代理。")}</p>
+              </Field>
+            ) : null}
             <Field className="relay-field-session-provider" label={t("Codex 会话身份")}>
               <AppSelect
                 value={sessionProvider}
@@ -10784,6 +10799,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     relayMode,
     sessionProvider: relaySessionProvider(profile),
     officialMixApiKey,
+    imageGenerationProxy: profile.imageGenerationProxy !== false,
     hideOfficialUsageAlert: profile.hideOfficialUsageAlert === true,
     testModel: profile.testModel || "",
     configContents: relayMode === "official" && !officialMixApiKey ? "" : profile.configContents || "",
@@ -11118,8 +11134,9 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "imageGenerationProxy" in patch) {
     const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0
+      || imageGenerationUsesProxy(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {

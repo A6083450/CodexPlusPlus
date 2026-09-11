@@ -42,6 +42,8 @@ pub struct RelayProfile {
     pub official_mix_api_key: bool,
     #[serde(rename = "noAuth", default)]
     pub no_auth: bool,
+    #[serde(rename = "imageGenerationProxy", default = "default_true")]
+    pub image_generation_proxy: bool,
     #[serde(rename = "hideOfficialUsageAlert", default)]
     pub hide_official_usage_alert: bool,
     #[serde(rename = "testModel", default)]
@@ -203,6 +205,7 @@ impl Default for RelayProfile {
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
+            image_generation_proxy: true,
             hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
@@ -229,11 +232,16 @@ impl Default for RelayProfile {
 
 impl RelayProfile {
     pub fn image_generation_uses_protocol_proxy(&self) -> bool {
-        self.protocol == RelayProtocol::Responses
+        self.image_generation_proxy
+            && self.protocol == RelayProtocol::Responses
             && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
-            && self.model_list.lines()
-                .chain(std::iter::once(crate::relay_config::relay_profile_model(self).as_str()))
-                .any(|model| model.trim().to_ascii_lowercase().starts_with("gpt-image-"))
+            && self.has_image_generation_models()
+    }
+
+    pub(crate) fn has_image_generation_models(&self) -> bool {
+        self.model_list.lines()
+            .chain(std::iter::once(crate::relay_config::relay_profile_model(self).as_str()))
+            .any(|model| model.trim().to_ascii_lowercase().starts_with("gpt-image-"))
     }
 
     pub fn uses_no_auth(&self) -> bool {
@@ -693,6 +701,7 @@ impl BackendSettings {
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 no_auth: false,
+                image_generation_proxy: true,
                 hide_official_usage_alert: false,
                 test_model: String::new(),
                 config_contents: String::new(),
@@ -747,6 +756,7 @@ impl BackendSettings {
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             no_auth: false,
+            image_generation_proxy: true,
             hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),

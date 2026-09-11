@@ -13,6 +13,7 @@ export type RelayModelRouteProfile = {
   relayMode: "official" | "mixedApi" | "pureApi" | "aggregate";
   officialMixApiKey: boolean;
   noAuth?: boolean;
+  imageGenerationProxy?: boolean;
   modelRoutes?: RelayModelRoute[];
   model?: string;
   modelList?: string;
@@ -73,6 +74,13 @@ export function findRelayModelRouteIssue(
   return null;
 }
 
+export function imageGenerationUsesProxy(profile: RelayModelRouteProfile): boolean {
+  return profile.imageGenerationProxy !== false && profile.protocol === "responses"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey)
+    && `${profile.model ?? ""}\n${profile.modelList ?? ""}`.split("\n")
+      .some(model => model.trim().toLowerCase().startsWith("gpt-image-"));
+}
+
 export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): boolean {
   if (settings.enhancementsEnabled) return true;
   const active = settings.relayProfiles.find((profile) => profile.id === settings.activeRelayId)
@@ -82,10 +90,7 @@ export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): b
     || active.protocol === "chatCompletions"
     || (active.relayMode === "pureApi" && active.noAuth === true)
     || (active.relayMode === "official" && active.officialMixApiKey)
-    || (active.protocol === "responses"
-      && (active.relayMode !== "official" || active.officialMixApiKey)
-      && `${active.model ?? ""}\n${active.modelList ?? ""}`.split("\n")
-        .some(model => model.trim().toLowerCase().startsWith("gpt-image-")))
+    || imageGenerationUsesProxy(active)
     || normalizeRelayModelRoutes(active.modelRoutes).some(
       (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
     );

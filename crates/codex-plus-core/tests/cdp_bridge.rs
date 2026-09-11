@@ -3542,6 +3542,50 @@ fn injection_script_places_service_tier_control_in_native_model_menu() {
 }
 
 #[test]
+fn injection_script_excludes_chat_reasoning_only_speed_menu() {
+    let script = assets::injection_script(57321);
+    let start = script
+        .find("  function codexServiceTierMenuModelCandidates()")
+        .unwrap();
+    let end = script[start..]
+        .find("  function codexServiceTierNativeSpeedRow(")
+        .unwrap()
+        + start;
+    let harness = format!(
+        r#"
+const assert = require('node:assert/strict');
+let effortOnly = true;
+const chatRow = {{
+  textContent: '即时',
+  getAttribute: () => null,
+  querySelector: (selector) => selector === '[data-effort-only="true"]' && effortOnly ? {{}} : null,
+}};
+const workRow = {{ textContent: 'GPT-6 Ultra', getAttribute: () => null, querySelector: () => null }};
+const imageRow = {{ textContent: 'GPT-Image-2 高', getAttribute: () => null, querySelector: () => null }};
+const document = {{ querySelectorAll: () => [chatRow, workRow, imageRow] }};
+const codexServiceTierSemanticModelMenuRowSelector = () => '[data-model-picker-view-toggle="true"]';
+{}
+assert.deepEqual(codexServiceTierMenuModelCandidates(), [workRow]);
+chatRow.textContent = 'Instant';
+assert.deepEqual(codexServiceTierMenuModelCandidates(), [workRow]);
+effortOnly = false;
+chatRow.textContent = 'DeepSeek';
+assert.deepEqual(codexServiceTierMenuModelCandidates(), [chatRow, workRow]);
+"#,
+        &script[start..end]
+    );
+    let output = std::process::Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("node should run the renderer regression check");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn injection_script_anchors_floating_menu_before_open_location_button() {
     let script = assets::injection_script(57321);
 
@@ -3609,6 +3653,18 @@ fn native_fast_toggle_survives_settings_update_and_turn_start() {
     let script = assets::injection_script(57321);
     let listener = script.split("function installCodexNativeServiceTierSelectionSync").nth(1).unwrap();
     assert!(listener.split("const codexServiceTierMenuVersion").next().unwrap().contains("[role=\"menuitemcheckbox\"]"));
+}
+
+#[test]
+fn custom_service_tier_does_not_carry_a_hidden_global_fast_default() {
+    let cases = run_service_tier_contract_harness();
+    assert_eq!(cases["customLegacyDefaultMode"], "inherit");
+    for request in cases["customUnselectedRequests"].as_array().unwrap() {
+        assert!(request["serviceTier"].is_null());
+        assert_eq!(request["serviceTierForTurn"], "default");
+    }
+    assert_eq!(cases["customExplicitFast"]["serviceTier"], "priority");
+    assert!(cases["customExplicitStandard"]["serviceTier"].is_null());
 }
 
 #[test]
@@ -4159,6 +4215,19 @@ const turnWithoutModel = api.applyServiceTierOverride("turn/start", {{
   service_tier: null,
 }}, "conversation-should-not-be-model");
 const turnWithoutModelDiagnosticModel = api.diagnostics().at(-1)?.detail?.model;
+
+api.setThreadState({{ mode: "custom", defaultMode: "fast", entries: {{
+  "thread-explicit-fast": {{ mode: "fast", at: Date.now() }},
+  "thread-explicit-standard": {{ mode: "standard", at: Date.now() }},
+}} }});
+const customLegacyDefaultMode = api.threadState().defaultMode;
+const customUnselectedRequests = ["thread/start", "thread/resume", "turn/start"].map(method =>
+  api.applyServiceTierOverride(method, {{
+    threadId: "thread-unselected", model: "gpt-5.4", serviceTier: null, serviceTierForTurn: "default",
+  }})
+);
+const customExplicitFast = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-explicit-fast", model: "gpt-5.4", serviceTier: null }});
+const customExplicitStandard = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-explicit-standard", model: "gpt-5.4", serviceTier: "priority" }});
 
 api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
 api.setThreadState({{ mode: "custom", defaultMode: "inherit", entries: {{}}, draft: {{ mode: "inherit", at: Date.now() }} }});
@@ -5215,6 +5284,10 @@ process.stdout.write(JSON.stringify({{
   nestedNativeMenuStandard,
   nestedNativeMenuFast,
   nativeCheckboxEnable,
+  customLegacyDefaultMode,
+  customUnselectedRequests,
+  customExplicitFast,
+  customExplicitStandard,
   nativeCheckboxDisable,
   nativeFastSettings,
   nativeFastTurn,

@@ -703,6 +703,9 @@ export const EN_PLAIN: Record<string, string> = {
   "正在解压并校验插件文件…": "Extracting and verifying plugin files…",
   "正在连接 openai/plugins…": "Connecting to openai/plugins…",
   "正常": "OK",
+  "图片生成代理接管": "Image generation proxy takeover",
+  "由 Codex++ 接管图片生成请求": "Let Codex++ proxy image generation requests",
+  "关闭后，图片模型不再触发本地代理；上游需支持直接生图。模型分流、免认证及官方会话身份仍可能需要代理。": "When disabled, image models no longer trigger the local proxy; your upstream must support direct image generation. Model routing, no-auth mode and OpenAI session identity may still require the proxy.",
   "此上游会通过本地 127.0.0.1:57321 转成 Responses API，需要从 Codex++ 启动 Codex。":
     "This upstream is converted to the Responses API via local 127.0.0.1:57321, which requires launching Codex from Codex++.",
   "此供应商会保留官方登录模式，并把请求混入当前 API Key；Codex增强仍使用兼容模式。":

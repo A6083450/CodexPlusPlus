@@ -191,3 +191,10 @@ test("disabled provider switching never rewrites live config for a first route",
 
   assert.equal(modelRouteSaveRequiresRestart(before, after, profile("source").baseUrl), false);
 });
+
+test("image takeover can be disabled without disabling required routing", () => {
+  const direct = profile("source", { modelList: "gpt-image-2", imageGenerationProxy: false });
+  assert.equal(settingsRequireLocalHelper(settings([direct])), false);
+  assert.equal(settingsRequireLocalHelper(settings([{ ...direct, protocol: "chatCompletions" }])), true);
+  assert.equal(settingsRequireLocalHelper(settings([{ ...direct, modelRoutes: [{ model: "gpt-6", targetRelayId: "target", targetModel: "" }] }])), true);
+});

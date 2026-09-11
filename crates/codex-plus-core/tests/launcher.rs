@@ -1693,6 +1693,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             relay_mode: codex_plus_core::settings::RelayMode::MixedApi,
             official_mix_api_key: false,
             no_auth: false,
+            image_generation_proxy: true,
             hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),

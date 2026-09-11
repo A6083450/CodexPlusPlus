@@ -3020,11 +3020,11 @@
     return codexServiceTierInheritedValue();
   }
 
-  function codexServiceTierDefaultModeForControlMode(controlMode, fallback = "inherit") {
+  function codexServiceTierDefaultModeForControlMode(controlMode) {
     if (controlMode === "global-fast") return "fast";
     if (controlMode === "global-standard") return "standard";
-    if (controlMode === "inherit") return "inherit";
-    return normalizeCodexThreadServiceTierMode(fallback);
+    // 自定义仅覆盖明确选择过的会话，不沿用历史全局 Fast 默认值。
+    return "inherit";
   }
 
   function codexServiceTierEffectiveThreadMode(threadMode = "inherit", defaultMode = "inherit") {
@@ -3102,7 +3102,7 @@
       const mode = parsed?.mode ? normalizeCodexServiceTierControlMode(parsed.mode) : (hasCustomState ? "custom" : "inherit");
       return {
         mode,
-        defaultMode: normalizeCodexThreadServiceTierMode(parsed?.defaultMode || codexServiceTierDefaultModeForControlMode(mode)),
+        defaultMode: codexServiceTierDefaultModeForControlMode(mode),
         entries,
         draft,
       };
@@ -3113,7 +3113,7 @@
 
   function writeThreadServiceTierState(state) {
     const mode = normalizeCodexServiceTierControlMode(state?.mode);
-    const defaultMode = normalizeCodexThreadServiceTierMode(state?.defaultMode || codexServiceTierDefaultModeForControlMode(mode));
+    const defaultMode = codexServiceTierDefaultModeForControlMode(mode);
     const rawEntries = state?.entries && typeof state.entries === "object" ? state.entries : {};
     const entries = Object.create(null);
     Object.entries(rawEntries)
@@ -11194,10 +11194,12 @@
   }
 
   function codexServiceTierMenuModelCandidates() {
+    // ChatGPT 聊天复用模型菜单组件，但只调节思考强度，不支持 Codex 速度档位。
     return [...new Set([
       ...document.querySelectorAll(`[data-model-picker-model-row]`),
       ...document.querySelectorAll(codexServiceTierSemanticModelMenuRowSelector()),
-    ])].filter((node) => !codexServiceTierImageModelRow(node));
+    ])].filter((node) => !node.querySelector?.('[data-effort-only="true"]')
+      && !codexServiceTierImageModelRow(node));
   }
 
   function codexServiceTierImageModelRow(node) {
