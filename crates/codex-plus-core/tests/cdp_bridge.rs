@@ -374,7 +374,7 @@ async function flushTimers() {{
     assert_eq!(result["afterReinjection"], json!({ "old": 0, "exact": 1 }));
     assert_eq!(
         result["coldStartFallback"],
-        json!({ "first": 0, "middle": 1, "last": 0 })
+        json!({ "first": 0, "middle": 0, "last": 0 })
     );
     assert_eq!(result["nativePreview"]["containerInMarkdown"], true);
     assert_eq!(result["nativePreview"]["targetChildren"], 2);
@@ -3174,10 +3174,10 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"12\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"14\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
-    assert!(script.contains("[role=\"menuitemcheckbox\"][data-fast-mode-enabled]"));
+    assert!(script.contains("querySelector?.(`[data-fast-mode-enabled]`)"));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3232,6 +3232,8 @@ const codexModelCatalog = {{
   model_provider: "custom",
 }};
 const codexPlusModelMetadata = () => null;
+const codexPlusModelServiceTiers = () => [];
+const codexPlusSettings = () => ({{ serviceTierControls: false }});
 const modelReasoningEfforts = () => [];
 const applyCodexPlusModelMetadata = () => false;
 const codexPlusModelNames = () => ["supplier-default", "extra-model"];
@@ -3553,6 +3555,7 @@ const assert = require('node:assert/strict');
 let profile = {{ relayMode: 'pureApi', protocol: 'responses', imageGenerationProxy: false,
   modelList: 'gpt-6\ngpt-image-2.5-flare' }};
 const codexRemoteSessionActiveProfile = () => profile;
+const codexPlusBackendSettings = {{}};
 const defaults = {{ image_generation: true, other_feature: true }};
 const manager = {{ requestClient: {{ hostId: 'local' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
 {}
@@ -3562,6 +3565,24 @@ patchCodexImageGenerationManager(manager);
 assert.equal(manager.settings.readDefaultFeatureOverrides, reader);
 assert.deepEqual(reader(), {{ image_generation: false, other_feature: true }});
 assert.equal(defaults.image_generation, true);
+const savedProfile = profile;
+profile = null; // Supplier management disabled: respect the effective config instead.
+codexPlusBackendSettings.nativeImageGenerationEnabled = false;
+assert.equal(reader().image_generation, false);
+const resume = {{ threadId: 'image-thread', config: {{ 'features.image_generation': true,
+  'features.other': true, features: {{ image_generation: true, retained: true }} }} }};
+const patchedResume = applyCodexImageGenerationRequestOverride('thread/resume', resume);
+assert.equal(patchedResume.config['features.image_generation'], false);
+assert.equal(patchedResume.config.features.image_generation, false);
+assert.equal(patchedResume.config.features.retained, true);
+assert.equal(patchedResume.config['features.other'], true);
+assert.equal(resume.config['features.image_generation'], true);
+assert.equal(applyCodexImageGenerationRequestOverride('turn/start', resume), resume);
+assert.equal(applyCodexImageGenerationRequestOverride('thread/start', {{}}).config['features.image_generation'], false);
+
+delete codexPlusBackendSettings.nativeImageGenerationEnabled;
+assert.equal(reader(), defaults);
+profile = savedProfile;
 profile.imageGenerationProxy = true;
 assert.equal(reader(), defaults);
 profile.imageGenerationProxy = false;
@@ -3859,6 +3880,29 @@ fn injection_script_applies_fast_service_tier_contract() {
         cases["modelListResult"]["data"][0]["serviceTiers"][0]["id"],
         "priority"
     );
+    for model in [
+        "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra",
+    ] {
+        assert_eq!(
+            cases["missingNativeTiers"][model]["created"][0]["id"], "priority", "{model}"
+        );
+        assert_eq!(
+            cases["missingNativeTiers"][model]["patched"][0]["id"], "priority", "{model}"
+        );
+        assert_eq!(cases["missingNativeTiers"][model]["changedAgain"], false, "{model}");
+    }
+    assert_eq!(cases["preservedNativeTiers"][1]["id"], "ultrafast");
+    assert_eq!(cases["preservedNativeTiers"][0]["description"], "Native priority");
+    assert_eq!(cases["unknownModelTiers"], serde_json::json!([]));
+    assert_eq!(cases["nativeMultiSpeedRowDetected"], true);
+    for model in ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] {
+        assert_eq!(cases["nativeModelsOutsideCatalog"][model][0]["id"], "priority", "{model}");
+        assert_eq!(cases["nativeQueryOutsideCatalog"][model][0]["id"], "priority", "{model}");
+    }
+    assert_eq!(cases["nativeModelsOutsideCatalog"]["unknown-model"], serde_json::json!([]));
+    assert_eq!(cases["outsideCatalogMetadataPreserved"], true);
+    assert_eq!(cases["speedControlsDisabledTiers"], serde_json::json!([]));
+
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
     assert_eq!(
         cases["solDescriptor"]["supportedReasoningEfforts"][4]["reasoningEffort"],
@@ -4363,6 +4407,30 @@ api.setModelCatalog({{
   }},
 }});
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
+const missingNativeTiers = {{}};
+for (const model of ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]) {{
+  const descriptor = {{ model, serviceTiers: [], additionalSpeedTiers: [] }};
+  api.applyModelMetadata(descriptor, model);
+  missingNativeTiers[model] = {{
+    created: api.modelDescriptor(model).serviceTiers,
+    patched: descriptor.serviceTiers,
+    changedAgain: api.applyModelMetadata(descriptor, model),
+  }};
+}}
+api.setModelCatalog({{
+  modelMetadata: {{ "gpt-5.6-sol": {{ serviceTiers: [{{ id: "priority", name: "Fallback Fast" }}] }} }},
+}});
+const nativeSpeedDescriptor = {{ model: "gpt-5.6-sol", serviceTiers: [
+  {{ id: "priority", name: "Fast", description: "Native priority" }},
+  {{ id: "ultrafast", name: "Ultrafast" }},
+] }};
+api.applyModelMetadata(nativeSpeedDescriptor, "gpt-5.6-sol");
+const preservedNativeTiers = nativeSpeedDescriptor.serviceTiers;
+const unknownModelTiers = api.modelDescriptor("unknown-model").serviceTiers;
+const nativeMultiSpeedRowDetected = !!api.nativeSpeedRow({{
+  querySelector: (selector) => selector === '[data-fast-mode-enabled]' ? {{ tagName: "SPAN" }} : null,
+}}, []);
+
 api.setModelCatalog({{
   status: "ok",
   model: "gpt-6-astra",
@@ -4381,6 +4449,24 @@ api.setModelCatalog({{
     }},
   }},
 }});
+// 启动目录仅含 GPT-6，原生 model/list 还包含 GPT-5.5/5.6；必须走真实列表补丁。
+const nativeRowsOutsideCatalog = ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "unknown-model"]
+  .map(model => ({{ model, serviceTiers: [], hidden: true, defaultReasoningEffort: "high" }}));
+const nativeListOutsideCatalog = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
+api.patchAppServerResult("model/list", nativeListOutsideCatalog);
+const nativeModelsOutsideCatalog = Object.fromEntries(nativeListOutsideCatalog.data.map(m => [m.model, m.serviceTiers]));
+const outsideCatalogMetadataPreserved = nativeListOutsideCatalog.data.filter(m => m.model !== "gpt-6-astra")
+  .every(m => m.hidden === true && m.defaultReasoningEffort === "high");
+let nativeQueryResult = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
+api.patchModelQueryClient({{ setQueriesData(filters, update) {{
+  if (filters.predicate({{ queryKey: ["models", "list", "local"] }})) nativeQueryResult = update(nativeQueryResult);
+}} }});
+const nativeQueryOutsideCatalog = Object.fromEntries(nativeQueryResult.data.map(m => [m.model, m.serviceTiers]));
+api.setBackendSettings({{ codexAppServiceTierControls: false }});
+const disabledNativeList = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
+api.patchAppServerResult("model/list", disabledNativeList);
+const speedControlsDisabledTiers = disabledNativeList.data[0].serviceTiers;
+api.setBackendSettings({{ codexAppServiceTierControls: true }});
 const astraFastAvailability = api.fastAvailability("gpt-6-astra");
 const astraDescriptor = api.modelDescriptor("gpt-6-astra");
 const nativeAstraDescriptor = {{
@@ -4431,7 +4517,7 @@ const reactRuntimeCandidates = api.reactRuntimeCandidates([{{
 }}]);
 const nativeFastRow = {{ native: true }};
 const nativeFastRowDetected = api.nativeSpeedRow({{
-  querySelector: (selector) => selector === '[role="menuitemcheckbox"][data-fast-mode-enabled]'
+  querySelector: (selector) => ['[role="menuitemcheckbox"][data-fast-mode-enabled]', '[data-fast-mode-enabled]'].includes(selector)
     ? nativeFastRow
     : null,
 }}, []) === nativeFastRow;
@@ -5299,6 +5385,8 @@ process.stdout.write(JSON.stringify({{
   existingSolDescriptor,
   modelListResult,
   solDescriptor,
+  missingNativeTiers, preservedNativeTiers, unknownModelTiers, nativeMultiSpeedRowDetected,
+  nativeModelsOutsideCatalog, nativeQueryOutsideCatalog, outsideCatalogMetadataPreserved, speedControlsDisabledTiers,
   astraFastAvailability,
   astraDescriptor,
   nativeAstraDescriptor,
@@ -6943,4 +7031,82 @@ fn noop_handler() -> bridge::BridgeHandler {
         Box::pin(async { Ok(json!({ "status": "ok" })) })
             as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
     })
+}
+
+#[test]
+fn image_persistence_restores_native_thread_even_when_repair_fails() {
+    let source = assets::renderer_script();
+    let start = source.find("  window.__codexPlusImagePersistenceJobs =").unwrap();
+    let end = source[start..].find("  function patchCodexImageGenerationManager").unwrap() + start;
+    let harness = r#"
+const assert = require('node:assert/strict');
+global.window = {};
+let calls = [], busy = false, fail = false, navigations = 0;
+let streamOwned = true;
+const conversation = { latestModel: "test", resumeState: "resumed",
+  turns: [{ items: [{ type: 'agentMessage', id: 'msg-image', text: 'old text' }] }],
+  turnHistory: { kind: 'canonical', history: { entitiesByKey: { turn: { items: [{ type: 'agentMessage', id: 'msg-image', text: 'old text' }] } } } }
+};
+const manager = {
+  requestClient: { hostId: 'local', async sendRequest(method, params) {
+    calls.push(method);
+    if (method === 'thread/archive') manager.notificationContext.handleThreadArchived('image-thread');
+    if (method === 'thread/unarchive') manager.notificationContext.handleThreadUnarchived('image-thread');
+    return { thread: { status: { type: busy ? 'active' : 'idle' }, cwd: '/tmp', turns: params?.includeTurns ? [{ items: [{ type: 'agentMessage', id: 'msg-image', text: '![image](/generated_images/new.png)' }] }] : [] } };
+  } },
+  streamState: { stopFollowingConversationState() { streamOwned = false; } },
+  notificationContext: { handleThreadArchived() { navigations++; }, handleThreadUnarchived() { navigations++; } },
+  getConversation: () => conversation, getConversationCwd: () => '/tmp',
+  updateConversationState(id, update) { update(conversation); },
+  async resumeConversation() { assert.equal(streamOwned, false, 'stale stream ownership would skip native resume'); assert.equal(conversation.resumeState, 'needs_resume'); calls.push('resume'); return { status: 'ready' }; }
+};
+global.collectCodexReactRuntimeCandidates = () => ({ conversationManagers: [manager] });
+global.postJson = async () => { calls.push('persist'); if (fail) throw Error('disk full'); return 1; };
+global.sendCodexPlusDiagnostic = () => {};
+(async () => {
+  const session = { session_id: 'image-thread' };
+  const first = window.__codexPlusPersistGeneratedImages(session);
+  assert.equal(first, window.__codexPlusPersistGeneratedImages(session));
+  assert.equal(await first, true);
+  assert.deepEqual(calls, ['thread/read', 'thread/archive', 'persist', 'thread/unarchive', 'resume', 'thread/read']);
+  assert.equal(window.__codexPlusImagePersistenceJobs.size, 0);
+  assert.equal(navigations, 0);
+  assert.equal(conversation.turns[0].items[0].text, '![image](/generated_images/new.png)');
+  assert.equal(conversation.turnHistory.history.entitiesByKey.turn.items[0].text, conversation.turns[0].items[0].text);
+  manager.notificationContext.handleThreadArchived('user-archived-thread');
+  assert.equal(navigations, 1);
+  calls = []; fail = true;
+  assert.equal(await window.__codexPlusPersistGeneratedImages(session), false);
+  assert.deepEqual(calls, ['thread/read', 'thread/archive', 'persist', 'thread/unarchive', 'resume', 'thread/read']);
+  calls = []; busy = true;
+  assert.equal(await window.__codexPlusPersistGeneratedImages(session), 'busy');
+  assert.deepEqual(calls, ['thread/read']);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"#;
+    let output = Command::new("node").arg("-e").arg(format!("{harness_prefix}\n{}\n{harness_suffix}", &source[start..end], harness_prefix = harness.split("(async () =>").next().unwrap(), harness_suffix = format!("(async () =>{}", harness.split_once("(async () =>").unwrap().1))).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn renderer_removes_codexplus_share_button_without_touching_native_share() {
+    let script = assets::injection_script(57321);
+    assert!(!script.contains("installSessionShareButton"));
+    assert!(script.contains("removeSessionShareButtons();"));
+    let start = script.find("function removeSessionShareButtons()").unwrap();
+    let end = start + script[start..].find("\n  function ").unwrap();
+    let source = &script[start..end];
+    let check = format!(r#"
+const assert = require('node:assert/strict');
+const sessionShareButtonClass = 'codex-session-share-button';
+let removed = 0;
+const document = {{ querySelectorAll(selector) {{
+  assert.equal(selector, '.codex-session-share-button');
+  return [{{remove() {{ removed++; }} }}, {{remove() {{ removed++; }} }}];
+}} }};
+{source}
+removeSessionShareButtons();
+assert.equal(removed, 2);
+"#);
+    let output = std::process::Command::new("node").args(["-e", &check]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }

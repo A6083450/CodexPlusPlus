@@ -18,7 +18,7 @@ test("image quality menus are excluded from service tier injection", () => {
 });
 
 test("native image delivery removes an existing recovery thumbnail", () => {
-  const source = readFileSync(new URL("../../../assets/inject/generated-images-inject.js", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../../../extensions/imagegen/ui/generated-images-inject.js", import.meta.url), "utf8");
   const start = source.indexOf("  function renderImages(");
   const end = source.indexOf("  async function refresh(", start);
   let removed = false;

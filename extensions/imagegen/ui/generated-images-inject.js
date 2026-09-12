@@ -21,7 +21,7 @@
       const exact = targets.find(
         (target) => target.getAttribute("data-response-annotation-target") === messageId,
       );
-      if (exact) return exact;
+      return exact || null;
     }
     if (
       Number.isInteger(responseIndex)
@@ -254,6 +254,23 @@
       if ((result?.status === "found" || result?.status === "empty") && Array.isArray(result.images)) {
         state.images = result.images;
         renderImages(state.images, responseTargets());
+        const persistKey = `${sessionId}:${state.images.map(image => image.id).join(",")}`;
+        if (state.images.length && state.persistKey !== persistKey
+            && typeof window.__codexPlusPersistGeneratedImages === "function") {
+          state.persistKey = persistKey;
+          const persisted = await window.__codexPlusPersistGeneratedImages(sessionRef);
+          if (persisted === true) {
+            state.requestKey = "";
+            state.images = [];
+            renderImages([], responseTargets());
+            state.timer = setTimeout(() => void refresh(), 150);
+          } else if (persisted === "busy") {
+            state.persistKey = "";
+            state.requestKey = "";
+            state.timer = setTimeout(() => void refresh(), 1500);
+          }
+        }
+
       } else if (result?.status === "failed") {
         state.requestKey = "";
       }

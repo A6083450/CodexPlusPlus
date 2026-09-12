@@ -1408,7 +1408,7 @@ startup_timeout_sec = 120
 HTTPS_PROXY = "http://127.0.0.1:1080"
 NO_PROXY = "localhost,127.0.0.1,::1"
 "#;
-    for server in ["cua_repl", "cua_repl_proxy"] {
+    for server in ["cua_repl", "cua_repl_proxy", "node_repl"] {
         let live = live.replace("cua_repl", server);
         let expected: toml::Value = live.parse().unwrap();
         for with_auth in [false, true] {

@@ -118,6 +118,9 @@ pub trait BridgeDataService: Send + Sync {
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult>;
     async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult>;
     async fn generated_images(&self, session: SessionRef) -> anyhow::Result<GeneratedImagesResult>;
+    async fn persist_generated_images(&self, _session: SessionRef) -> anyhow::Result<usize> {
+        anyhow::bail!("当前后端不支持保存原生图片引用")
+    }
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value>;
     async fn find_archived_thread_by_title(
         &self,
@@ -266,6 +269,9 @@ pub async fn handle_bridge_request(
             ctx.data
                 .generated_images(session_from_payload(&payload))
                 .await,
+        ),
+        "/thread-generated-images/persist" => result_value(
+            ctx.data.persist_generated_images(session_from_payload(&payload)).await,
         ),
         "/thread-usage-history" => {
             ctx.data
@@ -708,6 +714,19 @@ impl BridgeDataService for UnavailableDataService {
     }
 }
 
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/config_read.rs"));
+
+#[test]
+fn image_generation_setting_comes_from_live_config() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(configured_image_generation(home.path()), None);
+    for enabled in [false, true] {
+        std::fs::write(home.path().join("config.toml"),
+            format!("[features]\nimage_generation = {enabled}\n")).unwrap();
+        assert_eq!(configured_image_generation(home.path()), Some(enabled));
+    }
+}
+
 fn settings_payload_value(
     settings: BackendSettings,
     codex_app_version: String,
@@ -719,6 +738,11 @@ fn settings_payload_value(
     );
     let mut value = serde_json::to_value(settings)?;
     if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "nativeImageGenerationEnabled".to_string(),
+            configured_image_generation(&crate::relay_config::default_codex_home_dir())
+                .map(Value::Bool).unwrap_or(Value::Null),
+        );
         object.remove("codexAppStepwiseApiKey");
         object.insert(
             "activeRelaySessionProvider".to_string(),

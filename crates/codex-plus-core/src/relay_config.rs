@@ -1732,8 +1732,8 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     }
     remove_unsupported_approval_policies(&mut target_doc);
     preserve_live_hook_state(&mut target_doc, &live_doc);
-    // Computer Use is machine-local: stale provider snapshots must not replace its runtime or proxy.
-    for server in ["cua_repl", "cua_repl_proxy"] {
+    // Local REPL runtimes and proxies must not be replaced by stale provider snapshots.
+    for server in ["cua_repl", "cua_repl_proxy", "node_repl"] {
         if let Some(config) = live_doc
             .get("mcp_servers")
             .and_then(Item::as_table_like)
@@ -2147,19 +2147,10 @@ fn apply_relay_responses_compatibility(
     config_text: &str,
 ) -> anyhow::Result<String> {
     let config_text = apply_deepseek_responses_compatibility(profile, config_text)?;
-    if profile.image_generation_proxy
-        || profile.protocol != RelayProtocol::Responses
-        || (profile.relay_mode == crate::settings::RelayMode::Official && !profile.official_mix_api_key)
-        || !profile.has_image_generation_models()
-    {
-        return Ok(config_text);
-    }
-    // 直连图片模型由上游提供托管生图；关闭客户端同名函数，避免 image_gen.imagegen 冲突。
-    // 必须在公共配置合并后执行，否则 image_generation = true 会重新开启重复声明。
-    let mut doc = parse_toml_document(&config_text)?;
-    table_mut_or_insert(&mut doc, "features")?["image_generation"] = toml_edit::value(false);
-    Ok(normalize_optional_toml(doc))
+    apply_image_generation_compatibility(profile, &config_text)
 }
+
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/relay_compatibility.rs"));
 
 pub fn apply_deepseek_responses_compatibility(
     profile: &RelayProfile,

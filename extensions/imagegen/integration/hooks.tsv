@@ -1,0 +1,20 @@
+assets/inject/renderer-inject.js	/* @codex-imagegen:runtime */
+assets/inject/renderer-inject.js	await window.__codexPlusImagePersistenceJobs?.get(params?.threadId)
+assets/inject/renderer-inject.js	nextParams = applyCodexImageGenerationRequestOverride(requestMethod, nextParams)
+assets/inject/renderer-inject.js	conversationManagers.forEach(patchCodexImageGenerationManager)
+crates/codex-plus-core/src/assets.rs	RENDERER_SCRIPT.replace(SLOT, IMAGEGEN_RENDERER_EXTENSION)
+crates/codex-plus-core/src/assets.rs	extensions/imagegen/ui/generated-images-inject.js
+crates/codex-plus-core/src/imagegen_skill.rs	extensions/imagegen/rust/imagegen_skill.rs
+crates/codex-plus-data/src/generated_images.rs	extensions/imagegen/rust/generated_images.rs
+crates/codex-plus-core/src/relay_config.rs	apply_image_generation_compatibility(profile, &config_text)
+crates/codex-plus-core/src/relay_config.rs	extensions/imagegen/rust/relay_compatibility.rs
+crates/codex-plus-core/src/routes.rs	extensions/imagegen/rust/config_read.rs
+crates/codex-plus-core/src/routes.rs	"/thread-generated-images/persist"
+crates/codex-plus-core/src/routes.rs	nativeImageGenerationEnabled
+apps/codex-plus-launcher/src/main.rs	codex_plus_data::generated_images::persist_generated_images_from_paths
+apps/codex-plus-manager/src-tauri/src/commands.rs	codex_plus_core::imagegen_skill::install_bundled_imagegen_skill
+crates/codex-plus-core/build.rs	extensions/imagegen/integration/build_check.rs
+crates/codex-plus-core/tests/imagegen_skill.rs	extensions/imagegen/tests/imagegen_skill.rs
+crates/codex-plus-data/tests/generated_images.rs	extensions/imagegen/tests/generated_images.rs
+scripts/installer/macos/package-dmg.sh	extensions/imagegen/sync.py
+assets/inject/renderer-inject.js	await prepareCodexImageGenerationTurn(client, requestMethod, params)

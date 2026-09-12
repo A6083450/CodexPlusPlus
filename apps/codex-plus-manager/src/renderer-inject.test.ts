@@ -206,11 +206,12 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(renderer, /\n\s*refreshSessionCopyMenuItems\(\);/);
   });
 
-  it("adds an encrypted session sharing button to the active Codex conversation", async () => {
+  it("removes the injected share button while preserving shared session import", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
     assert.match(renderer, /sessionShareButtonClass\s*=\s*"codex-session-share-button"/);
-    assert.match(renderer, /function installSessionShareButton\(\)/);
+    assert.match(renderer, /function removeSessionShareButtons\(\)/);
+    assert.doesNotMatch(renderer, /installSessionShareButton/);
     assert.match(renderer, /function sessionShareMarkdown\(\)/);
     assert.match(renderer, /crypto\.subtle\.generateKey\(\{ name: "AES-GCM", length: 256 \}/);
     assert.match(renderer, /https:\/\/share\.codexpp\.cc/);
@@ -220,7 +221,6 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /codex-rollout/);
     assert.match(renderer, /function sessionImportMarkdown\(session\)/);
     assert.match(renderer, /codexpp-import-session/);
-    assert.match(renderer, /nativeShare\?\.closest\?\.\("\.ms-auto"\)/);
     assert.match(renderer, /#k=\$\{encrypted\.key\}/);
     assert.match(renderer, /navigator\.clipboard\.writeText\(shareUrl\)/);
     assert.match(renderer, /data-testid\*=\"message\"/);

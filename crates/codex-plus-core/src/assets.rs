@@ -7,7 +7,7 @@ use crate::settings::BackendSettings;
 
 const RENDERER_SCRIPT: &str = include_str!("../../../assets/inject/renderer-inject.js");
 const GENERATED_IMAGES_SCRIPT: &str =
-    include_str!("../../../assets/inject/generated-images-inject.js");
+    include_str!("../../../extensions/imagegen/ui/generated-images-inject.js");
 #[cfg(windows)]
 const DREAM_TARGET_CSS: &str =
     include_str!("../../../assets/inject/upstream/dream-skin/windows/dream-skin.css");
@@ -75,7 +75,13 @@ pub const DIAGNOSTIC_BUILD_ID: &str = "fixed6-20260814";
 const DREAM_SKIN_RENDERER_REVISION: &str = "24-home-composer-rounded";
 
 pub fn renderer_script() -> &'static str {
-    RENDERER_SCRIPT
+    static COMPOSED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        const IMAGEGEN_RENDERER_EXTENSION: &str = include_str!("../../../extensions/imagegen/ui/renderer-runtime.js");
+        const SLOT: &str = "  /* @codex-imagegen:runtime */\n\n";
+        assert_eq!(RENDERER_SCRIPT.matches(SLOT).count(), 1, "imagegen integration slot missing or duplicated");
+        RENDERER_SCRIPT.replace(SLOT, IMAGEGEN_RENDERER_EXTENSION)
+    });
+    &COMPOSED
 }
 
 pub fn generated_images_script() -> &'static str {

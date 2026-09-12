@@ -534,7 +534,6 @@
   const sessionCopyMenuItemVersion = "1";
   const sessionCopyMenuActivationTimeoutMs = 12000;
   const sessionShareButtonClass = "codex-session-share-button";
-  const sessionShareButtonVersion = "1";
   const codexPlusShareBaseUrl = "https://share.codexpp.cc";
   const codexPlusShareFallbackBaseUrl = "https://codexpp-share.pages.dev";
   const codexPlusShareMaxCharacters = 900000;
@@ -622,7 +621,7 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "12";
+  const codexAppServerModelRequestPatchVersion = "14";
   const codexNativeServiceTierSelectionSyncVersion = "3";
   const codexRemoteSessionRecoveryVersion = "5";
   const codexPluginMarketplaceUnlockVersion = "15";
@@ -5478,6 +5477,9 @@
     client.__codexPluginMarketplaceOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPluginMarketplacePatchedSendRequest(method, params, options) {
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
+      if (requestMethod === "turn/start") {
+        await window.__codexPlusImagePersistenceJobs?.get(params?.threadId);
+      }
       const restoredRequestParams = restorePluginMarketplaceRequestParams(params, requestMethod);
       const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
       const requestParams = patchPluginMarketplaceRequestParams(requestMethod, restoredRequestParams);
@@ -7126,10 +7128,30 @@
     return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
 
+  function codexPlusModelServiceTiers(modelName, nativeTiers) {
+    // 原生目录优先，保留 Ultrafast 等新档位；旧后端缺字段时仅补已确认支持 Fast 的模型。
+    const metadataTiers = codexPlusModelMetadata(modelName)?.serviceTiers;
+    const tiers = Array.isArray(nativeTiers) && nativeTiers.length ? nativeTiers : metadataTiers;
+    if (Array.isArray(tiers) && tiers.length) {
+      return tiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
+    }
+    return codexServiceTierSupportedFastModels.has(normalizeCodexServiceTierModelName(modelName))
+      ? [{ id: "priority", name: "Fast", description: "1.5x speed, increased usage" }]
+      : [];
+  }
+
+  function applyCodexPlusModelServiceTiers(descriptor, modelName) {
+    const serviceTiers = codexPlusModelServiceTiers(modelName, descriptor.serviceTiers);
+    if (JSON.stringify(descriptor.serviceTiers || []) === JSON.stringify(serviceTiers)) return false;
+    descriptor.serviceTiers = serviceTiers;
+    return true;
+  }
+
   function applyCodexPlusModelMetadata(descriptor, modelName) {
+    if (!descriptor) return false;
+    let changed = applyCodexPlusModelServiceTiers(descriptor, modelName);
     const metadata = codexPlusModelMetadata(modelName);
-    if (!descriptor || !metadata) return false;
-    let changed = false;
+    if (!metadata) return changed;
     for (const key of ["displayName", "description", "defaultReasoningEffort"]) {
       if (typeof metadata[key] === "string" && metadata[key] && descriptor[key] !== metadata[key]) {
         descriptor[key] = metadata[key];
@@ -7151,7 +7173,7 @@
         changed = true;
       }
     }
-    for (const key of ["inputModalities", "additionalSpeedTiers", "serviceTiers"]) {
+    for (const key of ["inputModalities", "additionalSpeedTiers"]) {
       if (!Array.isArray(metadata[key])) continue;
       const nextValues = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
       if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValues)) {
@@ -7183,9 +7205,7 @@
       inputModalities: Array.isArray(metadata?.inputModalities) ? [...metadata.inputModalities] : ["text"],
       supportsImageDetailOriginal: metadata?.supportsImageDetailOriginal === true,
       additionalSpeedTiers: Array.isArray(metadata?.additionalSpeedTiers) ? [...metadata.additionalSpeedTiers] : [],
-      serviceTiers: Array.isArray(metadata?.serviceTiers)
-        ? metadata.serviceTiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry)
-        : [],
+      serviceTiers: codexPlusModelServiceTiers(modelName),
     };
   }
 
@@ -7226,6 +7246,9 @@
           changed = true;
         }
         if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
+      } else if (codexPlusSettings().serviceTierControls) {
+        // 原生列表中的模型不一定出现在当前供应商目录，速度补丁不能受目录成员限制。
+        if (applyCodexPlusModelServiceTiers(item, item.model)) changed = true;
       }
     });
     customModels.forEach((modelName) => {
@@ -7550,24 +7573,7 @@
     return true;
   }
 
-  function patchCodexImageGenerationManager(manager) {
-    if (manager.requestClient?.hostId !== "local") return;
-    const settings = manager.settings;
-    if (typeof settings?.readDefaultFeatureOverrides !== "function"
-        || settings.__codexPlusImageGenerationDefaults) return;
-    const original = settings.readDefaultFeatureOverrides.bind(settings);
-    settings.readDefaultFeatureOverrides = (...args) => {
-      const defaults = original(...args);
-      const profile = codexRemoteSessionActiveProfile();
-      const directImages = profile?.imageGenerationProxy === false && profile.protocol === "responses"
-        && (profile.relayMode !== "official" || profile.officialMixApiKey)
-        && `${profile.model || ""}\n${profile.modelList || ""}`.split("\n")
-          .some((model) => model.trim().toLowerCase().startsWith("gpt-image-"));
-      // 桌面实验开关会覆盖 config.toml；新建和恢复会话共用此配置入口。
-      return directImages ? { ...defaults, image_generation: false } : defaults;
-    };
-    settings.__codexPlusImageGenerationDefaults = true;
-  }
+  /* @codex-imagegen:runtime */
 
   function patchCodexContextUsageManager(manager) {
     if (manager.requestClient?.hostId !== "local") return;
@@ -7655,9 +7661,11 @@
     client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
+      await prepareCodexImageGenerationTurn(client, requestMethod, params);
       let providerRefreshFailed = false;
       if (codexRemoteSessionProviderRequestMethod(requestMethod)
-          && codexRemoteSessionProviderPatchEnabled()
+          && (codexRemoteSessionProviderPatchEnabled()
+            || ["thread/start", "thread/resume", "thread/fork"].includes(requestMethod))
           && window.__codexSessionDeleteBridge) {
         const settingsLoaded = await loadBackendSettingsState();
         providerRefreshFailed = !settingsLoaded;
@@ -7672,6 +7680,9 @@
       let nextParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+      if (client.hostId === "local") {
+        nextParams = applyCodexImageGenerationRequestOverride(requestMethod, nextParams);
+      }
       if (["turn/start", "thread/settings/update"].includes(requestMethod)) {
         nextParams = applyCodexServiceTierRequestOverride(requestMethod, nextParams);
       }
@@ -7804,11 +7815,12 @@
   }
 
   function ensureCodexModelWhitelistInstalls() {
+    collectCodexReactRuntimeCandidates().conversationManagers.forEach(patchCodexImageGenerationManager);
     if (codexPlusModelUnlockEnabled()
-        || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())) {
+        || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
+        || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)) {
       installAppServerModelRequestPatch();
       collectCodexReactRuntimeCandidates().conversationManagers.forEach((manager) => {
-        patchCodexImageGenerationManager(manager);
         patchCodexContextUsageManager(manager);
       });
     }
@@ -8871,57 +8883,8 @@
     }
   }
 
-  function installSessionShareButton() {
-    const existing = document.querySelectorAll(`.${sessionShareButtonClass}`);
-    const ref = currentSessionRef();
-    if (!ref.session_id) {
-      existing.forEach((button) => button.remove());
-      return;
-    }
-    let button = existing[0];
-    existing.forEach((node) => { if (node !== button) node.remove(); });
-    if (!button) {
-      button = document.createElement("button");
-      button.type = "button";
-      button.className = `${sessionShareButtonClass} ${headerContextButtonClass}`;
-      button.textContent = "分享会话";
-      button.setAttribute("aria-label", "分享当前会话");
-      button.dataset.codexSessionShareVersion = sessionShareButtonVersion;
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        void createSessionShare();
-      }, true);
-    }
-    const nativeShare = Array.from(document.querySelectorAll('header button[aria-label="Share"], header button[aria-label="分享"], header button[aria-label*="Share"], header button[aria-label*="分享"]')).find(visibleElement);
-    const actionGroup = nativeShare?.closest?.(".ms-auto")
-      || document.querySelector("header .ms-auto")
-      || nativeShare?.parentElement?.parentElement?.parentElement;
-    if (actionGroup instanceof HTMLElement) {
-      button.style.position = "static";
-      button.style.pointerEvents = "auto";
-      button.style.webkitAppRegion = "no-drag";
-      // 只在按钮还不在操作栏里时才搬动它。过去还要求它必须排在最后，
-      // 一旦 Codex 在它后面挂了别的节点，这个条件就永远成立，
-      // 于是每轮 scan 都 appendChild 一次，反过来又触发下一轮 scan（issue #1960）。
-      if (button.parentElement !== actionGroup) {
-        actionGroup.appendChild(button);
-      }
-      return;
-    }
-    const header = document.querySelector('[data-testid="app-shell-header-context-menu-surface"]')?.closest?.("header")
-      || document.querySelector("header")
-      || document.querySelector(selectors.appHeader);
-    if (header instanceof HTMLElement) {
-      // 没有明确操作栏时也保持文档流，避免遮挡原生按钮。
-      button.style.position = "static";
-      button.style.pointerEvents = "auto";
-      button.style.webkitAppRegion = "no-drag";
-      button.style.marginLeft = "8px";
-      if (button.parentElement !== header) header.appendChild(button);
-    } else if (!button.isConnected) {
-      document.body.appendChild(button);
-    }
+  function removeSessionShareButtons() {
+    document.querySelectorAll(`.${sessionShareButtonClass}`).forEach((button) => button.remove());
   }
 
   function sessionImportMarkdown(session) {
@@ -11231,7 +11194,7 @@
   }
 
   function codexServiceTierNativeSpeedRow(container, rows, strings) {
-    const nativeFastToggle = container?.querySelector?.(`[role="menuitemcheckbox"][data-fast-mode-enabled]`);
+    const nativeFastToggle = container?.querySelector?.(`[data-fast-mode-enabled]`);
     if (nativeFastToggle) return nativeFastToggle;
     return rows.find((row) => {
       if (row.dataset.codexServiceTierMenuTrigger === "true") return false;
@@ -12752,7 +12715,7 @@
     syncCodexNativeSolidFastIcon();
     installCodexNativeServiceTierSelectionSync();
     installCodexServiceTierMenu();
-    installSessionShareButton();
+    removeSessionShareButtons();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
   }

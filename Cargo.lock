@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-core"
-version = "1.3.0+39"
+version = "1.3.0+48"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -448,13 +448,14 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-data"
-version = "1.3.0+39"
+version = "1.3.0+48"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "codex-plus-core",
  "fs2",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -467,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-launcher"
-version = "1.3.0+39"
+version = "1.3.0+48"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -481,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "codex-plus-manager"
-version = "1.3.0+39"
+version = "1.3.0+48"
 dependencies = [
  "anyhow",
  "async-trait",

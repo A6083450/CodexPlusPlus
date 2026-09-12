@@ -683,6 +683,13 @@ impl BridgeDataService for LauncherDataService {
         .map_err(|error| anyhow::anyhow!("generated images task failed: {error}"))
     }
 
+    async fn persist_generated_images(&self, session: SessionRef) -> anyhow::Result<usize> {
+        let db_paths = self.candidate_db_paths();
+        tokio::task::spawn_blocking(move || {
+            codex_plus_data::generated_images::persist_generated_images_from_paths(db_paths, &session)
+        }).await.map_err(|error| anyhow::anyhow!("persist images task failed: {error}"))?
+    }
+
     async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
         let adapter = self.storage_adapter();
         tokio::task::spawn_blocking(move || adapter.codex_thread_usage_history(&session))

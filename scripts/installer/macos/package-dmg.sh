@@ -4,6 +4,7 @@ set -euo pipefail
 VERSION="${1:-0.0.0}"
 ARCH="${2:-$(uname -m)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+python3 "$ROOT/extensions/imagegen/sync.py" --check --target "$ROOT"
 DIST="$ROOT/dist/macos"
 STAGE="$DIST/stage-${VERSION}-${ARCH}"
 BINARY_DIR="${BINARY_DIR:-$ROOT/target/release}"

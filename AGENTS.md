@@ -58,3 +58,10 @@
 - feature 分支命名：`codex/per-model-context` 或类似
 - 定期 `git fetch upstream && git rebase upstream/main` 保持同步
 - 目标：全栈完成后向主仓提 PR 合并
+
+## 独立生图扩展
+
+- 生图修复与本地 imagegen 增强的维护源为同级独立仓库 `../CodexPlusPlus-imagegen`，不在上游仓库中开发这部分实现。
+- 本仓库 `extensions/imagegen/` 是可独立构建的同步快照；修改维护源后用其 `sync.py --sync --target .` 同步，禁止覆盖宿主未同步改动。
+- 合并上游前后运行 `python3 ../CodexPlusPlus-imagegen/sync.py --check --target .`；缺失接入点必须逐项适配，不能用旧版整文件覆盖上游。
+- 接入约定和测试见 `extensions/imagegen/README.md`；不要移除 core/build.rs 和打包脚本中的接入检查。
