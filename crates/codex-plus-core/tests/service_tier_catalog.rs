@@ -152,77 +152,88 @@ fn sync_service_tier_catalog_patches_gpt6_in_default_model_cache() {
 
 #[test]
 fn sync_service_tier_catalog_replaces_invalid_gpt6_none_reasoning() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("config.toml"),
-        concat!(
-            "model = \"gpt-6-astra\"\n",
-            "model_reasoning_effort = \"none\"\n",
-            "model_provider = \"custom\"\n",
-        ),
-    )
-    .unwrap();
-    std::fs::write(
-        temp.path().join("models_cache.json"),
-        br#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":272000,"input_modalities":["text"],"supports_image_detail_original":false,"default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"none"}],"additional_speed_tiers":[],"service_tiers":[]}]}"#,
-    )
-    .unwrap();
+    for (slug, window) in [("gpt-6-astra", 1_050_000), ("gpt-6-sol", 272_000), ("gpt-6-luna", 272_000)] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            concat!(
+                "model = \"gpt-6-astra\"\n",
+                "model_reasoning_effort = \"none\"\n",
+                "model_provider = \"custom\"\n",
+            ).replace("gpt-6-astra", slug),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":272000,"input_modalities":["text"],"supports_image_detail_original":false,"default_reasoning_level":"none","supported_reasoning_levels":[{"effort":"none"}],"additional_speed_tiers":[],"service_tiers":[]}]}"#.replace("gpt-6-astra", slug),
+        )
+        .unwrap();
 
-    assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
+        assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
 
-    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(config.contains("model_reasoning_effort = \"medium\""));
-    assert!(config.contains("model_provider = \"custom\""));
-    let patched: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(temp.path().join("models_cache.json")).unwrap())
-            .unwrap();
-    assert_eq!(patched["models"][0]["context_window"], 1_050_000);
-    assert_eq!(patched["models"][0]["max_context_window"], 1_050_000);
-    assert_eq!(
-        patched["models"][0]["input_modalities"],
-        serde_json::json!(["text", "image"])
-    );
+        let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        assert!(config.contains("model_reasoning_effort = \"medium\""));
+        assert!(config.contains("model_provider = \"custom\""));
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("models_cache.json")).unwrap())
+                .unwrap();
+        assert_eq!(patched["models"][0]["context_window"], window);
+        assert_eq!(patched["models"][0]["max_context_window"], window);
+        assert_eq!(
+            patched["models"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+    }
 }
 
 #[test]
 fn gpt6_cache_preserves_native_ultra_and_the_selected_effort() {
-    let temp = tempfile::tempdir().unwrap();
-    let config = "model=\"gpt-6-astra\"\nmodel_reasoning_effort=\"ultra\"\n";
-    let cache = serde_json::json!({"models":[{
-        "slug":"gpt-6-astra", "multi_agent_version":"v2", "multi_agent_reasoning_effort":"xhigh",
-        "supported_reasoning_levels":[
-            {"effort":"none"},
-            {"effort":"low","description":"Native low"},
-            {"effort":"ultra","description":"Native automatic delegation"}
-        ]
-    }]});
-    std::fs::write(temp.path().join("config.toml"), config).unwrap();
-    std::fs::write(
-        temp.path().join("models_cache.json"),
-        serde_json::to_vec(&cache).unwrap(),
-    )
-    .unwrap();
-    assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
-    let patched: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(temp.path().join("models_cache.json")).unwrap())
-            .unwrap();
-    let levels = patched["models"][0]["supported_reasoning_levels"]
-        .as_array()
+    for slug in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = format!("model=\"{slug}\"\nmodel_reasoning_effort=\"ultra\"\n");
+        let cache = serde_json::json!({"models":[{
+            "slug":slug, "context_window":512000, "max_context_window":512000,
+            "service_tiers":[{"id":"priority"},{"id":"ultrafast"}],
+            "multi_agent_version":"v2", "multi_agent_reasoning_effort":"xhigh",
+            "supported_reasoning_levels":[
+                {"effort":"none"},
+                {"effort":"low","description":"Native low"},
+                {"effort":"ultra","description":"Native automatic delegation"}
+            ]
+        }]});
+        std::fs::write(temp.path().join("config.toml"), &config).unwrap();
+        std::fs::write(
+            temp.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
         .unwrap();
-    assert_eq!(levels[0]["description"], "Native low");
-    assert_eq!(levels.last().unwrap()["effort"], "ultra");
-    assert_eq!(
-        levels.last().unwrap()["description"],
-        "Native automatic delegation"
-    );
-    assert!(!levels.iter().any(|level| level["effort"] == "none"));
-    assert_eq!(patched["models"][0]["multi_agent_version"], "v2");
-    assert_eq!(patched["models"][0]["multi_agent_reasoning_effort"], "xhigh");
-    assert_eq!(
-        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
-        config
-    );
-    assert!(!sync_service_tier_catalog_in_home(temp.path()).unwrap());
+        assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("models_cache.json")).unwrap())
+                .unwrap();
+        assert_eq!(patched["models"][0]["service_tiers"][1]["id"], "ultrafast");
+        if slug != "gpt-6-astra" {
+            assert_eq!(patched["models"][0]["context_window"], 512000);
+            assert_eq!(patched["models"][0]["max_context_window"], 512000);
+        }
+        let levels = patched["models"][0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap();
+        assert_eq!(levels[0]["description"], "Native low");
+        assert_eq!(levels.last().unwrap()["effort"], "ultra");
+        assert_eq!(
+            levels.last().unwrap()["description"],
+            "Native automatic delegation"
+        );
+        assert!(!levels.iter().any(|level| level["effort"] == "none"));
+        assert_eq!(patched["models"][0]["multi_agent_version"], "v2");
+        assert_eq!(patched["models"][0]["multi_agent_reasoning_effort"], "xhigh");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+            config
+        );
+        assert!(!sync_service_tier_catalog_in_home(temp.path()).unwrap());
+    }
 }
 
 #[test]

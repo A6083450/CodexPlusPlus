@@ -56,9 +56,10 @@ pub fn sync_service_tier_catalog_in_home(home: &Path) -> anyhow::Result<bool> {
         .get("model_catalog_json")
         .and_then(Item::as_str)
         .is_some_and(is_managed_catalog);
-    let replaces_invalid_gpt6_reasoning = config.get("model").and_then(Item::as_str)
-        == Some("gpt-6-astra")
-        && config.get("model_reasoning_effort").and_then(Item::as_str) == Some("none");
+    let replaces_invalid_gpt6_reasoning = matches!(
+        config.get("model").and_then(Item::as_str),
+        Some("gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+    ) && config.get("model_reasoning_effort").and_then(Item::as_str) == Some("none");
     let mut changed = patch_native_model_cache(home, &config)?;
 
     if uses_managed_catalog {
@@ -94,12 +95,32 @@ fn patch_native_model_cache(home: &Path, config: &DocumentMut) -> anyhow::Result
         return Ok(false);
     };
     let context = context_metadata_from_config(config);
-    let gpt6 = gpt6_compat_metadata();
     let mut changed = false;
     for model in models.iter_mut().filter_map(Value::as_object_mut) {
         let mut metadata = context.clone();
-        if model.get("slug").and_then(Value::as_str) == Some("gpt-6-astra") {
-            for (key, value) in &gpt6 {
+        let slug = model.get("slug").and_then(Value::as_str).unwrap_or_default();
+        if matches!(slug, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna") {
+            for (key, value) in &gpt6_compat_metadata(slug) {
+                // 新模型保留原生窗口，兼容模板仅补缺失值；显式配置仍优先。
+                if slug != "gpt-6-astra"
+                    && matches!(
+                        key.as_str(),
+                        "context_window" | "max_context_window"
+                            | "effective_context_window_percent" | "auto_compact_token_limit"
+                    )
+                    && model.contains_key(key)
+                {
+                    continue;
+                }
+                // 保留原生新增速度档位，不用兼容模板抹掉 Ultrafast 等选项。
+                if matches!(key.as_str(), "service_tiers" | "additional_speed_tiers")
+                    && model
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .is_some_and(|tiers| !tiers.is_empty())
+                {
+                    continue;
+                }
                 let value = if key == "supported_reasoning_levels" {
                     merge_gpt6_reasoning_levels(model.get(key), value)
                 } else {
@@ -156,8 +177,8 @@ fn context_metadata_from_config(config: &DocumentMut) -> Map<String, Value> {
     metadata
 }
 
-fn gpt6_compat_metadata() -> Map<String, Value> {
-    let metadata = crate::model_suffix::runtime_model_metadata_entry("gpt-6-astra")
+fn gpt6_compat_metadata(slug: &str) -> Map<String, Value> {
+    let metadata = crate::model_suffix::runtime_model_metadata_entry(slug)
         .expect("bundled GPT-6 metadata");
     [
         "default_reasoning_level",

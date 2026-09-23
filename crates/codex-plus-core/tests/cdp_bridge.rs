@@ -3881,7 +3881,7 @@ fn injection_script_applies_fast_service_tier_contract() {
         "priority"
     );
     for model in [
-        "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra",
+        "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     ] {
         assert_eq!(
             cases["missingNativeTiers"][model]["created"][0]["id"], "priority", "{model}"
@@ -3912,6 +3912,19 @@ fn injection_script_applies_fast_service_tier_contract() {
         cases["solDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
         "ultra"
     );
+    for slug in ["gpt-6-sol", "gpt-6-luna"] {
+        let case = &cases["gpt6NewModels"][slug];
+        assert_eq!(case["fast"]["supported"], true, "{slug}");
+        assert_eq!(case["changedAgain"], false, "{slug}");
+        assert_eq!(case["descriptor"]["defaultReasoningEffort"], "medium", "{slug}");
+        assert_eq!(case["descriptor"]["multiAgentVersion"], "v2");
+        assert_eq!(case["descriptor"]["serviceTiers"][1]["id"], "ultrafast");
+        assert_eq!(case["descriptor"]["additionalSpeedTiers"], json!(["fast", "ultrafast"]));
+        let levels = case["descriptor"]["supportedReasoningEfforts"].as_array().unwrap();
+        assert_eq!(levels.iter().map(|l| l["reasoningEffort"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(levels[5]["description"], "Native automatic delegation");
+    }
     assert_eq!(cases["astraFastAvailability"]["supported"], true);
     assert_eq!(cases["astraDescriptor"]["defaultReasoningEffort"], "medium");
     assert_eq!(
@@ -4408,7 +4421,7 @@ api.setModelCatalog({{
 }});
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
 const missingNativeTiers = {{}};
-for (const model of ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"]) {{
+for (const model of ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {{
   const descriptor = {{ model, serviceTiers: [], additionalSpeedTiers: [] }};
   api.applyModelMetadata(descriptor, model);
   missingNativeTiers[model] = {{
@@ -4467,6 +4480,21 @@ const disabledNativeList = {{ data: structuredClone(nativeRowsOutsideCatalog) }}
 api.patchAppServerResult("model/list", disabledNativeList);
 const speedControlsDisabledTiers = disabledNativeList.data[0].serviceTiers;
 api.setBackendSettings({{ codexAppServiceTierControls: true }});
+const gpt6NewModels = {{}};
+const gpt6Metadata = {gpt6_metadata};
+for (const slug of ["gpt-6-sol", "gpt-6-luna"]) {{
+  api.setModelCatalog({{ model: slug, models: [slug], modelMetadata: gpt6Metadata }});
+  const result = {{ data: [{{ model: slug, defaultReasoningEffort: "none", multiAgentVersion: "v2",
+    supportedReasoningEfforts: [{{ reasoningEffort: "none" }}, {{ reasoningEffort: "ultra", description: "Native automatic delegation" }}],
+    serviceTiers: [{{ id: "priority" }}, {{ id: "ultrafast" }}],
+    additionalSpeedTiers: ["fast", "ultrafast"],
+  }}] }};
+  api.patchAppServerResult("model/list", result);
+  gpt6NewModels[slug] = {{ descriptor: result.data[0], fast: api.fastAvailability(slug),
+    changedAgain: api.applyModelMetadata(result.data[0], slug) }};
+}}
+api.setModelCatalog({{ model: "gpt-6-astra", models: ["gpt-6-astra"],
+  modelMetadata: {{ "gpt-6-astra": gpt6Metadata["gpt-6-astra"] }} }});
 const astraFastAvailability = api.fastAvailability("gpt-6-astra");
 const astraDescriptor = api.modelDescriptor("gpt-6-astra");
 const nativeAstraDescriptor = {{
@@ -5387,6 +5415,7 @@ process.stdout.write(JSON.stringify({{
   solDescriptor,
   missingNativeTiers, preservedNativeTiers, unknownModelTiers, nativeMultiSpeedRowDetected,
   nativeModelsOutsideCatalog, nativeQueryOutsideCatalog, outsideCatalogMetadataPreserved, speedControlsDisabledTiers,
+  gpt6NewModels,
   astraFastAvailability,
   astraDescriptor,
   nativeAstraDescriptor,
@@ -5510,6 +5539,11 @@ process.stdout.write(JSON.stringify({{
   process.exit(1);
 }});
 "#,
+        gpt6_metadata = serde_json::json!({
+            "gpt-6-astra": codex_plus_core::model_suffix::model_ui_metadata("gpt-6-astra"),
+            "gpt-6-sol": codex_plus_core::model_suffix::model_ui_metadata("gpt-6-sol"),
+            "gpt-6-luna": codex_plus_core::model_suffix::model_ui_metadata("gpt-6-luna"),
+        }),
         script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
             .expect("script path should serialize")
     )
