@@ -13,11 +13,27 @@ use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+
+/// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
+/// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
+///
+/// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
+/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
+/// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
+/// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
+pub fn protocol_proxy_port() -> u16 {
+    std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_COOLDOWN_RETRIES: usize = 3;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -36,6 +52,72 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
+
+fn should_retry_after_cooldown(retries: usize) -> bool {
+    retries < MAX_COOLDOWN_RETRIES
+}
+
+/// codex v2 远程压缩请求在 input 末尾携带的控制 item（openai/codex compact_remote_v2）。
+const COMPACTION_TRIGGER_TYPE: &str = "compaction_trigger";
+/// codex 期望响应里恰好包含一个的压缩结果 item，`encrypted_content` 只透传不校验。
+const COMPACTION_OUTPUT_TYPE: &str = "compaction";
+/// 本地代理生成摘要时注入的 user 指令（对齐 openai/codex prompts/templates/compact/prompt.md）。
+const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+/// 历史回放时 `compaction` item 展开成的文本前缀（对齐 codex SUMMARY_PREFIX 语义）。
+const COMPACTION_REPLAY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary produced by the other language model:\n";
+
+/// 判断 Responses 请求体是否为 codex v2 远程压缩请求：
+/// input 末尾（允许中间有尾随的空壳 item）存在 `compaction_trigger`。
+pub fn request_has_compaction_trigger(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.get("type").and_then(Value::as_str).is_some())
+                .map(|item| {
+                    item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER_TYPE)
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// 从请求 input 中剥离 `compaction_trigger` 控制项，返回去掉后的请求体。
+/// codex 只把它放在 input 末尾，其余位置的按未知类型忽略。
+fn strip_compaction_trigger(mut body: Value) -> Value {
+    if let Some(items) = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .filter(|items| !items.is_empty())
+    {
+        while items
+            .last()
+            .and_then(|item| item.get("type").and_then(Value::as_str))
+            == Some(COMPACTION_TRIGGER_TYPE)
+        {
+            items.pop();
+        }
+    }
+    body
+}
+
+/// 把压缩摘要请求改写成上游能理解的普通生成请求：
+/// - input 末尾注入 user 摘要指令；
+/// - tools/parallel_tool_calls 清空，避免摘要阶段触发工具调用。
+fn rewrite_request_for_compaction(mut body: Value) -> Value {
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": COMPACTION_SUMMARY_INSTRUCTION }]
+        }));
+    }
+    body["tools"] = json!([]);
+    body["tool_choice"] = json!("none");
+    body["parallel_tool_calls"] = json!(false);
+    body
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatReasoningStyle {
@@ -74,6 +156,8 @@ enum CodexCustomToolKind {
     Raw,
     ApplyPatch,
     BuiltIn,
+    /// Codex 的 tool_search 工具（MCP 延迟加载检索，execution: client）。
+    ToolSearch,
 }
 
 impl Default for CodexCustomToolKind {
@@ -108,6 +192,11 @@ impl CodexToolContext {
         self.custom_tools.contains_key(upstream_name)
     }
 
+    fn is_tool_search_proxy(&self, upstream_name: &str) -> bool {
+        self.custom_tools.get(upstream_name).map(|spec| spec.kind)
+            == Some(CodexCustomToolKind::ToolSearch)
+    }
+
     fn original_custom_tool_name(&self, upstream_name: &str) -> String {
         self.custom_tools
             .get(upstream_name)
@@ -133,6 +222,13 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
 }
 
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
+    responses_to_chat_completions_with_options(body, false)
+}
+
+pub fn responses_to_chat_completions_with_options(
+    body: Value,
+    standard: bool,
+) -> anyhow::Result<Value> {
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -150,7 +246,11 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     if let Some(input) = body.get("input") {
         append_responses_input(input, &mut messages);
     }
+    // 必须在 enforce_tool_call_pairing 之前：配对一旦被错误摘除就无法恢复。
+    relocate_interleaved_non_tool_messages(&mut messages);
     enforce_tool_call_pairing(&mut messages);
+    // 配对判定之后仍有无主 tool 消息（上游会直接 400），降级成 user 保住内容。
+    degrade_unpaired_tool_messages(&mut messages);
     // 必须在 enforce_tool_call_pairing 之后：它依赖 tool 消息的连续性，
     // 而这一步会往中间插入 user 消息。
     relocate_tool_output_images(&mut messages);
@@ -188,16 +288,29 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
         result["stream_options"] = stream_options;
     }
 
-    apply_chat_reasoning_options(&mut result, &body, model);
+    apply_chat_reasoning_options(&mut result, &body, model, standard);
 
-    let tool_context = build_codex_tool_context(body.get("tools"));
+    let mut tool_context = build_codex_tool_context(body.get("tools"));
+    // Codex 客户端把 tool_search 命中的 MCP 命名空间挂在历史里的 tool_search_output
+    // item 上，却不会把它们提升进下一轮请求的 tools 数组。这里补上这一跳：先登记进
+    // tool context（模型调用回来时才能还原 namespace），再用既有 namespace 链路展开
+    // 成 mcp__<server>__<tool>，否则上游只看到命名空间外壳，调不到内层工具。
+    let harvested_namespaces = collect_tool_search_output_namespaces(&body);
+    for namespace_tool in &harvested_namespaces {
+        add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+    }
     let mut has_chat_tools = false;
+    let mut converted = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted = responses_tools_to_chat_tools(tools, &tool_context);
-        if !converted.is_empty() {
-            has_chat_tools = true;
-            result["tools"] = json!(converted);
-        }
+        converted = responses_tools_to_chat_tools(tools, &tool_context);
+    }
+    for namespace_tool in &harvested_namespaces {
+        converted.extend(namespace_tool_to_chat_tools(namespace_tool, &tool_context));
+    }
+    dedup_chat_tools_by_name(&mut converted);
+    if !converted.is_empty() {
+        has_chat_tools = true;
+        result["tools"] = json!(converted);
     }
 
     if has_chat_tools {
@@ -232,7 +345,12 @@ pub fn chat_completion_to_response_with_request(
     body: Value,
     original_request: &Value,
 ) -> anyhow::Result<Value> {
-    let context = build_codex_tool_context(original_request.get("tools"));
+    let mut context = build_codex_tool_context(original_request.get("tools"));
+    // 反向同样要认领 tool_search_output 里的命名空间，否则模型调用
+    // mcp__<server>__<tool> 回来时查不到 namespace，还原不成 Responses item。
+    for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+        add_namespace_tools_to_context(&mut context, namespace_tool);
+    }
     chat_completion_to_response_with_context(body, &context, Some(original_request))
 }
 
@@ -294,7 +412,11 @@ pub struct UpstreamProxyResponse {
     pub content_type: String,
     pub is_stream: bool,
     pub wire_api: UpstreamWireApi,
+    /// 仅标记 Chat Completions 的合成摘要兼容路径；原生 Responses 保持透传。
+    /// 响应必须由代理重组为单个 `compaction` 输出项。
+    pub compaction: bool,
     pub response: reqwest::Response,
+    pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -369,6 +491,371 @@ pub struct ChatSseToResponsesConverter {
     utf8_remainder: Vec<u8>,
     state: ChatSseState,
     failed: bool,
+}
+
+/// codex v2 远程压缩的响应包装器：把上游摘要文本（无论 Responses 还是
+/// Chat 上游、流式还是非流式）封装成「恰好一个 `compaction` 输出项」的
+/// Responses SSE 流。输出项通过 output_item.done 显式交付给客户端，
+/// 不能只放进 response.completed.response.output。
+pub struct CompactionSseConverter {
+    response_id: String,
+    compaction_id: String,
+    model: String,
+    summary: String,
+    final_summary: Option<String>,
+    failed: Option<(String, Option<String>)>,
+    /// 跨网络 chunk 攒 SSE 事件的缓冲（见 push_upstream_bytes）。
+    sse_buffer: String,
+    sse_utf8_remainder: Vec<u8>,
+    responses_wire: bool,
+}
+
+impl CompactionSseConverter {
+    pub fn new(model: &str) -> Self {
+        Self {
+            response_id: format!("resp_compact_{}", chrono_now_millis()),
+            compaction_id: format!("cmp_{}", uuid::Uuid::new_v4().simple()),
+            model: model.to_string(),
+            summary: String::new(),
+            final_summary: None,
+            failed: None,
+            sse_buffer: String::new(),
+            sse_utf8_remainder: Vec::new(),
+            responses_wire: true,
+        }
+    }
+
+    /// 标记上游是 Chat Completions（SSE chunk 的增量在 `choices[].delta.content`）。
+    /// Responses 上游默认，增量在 `response.output_text.delta` 事件里。
+    pub fn with_chat_upstream(mut self) -> Self {
+        self.responses_wire = false;
+        self
+    }
+
+    /// 追加上游输出的一块文本内容（非流式路径直接喂完整摘要）。
+    pub fn push_summary_text(&mut self, text: &str) {
+        self.summary.push_str(text);
+    }
+
+    /// 当前已收集的原始摘要文本（剥 think 之前），供空摘要判定。
+    pub fn summary_text(&self) -> &str {
+        &self.summary
+    }
+
+    /// 喂入上游流式响应的一个网络 chunk。SSE 事件可能被 TCP 拆开，
+    /// 内部按 `\n\n` 边界缓冲；残缺块留在缓冲区等下一个 chunk。
+    pub fn push_upstream_bytes(&mut self, bytes: &[u8]) {
+        append_utf8_safe(&mut self.sse_buffer, &mut self.sse_utf8_remainder, bytes);
+        while let Some(block) = take_sse_block(&mut self.sse_buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            self.handle_upstream_sse_block(&block);
+        }
+    }
+
+    fn handle_upstream_sse_block(&mut self, block: &str) {
+        let mut event_name = "";
+        let mut data_parts: Vec<&str> = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                event_name = event.trim();
+            }
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data);
+            }
+        }
+        if data_parts.is_empty() {
+            return;
+        }
+        let data = data_parts.join("\n");
+        if data.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+        let event_type = chunk
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or(event_name);
+        if matches!(
+            event_type,
+            "response.failed" | "response.incomplete" | "error"
+        ) || chunk.get("error").is_some_and(|error| !error.is_null())
+        {
+            let error = chunk
+                .pointer("/response/error")
+                .or_else(|| chunk.get("error"));
+            self.fail(
+                error
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Compaction upstream stream failed or was incomplete")
+                    .to_string(),
+                error
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            );
+            return;
+        }
+        if self.responses_wire {
+            match event_type {
+                // Responses 流优先读取正文增量，排除携带同名 delta 字段的推理事件。
+                "response.output_text.delta" => {
+                    if let Some(delta) = chunk.get("delta").and_then(Value::as_str) {
+                        self.summary.push_str(delta);
+                    }
+                }
+                // 部分兼容实现不发送 delta，只在完成事件里携带完整正文。
+                "response.output_text.done" => {
+                    self.capture_final_summary(chunk.get("text"));
+                }
+                "response.content_part.done" => {
+                    self.capture_final_summary(chunk.pointer("/part/text"));
+                }
+                "response.output_item.done" => {
+                    let text = chunk
+                        .get("item")
+                        .map(extract_summary_text_from_response_item)
+                        .unwrap_or_default();
+                    self.capture_final_summary(Some(&json!(text)));
+                }
+                "response.completed" => {
+                    let text = chunk
+                        .get("response")
+                        .map(extract_summary_text_from_responses)
+                        .unwrap_or_default();
+                    self.capture_final_summary(Some(&json!(text)));
+                }
+                _ => {}
+            }
+        } else if let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        {
+            if let Some(content) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+            {
+                self.summary.push_str(content);
+            }
+            self.capture_final_summary(
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("content")),
+            );
+        }
+    }
+
+    fn capture_final_summary(&mut self, text: Option<&Value>) {
+        let Some(text) = text
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return;
+        };
+        self.final_summary = Some(text.to_string());
+    }
+
+    pub fn fail(&mut self, message: String, error_type: Option<String>) -> Vec<u8> {
+        self.failed = Some((message, error_type));
+        Vec::new()
+    }
+
+    /// 收尾：产出完整的 compaction 响应 SSE。
+    /// 链式推理上游（DeepSeek thinking 等）会把推理过程以 `<think>` 块
+    /// 混进正文，这里统一剥掉首部完整 think 块，只保留真正的摘要答案；
+    /// think 块未闭合（上游截断）时整个丢弃——剩下的只有推理残片。
+    pub fn finish(mut self) -> Vec<u8> {
+        if let Some(final_summary) = self.final_summary.take() {
+            self.summary = final_summary;
+        }
+        if let Some((_reasoning, answer)) = split_leading_think_block(&self.summary) {
+            self.summary = answer;
+        } else if self.summary.trim_start().starts_with(THINK_OPEN_TAG) {
+            self.summary = String::new();
+        }
+        self.summary = self.summary.trim().to_string();
+        // 剥掉 think 块后为空（上游空输出、纯推理文本、截断导致块未闭合），
+        // 一律按失败返回，避免向 codex 交付 `completed + 空 encrypted_content`
+        // 的空 checkpoint 静默清空会话。
+        if self.failed.is_none() && self.summary.is_empty() {
+            self.failed = Some((
+                "上游返回了空摘要，无法完成压缩".to_string(),
+                Some("compaction_empty_summary".to_string()),
+            ));
+        }
+        let mut output = String::new();
+        let mut response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": chrono_now_millis() / 1000,
+            "status": "in_progress",
+            "model": self.model,
+            "output": [],
+            "usage": default_responses_usage()
+        });
+        push_sse(
+            &mut output,
+            "response.created",
+            json!({"type": "response.created", "sequence_number": 0, "response": response}),
+        );
+        if let Some((message, error_type)) = self.failed {
+            response["status"] = json!("failed");
+            response["error"] = json!({
+                "code": error_type.unwrap_or_else(|| "compaction_failed".to_string()),
+                "message": message
+            });
+            push_sse(
+                &mut output,
+                "response.failed",
+                json!({"type": "response.failed", "sequence_number": 1, "response": response}),
+            );
+            output.push_str("data: [DONE]\n\n");
+            return output.into_bytes();
+        }
+        let compaction_item = json!({
+            "id": self.compaction_id,
+            "type": COMPACTION_OUTPUT_TYPE,
+            "encrypted_content": self.summary
+        });
+        for (sequence_number, event_type) in [
+            (1, "response.output_item.added"),
+            (2, "response.output_item.done"),
+        ] {
+            push_sse(
+                &mut output,
+                event_type,
+                json!({
+                    "type": event_type,
+                    "sequence_number": sequence_number,
+                    "output_index": 0,
+                    "item": compaction_item
+                }),
+            );
+        }
+        response["status"] = json!("completed");
+        response["output"] = json!([compaction_item]);
+        push_sse(
+            &mut output,
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": response
+            }),
+        );
+        output.push_str("data: [DONE]\n\n");
+        output.into_bytes()
+    }
+}
+
+fn chrono_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 非流式压缩响应包装：从上游 JSON 响应里提取 assistant 文本并封装成
+/// 恰好一个 `compaction` 输出项的 Responses 响应。
+pub fn wrap_non_stream_response_as_compaction(
+    upstream_body: &[u8],
+    model: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let upstream_json: Value = serde_json::from_slice(upstream_body)?;
+    let mut converter = CompactionSseConverter::new(model);
+    if let Some(error) = upstream_json.get("error").filter(|value| !value.is_null()) {
+        converter.fail(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("compaction upstream error")
+                .to_string(),
+            None,
+        );
+        return Ok(converter.finish());
+    }
+    let responses_text = extract_summary_text_from_responses(&upstream_json);
+    let text = if responses_text.is_empty() {
+        extract_summary_text_from_chat(&upstream_json)
+    } else {
+        responses_text
+    };
+    if text.is_empty() {
+        converter.fail(
+            "上游返回了空摘要，无法完成压缩".to_string(),
+            Some("compaction_empty_summary".to_string()),
+        );
+        return Ok(converter.finish());
+    }
+    converter.push_summary_text(&text);
+    Ok(converter.finish())
+}
+
+/// 从 Responses JSON 响应（`output[].content[].text`）提取 assistant 文本。
+fn extract_summary_text_from_responses(response: &Value) -> String {
+    let Some(items) = response.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        let text = extract_summary_text_from_response_item(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
+}
+
+fn extract_summary_text_from_response_item(item: &Value) -> String {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(COMPACTION_OUTPUT_TYPE) => item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 从 Chat Completions JSON 响应提取 assistant 文本。
+fn extract_summary_text_from_chat(response: &Value) -> String {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 历史回放：把 codex 历史里的 `compaction` item 展开成明文 user 消息。
+/// codex 下游请求会把上次压缩结果作为 `{"type":"compaction","encrypted_content":"..."}`
+/// 放进 input，第三方模型看不懂该类型，必须转成文本。
+fn expand_compaction_item(item: &Value) -> Option<Value> {
+    let summary = item.get("encrypted_content").and_then(Value::as_str)?;
+    let mut text = COMPACTION_REPLAY_PREFIX.to_string();
+    text.push_str(summary);
+    Some(json!({
+        "role": "user",
+        "content": text
+    }))
 }
 
 impl Default for ChatSseToResponsesConverter {
@@ -547,12 +1034,24 @@ pub async fn open_responses_proxy_request_for_path(
     original_user_agent: Option<&str>,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_for_path_with_beta(body, original_user_agent, request_path, None)
+        .await
+}
+
+/// 只转发客户端声明的 beta 能力，不转发客户端鉴权。
+pub async fn open_responses_proxy_request_for_path_with_beta(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
         original_user_agent,
         request_path,
+        beta_features,
     )
     .await
 }
@@ -561,8 +1060,14 @@ pub async fn open_responses_proxy_request_with_settings(
     body: &str,
     settings: crate::settings::BackendSettings,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, "/responses")
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        "/responses",
+        None,
+    )
+    .await
 }
 
 pub async fn open_responses_proxy_request_with_settings_for_path(
@@ -570,8 +1075,30 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
     settings: crate::settings::BackendSettings,
     request_path: &str,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, None, request_path)
-        .await
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        request_path,
+        None,
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_settings_for_path_and_beta(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    request_path: &str,
+    beta_features: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        None,
+        request_path,
+        beta_features,
+    )
+    .await
 }
 
 async fn open_responses_proxy_request_with_settings_and_user_agent(
@@ -579,6 +1106,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
     request_path: &str,
+    beta_features: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
@@ -617,16 +1145,22 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         Some(relay.id.as_str())
     );
     let relay_count = relays.len();
-    for (attempt, relay) in relays.into_iter().enumerate() {
+    let mut cooldown_retries = 0_usize;
+    'request: loop {
+        for (attempt, relay) in relays.iter().cloned().enumerate() {
         validate_upstream(&relay)?;
+        let channel_key = crate::channel_protection::key_for_relay(&relay);
+        let channel_permit =
+            crate::channel_protection::acquire(&channel_key, &relay).await;
         let model_override = aggregate_upstream_model_override(&settings, &relay);
-        let (endpoint, upstream_body, wire_api) = upstream_request_parts(
+        let (endpoint, upstream_body, wire_api, compaction) = upstream_request_parts(
             &relay,
             request_json.clone(),
             request_path,
             model_override.as_deref(),
         )
         .await?;
+        let is_compaction_request = compaction;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -648,23 +1182,25 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 }))
             }),
         );
-        let upstream = match send_upstream_request_for_responses(
-            upstream_request_builder(
-                crate::http_client::proxied_client(&effective_user_agent(
-                    &relay.user_agent,
-                    original_user_agent,
-                ))?,
-                &endpoint,
-                &relay,
-                is_stream,
-                &upstream_body,
-            ),
+        let mut builder = upstream_request_builder(
+            crate::http_client::proxied_client(&effective_user_agent(
+                &relay.user_agent,
+                original_user_agent,
+            ))?,
+            &endpoint,
+            &relay,
             is_stream,
-        )
-        .await
-        {
+            &upstream_body,
+        );
+        if wire_api == UpstreamWireApi::Responses {
+            if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
+                builder = builder.header("x-codex-beta-features", value);
+            }
+        }
+        let upstream = match send_upstream_request_for_responses(builder, is_stream).await {
             Ok(upstream) => upstream,
             Err(error) => {
+                drop(channel_permit);
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "protocol_proxy.upstream_request_failed",
                     json!({
@@ -693,6 +1229,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }
         };
         let status_code = upstream.status().as_u16();
+        let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_response",
             json!({
@@ -723,14 +1260,48 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .unwrap_or("")
             .to_string();
         if (200..300).contains(&status_code) || !has_more_candidates {
+            if !(200..300).contains(&status_code) {
+                let cooldown_started = crate::channel_protection::mark_failure(
+                    &channel_key,
+                    &relay,
+                    status_code,
+                    retry_after,
+                )
+                .await;
+                if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
+                    cooldown_retries = cooldown_retries.saturating_add(1);
+                    drop(channel_permit);
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.channel_cooldown_retry",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "statusCode": status_code,
+                            "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
+                            "retry": cooldown_retries
+                        }),
+                    );
+                    continue 'request;
+                }
+            }
             return Ok(UpstreamProxyResponse {
                 status_code,
                 is_stream: is_stream || content_type.contains("text/event-stream"),
                 content_type,
                 wire_api,
+                compaction: is_compaction_request,
                 response: upstream,
+                _channel_permit: Some(channel_permit),
             });
         }
+        crate::channel_protection::mark_failure(
+            &channel_key,
+            &relay,
+            status_code,
+            retry_after,
+        )
+        .await;
+        drop(channel_permit);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_failover",
             json!({
@@ -745,8 +1316,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "headerTimeoutSeconds": header_timeout.as_secs()
             }),
         );
+        }
+        anyhow::bail!("未找到可用的聚合供应商成员")
     }
-    anyhow::bail!("未找到可用的聚合供应商成员")
 }
 
 fn select_model_route(
@@ -841,7 +1413,9 @@ pub async fn open_models_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::Responses,
+        compaction: false,
         response: upstream,
+        _channel_permit: None,
     })
 }
 
@@ -890,7 +1464,9 @@ pub async fn open_audio_transcriptions_proxy_request(
         is_stream: false,
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
+        compaction: false,
         response: upstream,
+        _channel_permit: None,
     })
 }
 
@@ -1021,7 +1597,9 @@ async fn open_image_proxy_request(
         is_stream: false,
         content_type,
         wire_api,
+        compaction: false,
         response: upstream,
+        _channel_permit: None,
     })
 }
 
@@ -1054,29 +1632,68 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let request = crate::http_client::proxied_client(&effective_user_agent(
-        &relay.user_agent,
-        original_user_agent,
-    ))?
-    .post(chat_completions_url(&relay.base_url))
-    .header(reqwest::header::CONTENT_TYPE, "application/json")
-    .json(&request_json);
-    let upstream = with_relay_auth(request, &relay).send().await?;
-    let status_code = upstream.status().as_u16();
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let channel_key = crate::channel_protection::key_for_relay(&relay);
+    let mut cooldown_retries = 0_usize;
+    loop {
+        let channel_permit =
+            crate::channel_protection::acquire(&channel_key, &relay).await;
+        let request = crate::http_client::proxied_client(&effective_user_agent(
+            &relay.user_agent,
+            original_user_agent,
+        ))?
+        .post(chat_completions_url(&relay.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&request_json);
+        let upstream = match with_relay_auth(request, &relay).send().await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                drop(channel_permit);
+                return Err(error.into());
+            }
+        };
+        let status_code = upstream.status().as_u16();
+        let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
+        if !(200..300).contains(&status_code) {
+            let cooldown_started = crate::channel_protection::mark_failure(
+                &channel_key,
+                &relay,
+                status_code,
+                retry_after,
+            )
+            .await;
+            if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
+                cooldown_retries = cooldown_retries.saturating_add(1);
+                drop(channel_permit);
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.channel_cooldown_retry",
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "statusCode": status_code,
+                        "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
+                        "retry": cooldown_retries
+                    }),
+                );
+                continue;
+            }
+        }
+        let content_type = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
 
-    Ok(UpstreamProxyResponse {
-        status_code,
-        is_stream: is_stream || content_type.contains("text/event-stream"),
-        content_type,
-        wire_api: UpstreamWireApi::ChatCompletions,
-        response: upstream,
-    })
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: is_stream || content_type.contains("text/event-stream"),
+            content_type,
+            wire_api: UpstreamWireApi::ChatCompletions,
+            compaction: false,
+            response: upstream,
+            _channel_permit: Some(channel_permit),
+        });
+    }
 }
 
 async fn upstream_request_parts(
@@ -1084,10 +1701,14 @@ async fn upstream_request_parts(
     mut request_json: Value,
     request_path: &str,
     model_override: Option<&str>,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
-    let compact = is_responses_compact_proxy_path(request_path);
-    if compact && relay.protocol == RelayProtocol::ChatCompletions {
-        anyhow::bail!("Chat Completions 协议暂不支持 Responses compact 请求");
+) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
+    let compact = is_responses_compact_proxy_path(request_path)
+        || request_has_compaction_trigger(&request_json);
+    let is_v2_compaction = compact && request_has_compaction_trigger(&request_json);
+    // 原生 Responses 状态必须来自上游，不能以普通摘要冒充加密状态。
+    let synthetic_compaction = compact && relay.protocol == RelayProtocol::ChatCompletions;
+    if synthetic_compaction {
+        request_json = rewrite_request_for_compaction(strip_compaction_trigger(request_json));
     }
     if let Some(model) = model_override
         .map(str::trim)
@@ -1097,10 +1718,13 @@ async fn upstream_request_parts(
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request_json)?,
+        RelayProtocol::ChatCompletions => responses_to_chat_completions_with_options(
+            request_json,
+            relay.standard_openai_protocol,
+        )?,
     };
     if relay.protocol == RelayProtocol::Responses {
-        normalize_responses_custom_tool_call_ids(&mut body);
+        normalize_responses_item_ids(&mut body);
         crate::image_delivery::normalize_history_ids(&mut body);
         normalize_image_generation_tools(&mut body);
     }
@@ -1165,12 +1789,17 @@ async fn upstream_request_parts(
     };
     Ok((
         match relay.protocol {
-            RelayProtocol::Responses if compact => responses_compact_url(&relay.base_url),
+            // v2 压缩请求走普通 /responses 端点（compaction_trigger 在 input 里）；
+            // 显式 legacy compact 保留原端点。
+            RelayProtocol::Responses if compact && !is_v2_compaction => {
+                responses_compact_url(&relay.base_url)
+            }
             RelayProtocol::Responses => responses_url(&relay.base_url),
             RelayProtocol::ChatCompletions => chat_completions_url(&relay.base_url),
         },
         body,
         wire_api,
+        synthetic_compaction,
     ))
 }
 
@@ -1207,11 +1836,8 @@ fn with_relay_auth(
     request: reqwest::RequestBuilder,
     relay: &crate::settings::RelayProfile,
 ) -> reqwest::RequestBuilder {
-    if relay.uses_no_auth() {
-        request
-    } else {
-        request.bearer_auth(relay.api_key.trim())
-    }
+    // 认证（API Key / 无认证）+ 供应商自定义请求头，统一在 relay_headers 里决定优先级。
+    crate::relay_headers::apply(request, relay)
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -1241,6 +1867,7 @@ fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option
 pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyHttpResponse> {
     let request_json: Value = serde_json::from_str(body)?;
     let upstream = open_responses_proxy_request(body, None).await?;
+    let is_compaction = upstream.compaction;
     let status_code = upstream.status_code;
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
@@ -1254,6 +1881,32 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             status: http_status_line(status_code),
             content_type: "application/json; charset=utf-8".to_string(),
             body: serde_json::to_vec(&error)?,
+        });
+    }
+
+    if is_compaction {
+        // v2 压缩：无论上游协议/是否流式，都重组为单个 compaction 输出项。
+        let model = request_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !is_stream {
+            return Ok(ProxyHttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "text/event-stream; charset=utf-8".to_string(),
+                body: wrap_non_stream_response_as_compaction(&upstream_body, model)?,
+            });
+        }
+        let mut converter = CompactionSseConverter::new(model);
+        if wire_api != UpstreamWireApi::Responses {
+            converter = converter.with_chat_upstream();
+        }
+        // 整包已收齐，直接喂给有状态 SSE 解析器（与 launcher 逐 chunk 路径同逻辑）。
+        converter.push_upstream_bytes(&upstream_body);
+        return Ok(ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            body: converter.finish(),
         });
     }
 
@@ -1390,8 +2043,7 @@ fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(DEFAULT_PROTOCOL_PROXY_PORT)
-    {
+    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(protocol_proxy_port()) {
         return false;
     }
     matches!(
@@ -1492,6 +2144,15 @@ pub fn response_id_from_chat_id(id: Option<&str>) -> String {
     }
 }
 
+/// `resp_xxx` → `xxx`。message item 的 id 必须以 `msg_` 开头，
+/// 直接拼在 `response_id` 后面会得到上游拒收的 `resp_xxx_msg`（#1431）。
+fn response_id_body(response_id: &str) -> &str {
+    response_id
+        .strip_prefix("resp_")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(response_id)
+}
+
 fn push_sse(output: &mut String, event: &str, data: Value) {
     output.push_str("event: ");
     output.push_str(event);
@@ -1586,8 +2247,12 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
+        let mut tool_context = build_codex_tool_context(original_request.get("tools"));
+        for namespace_tool in &collect_tool_search_output_namespaces(original_request) {
+            add_namespace_tools_to_context(&mut tool_context, namespace_tool);
+        }
         Self {
-            tool_context: build_codex_tool_context(original_request.get("tools")),
+            tool_context,
             original_request: Some(original_request.clone()),
             ..Self::default()
         }
@@ -1798,7 +2463,7 @@ impl ChatSseState {
     fn push_text_delta_into(&mut self, delta: &str, output: &mut String) {
         if !self.text.added {
             let output_index = self.next_output_index();
-            let item_id = format!("{}_msg", self.response_id);
+            let item_id = format!("msg_{}", response_id_body(&self.response_id));
             self.text.output_index = Some(output_index);
             self.text.item_id = item_id.clone();
             self.text.added = true;
@@ -2371,36 +3036,90 @@ fn normalize_image_generation_tools(body: &mut Value) {
     }
 }
 
-fn normalize_responses_custom_tool_call_ids(body: &mut Value) {
+/// Responses 协议要求每个 input item 的 `id` 前缀与它的 `type` 对应，
+/// 例如 `message` 必须是 `msg_`、`function_call` 必须是 `fc_`。
+/// 前缀不匹配时上游直接以 `[ApiIdParam] [input[N].id] [invalid_id_prefix]` 拒绝**整份**请求，
+/// 于是这段历史被反复重放、会话永久不可用（#1431 / #1781 / #1796）。
+///
+/// 前缀表取自 Codex 自己的 rollout 记录（`~/.codex/sessions/**/rollout-*.jsonl`），
+/// 不是猜测：`message`/`reasoning`/`custom_tool_call`/`custom_tool_call_output`/
+/// `function_call`/`function_call_output` 分别对应 msg_/rs_/ctc_/ctco_/fc_/fco_。
+const RESPONSES_ITEM_ID_PREFIXES: &[(&str, &str)] = &[
+    ("message", "msg_"),
+    ("reasoning", "rs_"),
+    ("compaction", "cmp_"),
+    ("function_call", "fc_"),
+    ("function_call_output", "fco_"),
+    ("custom_tool_call", "ctc_"),
+    ("custom_tool_call_output", "ctco_"),
+];
+
+/// 供集成测试直接验证前缀归一结果：`upstream_request_parts` 需要真实网络，
+/// 用它测不方便。
+#[doc(hidden)]
+pub fn normalize_responses_item_ids_for_test(body: &mut Value) {
+    normalize_responses_item_ids(body);
+}
+
+/// 出站前把所有已知 item 的 id 前缀修正到与 `type` 一致。
+///
+/// 只认前缀表里的类型，未知类型原样通过——宁可放过，也不要把看不出类型语义的 id 改坏。
+fn normalize_responses_item_ids(body: &mut Value) {
     let Some(input) = body.get_mut("input") else {
         return;
     };
     match input {
         Value::Array(items) => {
             for item in items {
-                normalize_custom_tool_call_item_id(item);
+                normalize_responses_item_id(item);
             }
         }
-        Value::Object(_) => normalize_custom_tool_call_item_id(input),
+        Value::Object(_) => normalize_responses_item_id(input),
         _ => {}
     }
 }
 
-fn normalize_custom_tool_call_item_id(item: &mut Value) {
-    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+fn normalize_responses_item_id(item: &mut Value) {
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
         return;
-    }
+    };
+    let Some((_, prefix)) = RESPONSES_ITEM_ID_PREFIXES
+        .iter()
+        .find(|(kind, _)| *kind == item_type)
+    else {
+        return;
+    };
     let Some(id) = item.get("id").and_then(Value::as_str) else {
         return;
     };
-    if id.starts_with("ctc_") {
+    // 只有「前缀 + 非空后缀」才算已经合规。id 恰好等于前缀本身（`fc_`）是空壳，
+    // 放它过去会直接触发上游的 invalid_id_prefix，所以落到下面按 call_id 重建。
+    if id.len() > prefix.len() && id.starts_with(prefix) {
         return;
     }
-    let suffix = id
-        .strip_prefix("fc_")
-        .or_else(|| id.strip_prefix("item_"))
+    // 剥掉 id 上现有的前缀再换新的。取**最长**匹配：`fc_` 是 `fco_` 的前缀，
+    // 先撞上短的会把 `fco_call_a` 剥成 `call_a` 再换成 `fc_call_a`，
+    // 把 function_call_output 错改成 function_call。
+    // `item_` 是历史版本 Codex++ 自己造的前缀；`cp_` 来自压缩项错误使用
+    // `cp_{response_id}` 的版本；`resp_` 来自历史版本把 message item 命名成
+    // `{response_id}_msg`（#1431 / #1781），都要一并剥掉。
+    let suffix = ["item_", "cp_", "resp_"]
+        .into_iter()
+        .chain(RESPONSES_ITEM_ID_PREFIXES.iter().map(|(_, known)| *known))
+        .filter_map(|known| id.strip_prefix(known).map(|rest| (known.len(), rest)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, rest)| rest)
         .unwrap_or(id);
-    item["id"] = json!(format!("ctc_{suffix}"));
+    // 剥完是空串说明 id 恰好只由某个前缀组成，退回 call_id，再退回原 id。
+    let suffix = if suffix.is_empty() {
+        item.get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(id)
+    } else {
+        suffix
+    };
+    item["id"] = json!(format!("{prefix}{suffix}"));
 }
 
 fn append_responses_input(input: &Value, messages: &mut Vec<Value>) {
@@ -2517,6 +3236,48 @@ fn append_responses_item(
                 }
             }));
         }
+        Some("tool_search_call") => {
+            // Codex 的 tool_search 是客户端执行的代理工具，历史回放时按
+            // function tool_call 形态映射进 chat 消息流。
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if call_id.is_empty() {
+                return;
+            }
+            seen_tool_call_ids.insert(call_id.to_string());
+            pending_tool_calls.push(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "arguments": responses_arguments_to_chat(
+                        item.get("arguments").unwrap_or(&json!({}))
+                    )
+                }
+            }));
+        }
+        Some("tool_search_output") => {
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            if call_id.is_empty() {
+                return;
+            }
+            let output = item.get("tools").unwrap_or(&Value::Null);
+            if !seen_tool_call_ids.contains(call_id) {
+                flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+                flush_reasoning(messages, pending_reasoning);
+                messages.push(orphan_tool_output_message(call_id, output));
+                return;
+            }
+            flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_output_content(output)
+            }));
+        }
         Some("custom_tool_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
@@ -2591,6 +3352,18 @@ fn append_responses_item(
                 }
             }
         }
+        Some(COMPACTION_OUTPUT_TYPE) => {
+            // codex 历史回放：上次压缩的结果以 `compaction` item 形式出现在 input
+            // 里，`encrypted_content` 是我们生成的明文摘要，展开成 user 消息喂给上游。
+            flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
+            flush_reasoning(messages, pending_reasoning);
+            if let Some(message) = expand_compaction_item(item) {
+                messages.push(message);
+            }
+        }
+        Some(COMPACTION_TRIGGER_TYPE) => {
+            // 控制项不进上游历史；正常请求不该出现，出现即忽略。
+        }
         _ => {
             flush_tool_calls(messages, pending_tool_calls, pending_reasoning);
             if let Some(content) = item.get("content") {
@@ -2643,6 +3416,114 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
 ///
 /// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
 /// 避免丢失「模型曾试图调用某工具」这一信息。
+/// 把插在「连续 tool 结果」之间的非 tool 消息整体搬到该 tool 区之后
+/// （issue #2275 / #2257）。
+///
+/// 上游 codex 会把 `<image_resize_notice>` 这类提示以 developer（映射成 system）
+/// 或 user 消息的形式插在两条 tool 结果之间，形成夹心结构：
+/// `assistant(tool_calls=[a,b]) → tool(a) → developer → tool(b)`。
+/// `enforce_tool_call_pairing` 用 `take_while` 只收集「role 连续为 tool」的后续消息，
+/// 数到夹心就停，于是 followers 只有 1 条、`b` 被误判 orphaned 并从 `tool_calls`
+/// 摘掉，但 `b` 的 tool 消息还留在原地 —— 这正是「role 'tool' 无前置 tool_calls」
+/// 与「No tool output found for tool call」的来源。
+///
+/// 这里在配对判定**之前**把夹心消息移到 tool 区之后，使 tool 结果重新连续。
+/// system 形态的夹心会被后续的 `collapse_system_messages_to_head` 带到头部（合法），
+/// user 形态的则留在 tool 区之后（同样合法）。
+fn relocate_interleaved_non_tool_messages(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let Some(tool_calls) = messages[index].get("tool_calls").and_then(Value::as_array) else {
+            index += 1;
+            continue;
+        };
+        let mut unanswered: BTreeSet<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if unanswered.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 从本条 assistant 往后扫，收集本轮的所有 tool 结果与夹在其中的非 tool 消息，
+        // 直到 tool_call 集合配齐、撞上下一条 assistant（新轮次，不能越界）、或到底。
+        let mut tool_messages: Vec<Value> = Vec::new();
+        let mut interleaved: Vec<Value> = Vec::new();
+        let mut scan = index + 1;
+        while scan < messages.len() {
+            let role = messages[scan].get("role").and_then(Value::as_str);
+            if role == Some("assistant") {
+                break;
+            }
+            if role == Some("tool") {
+                if let Some(id) = messages[scan].get("tool_call_id").and_then(Value::as_str) {
+                    unanswered.remove(id);
+                }
+                tool_messages.push(messages[scan].clone());
+            } else if !tool_messages.is_empty() {
+                // 只有已经收到过 tool 结果之后的夹心才值得搬：
+                // 本条 assistant 尚未收到任何结果时，中间的消息是正常历史，不是夹心。
+                interleaved.push(messages[scan].clone());
+            }
+            scan += 1;
+            if unanswered.is_empty() {
+                break;
+            }
+        }
+
+        if interleaved.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 重建这段区间：tool 结果。配齐时）在前、夹心消息在后。
+        let rebuilt: Vec<Value> = tool_messages.into_iter().chain(interleaved).collect();
+        let rebuilt_len = rebuilt.len();
+        messages.splice(index + 1..scan, rebuilt);
+        // 跳过刚重建的区间，避免在搬动过的消息上重复扫描导致死循环。
+        index += 1 + rebuilt_len;
+    }
+}
+
+/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（issue #2275 / #2257 的防线）。
+///
+/// `enforce_tool_call_pairing` 目前只清理 assistant 侧（把 orphaned 的 tool_call
+/// 从 `tool_calls` 摘掉），被摘掉的那些 tool 消息本身仍留在原位，上游会直接
+/// 400「No tool output found for tool call」。这里把它们降级成 user，保住内容
+/// 且不再触发协议错误。
+fn degrade_unpaired_tool_messages(messages: &mut [Value]) {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let paired = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| known.contains(id));
+        if paired {
+            continue;
+        }
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        *message = json!({
+            "role": "user",
+            "content": content
+        });
+    }
+}
+
 fn enforce_tool_call_pairing(messages: &mut [Value]) {
     let mut index = 0;
     while index < messages.len() {
@@ -2917,6 +3798,19 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            // 合并路径同样要消费 pending_reasoning（issue #2210）。
+            // 触发时序：reasoning item → 不带 tool_calls 的 assistant 文本消息
+            // （pending_tool_calls 为空，reasoning 被附加到该文本消息并 take）→
+            // function_call。此时最后一条已是 assistant，走本分支提前 return，
+            // 若这里不追加，随后的 reasoning 就随函数返回被静默丢弃；
+            // 而 ensure_tool_call_reasoning_content 只补 content 与
+            // reasoning_content 同时为空的占位，content 非空时补不上。
+            if !pending_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(
+                    last,
+                    &std::mem::take(pending_reasoning).join("\n"),
+                );
+            }
             return;
         }
     }
@@ -3179,6 +4073,25 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                 }
             }
             "namespace" => add_namespace_tools_to_context(&mut context, tool),
+            // Codex 的 tool_search（MCP 延迟加载检索）是客户端执行的代理工具：
+            // 转发层把它当作 custom 代理工具登记，模型调用回来时还原成
+            // tool_search_call item，检索本身仍由 Codex 客户端执行。
+            "tool_search" => {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("tool_search");
+                context.custom_tools.insert(
+                    name.to_string(),
+                    CodexCustomToolSpec {
+                        openai_name: name.to_string(),
+                        kind: CodexCustomToolKind::ToolSearch,
+                        proxy_action: None,
+                    },
+                );
+                context.has_custom_tools = true;
+            }
             "web_search" | "local_shell" | "computer_use" => {
                 let name = tool
                     .get("name")
@@ -3278,6 +4191,28 @@ fn responses_tools_to_chat_tools(tools: &[Value], context: &CodexToolContext) ->
                 }
             }
             "namespace" => converted.extend(namespace_tool_to_chat_tools(tool, context)),
+            // tool_search 透传为 chat 的 function 工具，名字保持 tool_search，
+            // 检索由 Codex 客户端执行（execution: client），转发层只做搬运。
+            "tool_search" => {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("tool_search");
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let parameters = tool.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                converted.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters
+                    }
+                }));
+            }
             _ => {}
         }
     }
@@ -3407,7 +4342,9 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
         .as_object()
         .is_some_and(|object| object.len() == 1 && object.contains_key("$ref"));
     if !is_bare_ref {
-        if normalized.get("type").is_none() {
+        // `type: null` 与缺失等价：严格供应商（如 deepseek）会以
+        // `got 'type: null'` 拒绝整个请求（issue #2247）。
+        if normalized.get("type").is_none_or(Value::is_null) {
             normalized["type"] = json!("object");
         }
         if normalized.get("properties").is_none() {
@@ -3417,7 +4354,187 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
             normalized["required"] = json!([]);
         }
     }
-    inline_ref_siblings(&normalized)
+    let normalized = inline_ref_siblings(&normalized);
+    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性（issue #2367）。
+    flatten_top_level_combinators(normalized)
+}
+
+/// JSON Schema 的顶层组合器（`oneOf` / `anyOf` / `allOf`）。
+const SCHEMA_COMBINATOR_KEYS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// 摊平工具 schema **顶层**的组合器（issue #2367）。
+///
+/// zod-to-json-schema 会生成形如
+/// `{type:"object", properties:{}, oneOf:[{$ref:"#/$defs/__schema0"},…], $defs:{…}}`
+/// 的 schema。部分上游（Anthropic 系）拒绝顶层 `oneOf`，直接整轮 400、模型完全不可用。
+/// 全仓原本对 `oneOf` 零处理。
+///
+/// 策略（保守优先，绝不让整轮失败）：
+/// 1. 顶层有组合器时，逐分支归一化后再摊平；
+/// 2. `properties` 取各分支并集，同名属性都是 object 时递归合并其 properties；
+///    `required` 取交集（只有所有分支都要求才算必须）；
+/// 3. 剥掉组合器键，补回 `type:"object"`；
+/// 4. 无法摊平（分支不是对象、合并后 properties 为空）时把各分支塞进一个带
+///    description 的私有字段，保住信息且 schema 仍合法；
+/// 5. 结果仍不是合法对象 schema 时原样返回——宁可交给上游判断，也不静默丢掉工具。
+fn flatten_top_level_combinators(schema: Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema;
+    };
+    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_array).map(|a| (*key, a)))
+    else {
+        return schema;
+    };
+    if branches.is_empty() {
+        return schema;
+    }
+
+    // 分支常是裸 `$ref`（`{ "$ref": "#/$defs/__schema0" }`），它自己不带 `$defs`，
+    // 所以必须拿**父级**的 $defs 来解析——只对分支单独调 inline_ref_siblings
+    // 永远解析不出来（实测：分支落进降级路径，properties 为空）。
+    let defs = object.get("$defs").and_then(Value::as_object);
+
+    let mut properties = Map::new();
+    let mut required: Option<BTreeSet<String>> = None;
+    let mut flattenable = true;
+
+    for branch in branches {
+        let normalized = match resolve_local_definition(
+            branch
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(local_definition_name)
+                .unwrap_or(""),
+            defs,
+            &mut Vec::new(),
+        ) {
+            // 分支是裸 $ref：用父级 $defs 解析出真实 schema。
+            Ok(Some(resolved)) if branch.as_object().is_some_and(|o| o.len() == 1) => {
+                normalize_schema_value(&resolved, defs, &mut Vec::new()).unwrap_or(resolved)
+            }
+            _ => inline_ref_siblings(branch),
+        };
+        let Some(branch_object) = normalized.as_object() else {
+            flattenable = false;
+            break;
+        };
+        let branch_properties = branch_object.get("properties").and_then(Value::as_object);
+        let branch_required: BTreeSet<String> = branch_object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 分支没有 properties 时（例如 type:"string"）无法并入对象 schema。
+        if branch_properties.is_none() && !branch_required.is_empty() {
+            flattenable = false;
+            break;
+        }
+        for (name, value) in branch_properties.into_iter().flatten() {
+            merge_schema_property(&mut properties, name, value);
+        }
+        required = Some(match required {
+            None => branch_required,
+            Some(current) => current.intersection(&branch_required).cloned().collect(),
+        });
+    }
+
+    if !flattenable || properties.is_empty() {
+        // 降级：把分支原样塞进一个带说明的字段，schema 依然合法。
+        let mut fallback = object.clone();
+        fallback.insert(
+            "type".to_string(),
+            json!("object"),
+        );
+        fallback.insert("properties".to_string(), json!({}));
+        let mut description: Vec<String> = Vec::new();
+        for branch in branches {
+            if let Some(text) = branch.get("description").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    description.push(text.trim().to_string());
+                }
+            }
+        }
+        fallback.insert(
+            "x-merged-combinator".to_string(),
+            json!({
+                "kind": key,
+                "branches": branches,
+                "description": description.join("\n")
+            }),
+        );
+        for combinator in SCHEMA_COMBINATOR_KEYS {
+            fallback.remove(combinator);
+        }
+        return Value::Object(fallback);
+    }
+
+    let mut flattened = object.clone();
+    for combinator in SCHEMA_COMBINATOR_KEYS {
+        flattened.remove(combinator);
+    }
+    flattened.insert("type".to_string(), json!("object"));
+    flattened.insert("properties".to_string(), Value::Object(properties));
+    flattened.insert(
+        "required".to_string(),
+        json!(required
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>()),
+    );
+    Value::Object(flattened)
+}
+
+/// 把分支属性并入目标 properties；同名且两侧都是 object schema 时递归合并
+/// （properties 并集、required 取交集），否则保留先到的一方（非破坏性）。
+fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value: &Value) {
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.to_string(), value.clone());
+        return;
+    };
+    let (Some(left), Some(right)) = (existing.as_object(), value.as_object()) else {
+        return;
+    };
+    if left.get("properties").is_none() || right.get("properties").is_none() {
+        return;
+    }
+    let mut merged = left.clone();
+    let mut merged_properties = left
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (child_name, child_value) in right.get("properties").and_then(Value::as_object).into_iter().flatten() {
+        merge_schema_property(&mut merged_properties, child_name, child_value);
+    }
+    merged.insert("properties".to_string(), Value::Object(merged_properties));
+
+    let left_required: BTreeSet<String> = left
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let right_required: BTreeSet<String> = right
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    merged.insert(
+        "required".to_string(),
+        json!(left_required
+            .intersection(&right_required)
+            .cloned()
+            .collect::<Vec<_>>()),
+    );
+    *existing = Value::Object(merged);
 }
 
 fn inline_ref_siblings(root: &Value) -> Value {
@@ -3472,6 +4589,10 @@ fn normalize_schema_object(
 
     let mut normalized = Map::new();
     for (key, value) in object {
+        // JSON Schema 的 type 必须是字符串，null 恒非法，剥掉等价于未声明。
+        if key == "type" && value.is_null() {
+            continue;
+        }
         normalized.insert(key.clone(), normalize_schema_value(value, defs, resolving)?);
     }
     Ok(Value::Object(normalized))
@@ -3606,6 +4727,58 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
             "parameters": parameters
         }
     })
+}
+
+/// 从历史里的 tool_search_output item 收集 Codex 客户端检索命中的命名空间工具。
+///
+/// 条目形如 `{ type: "namespace", name, description, tools: [...] }`，必须走
+/// `add_namespace_tools_to_context` + `namespace_tool_to_chat_tools` 展开成
+/// `mcp__<server>__<tool>`。只取 namespace 名字的话上游只能看到外壳，
+/// 调不到内层工具，反向转换也还原不出 namespace 字段。
+fn collect_tool_search_output_namespaces(body: &Value) -> Vec<Value> {
+    let mut collected: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return collected;
+    };
+
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for tool in tools {
+            let Some(name) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if seen.insert(name.to_string()) {
+                collected.push(tool.clone());
+            }
+        }
+    }
+
+    collected
+}
+
+/// chat tools 按函数名去重，保留首次出现。
+fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    tools.retain(|tool| {
+        match tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        {
+            Some(name) => seen.insert(name.to_string()),
+            None => true,
+        }
+    });
 }
 
 fn patch_proxy_description(description: &str, action: &str, default_description: &str) -> String {
@@ -3880,7 +5053,7 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
     }
 
     Some(json!({
-        "id": format!("{response_id}_msg"),
+        "id": format!("msg_{}", response_id_body(response_id)),
         "type": "message",
         "status": "completed",
         "role": "assistant",
@@ -3951,6 +5124,20 @@ fn tool_call_added_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(&state.name) {
+        if tool_context.is_tool_search_proxy(&state.name) {
+            return json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "id": tool_call_item_id(&state.call_id, &state.name, tool_context),
+                    "type": "tool_search_call",
+                    "status": "in_progress",
+                    "call_id": state.call_id,
+                    "execution": "client",
+                    "arguments": {}
+                }
+            });
+        }
         return json!({
             "type": "response.output_item.added",
             "output_index": output_index,
@@ -3990,7 +5177,19 @@ fn push_tool_call_delta_sse(
     delta: &str,
     tool_context: &CodexToolContext,
 ) {
-    if tool_context.is_custom_tool_proxy(&state.name) {
+    if tool_context.is_tool_search_proxy(&state.name) {
+        // tool_search 走 function 参数流，客户端按 tool_search_call.arguments 聚合。
+        push_sse(
+            output,
+            "response.function_call_arguments.delta",
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": state.item_id,
+                "output_index": output_index,
+                "delta": delta
+            }),
+        );
+    } else if tool_context.is_custom_tool_proxy(&state.name) {
         let _ = delta;
     } else {
         push_sse(
@@ -4012,6 +5211,19 @@ fn push_tool_call_done_sse(
     output_index: u32,
     tool_context: &CodexToolContext,
 ) {
+    if tool_context.is_tool_search_proxy(&state.name) {
+        push_sse(
+            output,
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": state.item_id,
+                "output_index": output_index,
+                "arguments": state.arguments
+            }),
+        );
+        return;
+    }
     if tool_context.is_custom_tool_proxy(&state.name) {
         push_sse(
             output,
@@ -4053,6 +5265,19 @@ fn response_tool_call_item(
     tool_context: &CodexToolContext,
 ) -> Value {
     if tool_context.is_custom_tool_proxy(name) {
+        if tool_context.is_tool_search_proxy(name) {
+            // 官方客户端的 tool_search handler 只接受 tool_search_call item，
+            // function_call 形态会被拒绝，因此必须还原成专属 item 类型；
+            // arguments 转发层原样搬运（对象字符串双向保真）。
+            return json!({
+                "id": format!("tsc_{call_id}"),
+                "type": "tool_search_call",
+                "status": "completed",
+                "call_id": call_id,
+                "execution": "client",
+                "arguments": responses_arguments_to_chat_parse(arguments)
+            });
+        }
         return json!({
             "id": tool_call_item_id(call_id, name, tool_context),
             "type": "custom_tool_call",
@@ -4079,6 +5304,10 @@ fn response_tool_call_item(
 
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
     let prefix = if tool_context.is_custom_tool_proxy(name) {
+        if tool_context.is_tool_search_proxy(name) {
+            // 官方客户端给 tool_search_call 分配的 item id 前缀（见 codex id_prefix）。
+            return format!("tsc_{call_id}");
+        }
         "ctc_"
     } else {
         "fc_"
@@ -4859,6 +6088,16 @@ fn responses_arguments_to_chat(value: &Value) -> String {
     }
 }
 
+/// 把 chat 侧的 arguments 字符串解析回 JSON Value，供需要对象形态参数的
+/// item（如 tool_search_call）使用；解析失败时退回空对象，避免构造非法 item。
+fn responses_arguments_to_chat_parse(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
+}
+
 fn normalize_chat_tool_arguments_string(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4913,16 +6152,24 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
-fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str) {
+fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str, standard: bool) {
     let Some(reasoning_enabled) = reasoning_requested(body) else {
         return;
     };
-    let style = infer_chat_reasoning_style(model);
+    let style = if standard {
+        ChatReasoningStyle::Default
+    } else {
+        infer_chat_reasoning_style(model)
+    };
 
     match style {
         ChatReasoningStyle::Thinking => {
             result["thinking"] = json!({
-                "type": if reasoning_enabled { "enabled" } else { "disabled" }
+                "type": if reasoning_enabled {
+                    kimi_thinking_enabled_type(model)
+                } else {
+                    "disabled"
+                }
             });
         }
         ChatReasoningStyle::EnableThinking => {
@@ -5062,7 +6309,15 @@ fn map_chat_reasoning_effort(effort: &str, style: ChatReasoningStyle) -> Option<
 /// 仍只发 thinking 开关。
 fn is_kimi_coding_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.starts_with("k3") || model.contains("for-coding")
+    model.starts_with("k3") || model.contains("kimi-k3") || model.contains("for-coding")
+}
+
+fn kimi_thinking_enabled_type(model: &str) -> &'static str {
+    if is_kimi_coding_model(model) {
+        "adaptive"
+    } else {
+        "enabled"
+    }
 }
 
 fn supports_reasoning_effort(model: &str) -> bool {
@@ -5083,4 +6338,77 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+/// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
+#[cfg(test)]
+mod relay_custom_header_tests {
+    use super::*;
+    use crate::settings::{RelayHeaderKeyValue, RelayMode, RelayProfile};
+
+    fn header(key: &str, value: &str) -> RelayHeaderKeyValue {
+        RelayHeaderKeyValue {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn relay_with(headers: Vec<RelayHeaderKeyValue>) -> RelayProfile {
+        RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            api_key: "sk-upstream".to_string(),
+            custom_headers: headers,
+            ..RelayProfile::default()
+        }
+    }
+
+    fn build_upstream_request(relay: &RelayProfile) -> reqwest::Request {
+        upstream_request_builder(
+            reqwest::Client::new(),
+            "http://upstream.example/v1/responses",
+            relay,
+            false,
+            &serde_json::json!({ "model": "m" }),
+        )
+        .build()
+        .unwrap()
+    }
+
+    #[test]
+    fn upstream_request_carries_custom_headers() {
+        let request = build_upstream_request(&relay_with(vec![header("X-Tenant", "acme")]));
+        assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer sk-upstream"
+        );
+    }
+
+    /// 代理路径与测试连接、模型列表一致：显式 Authorization 优先于 API Key。
+    #[test]
+    fn upstream_request_prefers_custom_authorization() {
+        let request = build_upstream_request(&relay_with(vec![header(
+            "Authorization",
+            "Bearer explicit",
+        )]));
+        assert_eq!(request.headers().get_all("authorization").iter().count(), 1);
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer explicit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod channel_cooldown_retry_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_allows_three_automatic_retries_only() {
+        assert!(should_retry_after_cooldown(0));
+        assert!(should_retry_after_cooldown(1));
+        assert!(should_retry_after_cooldown(2));
+        assert!(!should_retry_after_cooldown(3));
+        assert!(!should_retry_after_cooldown(usize::MAX));
+    }
 }

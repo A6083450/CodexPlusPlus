@@ -25,6 +25,8 @@ struct ModelSource {
     name: String,
     base_url: String,
     api_key: String,
+    /// 供应商自定义请求头（issue #1685）。非供应商来源为空。
+    headers: Vec<crate::settings::RelayHeaderKeyValue>,
 }
 
 #[derive(Debug, Default)]
@@ -50,7 +52,12 @@ pub async fn read_codex_model_catalog() -> Value {
             }
         }
     }
-    let env = std::env::vars().collect::<HashMap<_, _>>();
+    let env = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            Some((name, value.to_string_lossy().into_owned()))
+        })
+        .collect::<HashMap<_, _>>();
     let client = match crate::http_client::proxied_client("CodexPlusPlus/1.0") {
         Ok(client) => client,
         Err(error) => {
@@ -424,6 +431,7 @@ fn model_sources_from_environment(
         } else {
             api_key
         },
+        headers: Vec::new(),
     }]
 }
 
@@ -460,6 +468,7 @@ fn model_source_from_config(
         },
         base_url,
         api_key,
+        headers: Vec::new(),
     })
 }
 
@@ -503,9 +512,21 @@ fn provider_api_key(
     }
 }
 
+/// 单个模型列表请求的整体预算（发请求 + 读响应体）。模型列表是小体量非流式响应，
+/// 30 秒足够；此前请求没有任何超时，上游不响应时管理器的「获取模型」会永久挂起。
+const MODELS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn fetch_models_from_source(
     client: &reqwest::Client,
     source: &ModelSource,
+) -> (Vec<String>, Value) {
+    fetch_models_from_source_with_timeout(client, source, MODELS_FETCH_TIMEOUT).await
+}
+
+async fn fetch_models_from_source_with_timeout(
+    client: &reqwest::Client,
+    source: &ModelSource,
+    timeout: std::time::Duration,
 ) -> (Vec<String>, Value) {
     let endpoint = models_endpoint(&source.base_url);
     let mut safe_source = json!({
@@ -526,23 +547,71 @@ async fn fetch_models_from_source(
     let mut request = client
         .get(&endpoint)
         .header(reqwest::header::ACCEPT, "application/json");
-    if !source.api_key.is_empty() {
+    // 与协议代理、供应商测试共用 relay_headers：显式 Authorization 优先于 API Key。
+    if !source.api_key.is_empty() && !crate::relay_headers::has_authorization(&source.headers) {
         request = request.bearer_auth(&source.api_key);
     }
+    request = crate::relay_headers::apply_headers(request, &source.headers);
 
-    match request.send().await {
-        Ok(response) if response.status().is_success() => match response.json::<Value>().await {
-            Ok(payload) => {
-                let models = unique_strings(parse_model_payload(&payload));
-                safe_source["status"] = json!("ok");
-                safe_source["models"] = json!(models.len());
-                (models, safe_source)
-            }
-            Err(error) => failed_source(safe_source, error.to_string()),
-        },
-        Ok(response) => failed_source(safe_source, format!("HTTP {}", response.status().as_u16())),
-        Err(error) => failed_source(safe_source, error.to_string()),
+    match tokio::time::timeout(timeout, async move {
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    })
+    .await
+    {
+        Err(_elapsed) => failed_source(
+            safe_source,
+            format!(
+                "上游 {} 秒内未返回模型列表（已超时中断）",
+                timeout.as_secs()
+            ),
+        ),
+        Ok(Err(error)) => failed_source(safe_source, error.to_string()),
+        Ok(Ok((status_code, body))) => interpret_models_response(status_code, &body, safe_source),
     }
+}
+
+fn interpret_models_response(
+    status_code: u16,
+    body: &str,
+    mut safe_source: Value,
+) -> (Vec<String>, Value) {
+    let payload = serde_json::from_str::<Value>(body.trim()).ok();
+    if !(200..300).contains(&status_code) {
+        return failed_source(
+            safe_source,
+            format!("HTTP {status_code}{}", upstream_error_detail(body)),
+        );
+    }
+    let Some(payload) = payload else {
+        return failed_source(
+            safe_source,
+            format!(
+                "HTTP {status_code} 响应不是有效 JSON{}",
+                upstream_error_detail(body)
+            ),
+        );
+    };
+    // 业务错误信封优先于模型列表判定：网关在错误态下可能回一个占位或部分
+    // 列表（issue 复现：{"code":401,"success":false,"data":[{"id":"..."}]}），
+    // 先看列表会把它当成「获取成功」，用户看到成功但实际令牌已失效。
+    // 反过来不会误伤正常响应——business_error_message 只认 success=false /
+    // code∉{0,200} / error 非空，标准 OpenAI 响应三者都没有。
+    if let Some(message) = business_error_message(&payload) {
+        return failed_source(safe_source, message);
+    }
+    let models = unique_strings(parse_model_payload(&payload));
+    if !models.is_empty() {
+        safe_source["status"] = json!("ok");
+        safe_source["models"] = json!(models.len());
+        return (models, safe_source);
+    }
+    // HTTP 200 且无业务错误信封：维持既有语义，按“网关可达但 0 个模型”处理
+    safe_source["status"] = json!("ok");
+    safe_source["models"] = json!(0);
+    (Vec::new(), safe_source)
 }
 
 fn failed_source(mut source: Value, message: String) -> (Vec<String>, Value) {
@@ -551,6 +620,86 @@ fn failed_source(mut source: Value, message: String) -> (Vec<String>, Value) {
     source["models"] = json!(0);
     source["responses_api"] = responses_api_status("unknown", "", "");
     (Vec::new(), source)
+}
+
+/// 部分网关用 HTTP 200 + 业务信封承载失败。智谱 Codex 专属端点（/api/v1）在 key
+/// 缺失或无效时返回 `{"code":401,"msg":"令牌已过期或验证不正确","success":false}`，
+/// HTTP 状态仍是 200，此前只认状态码，这类失败被解析成“0 个模型”，报错完全不
+/// 指向真因（#2190）。只在模型列表解析为空时才判信封——能取到数据就优先信数据，
+/// 避免误伤非标成功响应。
+fn business_error_message(payload: &Value) -> Option<String> {
+    let object = payload.as_object()?;
+    let envelope_failed = match object.get("success").and_then(Value::as_bool) {
+        Some(success) => !success,
+        None => {
+            numeric_business_code(object.get("code")).is_some_and(|failed| failed)
+                || object.get("error").is_some_and(|error| !error.is_null())
+        }
+    };
+    if !envelope_failed {
+        return None;
+    }
+    message_from_payload(object)
+}
+
+/// `code` 字段是否落在失败档：数字（含字符串数字）且不等于 0/200 视为失败，
+/// 0 是常见的“成功”码，200 是 OpenAI 系成功码。非数字 code 不参与判定。
+fn numeric_business_code(code: Option<&Value>) -> Option<bool> {
+    let code = code?;
+    let code = code.as_i64().or_else(|| {
+        code.as_str()
+            .and_then(|code| code.trim().parse::<i64>().ok())
+    })?;
+    Some(code != 0 && code != 200)
+}
+
+/// 从错误体对象里提取人话原因，兼容 OpenAI 系 `{"error":{"message":...}}`、
+/// 智谱 `{"msg":...}`、xAI `{"error":"..."}` 等形态。
+fn message_from_payload(object: &Map<String, Value>) -> Option<String> {
+    for key in ["error", "msg", "message"] {
+        let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let text = match value {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Object(nested) => nested
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|text| text.trim().to_string()),
+            _ => None,
+        };
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// 非 2xx（或非 JSON）时把上游错误体里的原因带进报错（如
+/// `HTTP 401：Incorrect API key provided`）。此前只报 "HTTP 401"，key 失效、
+/// 地址填错、套餐未开通全靠用户猜。
+fn upstream_error_detail(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let detail = serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|payload| message_from_payload(payload.as_object()?))
+        .unwrap_or_else(|| truncate_for_message(trimmed));
+    format!("：{detail}")
+}
+
+/// 报错信息里附带的响应体上限，避免上游回一整页 HTML 时把 UI 提示撑爆。
+fn truncate_for_message(text: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let mut truncated: String = text.chars().take(MAX_CHARS).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn responses_api_status(status: &str, endpoint: &str, message: &str) -> Value {
@@ -578,6 +727,7 @@ pub async fn fetch_relay_profile_model_ids(
             profile.upstream_base_url.trim().to_string()
         },
         api_key: profile.api_key.trim().to_string(),
+        headers: profile.custom_headers.clone(),
     };
     if source.base_url.is_empty() {
         anyhow::bail!("Base URL 不能为空");
@@ -641,9 +791,15 @@ fn parse_model_payload(payload: &Value) -> Vec<String> {
                     item.as_object().and_then(|object| {
                         ["id", "model", "name"]
                             .iter()
-                            .filter_map(|key| object.get(*key).and_then(Value::as_str))
-                            .find(|value| !value.trim().is_empty())
-                            .map(|value| value.trim().to_string())
+                            .filter_map(|key| {
+                                object
+                                    .get(*key)
+                                    .and_then(Value::as_str)
+                                    .map(|value| model_id_from_field(key, value))
+                                    .filter(|value| !value.is_empty())
+                            })
+                            .next()
+                            .map(ToString::to_string)
                     })
                 })
             })
@@ -662,10 +818,27 @@ fn parse_model_payload(payload: &Value) -> Vec<String> {
     }
     ["id", "model", "name"]
         .iter()
-        .filter_map(|key| object.get(*key).and_then(Value::as_str))
-        .find(|value| !value.trim().is_empty())
-        .map(|value| vec![value.trim().to_string()])
+        .filter_map(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(|value| model_id_from_field(key, value))
+                .filter(|value| !value.is_empty())
+        })
+        .next()
+        .map(|value| vec![value.to_string()])
         .unwrap_or_default()
+}
+
+/// 模型 ID 字段取值。Gemini 的列表把 ID 放在 `name` 字段且带 `models/` 前缀
+/// （如 `models/gemini-2.5-pro`），剥掉前缀让 ID 与请求体里的 `model` 值一致。
+fn model_id_from_field<'a>(key: &str, value: &'a str) -> &'a str {
+    let value = value.trim();
+    if key == "name" {
+        value.strip_prefix("models/").unwrap_or(value)
+    } else {
+        value
+    }
 }
 
 fn models_from_config_model_catalog_json(
@@ -839,4 +1012,192 @@ fn unquote_toml_string(value: &str) -> String {
         })
         .unwrap_or(value)
         .to_string()
+}
+
+#[cfg(test)]
+mod model_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn business_error_message_detects_zhipu_style_envelope() {
+        // 智谱 /api/v1 Codex 专属端点在 key 缺失或无效时返回 HTTP 200 + 业务信封（#2190）
+        let payload = json!({"code": 401, "msg": "令牌已过期或验证不正确", "success": false});
+        assert_eq!(
+            business_error_message(&payload).as_deref(),
+            Some("令牌已过期或验证不正确")
+        );
+    }
+
+    #[test]
+    fn business_error_message_detects_failed_code_without_success_field() {
+        let numeric = json!({"code": 1001, "msg": "鉴权失败"});
+        assert_eq!(
+            business_error_message(&numeric).as_deref(),
+            Some("鉴权失败")
+        );
+
+        let string_code = json!({"code": "401", "message": "invalid token"});
+        assert_eq!(
+            business_error_message(&string_code).as_deref(),
+            Some("invalid token")
+        );
+
+        let error_object = json!({"error": {"code": "1001", "message": "未收到 Authorization"}});
+        assert_eq!(
+            business_error_message(&error_object).as_deref(),
+            Some("未收到 Authorization")
+        );
+    }
+
+    #[test]
+    fn business_error_message_ignores_success_envelopes() {
+        for payload in [
+            json!({"code": 200, "success": true, "data": []}),
+            json!({"code": 0, "msg": "ok", "data": []}),
+            json!({"object": "list", "data": []}),
+            json!({"code": "200", "data": []}),
+            json!([{"id": "glm-5.3"}]),
+        ] {
+            assert_eq!(business_error_message(&payload), None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn interpret_models_response_keeps_ok_semantics_when_200_has_no_models() {
+        let (models, status) =
+            interpret_models_response(200, r#"{"object":"list","data":[]}"#, json!({"id": "t"}));
+        assert!(models.is_empty());
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["models"], 0);
+    }
+
+    #[test]
+    fn interpret_models_response_surfaces_business_error_on_http_200() {
+        let (models, status) = interpret_models_response(
+            200,
+            r#"{"code":401,"msg":"令牌已过期或验证不正确","success":false}"#,
+            json!({"id": "t"}),
+        );
+        assert!(models.is_empty());
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["message"], "令牌已过期或验证不正确");
+    }
+
+    #[test]
+    fn interpret_models_response_prefers_business_error_over_a_returned_model_list() {
+        // 网关在错误态下回了一个列表时，错误必须优先——否则用户看到「获取成功」
+        // 但令牌其实已失效，排查会往错误方向走。
+        let (models, status) = interpret_models_response(
+            200,
+            r#"{"code":401,"msg":"令牌已过期","success":false,"data":[{"id":"glm-5.3"}]}"#,
+            json!({"id": "t"}),
+        );
+        assert!(models.is_empty(), "错误态下的列表不应被当作可用模型");
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["message"], "令牌已过期");
+        assert_eq!(status["models"], 0);
+    }
+
+    #[test]
+    fn interpret_models_response_keeps_normal_lists_working_without_an_envelope() {
+        // 反向保护：标准 OpenAI 响应没有 success/code/error 字段，
+        // 提前检查业务错误不能把它误判成失败。
+        for body in [
+            r#"{"object":"list","data":[{"id":"gpt-5.6-sol"},{"id":"gpt-5.6-terra"}]}"#,
+            r#"{"code":200,"success":true,"data":[{"id":"glm-5.3"}]}"#,
+            r#"{"code":0,"msg":"ok","data":[{"id":"deepseek-v4"}]}"#,
+        ] {
+            let (models, status) = interpret_models_response(200, body, json!({"id": "t"}));
+            assert!(!models.is_empty(), "{body}");
+            assert_eq!(status["status"], "ok", "{body}");
+        }
+    }
+
+    #[test]
+    fn interpret_models_response_appends_upstream_reason_on_http_error() {
+        let (_, status) = interpret_models_response(
+            401,
+            r#"{"error":{"code":"1001","message":"Header中未收到Authorization参数，无法进行身份验证。"}}"#,
+            json!({"id": "t"}),
+        );
+        assert_eq!(status["status"], "failed");
+        let message = status["message"].as_str().unwrap();
+        assert!(message.starts_with("HTTP 401"), "{message}");
+        assert!(
+            message.contains("Header中未收到Authorization参数"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn interpret_models_response_reports_invalid_json_body() {
+        let (_, status) = interpret_models_response(200, "<html>502</html>", json!({"id": "t"}));
+        assert_eq!(status["status"], "failed");
+        let message = status["message"].as_str().unwrap();
+        assert!(message.contains("不是有效 JSON"), "{message}");
+        assert!(message.contains("<html>502</html>"), "{message}");
+    }
+
+    #[test]
+    fn upstream_error_detail_truncates_plain_text_bodies() {
+        assert_eq!(
+            upstream_error_detail("Authentication Fails (governor)"),
+            "：Authentication Fails (governor)"
+        );
+        assert_eq!(upstream_error_detail("   "), "");
+        let long_body = "x".repeat(500);
+        let detail = upstream_error_detail(&long_body);
+        assert!(detail.chars().count() < 260, "{}", detail.chars().count());
+    }
+
+    #[test]
+    fn parse_model_payload_strips_gemini_models_prefix() {
+        let models = parse_model_payload(&json!({
+            "models": [
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash"}
+            ]
+        }));
+        assert_eq!(models, vec!["gemini-2.5-pro", "gemini-2.5-flash"]);
+    }
+
+    #[test]
+    fn parse_model_payload_keeps_plain_name_fields() {
+        let models = parse_model_payload(&json!({
+            "models": [{"name": "moonshot-v1"}, {"id": "kimi-k2.6"}]
+        }));
+        assert_eq!(models, vec!["moonshot-v1", "kimi-k2.6"]);
+    }
+
+    #[tokio::test]
+    async fn models_fetch_times_out_when_upstream_never_responds() {
+        // 只 bind 不 accept：TCP 握手由内核完成，send 能成功，读响应体会一直挂起
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let source = ModelSource {
+            source_id: "test".to_string(),
+            source_type: "test".to_string(),
+            name: "Test".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "key".to_string(),
+            headers: Vec::new(),
+        };
+        let (_, status) = fetch_models_from_source_with_timeout(
+            &client,
+            &source,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(status["status"], "failed");
+        assert!(
+            status["message"]
+                .as_str()
+                .unwrap()
+                .contains("未返回模型列表"),
+            "{}",
+            status["message"]
+        );
+        drop(listener);
+    }
 }

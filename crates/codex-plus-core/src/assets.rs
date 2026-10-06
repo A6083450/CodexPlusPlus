@@ -278,11 +278,28 @@ fn dream_skin_skin_api_bootstrap_script(theme: &str) -> String {
     "composer-toolbar": ".composer-surface-chrome [role='toolbar']", dialog: "[role='dialog']",
   }};
   const mark = () => {{
-    for (const [part, selector] of Object.entries(map)) for (const node of document.querySelectorAll(selector)) node.setAttribute("data-ds-part", part);
+    for (const [part, selector] of Object.entries(map)) for (const node of document.querySelectorAll(selector)) {{
+      // data-ds-part 是皮肤 API 的挂载点标记，值不变时绝不重写，避免长会话里对每条消息重复置属性
+      if (node.getAttribute("data-ds-part") !== part) node.setAttribute("data-ds-part", part);
+    }}
   }};
   mark();
   window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__?.disconnect?.();
-  const observer = new MutationObserver(() => mark());
+  let markTimer = null;
+  const scheduleMark = () => {{
+    if (markTimer !== null) return;
+    markTimer = setTimeout(() => {{
+      markTimer = null;
+      mark();
+    }}, 250);
+  }};
+  const observer = new MutationObserver((records) => {{
+    // 流式输出只产生纯文本节点增删，不会增减皮肤挂载点；这类批次直接跳过（issue #2181）
+    if (records.every((record) =>
+      [...record.addedNodes].every((node) => node.nodeType === 3)
+      && [...record.removedNodes].every((node) => node.nodeType === 3))) return;
+    scheduleMark();
+  }});
   observer.observe(document.documentElement, {{ childList: true, subtree: true }});
   window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__ = observer;
 }})();"#,
@@ -428,7 +445,7 @@ pub fn injection_script(helper_port: u16) -> String {
 
 pub fn hide_official_usage_alert_config(settings: &BackendSettings) -> bool {
     let profile = settings.active_relay_profile();
-    profile.relay_mode == crate::settings::RelayMode::Official && profile.hide_official_usage_alert
+    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 
 pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettings) -> String {
@@ -469,7 +486,11 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&fast_startup).expect("fast startup config should serialize"),
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
-        renderer_script(),
+        format!(
+            "{}\n{}",
+            include_str!("../../../assets/inject/composer-readiness.js"),
+            renderer_script()
+        ),
         GENERATED_IMAGES_SCRIPT,
         stepwise_runtime,
         dream_skin_target_runtime,

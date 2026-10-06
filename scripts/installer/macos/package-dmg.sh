@@ -192,9 +192,36 @@ DMG_CREATED=false
 MOUNT_POINT=""
 MOUNT_DEVICE=""
 
+release_dmg_holders() {
+  local target="$1"
+  local pids=""
+
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -t -- "$target" 2>/dev/null || true)"
+  fi
+  # GitHub 的 macOS runner 上，hdiutil -force 失败后 diskimages-helper 仍会占着
+  # 设备，直到 job 收尾才被当成孤儿杀掉。那时 convert 已经来不及跑。
+  if [ -z "$pids" ] && [ "${GITHUB_ACTIONS:-}" = "true" ] && command -v pgrep >/dev/null 2>&1; then
+    pids="$(pgrep -x diskimages-helper || true)"
+  fi
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill -KILL $pids >/dev/null 2>&1 || true
+  fi
+}
+
 detach_dmg() {
   local target="$1"
   local attempt
+  local device_info
+
+  # target: /dev/disk4 或一个挂载点。判「设备是否仍注册」只在 /dev/* 时成立，
+  # 挂载点路径不会出现在 hdiutil info 的设备列里。
+  target_is_gone() {
+    [[ "$target" == /dev/* ]] || return 1
+    device_info="$(hdiutil info 2>/dev/null)" || return 1
+    ! printf '%s\n' "$device_info" | awk -v t="$target" '$1 == t { found = 1 } END { exit !found }'
+  }
 
   [ -z "$target" ] && return 0
   for attempt in 1 2 3 4; do
@@ -204,15 +231,23 @@ detach_dmg() {
 
     # hdiutil can report a transient failure even though the device detached
     # while the command was returning. Treat an already-gone device as done.
-    if ! hdiutil info 2>/dev/null | grep -Fq -- "$target"; then
+    if target_is_gone; then
       return 0
     fi
 
-    sleep "$attempt"
-    hdiutil detach "$target" -force >/dev/null 2>&1 || true
-    if ! hdiutil info 2>/dev/null | grep -Fq -- "$target"; then
+    # 普通 detach 失败后立刻补一次强制卸载：CI runner 上常见「卷已消失、
+    # 设备仍注册」的中间态，只靠普通的 detach 重试永远不会成功，必须 -force。
+    # 这一步曾在 e55c58b1 被移出循环，导致 macOS x64 打包稳定失败。
+    if hdiutil detach "$target" -force >/dev/null 2>&1; then
       return 0
     fi
+    if target_is_gone; then
+      return 0
+    fi
+
+    release_dmg_holders "$target"
+
+    sleep "$attempt"
   done
 
   echo "error: failed to detach DMG device: $target" >&2
@@ -252,8 +287,8 @@ fi
 MOUNT_OUTPUT="$(hdiutil attach "$DMG_WORK_PATH" -readwrite -noverify -noautoopen -nobrowse)"
 MOUNT_DEVICE="$(printf '%s\n' "$MOUNT_OUTPUT" | awk '/^\/dev\/disk/ {print $1; exit}')"
 MOUNT_POINT="$(printf '%s\n' "$MOUNT_OUTPUT" | awk 'match($0, /\/Volumes\//) {print substr($0, RSTART)}' | tail -1)"
-if [ -z "$MOUNT_POINT" ]; then
-  echo "error: failed to find mounted DMG volume" >&2
+if [ -z "$MOUNT_POINT" ] || [ -z "$MOUNT_DEVICE" ]; then
+  echo "error: failed to find mounted DMG device and volume" >&2
   exit 1
 fi
 VOLUME_NAME="$(basename "$MOUNT_POINT")"
@@ -293,27 +328,9 @@ then
   echo "warning: unable to persist Finder DMG window layout; the background is still included" >&2
 fi
 
-# GitHub macOS runner 上 Finder 刚完成窗口布局，卷可能仍被短暂占用
-# （Resource busy）；且优雅 detach 失败也可能已触发延迟弹出，后续重试会报
-# No such file or directory（卷已消失，应视为成功）。退避重试后仍失败才
-# -force；-force 后卷已消失同样视为成功。
-detach_volume() {
-  local attempt
-  for attempt in 1 2 3; do
-    if hdiutil detach "$MOUNT_POINT" >/dev/null; then
-      return 0
-    fi
-    if [ ! -e "$MOUNT_POINT" ]; then
-      return 0
-    fi
-    sleep "$((attempt * 2))"
-  done
-  hdiutil detach "$MOUNT_POINT" -force >/dev/null 2>&1
-  [ ! -e "$MOUNT_POINT" ]
-}
-
-if ! detach_volume; then
-  echo "error: failed to detach DMG volume $MOUNT_POINT" >&2
+# A disappeared mount directory does not prove the backing device was ejected.
+if ! detach_dmg "$MOUNT_DEVICE"; then
+  echo "error: failed to detach DMG device $MOUNT_DEVICE" >&2
   exit 1
 fi
 MOUNT_POINT=""
@@ -321,19 +338,32 @@ MOUNT_DEVICE=""
 
 # 上一步 detach 可能触发延迟弹出：卷目录已消失但磁盘镜像仍在弹出中，
 # convert 会暂时报 Resource temporarily unavailable——退避重试等它完成。
-for attempt in 1 2 3 4 5; do
+# macOS x64 runner 上镜像可能忙碌超过一分钟，所以重试窗口给得比较宽。
+DMG_CREATED=false
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
   if hdiutil convert "$DMG_WORK_PATH" -format UDZO -ov -o "$DMG"; then
     DMG_CREATED=true
     break
   fi
 
-  if [ "$attempt" -lt 5 ]; then
-    sleep "$((attempt * 3))"
+  if [ "$attempt" -lt 12 ]; then
+    sleep 5
   fi
 done
 
 if [ "$DMG_CREATED" != true ]; then
-  echo "error: failed to create DMG after 5 attempts" >&2
+  echo "error: failed to create DMG after 12 attempts" >&2
+  exit 1
+fi
+
+# Wait briefly for a nonempty output before reporting successful packaging.
+for attempt in 1 2 3 4 5; do
+  [ -s "$DMG" ] && break
+  sleep "$attempt"
+done
+if [ ! -s "$DMG" ]; then
+  echo "error: DMG output is missing or empty after conversion: $DMG" >&2
+  find "$DIST" -maxdepth 2 -type f -print >&2 || true
   exit 1
 fi
 

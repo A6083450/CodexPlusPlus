@@ -10,6 +10,10 @@
 # First-party scripts are embedded with include_str! and inspected by source-contract tests.
 assets/inject/*.js text eol=lf
 assets/inject/**/*.js text eol=lf
+assets/native-browser/*.mjs text eol=lf
+assets/native-browser/*.cjs text eol=lf
+assets/native-browser/fixtures/*.mjs text eol=lf
+assets/native-browser/inspector-NOTICE.txt text eol=lf
 
 # Keep every byte-exact upstream theme asset stable on all checkout platforms.
 assets/inject/upstream/**/*.js text eol=lf

@@ -35,11 +35,7 @@ For first-time setup, open the manager, verify the detected app path, configure 
 
 ## Community and Support
 
-Join the Codex++ community (QQ group: 830629290) to report issues, share feedback, or suggest features.
-
-WeChat: <a href="https://docs.qq.com/doc/DQ2VOanZTTFZJcUpZ#">get the latest group QR code</a>.
-
-<img src="docs/images/discussion-group-qr.jpg" alt="Codex++ WeChat group QR code" width="260">
+Join <a href="https://qm.qq.com/q/5h3pxpxg7S">Codex++ community group 4 (QQ group: 1127858981)</a> to report issues, share feedback, or suggest features.
 
 Telegram: <https://t.me/CodexPlusPlus>
 
@@ -49,10 +45,11 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 
 | Area | Capabilities |
 | --- | --- |
-| Provider configuration | Official login, official login plus API, pure API, and aggregate providers; Responses / Chat Completions; model tests, model discovery, Provider Doctor, cc-switch and deep-link imports |
-| Models and context | Per-model context windows, auto-compact limits, `model_catalog_json`, shared config, and per-provider MCP, Skill, and Plugin selection |
+| Provider configuration | Official login, official login plus API, pure API, and aggregate providers; Grok provider management; Responses / Chat Completions; model tests, model discovery, Provider Doctor, cc-switch and deep-link imports |
+| Models and context | Per-model context windows, auto-compact limits, `model_catalog_json`, model metadata import (models.json), shared config, and per-provider MCP, Skill, and Plugin selection |
 | Session management | Local session scanning, bulk deletion, Markdown export, token usage history, Provider metadata sync, and backups |
-| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, Chinese locale, fast startup, conversation width and scroll restore, service-tier controls, Goals, Stepwise, and image overlay |
+| WeChat connection | QR login connects personal WeChat to local Codex sessions; each WeChat contact maps to a separate session, with an allowed-user list |
+| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, Chinese locale, fast startup, conversation width and scroll restore, service-tier controls, Goals, Stepwise, skin management, and image overlay |
 | Development workflow | Project move, Upstream worktree creation, thread IDs, and Zed Remote project discovery and opening |
 | Scripts and maintenance | User script installation and toggles, app detection, shortcuts, Watcher, environment cleanup, logs, diagnostics, health checks, and Release updates |
 
@@ -82,6 +79,7 @@ Provider switching saves the current profile before applying the target profile.
 - Plain-text paste, forced Chinese locale, startup acceleration, and native menu localization.
 - Conversation width, scroll restoration, thread IDs, service-tier controls, and Goals.
 - Stepwise suggestions with a separate API, model, item count, and timeout.
+- Skin management: search, preview, install, and image replacement for Dream Skin community themes.
 - Upstream worktrees, Zed Remote, custom image overlays, and user scripts.
 
 Settings that depend on renderer injection generally require saving and restarting Codex++.
@@ -99,6 +97,8 @@ The manager's About page can check and start updates. When the silent launcher f
 - Codex local database: prefers `~/.codex/sqlite/*.db`, falls back to legacy `~/.codex/state_5.sqlite`
 - Codex++ state and logs: `~/.codex-session-delete/`
 - Provider Sync backups: `~/.codex/backups_state/provider-sync`
+
+`~/.codex` above refers to the Codex home directory: it follows the `CODEX_HOME` environment variable when set, and defaults to `.codex` under the user profile otherwise.
 
 ## FAQ
 

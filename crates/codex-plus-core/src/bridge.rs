@@ -20,6 +20,10 @@ use tokio_tungstenite::tungstenite::Message;
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// 陈旧会话的 generation 轮询间隔。旧会话只会在"socket 再收到消息"时走到循环顶部的
+/// generation 检查；bridge 失效场景下旧 socket 不会再有任何消息，没有这个轮询，
+/// 被顶替的会话会带着 Runtime.enable 订阅和脚本注册无限期滞留。
+pub const BRIDGE_GENERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type BridgeHandler = Arc<
     dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>
@@ -213,8 +217,18 @@ pub fn build_bridge_script(binding_name: &str) -> String {
     format!(
         r#"
 (() => {{
+  // Bridge 可能在请求进行中被重新注入。不要静默丢弃旧 resolver，
+  // 否则调用方的 Promise 会永久 pending（服务模式会一直显示“正在读取”）。
+  const previousCallbacks = window.__codexSessionDeleteCallbacks;
+  if (previousCallbacks && typeof previousCallbacks.forEach === "function") {{
+    previousCallbacks.forEach((callback) => {{
+      try {{ callback.resolve({{ status: "failed", message: "桥接已重新连接" }}); }} catch {{}}
+    }});
+  }}
   window.__codexSessionDeleteCallbacks = new Map();
-  window.__codexSessionDeleteSeq = 0;
+  window.__codexSessionDeleteSeq = Number.isFinite(window.__codexSessionDeleteSeq)
+    ? window.__codexSessionDeleteSeq
+    : 0;
   window.__codexPlusBridgeHealth = window.__codexPlusBridgeHealth || {{}};
   window.__codexPlusBridgeHealth.lastInjectionAt = Date.now();
   window.__codexSessionDeleteResolve = (id, result) => {{
@@ -247,11 +261,20 @@ pub fn bridge_health_check_script() -> &'static str {
   const bridge = window.__codexSessionDeleteBridge;
   const health = window.__codexPlusBridgeHealth;
   if (typeof bridge !== "function" || !health) return false;
+  // 窗口隐藏时 Chromium 会把后台定时器钳到约每分钟一次，心跳时间戳必然过期。
+  // 此时桥接对象仍在，不判定失效，避免看门狗按失败阈值每分钟重注入整份脚本
+  // （issue #2330）。
+  // 必须放在 bridge/health 存在性检查之后：页面重载后真丢桥时仍要能修复。
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return true;
   const now = Date.now();
   const lastSuccessAt = Number(health.lastSuccessAt) || 0;
   const lastInjectionAt = Number(health.lastInjectionAt) || 0;
+  const lastAttemptAt = Number(health.lastAttemptAt) || 0;
   if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
-  return lastSuccessAt > 0 && now - lastSuccessAt <= 15000;
+  if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
+  // 页面忙碌时状态请求会超时，但心跳仍在调用桥接。最近一次尝试也算活着，
+  // 避免看门狗把整份脚本反复注入并触发整页刷新。
+  return lastAttemptAt > 0 && now - lastAttemptAt <= 15000;
 })()
 "#
 }
@@ -369,6 +392,196 @@ pub async fn add_script_to_new_documents(
         .await
 }
 
+/// issue #2177：AppServerRequestClient 在 Codex 26.908+ 被藏进模块闭包且不再导出，
+/// 渲染层扫描无法触达，直接改写 dispatcher 又会撞上不可写的 RPC stub。
+/// 分两段接管：渲染层用纯文本定位算出 sendRequest 的断点坐标并放到
+/// `window.__codexPlusAppServerClientCapture`；这里用独立 CDP 会话按坐标下
+/// 条件断点（`!window.__codexPlusAppServerClientClass`），命中时把类构造器挂到
+/// `window.__codexPlusAppServerClientClass`，渲染层再对原型套用与旧版实例补丁
+/// 一致的请求逻辑。条件断点保证页面重载后自动重新捕获、正常路径零暂停。
+pub fn app_server_client_capture_condition() -> &'static str {
+    "!window.__codexPlusAppServerClientClass"
+}
+
+pub fn app_server_client_capture_probe_script() -> &'static str {
+    "JSON.stringify(window.__codexPlusAppServerClientCapture || null)"
+}
+
+pub fn parse_app_server_client_capture_location(value: &Value) -> Option<(String, u32, u32)> {
+    let text = value.as_str()?;
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let url_regex = parsed.get("urlRegex")?.as_str()?.to_string();
+    if url_regex.is_empty() {
+        return None;
+    }
+    let line_number = parsed.get("lineNumber")?.as_u64()?;
+    let column_number = parsed.get("columnNumber")?.as_u64()?;
+    if line_number > u32::MAX as u64 || column_number > u32::MAX as u64 {
+        return None;
+    }
+    Some((url_regex, line_number as u32, column_number as u32))
+}
+
+const APP_SERVER_CLIENT_CAPTURE_LOCATION_TIMEOUT: Duration = Duration::from_secs(90);
+const APP_SERVER_CLIENT_CAPTURE_LOCATION_POLL: Duration = Duration::from_secs(2);
+const APP_SERVER_CLIENT_CAPTURE_WATCH_CAP: Duration = Duration::from_secs(8 * 60 * 60);
+const APP_SERVER_CLIENT_CAPTURE_ON_CALL_FRAME: &str =
+    "try{window.__codexPlusAppServerClientClass=this.constructor}catch(e){};1";
+
+fn spawn_app_server_client_capture(websocket_url: &str, generation: BridgeGeneration) {
+    let websocket_url = websocket_url.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = run_app_server_client_capture(&websocket_url, generation).await {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.app_server_client_capture_failed",
+                json!({ "message": error.to_string() }),
+            );
+        }
+    });
+}
+
+
+async fn run_app_server_client_capture(
+    websocket_url: &str,
+    generation: BridgeGeneration,
+) -> anyhow::Result<()> {
+    let settings = crate::settings::SettingsStore::default()
+        .load()
+        .unwrap_or_default();
+    if !settings.codex_app_service_tier_controls && !settings.codex_app_model_whitelist_unlock {
+        return Ok(());
+    }
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    let probe_script = app_server_client_capture_probe_script();
+    let location_wait = async {
+        loop {
+            tokio::time::sleep(APP_SERVER_CLIENT_CAPTURE_LOCATION_POLL).await;
+            let Ok(response) = session
+                .send_command(
+                    next_message_id(),
+                    "Runtime.evaluate",
+                    runtime_evaluate_params(probe_script),
+                )
+                .await
+            else {
+                continue;
+            };
+            let Some(text) = response.pointer("/result/result/value").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if let Some(location) =
+                parse_app_server_client_capture_location(&Value::String(text.to_string()))
+            {
+                return Some(location);
+            }
+        }
+    };
+    let Some((url_regex, line_number, column_number)) = tokio::time::timeout(
+        APP_SERVER_CLIENT_CAPTURE_LOCATION_TIMEOUT,
+        location_wait,
+    )
+    .await
+    .unwrap_or(None)
+    else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.app_server_client_capture_skipped",
+            json!({ "reason": "capture_location_unavailable" }),
+        );
+        return Ok(());
+    };
+    session
+        .send_command(next_message_id(), "Debugger.enable", json!({}))
+        .await?;
+    let breakpoint = session
+        .send_command(
+            next_message_id(),
+            "Debugger.setBreakpointByUrl",
+            json!({
+                "lineNumber": line_number,
+                "columnNumber": column_number,
+                "urlRegex": url_regex,
+                "condition": app_server_client_capture_condition(),
+            }),
+        )
+        .await?;
+    let Some(breakpoint_id) = breakpoint
+        .pointer("/result/breakpointId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.app_server_client_capture_skipped",
+            json!({ "reason": "breakpoint_unresolved" }),
+        );
+        return Ok(());
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "bridge.app_server_client_capture_armed",
+        json!({
+            "lineNumber": line_number,
+            "columnNumber": column_number,
+        }),
+    );
+    let watch_deadline = tokio::time::Instant::now() + APP_SERVER_CLIENT_CAPTURE_WATCH_CAP;
+    let mut captured_once = false;
+    loop {
+        if !bridge_generation_is_current(&generation) {
+            break;
+        }
+        let message = tokio::time::timeout_at(watch_deadline, session.next_message()).await;
+        let Ok(message) = message else {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.app_server_client_capture_watch_expired",
+                json!({}),
+            );
+            break;
+        };
+        let Ok(Some(message)) = message else {
+            break;
+        };
+        if message.get("method").and_then(Value::as_str) != Some("Debugger.paused") {
+            continue;
+        }
+        if let Some(call_frame_id) = message
+            .pointer("/params/callFrames/0/callFrameId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            let _ = session
+                .send_command(
+                    next_message_id(),
+                    "Debugger.evaluateOnCallFrame",
+                    json!({
+                        "callFrameId": call_frame_id,
+                        "expression": APP_SERVER_CLIENT_CAPTURE_ON_CALL_FRAME,
+                        "returnByValue": true,
+                    }),
+                )
+                .await;
+        }
+        let _ = session
+            .send_command(next_message_id(), "Debugger.resume", json!({}))
+            .await;
+        if !captured_once {
+            captured_once = true;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.app_server_client_captured",
+                json!({}),
+            );
+        }
+    }
+    let _ = session
+        .send_command(
+            next_message_id(),
+            "Debugger.removeBreakpoint",
+            json!({ "breakpointId": breakpoint_id }),
+        )
+        .await;
+    Ok(())
+}
+
 pub async fn install_bridge(
     websocket_url: &str,
     binding_name: &str,
@@ -422,77 +635,77 @@ async fn install_bridge_impl(
     let mut session = CdpSession::new(socket).with_handler(handler);
     let generation = next_bridge_generation(websocket_url);
     session = session.with_generation(generation.clone());
+    let mut registered_script_ids = Vec::new();
 
-    session.send_command(1, "Runtime.enable", json!({})).await?;
-    session
-        .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
-        .await?;
-    session
-        .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
-        .await?;
+    let install_result: anyhow::Result<()> = async {
+        session.send_command(1, "Runtime.enable", json!({})).await?;
+        session
+            .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
+            .await?;
+        session
+            .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
+            .await?;
 
-    let bridge_script = build_bridge_script(binding_name);
-    session
-        .send_command(
-            4,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": bridge_script }),
-        )
-        .await?;
-    session
-        .send_command(
-            5,
-            "Runtime.evaluate",
-            runtime_evaluate_params(&bridge_script),
-        )
-        .await?;
+        let bridge_script = build_bridge_script(binding_name);
+        let response = session
+            .send_command(
+                4,
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": bridge_script }),
+            )
+            .await?;
+        collect_script_identifier(&response, &mut registered_script_ids);
+        session
+            .send_command(
+                5,
+                "Runtime.evaluate",
+                runtime_evaluate_params(&bridge_script),
+            )
+            .await?;
 
-    let paired_scripts = new_document_scripts.len() == immediate_runtime_scripts.len()
-        && new_document_scripts
-            .iter()
-            .zip(immediate_runtime_scripts)
-            .all(|(registered, immediate)| registered == immediate);
-    if paired_scripts {
+        let paired_scripts = new_document_scripts == immediate_runtime_scripts;
         for script in new_document_scripts {
-            let message_id = next_message_id();
-            session
-                .send_command(
-                    message_id,
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    json!({ "source": script }),
-                )
-                .await?;
-            let message_id = next_message_id();
-            session
-                .send_command(
-                    message_id,
-                    "Runtime.evaluate",
-                    runtime_evaluate_params(script),
-                )
-                .await?;
+            let response = session.send_command(
+                next_message_id(),
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": script }),
+            ).await?;
+            collect_script_identifier(&response, &mut registered_script_ids);
+            if paired_scripts {
+                session.send_command(next_message_id(), "Runtime.evaluate", runtime_evaluate_params(script)).await?;
+            }
         }
-    } else {
-        for script in new_document_scripts {
-            let message_id = next_message_id();
-            session
-                .send_command(
-                    message_id,
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    json!({ "source": script }),
-                )
-                .await?;
+        if !paired_scripts {
+            for script in immediate_runtime_scripts {
+                session.send_command(next_message_id(), "Runtime.evaluate", runtime_evaluate_params(script)).await?;
+            }
         }
-        for script in immediate_runtime_scripts {
-            let message_id = next_message_id();
-            session
-                .send_command(
-                    message_id,
-                    "Runtime.evaluate",
-                    runtime_evaluate_params(script),
-                )
-                .await?;
-        }
+        Ok(())
     }
+    .await;
+    if let Err(error) = install_result {
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
+        session.close().await;
+        return Err(error);
+    }
+
+    if !publish_bridge_generation(&generation) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.generation_superseded_before_publish",
+            json!({ "generation": generation.id }),
+        );
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
+        session.close().await;
+        return Ok(());
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "bridge.generation_published",
+        json!({ "generation": generation.id }),
+    );
 
     if !deferred_runtime_scripts.is_empty() {
         let websocket_url = websocket_url.to_string();
@@ -517,18 +730,7 @@ async fn install_bridge_impl(
         });
     }
 
-    if !publish_bridge_generation(&generation) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "bridge.generation_superseded_before_publish",
-            json!({ "generation": generation.id }),
-        );
-        session.close().await;
-        return Ok(());
-    }
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "bridge.generation_published",
-        json!({ "generation": generation.id }),
-    );
+    spawn_app_server_client_capture(websocket_url, generation.clone());
 
     let mut pending_calls = FuturesUnordered::new();
     session.enqueue_binding_calls(&mut pending_calls);
@@ -558,13 +760,30 @@ async fn install_bridge_impl(
                         Ok(None) | Err(_) => break,
                     }
                 }
+                // 不依赖 socket 消息也能发现 generation 过期：旧会话最多
+                // 一个轮询间隔内主动退出，避免失效场景下会话无限堆积。
+                _ = tokio::time::sleep(BRIDGE_GENERATION_POLL_INTERVAL) => {}
             }
         }
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
         session.close().await;
         release_bridge_generation(&generation);
     });
 
     Ok(())
+}
+
+fn collect_script_identifier(response: &Value, identifiers: &mut Vec<String>) {
+    if let Some(identifier) = response
+        .get("result")
+        .and_then(|result| result.get("identifier"))
+        .and_then(Value::as_str)
+        && !identifier.is_empty()
+    {
+        identifiers.push(identifier.to_string());
+    }
 }
 
 pub fn runtime_evaluate_params(script: &str) -> Value {
@@ -663,6 +882,18 @@ where
     async fn close(&mut self) {
         let _ = self.socket.send(Message::Close(None)).await;
         let _ = self.socket.close().await;
+    }
+
+    async fn remove_registered_scripts(&mut self, identifiers: &[String]) {
+        for identifier in identifiers {
+            let _ = self
+                .send_command_without_wait(
+                    next_message_id(),
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    json!({ "identifier": identifier }),
+                )
+                .await;
+        }
     }
 
     async fn send_command(

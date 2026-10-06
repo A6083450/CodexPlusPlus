@@ -409,6 +409,8 @@ body {
   background: hsl(var(--shell-bg));
   animation: topbar-enter var(--motion-normal) var(--motion-ease) both;
 }
+/* 注意：下面是 .topbar 的第二处定义，会覆盖上面这条（同优先级、源码更靠后）。
+   两处并存是历史遗留，实际生效的是下面那条 grid 布局。 */
 
 .topbar h1 {
   margin: 0;
@@ -423,6 +425,7 @@ body {
 .topbar-actions {
   display: flex;
   gap: 8px;
+  flex: 0 0 auto;
 }
 
 .screen {
@@ -513,6 +516,113 @@ body {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0;
+}
+
+.jojocode-overview {
+  border-color: hsl(var(--border));
+  background: hsl(var(--card));
+}
+
+.light .jojocode-overview {
+  background: hsl(var(--card));
+}
+
+.jojocode-overview-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+}
+
+.jojocode-overview-main {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.jojocode-overview-mark {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid hsl(var(--brand-accent) / 0.38);
+  border-radius: 8px;
+  background: hsl(var(--brand-accent) / 0.16);
+  color: hsl(var(--brand-accent));
+}
+
+/* 概览的置顶推荐位。
+   卡片内部沿用 .jojocode-overview-layout 的「左信息 / 右标签区」结构。 */
+.sponsor-board {
+  display: grid;
+  gap: 12px;
+}
+
+.sponsor-board > .panel {
+  min-width: 0;
+}
+
+/* 窄屏时「左信息 / 右标签区」并排会挤，改成上下排。 */
+@media (max-width: 1100px) {
+  .jojocode-overview-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jojocode-overview-side {
+    justify-items: start;
+  }
+
+  .jojocode-model-tags {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
+
+/* 赞助商自带 logo 时用它替换默认的 Network 图标，尺寸对齐避免布局跳动。 */
+.sponsor-logo {
+  width: 42px;
+  height: 42px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  object-fit: contain;
+}
+
+.jojocode-overview h2 {
+  margin: 2px 0 4px;
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.jojocode-overview p {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  line-height: 1.5;
+}
+
+.jojocode-overview-side {
+  display: grid;
+  justify-items: end;
+  gap: 10px;
+}
+
+.jojocode-model-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 460px;
+}
+
+.jojocode-model-tags span {
+  border: 1px solid hsl(var(--brand-accent) / 0.28);
+  border-radius: 999px;
+  background: hsl(var(--background) / 0.5);
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 8px;
 }
 
 .fill {
@@ -998,6 +1108,14 @@ body {
   background: hsl(var(--shell-bg));
 }
 
+.relay-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .relay-detail-body {
   flex: 1;
   min-height: 0;
@@ -1056,6 +1174,14 @@ body {
 .relay-file-head div {
   display: grid;
   gap: 3px;
+  min-width: 0;
+}
+
+.relay-editor-heading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
@@ -1618,6 +1744,65 @@ body {
   background: hsl(var(--surface-raised) / 0.45);
   padding: 14px;
 }
+
+/* 渠道保护默认折叠：details 复用 .relay-config-section 的外观，
+   summary 直接当区块标题用。 */
+details.relay-config-section > summary.relay-config-section-head {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.relay-config-section > summary.relay-config-section-head::-webkit-details-marker {
+  display: none;
+}
+
+details.relay-config-section > summary.relay-config-section-head::after {
+  content: "\25BE";
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+details.relay-config-section[open] > summary.relay-config-section-head::after {
+  transform: rotate(180deg);
+}
+
+/* 通用配置默认折叠为一行文字：summary 复用 .relay-file-head 的排版，
+   展开后才显示提取按钮与编辑器。 */
+details.relay-common-config-panel > summary.relay-common-config-summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.relay-common-config-panel > summary.relay-common-config-summary::-webkit-details-marker {
+  display: none;
+}
+
+details.relay-common-config-panel > summary.relay-common-config-summary::after {
+  content: "\25BE";
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+details.relay-common-config-panel[open] > summary.relay-common-config-summary::after {
+  transform: rotate(180deg);
+}
+
+/* 折叠态必须显式隐藏：Chrome 现在用 `::details-content` 的 visibility 实现
+   折叠，给子元素设 display/grid 会让它继续占位（实测 details 高 81px、
+   内容仍撑到 285px 并溢出）。展开时才用 grid 排布。 */
+details.relay-common-config-panel:not([open]) > .relay-common-config-body {
+  display: none;
+}
+
+details.relay-common-config-panel[open] > .relay-common-config-body {
+  display: grid;
+  gap: 12px;
+}
+
 
 .relay-config-section-head {
   display: flex;
@@ -2879,6 +3064,16 @@ body {
   margin-bottom: 0;
 }
 
+.switch-row.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.switch-row.is-disabled:hover {
+  border-color: hsl(var(--border));
+  background: hsl(var(--background));
+}
+
 .zed-remote-settings {
   display: grid;
   grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
@@ -3198,6 +3393,109 @@ body {
   flex: 0 0 auto;
   margin-top: 1px;
   color: hsl(var(--primary));
+}
+
+.recommend-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.recommend-hero strong,
+.recommend-hero span {
+  display: block;
+}
+
+.recommend-hero span {
+  margin-top: 3px;
+  color: hsl(var(--muted-foreground));
+  line-height: 1.45;
+}
+
+.ad-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.ad-card {
+  display: grid;
+  grid-template-rows: auto auto auto auto;
+  gap: 10px;
+  /* 不再用固定 min-height + space-between：内容多的卡片会被压扁，
+     内容少的则留一大片空白。让每张卡按自己的内容撑开。 */
+  width: 100%;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  padding: 12px;
+  text-decoration: none;
+  text-align: left;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+
+.ad-card:hover {
+  border-color: hsl(var(--ring));
+  background: hsl(var(--accent));
+  box-shadow: 0 12px 26px hsl(var(--foreground) / 0.08);
+  transform: translateY(-1px);
+}
+
+.ad-image {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 5;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: #080808;
+  object-fit: cover;
+}
+
+.ad-card strong {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.ad-card p {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  line-height: 1.5;
+}
+
+.ad-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ad-tags span {
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 8px;
+}
+
+.ad-link {
+  display: inline-flex;
+  align-items: center;
+  align-self: end;
+  gap: 6px;
+  color: hsl(var(--foreground));
+  font-weight: 700;
 }
 
 .toolbar {
@@ -3791,6 +4089,31 @@ input[type="range"]:focus-visible::-moz-range-thumb {
 
 input[type="range"]:disabled {
   opacity: 0.5;
+}
+
+/* cb3c7fa7 改版时误删了这两条：JSX 一直在用 .inline-check，但样式没了，
+   复选框退化成浏览器原生小方块（13×13），与同页 .switch-row 的开关形态
+   不一致。恢复为带描边的 40px 行内控件。 */
+.inline-check {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--surface-raised));
+  padding: 0 12px;
+  color: hsl(var(--foreground));
+  font-size: 13px;
+  font-weight: 650;
+  transition:
+    border-color var(--motion-fast) var(--motion-ease),
+    background-color var(--motion-fast) var(--motion-ease);
+}
+
+.inline-check input {
+  width: 16px;
+  height: 16px;
 }
 
 .check-row {
@@ -4865,7 +5188,7 @@ input[type="range"]:disabled {
 
 .relay-model-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1.6fr) minmax(130px, 0.7fr) minmax(110px, 0.6fr) minmax(180px, 1fr) 40px 40px;
+  grid-template-columns: 32px minmax(220px, 1.6fr) minmax(130px, 0.7fr) minmax(110px, 0.6fr) minmax(180px, 1fr) 40px 40px;
   align-items: center;
   gap: 8px;
   min-height: var(--relay-control-height);
@@ -4885,9 +5208,44 @@ input[type="range"]:disabled {
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.relay-model-drag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: grab;
+  touch-action: none;
+}
+
+.relay-model-drag:hover,
+.relay-model-drag:focus-visible {
+  border-color: hsl(var(--border));
+  background: hsl(var(--surface-raised));
+  color: hsl(var(--foreground));
+}
+
+.relay-model-drag:active {
+  cursor: grabbing;
+}
+
+.relay-model-drag svg {
+  pointer-events: none;
+}
+
 .relay-model-entry {
   display: grid;
   gap: 8px;
+}
+
+.relay-model-entry.dragging {
+  position: relative;
+  z-index: 1;
+  opacity: 0.82;
 }
 
 .relay-model-import-workbench {
@@ -4922,6 +5280,42 @@ input[type="range"]:disabled {
   background: hsl(var(--warning) / 0.12);
 }
 
+.relay-model-source-badge {
+  flex-shrink: 0;
+  border-radius: 9999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+  border: 1px solid hsl(var(--muted-foreground) / 0.55);
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--surface-sunken));
+}
+
+.relay-model-source-builtin {
+  color: hsl(var(--success-foreground, var(--foreground)));
+  border-color: hsl(var(--success, 160 84% 39%) / 0.9);
+}
+
+.relay-model-source-custom {
+  color: hsl(var(--primary-foreground, var(--foreground)));
+  border-color: hsl(var(--primary) / 0.9);
+}
+
+.relay-model-source-fallback {
+  color: hsl(var(--muted-foreground));
+}
+
+/* 行内导入按钮的元数据状态色：命中=绿、自定义=蓝、回退=默认无色 */
+.relay-model-import-button.relay-model-import-builtin {
+  border: 1px solid hsl(var(--success, 160 84% 39%) / 0.9);
+}
+
+.relay-model-import-button.relay-model-import-custom {
+  border: 1px solid hsl(var(--primary) / 0.9);
+}
+
+
 .relay-model-metadata-import-actions {
   display: flex;
   align-items: center;
@@ -4929,15 +5323,22 @@ input[type="range"]:disabled {
   gap: 12px;
 }
 
+/* 徽标与 slug 同行横排（c00177e 的既定设计）；c8ed14b 整文件覆盖时曾回退成
+   grid 单列导致竖排。flex-wrap 允许窄窗口下徽标整体折行而不挤压 slug。 */
 .relay-model-import-copy {
-  display: grid;
-  gap: 3px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   min-width: 0;
 }
 
-.relay-model-import-copy span {
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
+/* 省略号只作用于 slug 本身（strong）；不能再用 span 通配——那会把徽标的
+   10px 字号和三色 tone 覆盖成 muted 灰。 */
+.relay-model-import-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .relay-model-metadata-import-flow {
@@ -5203,6 +5604,18 @@ select {
   animation-duration: 150ms;
 }
 
+/* 顶栏两栏：标题｜右侧操作。
+   工具切换条已经移到侧栏，这里不再需要给中间留位置。 */
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.topbar > :first-child {
+  min-width: 0;
+}
+
 .topbar h1 {
   font-size: 17px;
   font-weight: 620;
@@ -5222,9 +5635,219 @@ select {
   max-width: 620px;
 }
 
-.topbar-actions {
+/* ── 工具切换条（侧栏内） ───────────────────────────────────── */
+/* 放在品牌区下方、导航之上：切换的是「整个控制台在看哪个工具」，
+   放在侧栏比放在顶栏更贴合它的语义，也不会随页面标题宽度漂移。 */
+
+.tool-switcher {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 4px;
+  border: 1px solid hsl(var(--sidebar-border));
+  border-radius: 10px;
+  background: hsl(var(--background) / 0.45);
+}
+
+.tool-chip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.tool-chip:hover:not(:disabled) {
+  background: hsl(var(--accent) / 0.6);
+  color: hsl(var(--foreground));
+}
+
+.tool-chip.active {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.16);
+  color: hsl(var(--foreground));
+}
+
+.tool-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.tool-chip-icon {
+  width: 15px;
+  height: 15px;
   flex: 0 0 auto;
+}
+
+.tool-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-chip-note {
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: hsl(var(--muted) / 0.8);
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+}
+
+/* ── Grok 供应商页 ──────────────────────────────────────────── */
+
+/* `.panel-head` 默认是 title 左、detail 右的横排；Grok 这两块说明文字长，
+   挤在右边缘会连成一片。这里让它们上下排。 */
+.grok-panel .panel-head {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.grok-panel .panel-head p {
+  line-height: 1.5;
+}
+
+.grok-empty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 18px 16px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 10px;
+  color: hsl(var(--muted-foreground));
+}
+
+.grok-empty strong {
+  display: block;
+  margin-bottom: 3px;
+  color: hsl(var(--foreground));
+  font-size: 13.5px;
+}
+
+.grok-empty span {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.grok-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.grok-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--background) / 0.5);
+}
+
+.grok-provider-row.active {
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.1);
+}
+
+.grok-provider-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.grok-provider-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.grok-provider-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.2);
+  color: hsl(var(--primary-foreground));
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.grok-provider-url,
+.grok-provider-models {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grok-provider-models {
+  flex: 0 0 auto;
+}
+
+.grok-provider-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.grok-live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.grok-live-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border) / 0.7);
+  border-radius: 8px;
+  background: hsl(var(--background) / 0.5);
+}
+
+.grok-live-label {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.grok-live-value {
+  font-size: 12.5px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
+.topbar-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
 }
 
 .screen {
@@ -5970,7 +6593,34 @@ select {
   grid-column: 1 / -1;
 }
 
+.relay-field-custom-headers {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 860px) {
+.relay-custom-headers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.relay-custom-header-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+}
+
+.relay-custom-headers-actions {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.relay-custom-headers-error {
+  color: hsl(var(--destructive));
+}
+
   .relay-advanced-fields,
   .relay-api-fields,
   .relay-vlm-section {
@@ -7590,6 +8240,43 @@ select {
 .settings-content .settings-block {
   border-top: 1px solid hsl(var(--border));
   padding-top: 14px;
+}
+
+.settings-content .check-row > span {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-content .check-row > span small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.channel-status-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.channel-status-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+}
+
+.channel-status-chip {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  padding: 3px 8px;
+}
+
+.channel-status-chip:hover {
+  border-color: hsl(var(--primary));
 }
 
 .settings-content .stepwise-settings-block {

@@ -42,6 +42,7 @@ async fn bridge_routes_cover_all_current_paths() {
         ),
         ("/user-scripts/delete", json!({"key": "user:a.js"})),
         ("/user-scripts/reload", json!({})),
+        ("/user-scripts/load", json!({})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
         ("/manager/open-transient", json!({})),
@@ -68,6 +69,8 @@ async fn bridge_routes_cover_all_current_paths() {
             json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
         ),
         ("/zed-remote/projects", json!({})),
+        ("/script-market/list", json!({})),
+        ("/script-market/install", json!({"id": "codex-relay-balance"})),
         (
             "/zed-remote/remember-project",
             json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
@@ -487,6 +490,7 @@ async fn runtime_routes_keep_user_script_inventory_shape() {
         json!({"key": "user:a.js", "enabled": false}),
     )
     .await;
+    let loaded = handle_bridge_request(ctx.clone(), "/user-scripts/load", json!({})).await;
     let reloaded = handle_bridge_request(ctx, "/user-scripts/reload", json!({})).await;
 
     assert_eq!(listed["enabled"], true);
@@ -494,6 +498,7 @@ async fn runtime_routes_keep_user_script_inventory_shape() {
     assert_eq!(global["enabled"], false);
     assert_eq!(script["scripts"][1]["enabled"], false);
     assert_eq!(reloaded["reloaded"], true);
+    assert_eq!(loaded["reloaded"], false);
     assert_eq!(reloaded["scripts"][0]["key"], "builtin:demo.js");
 }
 
@@ -618,7 +623,8 @@ async fn backend_status_includes_active_official_usage_alert_setting() {
         relay_profiles: vec![codex_plus_core::settings::RelayProfile {
             id: "official".to_string(),
             relay_mode: codex_plus_core::settings::RelayMode::Official,
-            hide_official_usage_alert: true,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
             ..Default::default()
         }],
         ..Default::default()
@@ -1072,7 +1078,9 @@ async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
         script_url: "https://example.com/demo.js".to_string(),
-        sha256: String::new(),
+        requirements: Vec::new(),
+        limitations: Vec::new(),
+        icon: String::new(),
     };
 
     codex_plus_core::script_market::install_market_script_content(
@@ -1130,9 +1138,14 @@ async fn core_runtime_reload_evaluates_enabled_user_bundle_and_status_is_ok() {
             })
         })
         .with_websocket_url("ws://page");
-    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData::default()));
+    let ctx = BridgeContext::new(
+        Arc::new(FakeSettings::default()),
+        Arc::new(runtime),
+        Arc::new(FakeData::default())
+    );
 
     let status = handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await;
+    let loaded = handle_bridge_request(ctx.clone(), "/user-scripts/load", json!({})).await;
     let reloaded = handle_bridge_request(ctx, "/user-scripts/reload", json!({})).await;
 
     assert_eq!(
@@ -1140,10 +1153,13 @@ async fn core_runtime_reload_evaluates_enabled_user_bundle_and_status_is_ok() {
         json!({"status": "ok", "message": "后端已连接", "version": codex_plus_core::version::VERSION, "hideOfficialUsageAlert": false})
     );
     assert_eq!(reloaded["scripts"][0]["key"], "builtin:demo.js");
+    assert_eq!(loaded["scripts"][0]["key"], "builtin:demo.js");
     let evaluated = evaluated.lock().unwrap();
-    assert_eq!(evaluated.len(), 1);
+    assert_eq!(evaluated.len(), 2);
     assert!(evaluated[0].starts_with("ws://page:"));
     assert!(evaluated[0].contains("window.demo = true;"));
+    assert!(!evaluated[0].contains(".prepareReload();"));
+    assert!(evaluated[1].contains(".prepareReload();"));
 }
 
 #[tokio::test]
@@ -1245,7 +1261,6 @@ fn script_market_manifest_filters_invalid_entries() {
                 "tags": ["ui", 42],
                 "homepage": "https://example.com/demo",
                 "script_url": "https://example.com/demo.js",
-                "sha256": ""
             },
             { "id": "", "name": "Bad", "version": "1", "script_url": "https://example.com/bad.js" },
             { "id": "missing-url", "name": "Bad", "version": "1" }
@@ -1283,7 +1298,9 @@ fn user_script_inventory_includes_market_metadata() {
             tags: vec!["ui".to_string()],
             homepage: "https://example.com/demo".to_string(),
             script_url: "https://example.com/demo.js".to_string(),
-            sha256: String::new(),
+            requirements: Vec::new(),
+            limitations: Vec::new(),
+            icon: String::new(),
         })
         .unwrap();
 
@@ -1320,7 +1337,9 @@ fn install_market_script_writes_file_and_records_metadata() {
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
         script_url: "https://example.com/demo.js".to_string(),
-        sha256: String::new(),
+        requirements: Vec::new(),
+        limitations: Vec::new(),
+        icon: String::new(),
     };
 
     codex_plus_core::script_market::install_market_script_content(
@@ -1358,7 +1377,9 @@ fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() 
         tags: Vec::new(),
         homepage: String::new(),
         script_url: "https://example.com/demo.js".to_string(),
-        sha256: "0000".to_string(),
+        requirements: Vec::new(),
+        limitations: Vec::new(),
+        icon: String::new(),
     };
 
     codex_plus_core::script_market::install_market_script_content(&manager, &script, b"new")

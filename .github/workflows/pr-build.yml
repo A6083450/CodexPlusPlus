@@ -30,11 +30,14 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci
 
       - name: Frontend tests
         working-directory: apps/codex-plus-manager
         run: npm test
+
+      - name: Check native browser inspector bundle
+        run: node scripts/assemble-native-browser-inspector.mjs --check
 
       - name: TypeScript check
         working-directory: apps/codex-plus-manager
@@ -116,7 +119,10 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci
+
+      - name: Check native browser inspector bundle
+        run: node scripts/assemble-native-browser-inspector.mjs --check
 
       - name: Build frontend
         working-directory: apps/codex-plus-manager

@@ -41,81 +41,30 @@ async function readStepwiseSource() {
   return `(() => {\n${fragments.join("\n")}\n})();\n`;
 }
 
-type FakeElementOptions = {
-  className?: string;
-  dismissLabel?: string;
-  hasProgress?: boolean;
-  styleDisplay?: string;
-};
+it("only reveals floating-panel content after the shell has settled open", async () => {
+  const source = await readFile(
+    new URL("../../../assets/inject/floating-panel/core/appearance.js", import.meta.url),
+    "utf8",
+  );
+  const panelRules = Array.from(
+    source.replace(/\$\{[^}]+\}/g, "0").matchAll(/(?:^|\n)\s*([^{}\n]*\.csw-panel)\s*\{([^}]+)\}/g),
+    ([, selector, declarations]) => ({ selector: selector.trim(), declarations }),
+  );
+  const hidden = panelRules.find((rule) => rule.selector === ".csw-panel");
+  assert.ok(hidden, "panel needs a hidden default for collapsed and interrupted states");
+  assert.match(hidden.declarations, /opacity:\s*0\s*;/);
+  assert.match(hidden.declarations, /visibility:\s*hidden\s*;/);
+  assert.match(hidden.declarations, /transition:\s*none\s*!important\s*;/);
 
-class FakeElement {
-  children: FakeElement[] = [];
-  dataset: Record<string, string> = {};
-  parentElement: FakeElement | null = null;
-  style: { display: string };
-  private readonly className: string;
-  private readonly dismissLabel: string;
-  private readonly hasProgress: boolean;
-
-  constructor(options: FakeElementOptions = {}) {
-    this.className = options.className ?? "";
-    this.dismissLabel = options.dismissLabel ?? "";
-    this.hasProgress = options.hasProgress ?? false;
-    this.style = { display: options.styleDisplay ?? "" };
+  const visible = panelRules.filter((rule) =>
+    /opacity:\s*1\s*;|visibility:\s*visible\s*;/.test(rule.declarations),
+  );
+  assert.ok(visible.length > 0, "settled content must remain visible");
+  for (const rule of visible) {
+    assert.ok(rule.selector.includes('[data-open="true"]'), rule.selector);
+    assert.ok(rule.selector.includes('[data-morphing="false"]'), rule.selector);
   }
-
-  appendChild(child: FakeElement) {
-    child.parentElement = this;
-    this.children.push(child);
-  }
-
-  getAttribute(name: string) {
-    return name === "aria-label" ? this.dismissLabel : null;
-  }
-
-  matches(selector: string) {
-    return selector === "div.w-full" && this.className.split(/\s+/).includes("w-full");
-  }
-
-  querySelector(selector: string) {
-    return selector === 'progress[max="100"]' && this.hasProgress ? new FakeElement() : null;
-  }
-
-  querySelectorAll(selector: string) {
-    return selector === "button" && this.dismissLabel ? [this] : [];
-  }
-}
-
-function usageAlertRuntime(renderer: string, cards: FakeElement[], managed: FakeElement[]) {
-  const start = renderer.indexOf("  function officialUsageAlertHidden(");
-  const end = renderer.indexOf("\n  let zedRemoteStatusPromise", start);
-  assert.ok(start >= 0 && end > start);
-  const source = renderer.slice(start, end);
-  const selectors: string[] = [];
-  const document = {
-    querySelectorAll(selector: string) {
-      selectors.push(selector);
-      return selector === '[data-codex-plus-usage-alert-hidden="true"]'
-        ? managed.filter((node) => node.dataset.codexPlusUsageAlertHidden === "true")
-        : cards;
-    },
-  };
-  const windowValue: Record<string, unknown> = {};
-  const create = new Function(
-    "window",
-    "document",
-    "HTMLElement",
-    `${source}\nreturn { officialUsageAlertHidden, refreshOfficialUsageAlertVisibility };`,
-  ) as (
-    windowValue: Record<string, unknown>,
-    documentValue: typeof document,
-    elementType: typeof FakeElement,
-  ) => {
-    officialUsageAlertHidden: () => boolean;
-    refreshOfficialUsageAlertVisibility: () => void;
-  };
-  return { runtime: create(windowValue, document, FakeElement), selectors, windowValue };
-}
+});
 
 function installRendererStyle(renderer: string) {
   const start = renderer.indexOf("  function installStyle()");
@@ -166,6 +115,12 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /codexPlusSidebarNavId\s*=\s*"codex-plus-sidebar-nav"/);
     assert.match(renderer, /function installCodexPlusSidebarNavigation\(\)/);
     assert.match(renderer, /aside\.app-shell-left-panel nav\[role="navigation"\]/);
+    // 新版把 role="navigation" 挪去了缩略图面板/演示目录，兜底要限定在 aside 内；
+    // 而图标栏本身也是 aside 里的 <nav> 且文档顺序在前，必须显式排除，
+    // 否则 "点导航就关页面" 的监听会挂到图标栏上，点自己的入口就把页面关掉。
+    assert.doesNotMatch(renderer, /aside\.app-shell-left-panel nav\[role="navigation"\], nav\[role="navigation"\]/);
+    assert.match(renderer, /aside\.app-shell-left-panel nav\[role="navigation"\]'\)/);
+    assert.match(renderer, /!nav\.hasAttribute\("data-app-navigation-rail"\)/);
     assert.match(renderer, /const insertionButton = pluginButton \|\| navButtons\.find/);
     assert.match(renderer, /selectors\.pluginNavButton/);
     assert.match(renderer, /button\.querySelector\(selectors\.pluginSvgPath\)/);
@@ -179,7 +134,7 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /target\?\.closest\(selectors\.sidebarThread\)/);
     assert.match(renderer, /closeCodexPlusPageAfterNativeNavigation\(\)/);
     assert.match(renderer, /setTimeout\(\(\) => \{\s*window\.__codexPlusPageNavigationCloseTimer = null;\s*closeCodexPlusPage\(\);/);
-    assert.match(renderer, /installCodexPlusSidebarNavigation\(\);/);
+    assert.match(renderer, /installCodexPlusNavigationEntries\(\);/);
     assert.match(renderer, /document\.querySelectorAll\(`#\$\{codexPlusMenuId\}/);
   });
 
@@ -240,6 +195,167 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /Codex 未能生成新名称/);
   });
 
+  it("mounts Codex++ and 拓展 entries into the new navigation rail", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /codexPlusRailNavId\s*=\s*"codex-plus-rail-nav"/);
+    assert.match(renderer, /codexPlusRailExtensionsId\s*=\s*"codex-plus-rail-extensions"/);
+    assert.match(renderer, /codexPlusRailSelector\s*=\s*"nav\[data-app-navigation-rail\]"/);
+    assert.match(renderer, /function installCodexPlusRailNavigation\(\)/);
+    // 模板按钮取自原生 destination，clone 后必须清掉这几个属性，
+    // 否则会被 Codex 的自定义/排序逻辑当成真 destination。
+    assert.match(renderer, /codexPlusRailDestinationSelector\s*=\s*"\[data-sidebar-destination\]"/);
+    assert.match(renderer, /button\.removeAttribute\("data-sidebar-destination"\)/);
+    assert.match(renderer, /button\.removeAttribute\("aria-current"\)/);
+    // 图标栏是纯图标，不塞文字标签。
+    assert.match(renderer, /class="codex-plus-rail-icon"/);
+    assert.doesNotMatch(renderer, /codex-plus-rail-icon"[^]*?<span class="truncate">/);
+  });
+
+  it("falls back to the legacy sidebar entry when the rail is absent", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /function installCodexPlusNavigationEntries\(\)/);
+    // 两条路径互斥：有 rail 就移除旧入口，没有就移除 rail 入口。
+    assert.match(renderer, /if \(installCodexPlusRailNavigation\(\)\) \{\s*detachCodexPlusSidebarNavigation\(\);\s*return;\s*\}/);
+    assert.match(renderer, /removeCodexPlusRailNavigation\(\);\s*installCodexPlusSidebarNavigation\(\);/);
+    assert.match(renderer, /function detachCodexPlusSidebarNavigation\(\)/);
+    // 启动补扫要认两条路径任意一条已装上。
+    assert.match(renderer, /const installed = document\.getElementById\(codexPlusSidebarNavId\)\s*\|\| document\.getElementById\(codexPlusRailNavId\);/);
+  });
+
+  it("opens 拓展 as a standalone page instead of a Codex++ tab", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /codexPlusExtensionsTab\s*=\s*"extensions"/);
+    assert.match(renderer, /function openCodexPlusExtensions\(\)/);
+    assert.match(renderer, /openCodexPlusModal\(\{ page: true, tab: codexPlusExtensionsTab \}\)/);
+    // 旧名 userScripts 仍要能映射过去，避免存量调用点失效。
+    assert.match(renderer, /if \(tab === "extensions" \|\| tab === "userScripts"\) return codexPlusExtensionsTab;/);
+    // 弹窗必须尊重传入的初始 tab，而不是硬编码 home。
+    assert.match(renderer, /selectCodexPlusTab\(initialTab\);/);
+    // 激活态要靠 data-codex-plus-active-tab 区分页面，必须排在 selectCodexPlusTab 之后。
+    assert.match(renderer, /selectCodexPlusTab\(initialTab\);\s*\/\/[^]*?if \(pageMode\) setCodexPlusSidebarNavActive\(true, codexPlusActiveEntry\(\) \|\| "home"\);/);
+  });
+
+  it("gives the page mode a two-column layout with its own left panel", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /function installCodexPlusPageLayout\(overlay, tab\)/);
+    assert.match(renderer, /function refreshCodexPlusPageNav\(tab\)/);
+    assert.match(renderer, /function renderCodexPlusPageNavItems\(tab\)/);
+    // 三栏容器是 createElement + className 赋值的，不是 markup 字面量。
+    assert.match(renderer, /layout\.className = "codex-plus-page-layout"/);
+    assert.match(renderer, /main\.className = "codex-plus-page-main"/);
+    // 只搬动已有的 modal-body，不重建里面的 data-codex-* 挂载点，
+    // 否则 renderUserScripts / 各 toggle 的 querySelector 会找不到目标。
+    assert.match(renderer, /main\.appendChild\(body\)/);
+    // 左面板只有「拓展」需要（它是脚本列表）；主页是单栏内容页，
+    // 页面切换交给图标栏入口，所以导航容器要在条件分支里创建。
+    assert.match(renderer, /if \(tab === codexPlusExtensionsTab\) \{[\s\S]{0,400}nav\.className = "codex-plus-page-nav"/);
+    assert.match(renderer, /data-codex-plus-page-nav-body="true"/);
+    // 布局必须在 selectCodexPlusTab 之前建好，否则刷新左面板时找不到容器。
+    assert.match(renderer, /installCodexPlusPageLayout\(overlay, initialTab\);[\s\S]{0,900}selectCodexPlusTab\(initialTab\);/);
+    // 左面板分组导航走同一个选中函数。
+    assert.match(renderer, /const pageNav = target\?\.closest\("\[data-codex-plus-page-nav\]"\)/);
+    assert.match(renderer, /selectCodexPlusTab\(pageNav\.getAttribute\("data-codex-plus-page-nav"\)\)/);
+  });
+
+  it("把 Codex++ 和拓展接成独立页面，保留无推荐内容的 fork 行为", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /id: codexPlusRailNavId, label: "Codex\+\+"/);
+    assert.match(renderer, /id: codexPlusRailExtensionsId, label: "拓展"/);
+    assert.doesNotMatch(renderer, /codexPlusRailSponsorId|fetchCodexPlusAds|key: "sponsor"|tab === "sponsor"/);
+
+    // 弹窗里的 tab 条已随入口外移删除，不该再有残留。
+    assert.doesNotMatch(renderer, /codex-plus-tab-button/);
+
+    // 「拓展」入口用 VSCode 的扩展字形，和列表默认图标同一份 path。
+    assert.match(renderer, /extensions: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="\$\{codexPlusDefaultExtensionIconPath\}"/);
+
+    // 界面缩放：读 Codex 的 zoom 变量，套到 overlay 上，尺寸用 calc 反向抵消。
+    assert.match(renderer, /const codexPlusWindowZoomVar = "--codex-window-zoom"/);
+    assert.match(renderer, /function codexPlusWindowZoom\(\)/);
+    assert.match(renderer, /function applyCodexPlusZoom\(overlay\)/);
+    assert.match(renderer, /overlay\.style\.setProperty\("zoom", String\(zoom\)\)/);
+    assert.match(renderer, /width: calc\(100vw \/ var\(--codex-plus-zoom, 1\)\)/);
+    // 页面模式的 left 偏移要按 zoom 折算回布局坐标，CSS 里的 width 用的是同一个空间，
+    // 两边量纲不一致会把右边缘算短（曾出现 62 + 1652 = 1714，视口 1727）。
+    assert.match(renderer, /const layoutLeft = zoom === 1 \? left : left \/ zoom;/);
+    assert.match(renderer, /overlay\.style\.setProperty\("--codex-plus-page-left", `\$\{layoutLeft\}px`\)/);
+  });
+
+  it("颜色走 Codex 的语义令牌，不写死调色板", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    // applyCodexPlusTheme 读宿主算好的令牌，取不到才回落。
+    assert.match(renderer, /function applyCodexPlusTheme\(overlay\)/);
+    assert.match(renderer, /--color-token-text-primary/);
+    assert.match(renderer, /--color-token-text-secondary/);
+    assert.match(renderer, /--color-token-bg-primary/);
+    // 早先写死的 zinc 调色板不能再出现在主题函数里。
+    const themeBody = renderer.slice(
+      renderer.indexOf("function applyCodexPlusTheme(overlay)"),
+      renderer.indexOf("function codexPlusModalTab(tab)"),
+    );
+    assert.ok(themeBody.length > 0, "找不到 applyCodexPlusTheme 的函数体");
+    assert.ok(!themeBody.includes('text: "#f3f4f6"'), "主题函数里残留硬编码的正文色");
+    assert.ok(!themeBody.includes('textSecondary: "#a1a1aa"'), "主题函数里残留硬编码的次要色");
+  });
+
+  it("lists user scripts in the 拓展 page left panel", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /function renderCodexPlusExtensionsNav\(\)/);
+    // 点左面板的行 = 选中（右侧看详情），不直接切开关——
+    // 开关移到详情页，避免点行就误触发启停。
+    assert.match(renderer, /data-codex-extensions-select="installed:\$\{escapeHtml\(entry\.key\)\}"/);
+    assert.match(renderer, /data-codex-extensions-select="market:\$\{escapeHtml\(entry\.key\)\}"/);
+    assert.match(renderer, /codex-plus-page-nav-item-state/);
+    // 每个条目都有图标，没有自带图标的用默认字形。
+    assert.match(renderer, /codex-plus-page-nav-item-icon/);
+    assert.match(renderer, /codexPlusDefaultExtensionIconPath/);
+    // 脚本启停/状态变化要同步到左面板与详情。
+    assert.match(renderer, /if \(codexPlusActiveEntry\(\) === "extensions"\) refreshCodexPlusExtensionsView\(\);/);
+  });
+
+  it("shows a VSCode-style detail pane for the selected 拓展", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /function renderCodexPlusExtensionsDetail\(\)/);
+    assert.match(renderer, /data-codex-plus-extensions-detail="true"/);
+    assert.match(renderer, /function codexPlusExtensionsSelectionDetail\(\)/);
+    // 详情里给已安装的开关（复用 user-script-key 委托）与卸载入口。
+    assert.match(renderer, /data-codex-extensions-uninstall=/);
+    assert.match(renderer, /function uninstallUserScript\(key\)/);
+    assert.match(renderer, /postJson\("\/user-scripts\/delete", \{ key \}\)/);
+    // 内置脚本在只读目录里，只给用户脚本提供卸载。
+    assert.match(renderer, /if \(local\?\.source === "user"\)/);
+    // 市场条目在详情里也能直接安装。
+    assert.match(renderer, /codex-plus-extensions-detail-primary/);
+    // 选中项要高亮。
+    assert.match(renderer, /data-active="\$\{String\(selected\)\}"/);
+  });
+
+  it("gives 拓展 a searchable 已安装 / 市场 分组视图", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /data-codex-extensions-search="true"/);
+    assert.match(renderer, /function refreshCodexPlusExtensionsView\(\)/);
+    assert.match(renderer, /function codexPlusExtensionsEntries\(\)/);
+    assert.match(renderer, /function loadScriptMarket\(/);
+    // 市场走 bridge 的两个新路由。
+    assert.match(renderer, /postJson\("\/script-market\/list", \{\}\)/);
+    assert.match(renderer, /postJson\("\/script-market\/install", \{ id \}\)/);
+    // 空分组要留着显示占位（加载中/加载失败），只在搜索无匹配时才省略——
+    // 否则「正在读取脚本市场…」和错误提示会被一起藏掉，面板全空。
+    assert.match(renderer, /if \(!entries\.length && searching\) return "";/);
+    assert.doesNotMatch(renderer, /if \(!entries\.length && \(searching \|\| !count\)\) return "";/);
+    // 搜索重绘后要把焦点放回输入框，否则每敲一个字就断。
+    assert.match(renderer, /next\.setSelectionRange\(next\.value\.length, next\.value\.length\)/);
+  });
+
   it("does not install Codex++ UI in embedded browser documents", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
@@ -267,8 +383,8 @@ describe("renderer injection header compatibility", () => {
     assert.match(css, /html\.dark[\s\S]*--codex-plus-bg-primary:[^;]*#202020/);
     assert.match(css, /@media \(prefers-color-scheme: dark\)[\s\S]*html:not\(\.light\):not\(\[data-theme="light"\]\)/);
     assert.match(css, /\.codex-plus-modal-content[\s\S]*background: var\(--codex-plus-bg-primary\)/);
-    assert.match(css, /\.codex-plus-page-overlay\s*\{[^}]*background: var\(--codex-plus-bg-primary\)/);
-    assert.match(css, /\.codex-plus-page-overlay \.codex-plus-modal-content\s*\{[^}]*background: var\(--codex-plus-bg-primary\)/);
+    assert.match(css, /\.codex-plus-page-overlay\s*\{[^}]*background: var\(--codex-plus-bg-primary(?:, #fff)?\)/);
+    assert.match(css, /\.codex-plus-page-overlay \.codex-plus-modal-content\s*\{[^}]*background: var\(--codex-plus-bg-primary(?:, #fff)?\)/);
     assert.match(css, /\.codex-plus-page-overlay \.codex-plus-modal-close\s*\{[^}]*border: 1px solid var\(--codex-plus-border\)/);
     assert.match(css, /\.codex-plus-row-description[\s\S]*color: var\(--codex-plus-text-secondary\)/);
   });
@@ -284,41 +400,70 @@ describe("renderer injection header compatibility", () => {
     assert.match(css, /:where\([^)]*codex-plus-modal-overlay[^)]*\)\s*\{[^}]*font-family:\s*inherit;/s);
   });
 
-  it("hides only the official usage alert and restores it without changing upstream styles", async () => {
+  it("rewrites official usage status at the cache boundary instead of scanning alerts", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const wrapper = new FakeElement({ className: "w-full", styleDisplay: "grid" });
-    const usageAlert = new FakeElement({ dismissLabel: "Dismiss usage alert", hasProgress: true });
-    const otherStatus = new FakeElement({ dismissLabel: "Dismiss sync status", hasProgress: true });
-    wrapper.appendChild(usageAlert);
-    const { runtime, selectors, windowValue } = usageAlertRuntime(renderer, [usageAlert, otherStatus], [wrapper]);
+    const scanStart = renderer.indexOf("  function scanLightweight()");
+    const scanEnd = renderer.indexOf("  function officialUsagePolicy()", scanStart);
+    assert.ok(scanStart >= 0 && scanEnd > scanStart);
+    const scan = renderer.slice(scanStart, scanEnd);
 
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(otherStatus.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.deepEqual(selectors, [
-      '[data-codex-plus-usage-alert-hidden="true"]',
-      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
-    ]);
-
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(wrapper.children[0], usageAlert);
-    assert.equal(selectors.at(-1), '[data-codex-plus-usage-alert-hidden="true"]');
-  });
-
-  it("refreshes active-profile usage alert settings through the existing backend heartbeat", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
+    assert.doesNotMatch(scan, /syncOfficialUsagePolicy|refreshOfficialUsageAlert/);
     assert.match(renderer, /typeof nextStatus\.hideOfficialUsageAlert === "boolean"/);
     assert.match(renderer, /window\.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus\.hideOfficialUsageAlert/);
-    assert.match(renderer, /\[data-codex-plus-usage-alert-hidden="true"\] \{ display: none !important; \}/);
-    assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
+    assert.match(renderer, /function syncOfficialUsagePolicy\(\)/);
+    assert.match(renderer, /queryKey\[1\] !== "image-generation"/);
+    assert.match(renderer, /image_generation_limit_reached/);
+    assert.match(renderer, /if \(loaded\) syncOfficialUsagePolicy\(\);/);
+    assert.doesNotMatch(renderer, /officialUsageAlertCards|refreshOfficialUsageAlertVisibility|codex-plus-hide-usage-alert/);
+    assert.doesNotMatch(renderer, /mutationTouchesUsageAlert/);
+    assert.match(renderer, /function isOfficialLowQuotaSidebarCard/);
+    assert.match(renderer, /function isOfficialLowQuotaComposerBanner/);
+    assert.match(renderer, /upsell-banner-title-/);
+    assert.match(renderer, /function isOfficialLowQuotaComposerAside/);
+    assert.match(renderer, /tagName !== "ASIDE"/);
+    assert.match(renderer, /rounded-3xl/);
+    assert.match(renderer, /function syncOfficialUsageWindowMode/);
+    assert.match(renderer, /key === "official-hide"/);
+    assert.match(renderer, /officialUsageWindowObserver\?\.disconnect\(\)/);
+    assert.match(renderer, /officialUsageWindowMarker\}="hidden"/);
+    assert.doesNotMatch(scan, /startOfficialUsageWindowBlock|hideOfficialUsageWindowsWithin/);
+    const policyStart = renderer.indexOf("  function syncOfficialUsagePolicy()");
+    const policyEnd = renderer.indexOf("  if (window.__CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__)", policyStart);
+    assert.ok(policyStart >= 0 && policyEnd > policyStart);
+    const policy = renderer.slice(policyStart, policyEnd);
+    const sameKey = policy.slice(policy.indexOf("if (key === officialUsagePolicyApplied)"), policy.indexOf("const previous"));
+    assert.match(sameKey, /rewriteCachedOfficialUsage/);
+    assert.doesNotMatch(sameKey, /hideOfficialUsageWindowsWithin|querySelectorAll/);
+    assert.match(renderer, /function codexPlusPublishUsageData/);
+    assert.match(renderer, /unlockSend: mixed/);
+    assert.match(renderer, /limit_reached: false/);
+    assert.doesNotMatch(renderer, /__codexPlusApiQuotaGate/);
+    assert.doesNotMatch(renderer, /installExternalApiQuotaGate|__codexPlusApiQuotaBreakpoint|refreshComposers/);
+  });
+
+  // issue #2169：HTTP 回落成功不得掩盖桥接通道故障。桥接失败计数独立于后端状态，
+  // 连续失败时状态灯降级呈现；回落路径绝不能清零计数或刷新 bridge 健康时间戳，
+  // 否则启动器侧健康检查失去修复动力，重注入风暴对用户完全静默。
+  it("surfaces persistent bridge degradation while the http fallback keeps the backend reachable", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /const CODEX_PLUS_BRIDGE_FAILURE_THRESHOLD = 3;/);
+    assert.match(
+      renderer,
+      /function recordCodexPlusBridgeFailure\(\) \{\s*codexPlusBridgeFailureCount \+= 1;\s*\}/,
+    );
+    // 降级渲染：桥接连续失败 + 后端 ok → degraded
+    assert.match(renderer, /bridgeDegraded && rawStatus === "ok" \? "degraded" : rawStatus/);
+    assert.match(renderer, /桥接降级，自动修复中/);
+    // 回落分支只记失败，不得触碰成功路径
+    const fallbackBlock = renderer.match(
+      /const fallback = await fetchBackendStatusFromHelper\(path, payload\);[\s\S]*?return fallback;\s*\}/,
+    );
+    assert.ok(fallbackBlock, "http fallback block not found in postJson");
+    assert.doesNotMatch(fallbackBlock[0], /recordCodexPlusBridgeSuccess\(\)/);
+    // 降级状态有专属样式（指示灯与文本）
+    assert.match(renderer, /\.codex-plus-backend-indicator\[data-status="degraded"\]/);
+    assert.match(renderer, /\.codex-plus-backend-label\[data-status="degraded"\]/);
   });
 
   it("keeps the Codex++ trigger pill-shaped across checkout line endings", async () => {
@@ -698,6 +843,8 @@ describe("renderer injection plugin marketplace patch", () => {
     assert.equal(harness.sweeps(), 1);
     assert.deepEqual(harness.diagnostics(), ["plugin_marketplace_request_patch_installed"]);
   });
+
+
 });
 
 describe("relay pureApi provider resolution", () => {
@@ -969,5 +1116,859 @@ describe("Stepwise generation mode contracts", () => {
       styles,
       /\.stepwise-settings-block input[^,]*,[\s\S]*?\.stepwise-settings-block \.app-select-trigger,[\s\S]*?\.stepwise-settings-block \.field-select,[\s\S]*?\.stepwise-settings-block \.select-input\s*\{[\s\S]*?height:\s*var\(--stepwise-control-height\);[\s\S]*?min-height:\s*var\(--stepwise-control-height\);/,
     );
+  });
+});
+
+// issue #2256/#2255：app-server model request patch 的 miss 熔断以前被 provider
+// 重试路径提前 return 绕过，失败变成 250ms 无限重试（每轮全量 fetch 全部 app asset）。
+describe("renderer injection app-server model request patch", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  interface AppServerPatchHarness {
+    install: () => void;
+    sweeps: () => number;
+    diagnostics: () => string[];
+    settle: () => Promise<void>;
+  }
+
+  function appServerPatchRuntime(renderer: string, patchSucceeds: boolean): AppServerPatchHarness {
+    const start = renderer.indexOf("  const appServerModelRequestPatchMaxMisses = ");
+    const end = renderer.indexOf("\n  function ensureCodexModelWhitelistInstalls(", start);
+    assert.ok(start >= 0 && end > start, "app-server model request patch block not found");
+    const source = renderer.slice(start, end);
+
+    let sweeps = 0;
+    let pending: Array<() => void> = [];
+    const diagnostics: string[] = [];
+    const timers: Array<number> = [];
+    const fakeWindow: Record<string, unknown> = {
+      setTimeout: ((fn: () => void) => {
+        timers.push(0);
+        pending.push(fn);
+        return 0;
+      }) as unknown,
+      clearTimeout: () => {},
+    };
+
+    const factory = new Function(
+      "window",
+      "codexAppServerModelRequestPatchVersion",
+      "codexRemoteSessionProviderPatchEnabled",
+      "loadAppServerRequestCandidates",
+      "patchAppServerModelRequestClient",
+      "sendCodexPlusDiagnostic",
+      "Date",
+      `${source}\nreturn installAppServerModelRequestPatch;`,
+    );
+
+    const install = factory(
+      fakeWindow,
+      1,
+      // provider patch 开关两态都要测：以前 enabled 时走提前 return 绕过熔断。
+      () => true,
+      () =>
+        new Promise((resolve) => {
+          sweeps += 1;
+          pending.push(() => resolve({ modules: [{}], candidates: [{}], sources: [], discovery: "fallback" }));
+        }),
+      () => patchSucceeds,
+      (event: string) => diagnostics.push(event),
+      Date,
+    ) as () => void;
+
+    const settle = async () => {
+      // 重试定时器是挂起的回调：排空 sweep 再触发到期的 retry，直到没有新定时器。
+      for (let round = 0; round < 32; round += 1) {
+        if (!pending.length) break;
+        const flushSweeps = pending;
+        pending = [];
+        flushSweeps.forEach((resolve) => resolve());
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    };
+
+    return { install, sweeps: () => sweeps, diagnostics: () => diagnostics, settle };
+  }
+
+  it("does not start a new sweep while the previous one is still running", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), false);
+
+    for (let i = 0; i < 20; i += 1) harness.install();
+
+    assert.equal(harness.sweeps(), 1);
+    await harness.settle();
+  });
+
+  it("stops retrying via the provider path once maxMisses is reached", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), false);
+
+    // 反复 install + settle，让每轮 miss 走完 provider 重试调度。
+    for (let i = 0; i < 40; i += 1) {
+      harness.install();
+      await harness.settle();
+    }
+
+    // 关键回归断言：以前 provider 路径无限重试（40 轮 = 40 次 sweep），
+    // 现在到 maxMisses(8) 就熔断停手。
+    assert.equal(harness.sweeps(), 8);
+    assert.equal(harness.diagnostics().filter((e) => e === "model_app_server_request_patch_not_found").length, 1);
+    assert.deepEqual(harness.diagnostics().at(-1), "model_app_server_request_patch_skipped");
+    const settled = harness.sweeps();
+    harness.install();
+    await harness.settle();
+    assert.equal(harness.sweeps(), settled);
+  });
+
+  it("keeps working normally when the patch actually lands", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), true);
+
+    harness.install();
+    await harness.settle();
+    for (let i = 0; i < 10; i += 1) harness.install();
+
+    assert.equal(harness.sweeps(), 1);
+    assert.deepEqual(harness.diagnostics(), ["model_app_server_request_patch_installed"]);
+  });
+});
+
+// renderer-inject.js 现在是「分片源码 + 生成产物」：真正的源码在
+// assets/inject/renderer-inject/*.js，产物是拼回去的单体文件，供 assets.rs 的
+// include_str! 和本文件的大量按路径断言消费。
+// 这组用例防止有人只改产物、不回改分片，让两边悄悄分叉。
+describe("renderer inject 分片与产物一致", () => {
+  const fragmentDir = new URL("../../../assets/inject/renderer-inject/", import.meta.url);
+  const artifactPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  async function assembleFromFragments(): Promise<{ source: string; names: string[] }> {
+    const manifest = JSON.parse(
+      await readFile(new URL("manifest.json", fragmentDir), "utf8"),
+    ) as { fragments: Array<{ name: string; description?: string }> };
+    assert.ok(
+      Array.isArray(manifest.fragments) && manifest.fragments.length > 0,
+      "manifest.json 必须有 fragments",
+    );
+    const bodies = await Promise.all(
+      manifest.fragments.map(async (fragment) => {
+        assert.ok(fragment.name, "分片必须带 name");
+        const body = await readFile(new URL(fragment.name, fragmentDir), "utf8");
+        // 每片以换行收尾，直接相接才能还原原始行结构；漏了会让两处声明粘连。
+        assert.ok(body.endsWith("\n"), `分片 ${fragment.name} 未以换行结尾`);
+        return body;
+      }),
+    );
+    return { source: bodies.join(""), names: manifest.fragments.map((f) => f.name) };
+  }
+
+  it("分片按 manifest 顺序拼接后与产物逐字节一致", async () => {
+    const { source, names } = await assembleFromFragments();
+    const artifact = await readFile(artifactPath, "utf8");
+    assert.equal(
+      source,
+      artifact,
+      `产物与分片不一致（分片 ${names.length} 个）。` +
+        "改分片后请跑 node scripts/assemble-renderer-inject.mjs 重新组装。",
+    );
+  });
+
+  it("拼接结果是完整可解析的单个 IIFE", async () => {
+    const { source } = await assembleFromFragments();
+    assert.match(source, /^(?:\(\(\) => \{|\(function installCodexPlusRenderer\(\) \{)\n/, "必须以 IIFE 开头");
+    assert.ok(source.includes("\n})();\n"), "必须包含主 IIFE 的收尾");
+    // 语法解析（不执行）能抓出分片切坏造成的括号不匹配。
+    assert.doesNotThrow(() => new Function(source));
+  });
+
+  it("测试辅助依赖的锚点仍落在同一个分片里且顺序不变", async () => {
+    // installRendererStyle() 用 indexOf 划区间，靠这两个标记定位。
+    // 它们一旦被拆到不同分片、或前后顺序反转，helper 会静默取到空区间。
+    const { source } = await assembleFromFragments();
+    const start = source.indexOf("  function installStyle()");
+    const end = source.indexOf("\n  function defaultCodexPlusSettings", start);
+    assert.ok(start >= 0, "找不到 installStyle 锚点");
+    assert.ok(end > start, "defaultCodexPlusSettings 必须排在 installStyle 之后");
+  });
+
+  it("拓展列表渲染不裸取 entry.item", async () => {
+    // 已安装条目的形状是 { kind, key, name, meta, enabled, script }，没有 item；
+    // 只有市场条目才有。裸取 entry.item.description 会在列表里只要有任意一个
+    // 已安装脚本时就抛 TypeError，整块渲染中断，左面板停在「正在读取…」占位。
+    // 已安装条目要走 codexPlusExtensionMarketItem(entry) 按 market_id 回查。
+    const { source } = await assembleFromFragments();
+    const openingTag = source.indexOf("  function renderCodexPlusExtensionsNav()");
+    const closingTag = source.indexOf("\n  /** 左面板内容变了就整块重绘", openingTag);
+    assert.ok(openingTag >= 0, "找不到 renderCodexPlusExtensionsNav");
+    assert.ok(closingTag > openingTag, "找不到函数结束位置");
+    const body = source.slice(openingTag, closingTag);
+    assert.ok(
+      !/entry\.item\s*\./.test(body),
+      "itemHtml 里出现了不带可选链的 entry.item.*，会在已安装条目上抛 TypeError",
+    );
+    assert.ok(
+      body.includes("codexPlusExtensionMarketItem(entry)"),
+      "itemHtml 应该用 codexPlusExtensionMarketItem(entry) 解析图标与简介来源",
+    );
+  });
+});
+
+// 分片重构后的实例和原型入口必须共用 fork 的请求改写，避免新版入口绕过生图。
+it("preserves fork request overrides in both app-server entrypoints", async () => {
+  const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const start = source.indexOf("  function applyCodexAppServerRequestOverrides(");
+  const end = source.indexOf("\n  function patchAppServerModelRequestClient(", start);
+  assert.ok(start >= 0 && end > start, "shared app-server overrides must exist");
+  const body = source.slice(start, end);
+  const apply = new Function(
+    "applyCodexImageGenerationRequestOverride",
+    "applyCodexServiceTierRequestOnly",
+    `${body}\nreturn applyCodexAppServerRequestOverrides;`,
+  )(
+    (_method: string, params: object) => ({ ...params, imageGeneration: true }),
+    (_method: string, params: object) => ({ ...params, serviceTier: "priority" }),
+  );
+  assert.deepEqual(apply("turn/start", { hostId: "local" }, { model: "gpt-image-2" }), {
+    model: "gpt-image-2", imageGeneration: true, serviceTier: "priority",
+  });
+  assert.deepEqual(apply("turn/start", { hostId: "remote" }, { model: "gpt-6-sol" }), {
+    model: "gpt-6-sol", serviceTier: "priority",
+  });
+  const nativeThreadParams = { model: "gpt-6-sol" };
+  assert.equal(apply("thread/start", { hostId: "remote" }, nativeThreadParams), nativeThreadParams);
+  assert.equal((source.match(/applyCodexAppServerRequestOverrides\(requestMethod, client, providerParams\)/g) || []).length, 2);
+  const prototype = source.slice(source.indexOf("  function installCodexAppServerClientPrototypePatch("), source.indexOf("  const appServerModelRequestPatchMaxMisses = "));
+  assert.ok(prototype.includes("await prepareCodexImageGenerationTurn(client, requestMethod, params)"));
+  assert.ok(prototype.includes("refreshCodexNativeModelCache"));
+});
+
+it("assembles the imagegen runtime into the resolved renderer without syntax drift", async () => {
+  const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const runtime = await readFile(new URL("../../../extensions/imagegen/ui/renderer-runtime.js", import.meta.url), "utf8");
+  const generatedImages = await readFile(new URL("../../../extensions/imagegen/ui/generated-images-inject.js", import.meta.url), "utf8");
+  const slot = "  /* @codex-imagegen:runtime */\n\n";
+  assert.equal(renderer.split(slot).length, 2, "imagegen slot must appear exactly once");
+  assert.doesNotThrow(() => new Function(`${renderer.replace(slot, runtime)}\n${generatedImages}`));
+});
+
+// 新版原生滑杆菜单的横排控件不能插入旧版速度子菜单。
+it("keeps the native power-slider menu free of legacy speed rows", async () => {
+  const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const start = source.indexOf("  function codexServiceTierNativeSpeedRow(");
+  const end = source.indexOf("\n  function installCodexServiceTierMenu(", start);
+  assert.ok(start >= 0 && end > start);
+  const detect = vm.runInNewContext(`(${source.slice(start, end).trim()})`);
+  const slider = { tagName: "DIV" };
+  const menu = { querySelector: (selector: string) => selector === "[data-model-picker-power-slider]" ? slider : null };
+  const container = { querySelector: () => null, closest: (selector: string) => selector === '[role="menu"]' ? menu : null };
+  assert.equal(detect(container, [], { speed: "速度" }), slider);
+  assert.equal(detect({ querySelector: () => null }, [], { speed: "速度" }), undefined);
+  const nativeFast = { tagName: "SPAN" };
+  assert.equal(detect({ querySelector: () => nativeFast }, [], { speed: "速度" }), nativeFast);
+});
+
+// Fast 的界面、原生列表与请求共用同一能力判定，不能遗漏新模型或元数据。
+it("recognizes GPT-6.1 Sol and metadata-declared Fast without enabling unknown models", async () => {
+  const source = await readFile(new URL("../../../assets/inject/renderer-inject/20-menu.js", import.meta.url), "utf8");
+  const set = source.match(/  const codexServiceTierSupportedFastModels = .+;/)![0];
+  const additions = source.match(/^  \["gpt-5\.6-sol".*forEach.*$/m)![0];
+  const extract = (name: string, next: string) => {
+    const start = source.indexOf(`  function ${name}(`);
+    const end = source.indexOf(`  function ${next}(`, start);
+    assert.ok(start >= 0 && end > start);
+    return source.slice(start, end);
+  };
+  const api = vm.runInNewContext(`${set}\n${additions}\n${extract("codexServiceTierFastSupportedForModel", "codexServiceTierFastUnsupportedMessage")}\n${extract("codexServiceTierFastAvailability", "codexServiceTierInheritedValue")}\n({ fast: codexServiceTierFastAvailability })`, {
+    normalizeCodexServiceTierModelName: (model: string) => model.toLowerCase(),
+    codexPlusModelMetadata: (model: string) => model === "relay-priority" ? { serviceTiers: [{ id: "priority" }] } : null,
+  });
+  assert.equal(api.fast("gpt-6.1-sol").supported, true);
+  assert.equal(api.fast("relay-priority").supported, true);
+  assert.equal(api.fast("unknown-model").supported, false);
+});
+
+it("leaves full session-index scans to the existing periodic job instead of blocking startup", async () => {
+  const source = await readFile(new URL("../../codex-plus-launcher/src/main.rs", import.meta.url), "utf8");
+  const start = source.indexOf("    async fn run_provider_sync(&self)");
+  const end = source.indexOf("    fn has_pending_remote_control_session_recoveries", start);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(source.slice(start, end), /repair_session_index_automatically/);
+  assert.match(source, /Duration::from_secs\(30 \* 60\),\s*\|\| repair_session_index_automatically\(true\)/);
+});
+
+/**
+ * 拓展接口层的契约测试。
+ *
+ * 这些测试把 01-registry.js 与 91-extension-api.js 的定义抽出来单独执行，
+ * 不依赖真实 DOM——注册中心本身刻意不读 DOM，正是为了让它可以这样被验证。
+ */
+describe("拓展注册中心", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  interface RegistryHarness {
+    registry: { rowActions: Map<string, unknown>; navEntries: Map<string, unknown>; pages: Map<string, unknown>; menuItems: Map<string, unknown> };
+    register: (kind: string, reg: Map<string, unknown>, id: string, def: unknown, key: string) => () => void;
+    registerSelector: (selector: string) => boolean;
+    extensionSelector: () => string;
+    isExtensionNode: (node: unknown) => boolean;
+    items: (reg: Map<string, unknown>) => Array<Record<string, unknown>>;
+    runCallback: (key: string, label: string, cb: () => unknown) => { ok: boolean; value?: unknown; error?: string };
+    failures: () => Array<{ script_key: string; message: string }>;
+    registryLog: () => unknown[];
+  }
+
+  async function registryRuntime(): Promise<RegistryHarness> {
+    // 直接读注册中心分片本身：它刻意不读 DOM、不依赖 prelude 常量，所以能独立执行。
+    // 不要从产物里 indexOf 切片——注册中心与接口层之间隔着十来个分片，区间会失控。
+    const source = await readFile(
+      new URL("../../../assets/inject/renderer-inject/01-registry.js", import.meta.url),
+      "utf8",
+    );
+
+    const windowValue: Record<string, unknown> = {};
+    const documentValue = {
+      // registerCodexPlusExtensionSelector 用空 fragment 验证选择器语法，
+      // 非法选择器会抛错，模拟这个方法就足以覆盖合法性判定。
+      createDocumentFragment: () => ({
+        querySelector: (selector: string) => {
+          if (/[<>]/.test(selector)) throw new Error("invalid selector");
+          return null;
+        },
+      }),
+    };
+    const factory = new Function(
+      "window",
+      "document",
+      `${source}
+return { codexPlusRegistry, registerCodexPlusExtension, registerCodexPlusExtensionSelector,
+  codexPlusExtensionSelector, isCodexPlusExtensionNode, codexPlusExtensionItems,
+  runCodexPlusExtensionCallback };`,
+    );
+    const api = factory(windowValue, documentValue) as Record<string, unknown>;
+    return {
+      registry: api.codexPlusRegistry as RegistryHarness["registry"],
+      register: api.registerCodexPlusExtension as RegistryHarness["register"],
+      registerSelector: api.registerCodexPlusExtensionSelector as RegistryHarness["registerSelector"],
+      extensionSelector: api.codexPlusExtensionSelector as RegistryHarness["extensionSelector"],
+      isExtensionNode: api.isCodexPlusExtensionNode as RegistryHarness["isExtensionNode"],
+      items: api.codexPlusExtensionItems as RegistryHarness["items"],
+      runCallback: api.runCodexPlusExtensionCallback as RegistryHarness["runCallback"],
+      failures: () => (windowValue.__codexPlusExtensionFailures || []) as Array<{ script_key: string; message: string }>,
+      registryLog: () => (windowValue.__codexPlusRegistryLog || []) as unknown[],
+    };
+  }
+
+  it("第三方项从 1000 起排，不会插到内置项前面", async () => {
+    const runtime = await registryRuntime();
+    runtime.register("rowAction", runtime.registry.rowActions, "builtin:a", { order: 10, onActivate() {} }, "builtin");
+    runtime.register("rowAction", runtime.registry.rowActions, "ext:b", { order: 5, onActivate() {} }, "user:x.js");
+    const items = runtime.items(runtime.registry.rowActions);
+    // 传入的 5 被抬到 1000：内置项永远排在拓展项之前。
+    assert.deepEqual(items.map((item) => item.id), ["builtin:a", "ext:b"]);
+    assert.equal(items[1].order, 1000);
+  });
+
+  it("按脚本配额限制注册数量，超出时抛错", async () => {
+    const runtime = await registryRuntime();
+    for (let index = 0; index < 16; index += 1) {
+      runtime.register("navEntry", runtime.registry.navEntries, `ext:${index}`, { onActivate() {} }, "user:noisy.js");
+    }
+    assert.throws(
+      () => runtime.register("navEntry", runtime.registry.navEntries, "ext:overflow", { onActivate() {} }, "user:noisy.js"),
+      /最多注册 16 项/,
+    );
+    // 另一个脚本不受影响。
+    assert.doesNotThrow(
+      () => runtime.register("navEntry", runtime.registry.navEntries, "ext:other", { onActivate() {} }, "user:other.js"),
+    );
+  });
+
+  it("拒绝重复 id 与缺少回调的定义", async () => {
+    const runtime = await registryRuntime();
+    runtime.register("page", runtime.registry.pages, "ext:p", { render() {} }, "user:x.js");
+    assert.throws(
+      () => runtime.register("page", runtime.registry.pages, "ext:p", { render() {} }, "user:x.js"),
+      /已被占用/,
+    );
+    assert.throws(
+      () => runtime.register("page", runtime.registry.pages, "ext:empty", {}, "user:x.js"),
+      /必须提供 render \/ onActivate/,
+    );
+  });
+
+  it("菜单项的开关形态（只给 onChange）不被校验误拒", async () => {
+    const runtime = await registryRuntime();
+    // 开关形态没有 render / onActivate，早期实现会把它当成非法定义拒掉。
+    assert.doesNotThrow(
+      () => runtime.register("menuItem", runtime.registry.menuItems, "ext:toggle", { onChange() {} }, "user:x.js"),
+    );
+    assert.doesNotThrow(
+      () => runtime.register("page", runtime.registry.pages, "ext:cleanup-only", { onCleanup() {} }, "user:x.js"),
+    );
+  });
+
+  it("dispose 只移除自己注册的那一项", async () => {
+    const runtime = await registryRuntime();
+    const dispose = runtime.register("page", runtime.registry.pages, "ext:first", { render() {} }, "user:x.js");
+    runtime.register("page", runtime.registry.pages, "ext:second", { render() {} }, "user:y.js");
+    dispose();
+    assert.deepEqual([...runtime.registry.pages.keys()], ["ext:second"]);
+    // 重复 dispose 不应误删后来者。
+    dispose();
+    assert.deepEqual([...runtime.registry.pages.keys()], ["ext:second"]);
+  });
+
+  it("选择器登记拒绝非法语法，避免 closest() 在每次 mutation 上抛错", async () => {
+    const runtime = await registryRuntime();
+    assert.equal(runtime.registerSelector('[data-codex-plus-ext="a"]'), true);
+    assert.match(runtime.extensionSelector(), /data-codex-plus-ext/);
+    assert.equal(runtime.registerSelector("div << p"), false);
+    assert.equal(runtime.registerSelector(""), false);
+  });
+
+  it("回调抛错时记进该脚本的失败通道，不向调用方抛出", async () => {
+    const runtime = await registryRuntime();
+    const outcome = runtime.runCallback("user:broken.js", "rowAction.onActivate", () => {
+      throw new Error("boom");
+    });
+    assert.equal(outcome.ok, false);
+    assert.match(String(outcome.error), /boom/);
+    assert.equal(runtime.failures().length, 1);
+    assert.equal(runtime.failures()[0].script_key, "user:broken.js");
+  });
+});
+
+/**
+ * 对外接口层的护栏测试。
+ *
+ * 接口层挂在 window.codexPlus 上、面向第三方脚本，所以「哪些能力被开放」必须
+ * 有测试守着——新增路由时默认不开放，漏网才是 bug。
+ */
+describe("拓展接口层", () => {
+  const apiFragmentPath = new URL(
+    "../../../assets/inject/renderer-inject/91-extension-api.js",
+    import.meta.url,
+  );
+  const artifactPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  async function readRouteWhitelist(): Promise<string[]> {
+    const source = await readFile(apiFragmentPath, "utf8");
+    const start = source.indexOf("const codexPlusExtensionRoutes = new Set([");
+    const end = source.indexOf("]);", start);
+    assert.ok(start >= 0 && end > start, "找不到路由白名单");
+    const body = source.slice(start, end);
+    return Array.from(body.matchAll(/"([^"]+)"/g), ([, route]) => route);
+  }
+
+  it("路由白名单只放只读能力，不含设置写入与远端控制", async () => {
+    const routes = await readRouteWhitelist();
+    assert.ok(routes.length > 0, "白名单不能为空");
+    // 这些路由一旦开放，第三方脚本就能改用户配置或操作远端，必须显式决策后才能加。
+    for (const forbidden of ["/settings/set", "/settings/get", "/delete", "/undo", "/share/create"]) {
+      assert.ok(!routes.includes(forbidden), `${forbidden} 不应默认开放给拓展`);
+    }
+    assert.ok(routes.includes("/diagnostics/log"), "诊断上报应保持开放");
+  });
+
+  it("接口对象在 IIFE 收尾前挂载", async () => {
+    const renderer = await readFile(artifactPath, "utf8");
+    const mount = renderer.indexOf("window.codexPlus = buildCodexPlusExtensionApi();");
+    const tail = renderer.indexOf("\n})();\n");
+    assert.ok(mount >= 0, "找不到 window.codexPlus 的挂载点");
+    // 挂载必须在主 IIFE 结束之前，否则闭包里的函数已经不可达。
+    assert.ok(mount < tail, "挂载点必须位于 IIFE 收尾之前");
+  });
+});
+
+/**
+ * 菜单项的接入方式护栏。
+ *
+ * 菜单的接入点是「在 home 面板模板末尾追加一块」，不是把内置的一百多行模板
+ * 拆成数据结构——后者会动到内置 UI 主干。这些断言守住这个决定，以及点击
+ * 委托的分支顺序。
+ */
+describe("拓展菜单项", () => {
+  const settingsPath = new URL(
+    "../../../assets/inject/renderer-inject/40-backend-settings.js",
+    import.meta.url,
+  );
+  const hostPath = new URL(
+    "../../../assets/inject/renderer-inject/92-extension-host.js",
+    import.meta.url,
+  );
+
+  it("内置菜单模板保持原样，只追加一个拓展挂载点", async () => {
+    const source = await readFile(settingsPath, "utf8");
+    // 挂载点在 home 面板里，且位于「提出问题」之后（即内置项末尾）。
+    const openIdx = source.indexOf("overlay.innerHTML = `");
+    const mountIdx = source.indexOf("${renderCodexPlusExtensionMenuRows()}");
+    const issueIdx = source.indexOf("提出问题");
+    assert.ok(mountIdx > 0, "找不到拓展菜单挂载点");
+    assert.ok(mountIdx > issueIdx, "挂载点应位于内置项之后");
+    // 关键：内置的行仍然是内联模板，没有被拆成数组。
+    assert.ok(
+      source.slice(openIdx, mountIdx).includes('class="codex-plus-row"'),
+      "内置菜单行应当仍是内联模板",
+    );
+    assert.ok(
+      !/const codexPlusBuiltinMenuRows\s*=/.test(source),
+      "不应把内置菜单行抽成数组",
+    );
+  });
+
+  it("点击委托里拓展分支排在内置分支之前", async () => {
+    const source = await readFile(settingsPath, "utf8");
+    const handler = source.indexOf('overlay.addEventListener("click"');
+    assert.ok(handler > 0, "找不到点击委托");
+    const body = source.slice(handler, handler + 600);
+    const extIdx = body.indexOf("handleCodexPlusExtensionMenuClick(target)");
+    const devtoolsIdx = body.indexOf("data-codex-open-devtools");
+    assert.ok(extIdx > 0, "点击委托应当调用拓展菜单处理器");
+    assert.ok(extIdx < devtoolsIdx, "拓展分支应排在内置分支之前");
+  });
+
+  it("开关与按钮分别渲染成不同的控件", async () => {
+    const source = await readFile(hostPath, "utf8");
+    const start = source.indexOf("function renderCodexPlusExtensionMenuRows()");
+    const end = source.indexOf("function handleCodexPlusExtensionMenuClick(", start);
+    assert.ok(start > 0 && end > start, "找不到菜单渲染函数");
+    const body = source.slice(start, end);
+    assert.match(body, /data-codex-plus-ext-setting/, "开关应有自己的 data 属性");
+    assert.match(body, /data-codex-plus-ext-action/, "按钮应有自己的 data 属性");
+    // 是追加到 home 面板，不是替换它。
+    assert.ok(!/panel\.innerHTML\s*=/.test(body), "不应整体替换面板内容");
+  });
+
+  it("菜单项失败经由脚本状态上报，不向调用方抛出", async () => {
+    const source = await readFile(hostPath, "utf8");
+    const start = source.indexOf("function handleCodexPlusExtensionMenuClick(");
+    const body = source.slice(start, start + 1400);
+    assert.match(body, /runCodexPlusExtensionCallback/, "回调必须经失败隔离包装");
+    assert.ok(!/try\s*{[\s\S]*item\.onActivate\(/.test(body), "不应裸调 onActivate");
+  });
+});
+
+/**
+ * 会话视图对齐（issue #2258 / #2085）的夹具运行时。
+ *
+ * 这里跑的是产物里真实的目标查找与宽度计算函数，配一个极简 DOM 桩——
+ * 只实现查找链路真正用到的方法（querySelector/matches/closest/getBoundingClientRect）。
+ * 类名夹具直接取自 Codex 打包产物里的字符串，不手写臆造。
+ */
+function conversationViewRuntime(renderer: string) {
+  const start = renderer.indexOf("  // 旧版（26.9xx 之前）内容容器类名清单");
+  const end = renderer.indexOf("  const codexNativeServiceTierPickerVersion = ", start);
+  assert.ok(start >= 0 && end > start, "conversation view target finder block not found");
+  const finderSource = renderer.slice(start, end);
+  // 宽度计算与目标查找在文件里不相邻，单独切一段。
+  const widthStart = renderer.indexOf("  function conversationViewEffectiveWidth(");
+  const widthEnd = renderer.indexOf("  function conversationViewHtmlCenter(", widthStart);
+  assert.ok(widthStart >= 0 && widthEnd > widthStart, "conversation view width block not found");
+  const widthSource = renderer.slice(widthStart, widthEnd);
+  const source = `${finderSource}\n${widthSource}`;
+
+  const selectorStart = renderer.indexOf("  const selectors = {");
+  const selectorEnd = renderer.indexOf("  };", selectorStart) + 4;
+  assert.ok(selectorStart >= 0, "selectors table not found");
+  const selectorsTable = renderer.slice(selectorStart, selectorEnd);
+
+  type FakeEl = {
+    tagName: string;
+    className: string;
+    attrs: Record<string, string>;
+    children: FakeEl[];
+    parentElement: FakeEl | null;
+    style: Record<string, string>;
+    dataset: Record<string, string>;
+    rect: { left: number; width: number };
+    vars: Record<string, string>;
+    padding: { left: string; right: string };
+    querySelectorAll(selector: string): FakeEl[];
+    querySelector(selector: string): FakeEl | null;
+    matches(selector: string): boolean;
+    closest(selector: string): FakeEl | null;
+    getBoundingClientRect(): { left: number; width: number; right: number; top: number; bottom: number; height: number };
+  };
+
+  function matches(el: FakeEl, selector: string): boolean {
+    if (selector === "div") return el.tagName === "DIV";
+    if (selector.startsWith("[") && selector.endsWith("]")) {
+      const body = selector.slice(1, -1);
+      const eq = body.indexOf("=");
+      const name = eq === -1 ? body : body.slice(0, eq);
+      const value = eq === -1 ? null : body.slice(eq + 1).replace(/^["']|["']$/g, "");
+      const actual = el.attrs[name];
+      if (actual === undefined) return false;
+      return value === null ? true : actual === value;
+    }
+    if (selector.startsWith(".")) return el.className.split(/\s+/).includes(selector.slice(1));
+    throw new Error(`夹具未实现的选择器: ${selector}`);
+  }
+
+  function descendants(root: FakeEl, out: FakeEl[] = []): FakeEl[] {
+    for (const child of root.children) {
+      out.push(child);
+      descendants(child, out);
+    }
+    return out;
+  }
+
+  function query(root: FakeEl, selector: string): FakeEl[] {
+    const parts = selector.split(",").map((part) => part.trim());
+    return descendants(root).filter((el) => parts.some((part) => matches(el, part)));
+  }
+
+  function el(tag: string, className = "", attrs: Record<string, string> = {}): FakeEl {
+    const node: FakeEl = {
+      tagName: tag.toUpperCase(),
+      className,
+      attrs,
+      children: [],
+      parentElement: null,
+      style: {},
+      dataset: {},
+      rect: { left: 0, width: 0 },
+      vars: {},
+      padding: { left: "", right: "" },
+      querySelectorAll: (selector: string) => query(node, selector),
+      querySelector: (selector: string) => query(node, selector)[0] ?? null,
+      matches: (selector) => matches(node, selector),
+      closest: (selector) => {
+        let current: FakeEl | null = node;
+        while (current) {
+          if (matches(current, selector)) return current;
+          current = current.parentElement;
+        }
+        return null;
+      },
+      getBoundingClientRect: () => ({
+        left: node.rect.left,
+        width: node.rect.width,
+        right: node.rect.left + node.rect.width,
+        top: 0,
+        bottom: 0,
+        height: 0,
+      }),
+    };
+    return node;
+  }
+
+  function append(parent: FakeEl, child: FakeEl): FakeEl {
+    parent.children.push(child);
+    child.parentElement = parent;
+    return child;
+  }
+
+  const root = el("body");
+  const documentValue = {
+    querySelector: (selector: string) => query(root, selector)[0] ?? null,
+    querySelectorAll: (selector: string) => query(root, selector),
+    documentElement: { getBoundingClientRect: () => ({ left: 0, width: 1440, right: 1440, top: 0, bottom: 0, height: 0 }) },
+  };
+  const factory = new Function(
+    "document",
+    "getComputedStyle",
+    "sendCodexPlusDiagnostic",
+    "codexPlusSettings",
+    "localStorage",
+    `${selectorsTable}
+const conversationViewMinWidth = 320;
+const conversationViewMaxAllowedWidth = 4000;
+const conversationViewDefaultWidth = 900;
+const conversationViewLegacyWidthKey = "codexPlus.threadCenter.maxWidth";
+// 夹具只需要观察 style 写入结果，原始值记录这一步用空实现顶掉。
+function conversationViewRememberOriginals() {}
+function normalizeConversationViewWidth(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(320, Math.min(4000, Math.round(number)));
+}
+function conversationViewWidth() {
+  const settingsWidth = normalizeConversationViewWidth(codexPlusSettings().conversationViewMaxWidth);
+  if (settingsWidth) return settingsWidth;
+  const legacyWidth = normalizeConversationViewWidth(localStorage.getItem(conversationViewLegacyWidthKey));
+  return legacyWidth || 900;
+}
+${source}
+return {
+  findContent: conversationViewFindContentEl,
+  findComposer: conversationViewFindComposerEl,
+  effective: conversationViewEffectiveWidth,
+  available: conversationViewAvailableWidth,
+  apply: conversationViewApplyNativeWidth,
+};`,
+  );
+
+  const api = factory(
+    documentValue,
+    (node: FakeEl) => {
+      // 同时充当 padding 来源与 CSSStyleDeclaration：兜底的变量反查会读索引属性。
+      const style: Record<string, unknown> = {
+        paddingLeft: node.padding.left,
+        paddingRight: node.padding.right,
+        length: Object.keys(node.vars).length,
+        getPropertyValue: (name: string) => node.vars[name] ?? "",
+      };
+      Object.keys(node.vars).forEach((name, index) => { style[index] = name; });
+      return style;
+    },
+    () => undefined,
+    () => ({ conversationView: true, conversationViewMaxWidth: 900 }),
+    { getItem: () => null },
+  ) as {
+    findContent(): FakeEl | null;
+    findComposer(): FakeEl | null;
+    effective(containerWidth: number): number;
+    available(el: FakeEl): number;
+    apply(el: FakeEl, effectiveWidth: number): void;
+  };
+
+  return { root, el, append, api };
+}
+
+describe("renderer injection conversation view alignment", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  // 夹具类名取自真实产物：
+  //   旧版内容容器 "… flex shrink-0 flex-col pb-8"
+  //   新版内容容器 "relative flex flex-1 shrink-0 flex-col"
+  //   页脚包裹层   "relative z-10 flex flex-col mx-auto w-full max-w-(--thread-content-max-width) px-toolbar"
+  const legacyContentClass = "mx-auto w-full max-w-(--thread-content-max-width) px-toolbar relative flex shrink-0 flex-col pb-8";
+  const newContentClass = "relative flex flex-1 shrink-0 flex-col";
+
+  async function buildFixture(mode: "legacy" | "modern") {
+    const runtime = conversationViewRuntime(await readFile(rendererPath, "utf8"));
+    const scroller = runtime.append(runtime.root, runtime.el("div", "thread-scroll-container"));
+    const host = runtime.append(scroller, runtime.el("div", "h-full flex"));
+    if (mode === "legacy") {
+      runtime.append(host, runtime.el("div", legacyContentClass));
+    } else {
+      // 新版：结构上只剩居中 + 满宽 + thread 宽度工具类，pb-8 已并入条件组合。
+      runtime.append(host, runtime.el(
+        "div",
+        "relative flex flex-1 shrink-0 flex-col",
+        { "data-thread-user-message-navigation-content": "" },
+      ));
+    }
+    // 页脚包裹层带同样的宽度工具类，是最容易被误认成内容容器的节点。
+    const footer = runtime.append(host, runtime.el(
+      "div",
+      "relative z-10 flex flex-col mx-auto w-full max-w-(--thread-content-max-width) px-toolbar",
+      { "data-thread-scroll-footer": "true" },
+    ));
+    runtime.append(footer, runtime.el(
+      "div",
+      "mx-auto flex w-full max-w-(--thread-body-max-width) flex-col gap-8",
+    ));
+    return { runtime, scroller, host, footer };
+  }
+
+  it("旧版类名容器仍然命中", async () => {
+    const { runtime } = await buildFixture("legacy");
+    const found = runtime.api.findContent();
+    assert.ok(found, "旧版类名应命中");
+    assert.match(found.className, /pb-8/);
+  });
+
+  // 回归点：新版 Codex 把 max-w-(--thread-content-max-width) 换成
+  // max-w-(--thread-body-max-width)、pb-8 消失后，全等匹配归零、居中宽度规则整体失效（#2258）。
+  it("新版容器结构变化后仍能命中内容容器", async () => {
+    const { runtime, footer } = await buildFixture("modern");
+    const found = runtime.api.findContent();
+    assert.ok(found, "新版类名变化后必须仍有降级路径，不能返回 null");
+    assert.notEqual(found, footer, "不能把页脚包裹层当成内容容器");
+    assert.equal(found.attrs["data-thread-user-message-navigation-content"], "");
+  });
+
+  it("作曲器优先落在页脚结构内，而不是内容容器", async () => {
+    const { runtime, footer } = await buildFixture("modern");
+    const found = runtime.api.findComposer();
+    assert.ok(found, "作曲器应命中");
+    assert.ok(found.closest("[data-thread-scroll-footer]"), "作曲器应在页脚包裹层内");
+    assert.notEqual(found, footer);
+  });
+
+  // 用途词换过好几轮（content → body），所以按形状而不是字面量识别；
+  // 与 50-navigation.js 的 ...FilterSourcePattern 同一套做法。
+  it("宽度工具类按形状识别，换用途词也认", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const match = renderer.match(/const conversationViewThreadWidthTokenPattern\s*=\s*\/([\s\S]*?)\/;/);
+    assert.ok(match, "未找到 conversationViewThreadWidthTokenPattern");
+    const pattern = new RegExp(match![1]);
+    for (const token of [
+      "max-w-(--thread-content-max-width)", // 旧版
+      "max-w-(--thread-body-max-width)", // 26.9xx 起
+      "max-w-(--thread-content-responsive-max-width)",
+      "md:max-w-(--thread-content-max-width)", // 带断点前缀
+    ]) {
+      assert.ok(pattern.test(token), `应命中: ${token}`);
+    }
+    // 哈希类名与无关工具类必须排掉；尤其不能把 max-w-2xl 这类固定宽度也算进来。
+    for (const token of ["max-w-2xl", "_shell_151xi_3", "max-w-full", "w-full"]) {
+      assert.ok(!pattern.test(token), `不应命中: ${token}`);
+    }
+  });
+
+  it("两处类名都不对时按 CSS 变量反查宿主节点", async () => {
+    const runtime = conversationViewRuntime(await readFile(rendererPath, "utf8"));
+    const scroller = runtime.append(runtime.root, runtime.el("div", "thread-scroll-container"));
+    const host = runtime.append(scroller, runtime.el("div", "h-full flex"));
+    // 既没有新版类名工具类，也没有 data-* 锚点，只剩 Codex 注入的 CSS 变量。
+    const bare = runtime.append(host, runtime.el("div", "some-renamed-class"));
+    bare.vars["--thread-body-max-width"] = "calc(900px + 0px)";
+    const found = runtime.api.findContent();
+    assert.ok(found, "兜底候选应能反查到宿主节点");
+    assert.equal(found, bare);
+  });
+
+  it("目标全部缺失时上报诊断，不再静默 return", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  function conversationViewAlignNow()");
+    const end = renderer.indexOf("  function conversationViewHasRoomForHtmlCenterAt(", start);
+    assert.ok(start >= 0 && end > start);
+    const body = renderer.slice(start, end);
+    assert.match(body, /conversationViewReportMissingTargets\(\)/, "归零路径必须上报诊断");
+    assert.match(renderer, /"conversation_view_target_not_found"/);
+  });
+
+  // #2085：设置值是上限，实际宽度按容器可用宽度收敛。
+  it("容器窄于设置上限时按容器宽度收敛，宽于上限时用上限", async () => {
+    const { runtime } = await buildFixture("modern");
+    // 设置 900（夹具里 conversationViewMaxWidth = 900）。
+    assert.equal(runtime.api.effective(1400), 900, "宽容器应按设置上限");
+    assert.equal(runtime.api.effective(600), 600, "窄容器应按容器可用宽度");
+    assert.equal(runtime.api.effective(0), 900, "拿不到几何时回落设置上限");
+    assert.equal(runtime.api.effective(Number.NaN), 900);
+    // 硬下限仍是既有边界，不因自适应而改变。
+    assert.equal(runtime.api.effective(100), 320);
+  });
+
+  it("可用宽度取宿主内容盒（扣掉左右内边距）", async () => {
+    const { runtime, host } = await buildFixture("modern");
+    host.rect.width = 1000;
+    host.padding.left = "16px";
+    host.padding.right = "16px";
+    const target = runtime.api.findContent()!;
+    assert.equal(runtime.api.available(target), 968);
+    // 写进 style 的是收敛后的值，不是写死设置值。
+    runtime.api.apply(target, runtime.api.effective(runtime.api.available(target)));
+    assert.equal(target.style.maxWidth, "900px");
+    host.rect.width = 500;
+    runtime.api.apply(target, runtime.api.effective(runtime.api.available(target)));
+    assert.equal(target.style.maxWidth, "468px");
+  });
+
+  // 自适应计算必须留在既有的「先统一写 style、再统一读几何」两阶段里，
+  // 否则退回 commit 82fb0924 修掉的读-写交替强制重排。
+  it("自适应计算不引入逐元素读-写交替", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  function conversationViewAlignNow()");
+    const end = renderer.indexOf("  function conversationViewReportMissingTargets(", start);
+    const body = renderer.slice(start, end);
+    // 宽度读取必须集中在写之前，且是一次 map 批量读取。
+    const readIndex = body.indexOf("conversationViewAvailableWidth(el)");
+    const writeIndex = body.indexOf("conversationViewApplyNativeWidth(el");
+    assert.ok(readIndex >= 0 && writeIndex > readIndex, "读取必须在写入之前");
+    assert.match(body, /targets\.map\(\(el\) => conversationViewAvailableWidth\(el\)\)/);
   });
 });

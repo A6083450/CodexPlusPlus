@@ -1,4 +1,4 @@
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const VOLCENGINE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-volcengine.png");
@@ -8,16 +8,10 @@ const APIKEY_FUN_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-api
 const RAWCHAT_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-rawchat.svg");
 const RUNAPI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-runapi.png");
 const BAIKEWEI_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-baikewei-ai.jpg");
-const CUBENCE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-cubence.png");
 const DEEPKEY_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-deepkey.png");
-const ERGOU_API_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-ergou-api.png");
 const APIMART_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apimart.png");
 const FENNO_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-fenno-ai.png");
 const QINIU_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-qiniu-ai.png");
-const BUILTIN_SPONSOR_EXPIRES_AT: &str = "2026-08-02T23:59:59+08:00";
-const DEEPKEY_SPONSOR_EXPIRES_AT: &str = "2026-08-25T23:59:59+08:00";
-const APIMART_SPONSOR_EXPIRES_AT: &str = "2026-09-27T23:59:59+08:00";
-const NEW_SPONSOR_EXPIRES_AT: &str = "2026-11-27T23:59:59+08:00";
 
 pub const DEFAULT_AD_LIST_URLS: [&str; 2] = [
     "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
@@ -44,8 +38,31 @@ pub fn normalize_ad_payload(payload: Value) -> Value {
         .cloned()
         .collect::<Vec<_>>();
     fill_known_remote_logos(&mut ads);
-    append_builtin_sponsors(&mut ads);
-    json!({ "version": version, "ads": ads })
+    // `topAd` 是独立的置顶赞助位，**不参与** `ads` 列表的排序与过期过滤语义。
+    // 它比普通推荐贵，由商务单独指定，所以不能混在推荐池里按数组顺序取。
+    let top_ad = payload
+        .get("top_ad")
+        .or_else(|| payload.get("topAd"))
+        .filter(|value| is_usable_ad(value))
+        .cloned();
+    match top_ad {
+        Some(top_ad) => json!({ "version": version, "ads": ads, "topAd": top_ad }),
+        None => json!({ "version": version, "ads": ads }),
+    }
+}
+
+/// 一条广告是否可用（类型、标题、描述、URL 齐全）。
+fn is_usable_ad(ad: &Value) -> bool {
+    let ad_type = ad.get("type").and_then(Value::as_str);
+    let field = |key: &str| {
+        ad.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    matches!(ad_type, Some("sponsor" | "normal"))
+        && field("title")
+        && field("description")
+        && field("url")
 }
 
 fn fill_known_remote_logos(ads: &mut [Value]) {
@@ -85,124 +102,6 @@ fn known_remote_logo(id: &str) -> Option<(&'static str, &'static [u8])> {
         "qiniu-ai" => Some(("image/png", QINIU_AI_IMAGE)),
         _ => None,
     }
-}
-
-fn append_builtin_sponsors(ads: &mut Vec<Value>) {
-    let insert_at = ads
-        .iter()
-        .rposition(|ad| ad.get("type").and_then(Value::as_str) == Some("sponsor"))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let builtins = [
-        builtin_sponsor(
-            "cubence",
-            "Cubence",
-            "稳定、高效的 API 中转服务，支持 Claude Code、Codex、Gemini 等模型，适合日常开发和团队使用。",
-            "https://cubence.com?source=codexplusplus",
-            CUBENCE_IMAGE,
-            "image/png",
-            &["Claude Code", "Codex / Gemini", "稳定接入"],
-            BUILTIN_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "quya-cloud-bridge",
-            "quya.org 云桥",
-            "一站式 AI 中转平台，集成 Claude Code、Codex、Gemini 等模型，提供包月和按量计费方案。",
-            "https://www.quya.org/?promo=CODEX",
-            TOKEN_BRIDGE_IMAGE,
-            "image/svg+xml",
-            &[
-                "Claude Code / Codex / Gemini",
-                "国内直连",
-                "包月 / 按量计费",
-            ],
-            BUILTIN_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "deepkey-api-key",
-            "deepkey｜API KEY",
-            "面向开发者与学生群体的 API KEY 服务，提供稳定接口和提示词工程交流社区。",
-            "https://deepkey.top/register?aff=DNVc",
-            DEEPKEY_IMAGE,
-            "image/png",
-            &["稳定接口", "开发者社区", "提示词交流"],
-            DEEPKEY_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "ergou-api",
-            "二狗 API",
-            "AI API 中转服务，覆盖 Claude、GPT、Gemini 等模型，提供低延迟线路和备用链路。",
-            "https://ergouapi.com/r/gh-codexplusplus",
-            ERGOU_API_IMAGE,
-            "image/png",
-            &["Claude / GPT / Gemini", "低延迟线路", "备用链路"],
-            BUILTIN_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "apimart",
-            "API Mart",
-            "专注 AI 图片和视频生成的低价 API 平台，一套异步 API 覆盖图片与视频任务，支持大批量生成和按量付费。",
-            "https://go.apimart.ai/gh-codexplusplus",
-            APIMART_IMAGE,
-            "image/png",
-            &["图片 / 视频", "异步任务 API", "按量付费"],
-            APIMART_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "fenno-ai",
-            "FennoAI",
-            "稳定高效的 Codex API 中转服务，兼容 OpenAI 与 Anthropic 协议，支持企业级调用、公对公结算和开票。",
-            "https://api.fenno.ai/s/ZZM7",
-            FENNO_AI_IMAGE,
-            "image/png",
-            &["Codex 中转", "企业级调用", "公对公结算"],
-            NEW_SPONSOR_EXPIRES_AT,
-        ),
-        builtin_sponsor(
-            "qiniu-ai",
-            "七牛云",
-            "七牛云旗下企业级大模型 MaaS 平台，一站式调用全球 150 多个主流模型，覆盖文本、图像、音频、视频等全模态能力。",
-            "https://s.qiniu.com/7zUJri",
-            QINIU_AI_IMAGE,
-            "image/png",
-            &["150+ 主流模型", "全模态能力", "企业免费额度"],
-            NEW_SPONSOR_EXPIRES_AT,
-        ),
-    ];
-    let mut cursor = insert_at;
-    for sponsor in builtins {
-        let id = sponsor.get("id").and_then(Value::as_str);
-        if id.is_some_and(|id| {
-            ads.iter()
-                .any(|ad| ad.get("id").and_then(Value::as_str) == Some(id))
-        }) {
-            continue;
-        }
-        ads.insert(cursor, sponsor);
-        cursor += 1;
-    }
-}
-
-fn builtin_sponsor(
-    id: &str,
-    title: &str,
-    description: &str,
-    url: &str,
-    image: &[u8],
-    image_mime: &str,
-    highlights: &[&str],
-    expires_at: &str,
-) -> Value {
-    let mut sponsor = Map::new();
-    sponsor.insert("id".to_string(), json!(id));
-    sponsor.insert("type".to_string(), json!("sponsor"));
-    sponsor.insert("title".to_string(), json!(title));
-    sponsor.insert("description".to_string(), json!(description));
-    sponsor.insert("url".to_string(), json!(url));
-    sponsor.insert("expires_at".to_string(), json!(expires_at));
-    sponsor.insert("image".to_string(), json!(data_uri(image_mime, image)));
-    sponsor.insert("highlights".to_string(), json!(highlights));
-    Value::Object(sponsor)
 }
 
 fn data_uri(mime: &str, bytes: &[u8]) -> String {
@@ -265,4 +164,61 @@ where
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ad list unavailable")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sponsored(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "sponsor",
+            "title": id,
+            "description": "描述",
+            "url": "https://example.com/",
+        })
+    }
+
+    #[test]
+    fn top_ad_is_kept_out_of_the_recommendation_pool() {
+        let normalized = normalize_ad_payload(json!({
+            "version": 1,
+            "ads": [sponsored("pool-a")],
+            "top_ad": sponsored("premium"),
+        }));
+
+        // 贵价置顶位有自己的字段，不能混进 ads 数组参与排序。
+        assert_eq!(normalized["topAd"]["id"], json!("premium"));
+        let pool = normalized["ads"].as_array().unwrap();
+        assert!(
+            !pool.iter().any(|ad| ad["id"] == json!("premium")),
+            "置顶位不应出现在推荐池里"
+        );
+    }
+
+    #[test]
+    fn top_ad_accepts_camel_case() {
+        let camel = normalize_ad_payload(json!({
+            "version": 1,
+            "ads": [],
+            "topAd": sponsored("premium"),
+        }));
+        assert_eq!(camel["topAd"]["id"], json!("premium"));
+    }
+
+    #[test]
+    fn missing_or_unusable_top_ad_is_omitted() {
+        for payload in [
+            json!({ "version": 1, "ads": [] }),
+            json!({
+                "version": 1,
+                "ads": [],
+                "top_ad": { "type": "sponsor", "title": "残缺", "description": "描述" },
+            }),
+        ] {
+            let normalized = normalize_ad_payload(payload);
+            assert!(normalized.get("topAd").is_none());
+        }
+    }
 }

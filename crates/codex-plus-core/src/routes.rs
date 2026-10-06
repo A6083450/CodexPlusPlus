@@ -85,6 +85,17 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value>;
     async fn delete_user_script(&self, key: String) -> anyhow::Result<Value>;
     async fn reload_user_scripts(&self) -> anyhow::Result<Value>;
+    async fn load_user_scripts(&self) -> anyhow::Result<Value> {
+        self.user_script_inventory().await
+    }
+    /// 拉市场清单，并合并本地已安装状态。
+    async fn script_market_list(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("script market is unavailable")
+    }
+    /// 按 id 从市场安装脚本。
+    async fn script_market_install(&self, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("script market is unavailable")
+    }
     async fn open_devtools(&self) -> anyhow::Result<Value>;
     async fn open_manager(&self, payload: Value) -> anyhow::Result<Value>;
     async fn open_transient_manager(&self, payload: Value) -> anyhow::Result<Value> {
@@ -197,6 +208,7 @@ pub async fn handle_bridge_request(
                 .to_string();
             ctx.runtime.delete_user_script(key).await
         }
+        "/user-scripts/load" => ctx.runtime.load_user_scripts().await,
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
@@ -226,6 +238,8 @@ pub async fn handle_bridge_request(
         }
         "/zed-remote/open" => ctx.runtime.open_zed_remote(payload.clone()).await,
         "/zed-remote/projects" => ctx.runtime.list_zed_remote_projects(payload.clone()).await,
+        "/script-market/list" => ctx.runtime.script_market_list().await,
+        "/script-market/install" => ctx.runtime.script_market_install(payload.clone()).await,
         "/zed-remote/remember-project" => {
             ctx.runtime
                 .remember_zed_remote_project(payload.clone())
@@ -482,16 +496,51 @@ impl BridgeRuntimeService for CoreRuntimeService {
         }
     }
 
+    async fn load_user_scripts(&self) -> anyhow::Result<Value> {
+        if let (Some(user_scripts), Some(websocket_url), Some(evaluator)) = (
+            &self.user_scripts,
+            self.websocket_url.as_deref(),
+            &self.user_script_evaluator,
+        ) {
+            evaluator(websocket_url, &user_scripts.build_initial_bundle()?)?;
+        } else {
+            anyhow::bail!("Codex 页面尚未连接");
+        }
+        self.user_script_inventory().await
+    }
+
+    async fn script_market_list(&self) -> anyhow::Result<Value> {
+        let Some(user_scripts) = &self.user_scripts else {
+            anyhow::bail!("用户脚本目录不可用");
+        };
+        crate::script_market::list_market_scripts(user_scripts).await
+    }
+
+    async fn script_market_install(&self, payload: Value) -> anyhow::Result<Value> {
+        let Some(user_scripts) = &self.user_scripts else {
+            anyhow::bail!("用户脚本目录不可用");
+        };
+        let id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if id.is_empty() {
+            anyhow::bail!("脚本 id 不能为空");
+        }
+        crate::script_market::install_market_script_by_id(user_scripts, id).await
+    }
+
     async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
         if let (Some(user_scripts), Some(websocket_url), Some(evaluator)) = (
             &self.user_scripts,
             self.websocket_url.as_deref(),
             &self.user_script_evaluator,
         ) {
-            let bundle = user_scripts.build_enabled_bundle()?;
-            if !bundle.trim().is_empty() {
-                evaluator(websocket_url, &bundle)?;
-            }
+            let bundle = user_scripts.build_reload_bundle()?;
+            evaluator(websocket_url, &bundle)?;
+        } else {
+            anyhow::bail!("Codex 页面尚未连接");
         }
         self.user_script_inventory().await
     }

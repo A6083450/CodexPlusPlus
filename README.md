@@ -71,27 +71,11 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
   </tr>
   <tr>
     <td align="center">
-      <a href="https://runapi.host/register?aff=AWJq">
-        <img src="docs/images/sponsor-runapi.png" alt="RunAPI" width="150">
+      <a href="https://grooroute.com/register?aff=2B3KJR5SRNTX">
+        <img src="docs/images/sponsor-grooroute.png" alt="GrooRoute" width="170">
       </a>
     </td>
-    <td><a href="https://runapi.host/register?aff=AWJq"><strong>RunAPI</strong></a><br>RunAPI 是高效稳定的 API OpenRouter 平替平台，一个 API Key 即可访问 OpenAI、Claude、Gemini、DeepSeek、Grok 等 150+ 主流模型，低至 1 折，极其稳定，可以无缝兼容 Claude Code、OpenClaw 等工具。</td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://www.quya.org/?promo=CODEX">
-        <img src="docs/images/sponsor-0029.svg" alt="quya.org 云桥" height="80">
-      </a>
-    </td>
-    <td><a href="https://www.quya.org/?promo=CODEX"><strong>quya.org 云桥｜一站式 AI 中转平台</strong></a><br>quya.org 云桥（原 0029.org）是一个集成 Claude Code、Codex 以及 Gemini 最新模型的一站式中转平台，为你提供稳定、高效且高性价比的 AI 中转服务。本站提供灵活的包月套餐/按量计费计划，国内直连，无需魔法，极速响应。支持个人和企业接入，价格最低为官方 0.12 折。</td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://app.everyapi.ai/signin?aff=imP7QQfaZm&amp;utm_source=referral&amp;utm_medium=codexplusplus">
-        <img src="docs/images/sponsor-everyapi.png" alt="EveryAPI" height="80">
-      </a>
-    </td>
-    <td><a href="https://app.everyapi.ai/signin?aff=imP7QQfaZm&amp;utm_source=referral&amp;utm_medium=codexplusplus"><strong>EveryAPI</strong></a><br>EveryAPI 自带桌面客户端，可为 Claude Code、Codex、Cursor 等 20 多款 AI 工具自动完成配置。一把密钥即可调用 Claude、GPT、DeepSeek、GLM、MiniMax、Kimi、豆包等模型，并支持自建节点直连和渠道供货。通过专属链接注册即送 14 元额度，首充额外赠送 20%；付款时使用优惠码 <code>codexplusplus</code> 再享长期 8 折。</td>
+    <td><a href="https://grooroute.com/register?aff=2B3KJR5SRNTX"><strong>GrooRoute｜官方原模型 API</strong></a><br>GrooRoute 提供 Claude 与 GPT 全系官方原模型，一行配置即可接入 Claude Code、Codex 或直接调用 API，官方承诺不掺假、永久保真。限时注册活动：充值 50 美元赠送 50 美元，通过<a href="https://grooroute.com/register?aff=2B3KJR5SRNTX">专属链接注册</a>并完成充值后，联系客服即可获取优惠。官网：<a href="https://grooroute.com/">grooroute.com</a>。</td>
   </tr>
   <tr>
     <td align="center">
@@ -111,27 +95,11 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
   </tr>
   <tr>
     <td align="center">
-      <a href="https://ergouapi.com/r/gh-codexplusplus">
-        <img src="docs/images/sponsor-ergou-api.png" alt="二狗 API" height="80">
-      </a>
-    </td>
-    <td><a href="https://ergouapi.com/r/gh-codexplusplus"><strong>二狗 API</strong></a><br>二狗，稳如老狗的 AI API 中转站。全站 0.1x~0.2x 超低倍率，提供 Claude/GPT/Gemini 等多个国内外 100% 纯血大模型接口，顶级 IPLC 线路 + 住宅双 ISP 冗余，确保全国范围稳定低延迟访问。欢迎各位开发者、工作室注册使用。</td>
-  </tr>
-  <tr>
-    <td align="center">
       <a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8">
         <img src="docs/images/sponsor-baikewei-ai.jpg" alt="百可为AI" height="80">
       </a>
     </td>
     <td><a href="https://cn.hb-api.online/register?aff=8KA2ZKWNHND8"><strong>百可为AI</strong></a><br>百可为AI 是面向开发者、团队和 AI 工具用户的一站式大模型 API 服务平台，支持 Claude、OpenAI、Gemini、Codex 等主流模型能力接入。平台提供稳定中转、灵活计费、用量统计、余额管理和多场景 API 调用能力，适合 Claude Code、Codex、AI 生图、自动化脚本和各类智能应用长期使用。新用户注册可领取免费额度，开发者可快速接入、即开即用，让 AI 能力更稳定、更高效、更省心。</td>
-  </tr>
-  <tr>
-    <td align="center">
-      <a href="https://deepkey.top/register?aff=DNVc">
-        <img src="docs/images/sponsor-deepkey.png" alt="deepkey" height="90">
-      </a>
-    </td>
-    <td><a href="https://deepkey.top/register?aff=DNVc"><strong>deepkey｜API KEY</strong></a><br>感谢 deepkey 赞助本项目！deepkey 起初只是连接顶级算力的上游供应商，凭借稳定低价的接口被学生群体发现并口口相传。随着开发者与学子的涌入，这里不再只是 API 的搬运工，而是共同探讨提示词工程、分享创新应用的温暖社区。从工具到伙伴，deepkey 见证了无数灵感的诞生与落地。通过<a href="https://deepkey.top/register?aff=DNVc">此链接注册</a>进入群聊，可享受福利并与小伙伴们一起探讨。</td>
   </tr>
   <tr>
     <td align="center">
@@ -161,9 +129,7 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
 
 ## 交流与支持
 
-欢迎加入 Codex++ 交流 3 群（QQ群：619480492），反馈问题、交流使用体验或提出新功能建议。<a href="https://qm.qq.com/q/Erf1F1zwqs">点击链接加入群聊</a>。
-
-<img src="docs/images/discussion-group-qr.jpg" alt="Codex++ 微信群二维码" width="260">
+欢迎加入 Codex++ 交流 4 群（QQ群：1127858981），反馈问题、交流使用体验或提出新功能建议。<a href="https://qm.qq.com/q/5h3pxpxg7S">点击链接加入群聊</a>。
 
 Telegram 频道：<https://t.me/CodexPlusPlus>
 
@@ -173,10 +139,11 @@ Telegram 频道：<https://t.me/CodexPlusPlus>
 
 | 模块 | 功能 |
 | --- | --- |
-| 供应商配置 | 官方登录、官方登录混入 API、纯 API、聚合供应商；Responses / Chat Completions；模型测试、模型列表、Provider Doctor、cc-switch 与链接导入 |
-| 模型与上下文 | 每模型上下文窗口、自动压缩阈值、`model_catalog_json`、通用配置，以及按供应商选择 MCP、Skill 和 Plugin |
+| 供应商配置 | 官方登录、官方登录混入 API、纯 API、聚合供应商；Grok 供应商管理；Responses / Chat Completions；模型测试、模型列表、Provider Doctor、cc-switch 与链接导入 |
+| 模型与上下文 | 每模型上下文窗口、自动压缩阈值、`model_catalog_json`、模型元数据导入（models.json）、通用配置，以及按供应商选择 MCP、Skill 和 Plugin |
 | 会话管理 | 扫描本地会话、批量删除、Markdown 导出、Token 用量历史、Provider metadata 同步与备份 |
-| Codex 增强 | 插件市场与模型白名单、会话操作、粘贴修复、中文界面、快速启动、会话宽度与滚动恢复、服务层级控制、Goals、Stepwise、图片覆盖层 |
+| 微信连接 | 个人微信扫码连接本机 Codex 会话，每个微信联系人映射到独立会话，可配置允许的微信用户 |
+| Codex 增强 | 插件市场与模型白名单、会话操作、粘贴修复、中文界面、快速启动、会话宽度与滚动恢复、服务层级控制、Goals、Stepwise、皮肤管理、图片覆盖层 |
 | 开发工作流 | 项目移动、Upstream worktree、线程 ID、Zed Remote 项目识别与打开 |
 | 脚本与维护 | 用户脚本安装与启停、应用检测、快捷方式、Watcher、环境冲突、日志诊断、健康检查和 Release 更新 |
 
@@ -206,6 +173,7 @@ Codex++ 将官方登录、混入 API 和纯 API 分开保存和切换：
 - 富文本粘贴转纯文本、强制中文、启动加速和原生菜单本地化。
 - 会话宽度、滚动位置恢复、线程 ID、服务层级切换和 Goals。
 - Stepwise 下一步建议，可单独配置 API、模型、建议数量与超时。
+- 皮肤管理：Dream Skin 社区主题的搜索、预览、安装和换图。
 - Upstream worktree、Zed Remote、自定义图片覆盖层和用户脚本。
 
 依赖注入脚本的设置通常需要保存后重新启动 Codex++ 才会生效。
@@ -217,6 +185,8 @@ Codex++ 通过 GitHub Release 发布安装包。Windows 会生成 NSIS 安装程
 管理工具的“关于”页可以检查并启动更新。静默启动器发现新版本时会拉起管理工具并进入更新提示。
 
 ## 数据位置
+
+以下 `~/.codex` 均指 Codex 主目录：设置了 `CODEX_HOME` 环境变量时以该目录为准，否则为用户目录下的 `.codex`。
 
 - Codex 配置：`~/.codex/config.toml`
 - Codex 登录状态：`~/.codex/auth.json`

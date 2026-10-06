@@ -41,6 +41,9 @@ fn bridge_script_defines_expected_globals_and_binding() {
     assert!(script.contains("window.__codexSessionDeleteResolve"));
     assert!(script.contains("window.__codexSessionDeleteReject"));
     assert!(script.contains("codexSessionDeleteV2"));
+    assert!(script.contains("previousCallbacks"));
+    assert!(script.contains("桥接已重新连接"));
+    assert!(script.contains("Number.isFinite(window.__codexSessionDeleteSeq)"));
 }
 
 #[test]
@@ -479,7 +482,7 @@ fn stepwise_script_uses_the_floating_panel_entrypoint() {
 fn stepwise_runtime_bumps_version_when_reinjection_contract_changes() {
     let script = assets::stepwise_script();
 
-    assert!(script.contains("const SCRIPT_VERSION = \"2.0.7\";"));
+    assert!(script.contains("const SCRIPT_VERSION = \"2.0.8\";"));
 }
 
 #[test]
@@ -914,10 +917,10 @@ fn official_login_usage_alert_setting_controls_renderer_injection() {
 
     assert!(
         assets::injection_script_with_settings(57321, &settings(RelayMode::Official, true, false))
-            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;")
+            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;")
     );
     assert!(
-        assets::injection_script_with_settings(57321, &settings(RelayMode::Official, true, true))
+        assets::injection_script_with_settings(57321, &settings(RelayMode::Official, false, true))
             .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;")
     );
     assert!(
@@ -931,13 +934,261 @@ fn official_login_usage_alert_setting_controls_renderer_injection() {
 }
 
 #[test]
-fn usage_alert_hider_uses_sidebar_semantics_instead_of_percentage_copy() {
+fn usage_status_rewrite_targets_the_main_rate_limit_cache() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("officialUsageAlertCards"));
-    assert!(script.contains("progress[max=\"100\"]"));
-    assert!(script.contains("dismiss usage alert|关闭使用量提醒"));
-    assert!(script.contains("codexPlusUsageAlertHidden"));
+    assert!(script.contains("function syncOfficialUsagePolicy"));
+    assert!(script.contains("image_generation_limit_reached"));
+    assert!(script.contains("queryKey[1] !== \"image-generation\""));
+    assert!(!script.contains("officialUsageAlertCards"));
+    assert!(!script.contains("codex-plus-hide-usage-alert"));
+    assert!(!script.contains("refreshOfficialUsageAlertVisibility"));
+}
+
+#[test]
+fn official_usage_status_unlocks_external_relay_and_hides_alerts_only_when_enabled() {
+    let cases = run_official_usage_status_harness();
+
+    assert_eq!(cases["pureApiAllowed"], false);
+    assert_eq!(cases["pureApiWarning"], "low");
+    assert_eq!(cases["officialAllowed"], false);
+    assert_eq!(cases["officialLimitReached"], true);
+    assert_eq!(cases["officialUpstreamAllowed"], true);
+    assert_eq!(cases["officialUpstreamLimitReached"], false);
+    assert_eq!(cases["officialMixAllowed"], true);
+    assert_eq!(cases["officialMixLimitReached"], false);
+    assert_eq!(cases["officialWarning"], "low");
+    assert_eq!(cases["officialModelPicker"]["title"], "picker");
+    assert!(cases["hiddenTextUpsell"].is_null());
+    assert_eq!(cases["officialPercent"], 100);
+    assert!(cases["hiddenWarning"].is_null());
+    assert_eq!(cases["hiddenAllowed"], true);
+    assert_eq!(cases["hiddenLimitReached"], false);
+    assert_eq!(cases["hiddenPercent"], 100);
+    assert_eq!(cases["hiddenResetAt"], 1_700_000_000);
+    assert_eq!(cases["hiddenImageUpsell"], "image_generation_limit_reached");
+    assert!(cases["hiddenModelPicker"].is_null());
+    assert_eq!(cases["hiddenSpendReached"], true);
+    assert_eq!(cases["hiddenCredits"], false);
+    assert_eq!(cases["streamAllowed"], true);
+    assert_eq!(cases["streamId"], "stream-1");
+    assert_eq!(cases["unrelatedAllowed"], false);
+    assert!(cases["openUnchanged"].as_bool().unwrap());
+    assert_eq!(cases["imageQueryAllowed"], false);
+    assert_eq!(cases["mainQueryAllowed"], false);
+    assert_eq!(cases["mainQueryWarning"], "low");
+    assert_eq!(cases["mainQueryPercent"], 100);
+    assert_eq!(cases["publishedAllowed"], true);
+    assert_eq!(cases["publishedLimitReached"], false);
+    assert_eq!(cases["imagePublishedAllowed"], false);
+    assert_eq!(cases["invalidatedMain"], 0);
+    assert_eq!(cases["invalidatedImage"], 0);
+    assert_eq!(cases["imageKeyIgnored"], true);
+    assert_eq!(cases["plainKeyMatched"], true);
+    assert_eq!(cases["scopedKeyMatched"], true);
+}
+
+fn run_official_usage_status_harness() -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("renderer-inject.js");
+    let harness_path = temp.path().join("usage-status-harness.cjs");
+    std::fs::write(&script_path, assets::injection_script(57321))
+        .expect("injection script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+function node() {{
+  return {{
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
+    closest() {{ return null; }}, getAttribute() {{ return null; }},
+    classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
+    dataset: {{}}, style: {{}}, children: [], isConnected: true, textContent: "", innerHTML: "",
+  }};
+}}
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__ = true;
+window.addEventListener = () => {{}};
+window.removeEventListener = () => {{}};
+window.dispatchEvent = () => true;
+globalThis.MutationObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.ResizeObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.IntersectionObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+globalThis.document = {{
+  scripts: [], documentElement: node(), body: node(), createElement: () => node(),
+  getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+  addEventListener() {{}}, removeEventListener() {{}},
+}};
+globalThis.localStorage = {{ getItem: () => null, setItem() {{}}, removeItem() {{}} }};
+globalThis.location = {{ href: "app://-/index.html", pathname: "/", search: "", hash: "" }};
+window.location = globalThis.location;
+globalThis.navigator = {{ userAgent: "node-test" }};
+globalThis.performance = {{ getEntriesByType: () => [] }};
+require(scriptPath);
+const api = window.__codexPlusRateLimitUnlockTest;
+if (!api) throw new Error("usage status test api missing");
+
+const status = () => ({{
+  plan_type: "plus",
+  user_id: "user-1",
+  account_id: "acct-1",
+  rate_limit_reached_type: {{ type: "rate_limit_reached" }},
+  sidebar_usage_warnings: {{ default: {{ title: "low" }} }},
+  rate_limit_warning: {{ title: "low" }},
+  rate_limit_upsell: {{ banner_type: "image_generation_limit_reached", title: "image" }},
+  model_picker_upsell: {{ title: "picker" }},
+  spend_control: {{ reached: true }},
+  credits: {{ has_credits: false }},
+  rate_limit: {{
+    allowed: false,
+    limit_reached: true,
+    primary_window: {{ used_percent: 100, reset_at: 1700000000 }},
+  }},
+}});
+const profile = (relayMode, officialMixApiKey, upstreamBaseUrl) => ({{
+  relayProfilesEnabled: true,
+  activeRelayId: "active",
+  relayProfiles: [{{ id: "active", relayMode, officialMixApiKey, upstreamBaseUrl }}],
+}});
+const warningTitle = (value) => value?.rate_limit_warning?.title ?? null;
+
+api.setBackendSettings(profile("pureApi", true));
+api.setHideAlerts(true);
+const pureApi = api.rewrite(status());
+
+api.setBackendSettings(profile("official", false));
+api.setHideAlerts(false);
+const official = api.rewrite(status());
+api.setBackendSettings(profile("official", true, "https://api.openai.com/v1"));
+const officialUpstream = api.rewrite(status());
+api.setBackendSettings(profile("official", true, "https://proxy.example/v1"));
+const officialMix = api.rewrite(status());
+api.setHideAlerts(true);
+const hidden = api.rewrite(status());
+const textBanner = api.rewrite({{
+  ...status(),
+  rate_limit_upsell: {{ banner_type: "plus_rate_limit_reached", title: "upgrade" }},
+}});
+const stream = api.rewrite({{ stream_id: "stream-1", usage: status() }});
+const unrelated = api.rewrite({{ ok: true, allowed: false }});
+const openStatus = {{
+  plan_type: "plus",
+  user_id: "user-1",
+  account_id: "acct-1",
+  rate_limit: {{ allowed: true, limit_reached: false, primary_window: {{ used_percent: 12, reset_at: 10 }} }},
+}};
+const openUnchanged = api.rewrite(openStatus) === openStatus;
+
+let invalidatedMain = 0;
+let invalidatedImage = 0;
+function PublicationQuery(queryKey) {{
+  this.queryKey = queryKey;
+  this.state = {{ data: null }};
+  this.stored = null;
+}}
+PublicationQuery.prototype.setData = function(data) {{
+  this.stored = data;
+  this.state.data = data;
+  return data;
+}};
+const publicationQuery = new PublicationQuery(["rate-limit-status", "user-1"]);
+const imagePublicationQuery = new PublicationQuery(["rate-limit-status", "image-generation"]);
+const queries = [
+  {{ queryKey: ["rate-limit-status", "user-1", "acct-1"], state: {{ data: status() }} }},
+  {{ queryKey: ["rate-limit-status", "image-generation", "sig"], state: {{ data: status() }} }},
+];
+const client = {{
+  getQueryCache() {{
+    return {{
+      findAll() {{ return queries; }},
+      getAll() {{ return [publicationQuery, imagePublicationQuery]; }},
+      subscribe() {{ return () => {{}}; }},
+    }};
+  }},
+  setQueryData(queryKey, updater) {{
+    const query = queries.find((item) => JSON.stringify(item.queryKey) === JSON.stringify(queryKey));
+    if (!query) return;
+    query.state.data = typeof updater === "function" ? updater(query.state.data) : updater;
+  }},
+  invalidateQueries(filter) {{
+    const key = filter?.queryKey || [];
+    if (key[1] === "image-generation") invalidatedImage += 1;
+    else invalidatedMain += 1;
+  }},
+}};
+window.__REACT_QUERY_CLIENT__ = client;
+api.setBackendSettings(profile("official", false));
+api.setHideAlerts(true);
+api.install();
+api.setBackendSettings(profile("pureApi", false));
+api.setHideAlerts(false);
+api.install();
+api.setBackendSettings(profile("official", true, "https://proxy.example/v1"));
+publicationQuery.setData(status());
+imagePublicationQuery.setData(status());
+
+console.log(JSON.stringify({{
+  pureApiAllowed: pureApi.rate_limit.allowed,
+  pureApiWarning: warningTitle(pureApi),
+  officialAllowed: official.rate_limit.allowed,
+  officialLimitReached: official.rate_limit.limit_reached,
+  officialUpstreamAllowed: officialUpstream.rate_limit.allowed,
+  officialUpstreamLimitReached: officialUpstream.rate_limit.limit_reached,
+  officialMixAllowed: officialMix.rate_limit.allowed,
+  officialMixLimitReached: officialMix.rate_limit.limit_reached,
+  officialWarning: warningTitle(official),
+  officialModelPicker: official.model_picker_upsell,
+  hiddenTextUpsell: textBanner.rate_limit_upsell,
+  officialPercent: official.rate_limit.primary_window.used_percent,
+  hiddenWarning: warningTitle(hidden),
+  hiddenAllowed: hidden.rate_limit.allowed,
+  hiddenLimitReached: hidden.rate_limit.limit_reached,
+  hiddenPercent: hidden.rate_limit.primary_window.used_percent,
+  hiddenResetAt: hidden.rate_limit.primary_window.reset_at,
+  hiddenImageUpsell: hidden.rate_limit_upsell?.banner_type ?? null,
+  hiddenModelPicker: hidden.model_picker_upsell,
+  hiddenSpendReached: hidden.spend_control.reached,
+  hiddenCredits: hidden.credits.has_credits,
+  streamAllowed: stream.usage.rate_limit.allowed,
+  streamId: stream.stream_id,
+  unrelatedAllowed: unrelated.allowed,
+  openUnchanged,
+  imageQueryAllowed: queries[1].state.data.rate_limit.allowed,
+  mainQueryAllowed: queries[0].state.data.rate_limit.allowed,
+  mainQueryWarning: warningTitle(queries[0].state.data),
+  mainQueryPercent: queries[0].state.data.rate_limit.primary_window.used_percent,
+  publishedAllowed: publicationQuery.stored?.rate_limit?.allowed ?? null,
+  publishedLimitReached: publicationQuery.stored?.rate_limit?.limit_reached ?? null,
+  imagePublishedAllowed: imagePublicationQuery.stored?.rate_limit?.allowed ?? null,
+  invalidatedMain,
+  invalidatedImage,
+  imageKeyIgnored: api.isRateLimitQueryKey(["rate-limit-status", "image-generation"]) === false,
+  plainKeyMatched: api.isRateLimitQueryKey(["rate-limit-status"]) === true,
+  scopedKeyMatched: api.isRateLimitQueryKey(["rate-limit-status", "user-1", "acct-1"]) === true,
+}}));
+process.exit(0);
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run official usage status harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON")
 }
 
 #[test]
@@ -2575,7 +2826,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -2587,7 +2838,7 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
     assert!(!script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(!script.contains("isCodexPluginMarketplaceHiddenFilter"));
     assert!(!script.contains("Array.prototype.filter"));
@@ -2597,7 +2848,7 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(!script.contains("Array.prototype.filter"));
@@ -2907,6 +3158,32 @@ fn injection_script_exposes_conversation_view_width_control() {
 }
 
 #[test]
+fn injection_script_conversation_view_engine_drops_background_poll() {
+    let script = assets::injection_script(57321);
+
+    // 对齐引擎不应再有常驻的 350ms 轮询托底（issue #2221 的 layout thrashing 根因之一）。
+    assert!(!script.contains("setInterval(() => scheduleConversationViewAlign"));
+    // 运行时用独立标志防 observer 泄漏，而不是借用 pollId 作守卫。
+    assert!(script.contains("runtimeStarted"));
+    // 批量两阶段对齐：先统一应用宽度/复位，再批量读取几何。
+    assert!(script.contains("conversationViewHasRoomForHtmlCenterAt"));
+    // 事件驱动的 16 帧 settle 保留。
+    assert!(script.contains("function scheduleConversationViewAlign"));
+}
+
+#[test]
+fn injection_script_heartbeat_syncs_backend_settings() {
+    let script = assets::injection_script(57321);
+
+    // 心跳在健康时顺带刷新后端设置，让 manager 侧的改动能传播到已运行窗口（issue #2221）。
+    assert!(script.contains("function syncBackendSettingsFromHeartbeat"));
+    assert!(script.contains("syncBackendSettingsInFlight"));
+    assert!(script.contains("void syncBackendSettingsFromHeartbeat();"));
+    assert!(script.contains("previousConversationView"));
+    assert!(script.contains("refreshConversationView();"));
+}
+
+#[test]
 fn injection_script_exposes_sidebar_thread_id_badge_control() {
     let script = assets::injection_script(57321);
 
@@ -2972,8 +3249,10 @@ fn injection_script_refreshes_sidebar_after_session_undo() {
         .split_once("function showToast")
         .expect("refresh helper should end before toast helper")
         .0;
+    // 签名在开放拓展接口时改成 (message, options)：第二个参数既接受旧的
+    // undoToken 字符串，也接受 { undoToken, type } 对象，见 80-session-share.js。
     let toast = script
-        .split_once("function showToast(message, undoToken)")
+        .split_once("function showToast(message, options = {})")
         .expect("undo toast should exist")
         .1
         .split_once("function upstreamWorktreeField")
@@ -3314,6 +3593,18 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("data-codex-service-tier-controls"));
     assert!(script.contains("removeCodexServiceTierBadges"));
     assert!(script.contains("installCodexServiceTierDispatcherPatch"));
+    assert!(script.contains("codexServiceTierDispatcherPatchable"));
+    assert!(script.contains("dispatcher is a non-writable RPC stub"));
+    assert!(script.contains("Object.isExtensible(dispatcher)"));
+    assert!(script.contains("applyCodexServiceTierRequestOnly"));
+    assert!(script.contains("codexPlusServiceTierPrewarmThreadStart"));
+    assert!(script.contains("Object.isExtensible(client)"));
+    assert!(script.contains("locateCodexAppServerClientBreakpoint"));
+    assert!(script.contains("installCodexAppServerClientCapture"));
+    assert!(script.contains("__codexPlusAppServerClientCapture"));
+    assert!(script.contains("installCodexAppServerClientPrototypePatch"));
+    assert!(script.contains("__codexPlusAppServerClientClass"));
+    assert!(script.contains("app_server_client_prototype_patch_installed"));
     assert!(script.contains("服务模式"));
     assert!(script.contains("data-codex-service-tier-status"));
     assert!(script.contains("data-codex-service-tier-inherit"));
@@ -3895,7 +4186,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["preservedNativeTiers"][0]["description"], "Native priority");
     assert_eq!(cases["unknownModelTiers"], serde_json::json!([]));
     assert_eq!(cases["nativeMultiSpeedRowDetected"], true);
-    for model in ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] {
+    for model in ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6.1-sol"] {
         assert_eq!(cases["nativeModelsOutsideCatalog"][model][0]["id"], "priority", "{model}");
         assert_eq!(cases["nativeQueryOutsideCatalog"][model][0]["id"], "priority", "{model}");
     }
@@ -4026,6 +4317,17 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["appServerParamsUnchanged"], true);
     assert_eq!(cases["appServerProjectlessParamsUnchanged"], true);
     assert_eq!(cases["appServerSentCount"], 7);
+    assert_eq!(cases["serviceTierClientPatched"], true);
+    assert_eq!(cases["serviceTierClientSendTier"], "priority");
+    assert_eq!(cases["serviceTierClientPrewarmTier"], "priority");
+    assert_eq!(cases["frozenClientPatchSkipped"], true);
+    assert_eq!(cases["captureLine"], 1);
+    assert_eq!(cases["captureColumn"], 24);
+    assert_eq!(cases["captureMissIsNull"], true);
+    assert_eq!(cases["prototypePatched"], true);
+    assert_eq!(cases["prototypeSendTier"], "priority");
+    assert_eq!(cases["prototypePrewarmTier"], "priority");
+    assert_eq!(cases["prototypeStateHasClass"], true);
     assert_eq!(
         cases["providerFromMissing"]["modelProvider"],
         "vendor_alpha"
@@ -4261,7 +4563,6 @@ const unrelatedFastIconPatched = typeof api.patchNativeFastIcon === "function"
 api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
 api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
-
 const inheritUnsetStatus = api.statusSummary({{
   controlMode: "inherit",
   threadMode: "inherit",
@@ -4463,7 +4764,7 @@ api.setModelCatalog({{
   }},
 }});
 // 启动目录仅含 GPT-6，原生 model/list 还包含 GPT-5.5/5.6；必须走真实列表补丁。
-const nativeRowsOutsideCatalog = ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "unknown-model"]
+const nativeRowsOutsideCatalog = ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6.1-sol", "unknown-model"]
   .map(model => ({{ model, serviceTiers: [], hidden: true, defaultReasoningEffort: "high" }}));
 const nativeListOutsideCatalog = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
 api.patchAppServerResult("model/list", nativeListOutsideCatalog);
@@ -4931,6 +5232,7 @@ const appServerClient = {{
   }},
 }};
 api.patchAppServerClient(appServerClient);
+localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: false }}));
 
 appServerClient.sendRequest("start-conversation", nativeAppServerParams, {{ signal: "native" }}).then(async () => {{
 await appServerClient.sendRequest(
@@ -4938,6 +5240,39 @@ await appServerClient.sendRequest(
   nativeProjectlessAppServerParams,
   {{ signal: "native-projectless" }}
 );
+api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
+api.setBackendSettings({{ codexAppServiceTierControls: true }});
+localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
+const serviceTierClientCalls = [];
+const serviceTierClient = {{
+  async sendRequest(method, params) {{ serviceTierClientCalls.push({{ method, params }}); return {{ ok: true }}; }},
+  async prewarmThreadStart(params) {{ serviceTierClientCalls.push({{ method: "prewarm", params }}); return {{ ok: true }}; }},
+}};
+const serviceTierClientPatched = api.patchAppServerClient(serviceTierClient);
+await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4" }});
+await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4" }});
+const serviceTierClientSendTier = serviceTierClientCalls[0]?.params?.serviceTier;
+const serviceTierClientPrewarmTier = serviceTierClientCalls[1]?.params?.serviceTier;
+const frozenClient = Object.preventExtensions({{ async sendRequest() {{ return {{ ok: true }}; }} }});
+const frozenClientPatchSkipped = api.patchAppServerClient(frozenClient) === false;
+const captureSample = "x" + String.fromCharCode(10) + "async sendRequest(e,t,n){{if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);}}";
+const captureLocation = api.locateAppServerClientBreakpoint(captureSample);
+const captureLine = captureLocation ? captureLocation.lineNumber : -1;
+const captureColumn = captureLocation ? captureLocation.columnNumber : -1;
+const captureMissIsNull = api.locateAppServerClientBreakpoint("no marker here") === null;
+window.__codexPlusAppServerClientClass = class CodexPlusTestClient {{
+  async sendRequest(method, params) {{ return {{ method, params }}; }}
+  async prewarmThreadStart(params) {{ return {{ prewarm: params }}; }}
+}};
+const prototypePatched = api.installAppServerClientPrototypePatch();
+const protoClient = new window.__codexPlusAppServerClientClass();
+const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4" }});
+const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4" }});
+const prototypeSendTier = protoTurn && protoTurn.params ? protoTurn.params.serviceTier : null;
+const prototypePrewarmTier = protoPrewarm && protoPrewarm.prewarm ? protoPrewarm.prewarm.serviceTier : null;
+const prototypeState = api.appServerClientPrototypeState();
+api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
+api.setBackendSettings({{ codexAppServiceTierControls: false }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
 const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
@@ -5489,6 +5824,18 @@ process.stdout.write(JSON.stringify({{
   appServerParamsUnchanged,
   appServerProjectlessParamsUnchanged,
   appServerSentCount: appServerCalls.length,
+  serviceTierClientPatched,
+  serviceTierClientSendTier,
+  serviceTierClientPrewarmTier,
+  frozenClientPatchSkipped,
+  captureLine,
+  captureColumn,
+  captureMissIsNull,
+  prototypePatched,
+  prototypeSendTier,
+  prototypePrewarmTier,
+  prototypeStateHasClass: prototypeState.hasClass,
+  prototypeStateInstalled: prototypeState.installed !== null,
   providerFromMissing,
   providerFromOpenAi,
   providerFromOtherUnchanged: providerFromOther === explicitOtherProvider,
@@ -5586,6 +5933,7 @@ fn injection_script_restores_thread_scroll_positions() {
     assert!(script.contains("codexThreadScroll"));
     assert!(script.contains("installThreadScrollRouteHooks"));
     assert!(script.contains("scheduleThreadScrollSync"));
+    assert!(script.contains("localStorage.removeItem(codexThreadScrollKey)"));
 }
 
 #[test]
@@ -5687,7 +6035,7 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
         std::fs::read_to_string(repo.join("apps/codex-plus-manager/src-tauri/src/lib.rs")).unwrap();
 
     assert!(source.contains("官方混入 API Key"));
-    assert!(source.contains("关闭官方低额度提示"));
+    assert!(!source.contains("关闭官方低额度提示"));
     assert!(source.contains("hideOfficialUsageAlert"));
     assert!(source.contains("纯 API"));
     assert!(source.contains("apply_pure_api_injection"));
@@ -5750,6 +6098,7 @@ fn bridge_health_check_script_uses_persisted_real_probe_result() {
     assert!(script.contains("__codexPlusBridgeHealth"));
     assert!(script.contains("lastSuccessAt"));
     assert!(script.contains("lastInjectionAt"));
+    assert!(script.contains("lastAttemptAt"));
     assert!(!script.contains("/backend/status"));
 }
 
@@ -5771,6 +6120,8 @@ if (run({{ lastInjectionAt: 0, lastSuccessAt: now }}) !== true) process.exit(2);
 if (run({{ lastInjectionAt: now, lastSuccessAt: 0 }}) !== true) process.exit(3);
 if (run({{ lastInjectionAt: now - 6000, lastSuccessAt: 0 }}) !== false) process.exit(4);
 if (run({{ lastInjectionAt: 1, lastSuccessAt: now - 16000 }}) !== false) process.exit(5);
+if (run({{ lastInjectionAt: 0, lastSuccessAt: 0, lastAttemptAt: now }}) !== true) process.exit(7);
+if (run({{ lastInjectionAt: 1, lastSuccessAt: now - 16000, lastAttemptAt: now - 16000 }}) !== false) process.exit(8);
 if (run({{ lastInjectionAt: now, lastSuccessAt: now }}, false) !== false) process.exit(6);
 "#,
         script = script
@@ -6828,6 +7179,106 @@ async fn superseded_bridge_session_stops_answering_binding_calls() {
         .expect("fresh server task should finish without panicking");
 }
 
+/// 被顶替的旧会话不能依赖"socket 再收到消息"来发现 generation 过期：
+/// bridge 失效场景下旧 socket 不会再有任何消息（binding 事件只投递给最新会话），
+/// 旧会话必须靠 generation 轮询在一个间隔内主动关闭，否则会带着
+/// Runtime.enable 订阅与脚本注册无限期滞留（issue #2169 的会话堆积来源）。
+#[tokio::test]
+async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let url = websocket_url(address);
+    let (stale_closed_tx, stale_closed_rx) = oneshot::channel();
+    let (fresh_alive_tx, fresh_alive_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (stale_stream, _) = listener
+            .accept()
+            .await
+            .expect("stale client should connect");
+        let mut stale = accept_async(stale_stream)
+            .await
+            .expect("stale websocket should upgrade");
+        acknowledge_bridge_install(&mut stale).await;
+
+        let (fresh_stream, _) = listener
+            .accept()
+            .await
+            .expect("fresh client should connect");
+        let mut fresh = accept_async(fresh_stream)
+            .await
+            .expect("fresh websocket should upgrade");
+        acknowledge_bridge_install(&mut fresh).await;
+
+        // 旧会话会先移除自己注册的 new-document 脚本，再由 generation 轮询关闭 socket。
+        let stale_cleanup = tokio::time::timeout(
+            bridge::BRIDGE_GENERATION_POLL_INTERVAL + Duration::from_millis(1500),
+            async {
+                let mut removed = false;
+                loop {
+                    match recv_text_message(&mut stale).await {
+                        Some(text) => {
+                            let message: serde_json::Value = serde_json::from_str(&text)
+                                .expect("bridge cleanup message should be JSON");
+                            if message["method"] == "Page.removeScriptToEvaluateOnNewDocument" {
+                                removed = true;
+                            }
+                        }
+                        None => break removed,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_or(false);
+        let _ = stale_closed_tx.send(stale_cleanup);
+
+        // 新会话不受影响，仍应正常应答 binding 调用。
+        send_json(
+            &mut fresh,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "fresh",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        let fresh_resolved = tokio::time::timeout(Duration::from_secs(2), recv_text_message(&mut fresh))
+            .await
+            .is_ok_and(|message| {
+                message.is_some_and(|text| text.contains("__codexSessionDeleteResolve"))
+            });
+        let _ = fresh_alive_tx.send(fresh_resolved);
+    });
+
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("first bridge install should succeed");
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("second bridge install should succeed");
+
+    assert!(
+        stale_closed_rx
+            .await
+            .expect("stale server task should finish without panicking"),
+        "superseded session must close its socket without any incoming message"
+    );
+    assert!(
+        fresh_alive_rx
+            .await
+            .expect("fresh server task should finish without panicking"),
+        "fresh session must keep resolving bridge requests"
+    );
+}
+
 #[tokio::test]
 async fn failed_bridge_reinstall_keeps_existing_session_current() {
     let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
@@ -6987,7 +7438,12 @@ async fn acknowledge_bridge_install(socket: &mut TestSocket) {
     for expected_id in 1..=5 {
         let command = recv_json(socket).await;
         assert_eq!(command["id"], expected_id);
-        send_json(socket, json!({ "id": expected_id, "result": {} })).await;
+        let result = if expected_id == 4 {
+            json!({ "identifier": "bridge-script-test" })
+        } else {
+            json!({})
+        };
+        send_json(socket, json!({ "id": expected_id, "result": result })).await;
     }
 }
 
@@ -7143,4 +7599,32 @@ assert.equal(removed, 2);
 "#);
     let output = std::process::Command::new("node").args(["-e", &check]).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn app_server_client_capture_condition_targets_class_handle() {
+    assert_eq!(
+        bridge::app_server_client_capture_condition(),
+        "!window.__codexPlusAppServerClientClass"
+    );
+}
+
+#[test]
+fn parse_app_server_client_capture_location_reads_renderer_report() {
+    let report = json!({
+        "urlRegex": "app://-/assets/app-initial-abc123.js",
+        "lineNumber": 1796_u64,
+        "columnNumber": 87512_u64,
+    });
+    let (url_regex, line, column) =
+        bridge::parse_app_server_client_capture_location(&serde_json::Value::String(
+            report.to_string(),
+        ))
+        .expect("renderer report should parse");
+    assert_eq!(url_regex, "app://-/assets/app-initial-abc123.js");
+    assert_eq!(line, 1796);
+    assert_eq!(column, 87512);
+    assert!(bridge::parse_app_server_client_capture_location(&json!("null")).is_none());
+    assert!(bridge::parse_app_server_client_capture_location(&json!("{}")).is_none());
+    assert!(bridge::parse_app_server_client_capture_location(&json!("")).is_none());
 }
