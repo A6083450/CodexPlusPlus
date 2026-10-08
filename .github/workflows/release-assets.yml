@@ -131,6 +131,9 @@ jobs:
     # 用户不必再自己判断架构，Release 也只多一个而不是两个产物。
     name: macOS DMG (universal)
     runs-on: macos-14
+    env:
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      MACOS_NOTARY_PROFILE: ${{ secrets.MACOS_SIGNING_IDENTITY != '' && secrets.APPLE_API_KEY_P8 != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && 'codexplusplus-notary' || '' }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
@@ -138,6 +141,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Import Developer ID certificate
+        if: env.MACOS_SIGNING_IDENTITY != ''
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -162,6 +166,7 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
 
       - name: Install Developer ID intermediate certificate
+        if: env.MACOS_SIGNING_IDENTITY != ''
         run: |
           set -euo pipefail
           # runner 的系统钥匙串里没有 Developer ID G2 中间证书，
@@ -174,6 +179,7 @@ jobs:
           security find-identity -v -p codesigning
 
       - name: Store notarization credentials
+        if: env.MACOS_NOTARY_PROFILE != ''
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
@@ -211,15 +217,14 @@ jobs:
         run: npm run vite:build
 
       - name: Build universal macOS DMG
-        env:
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          MACOS_NOTARY_PROFILE: codexplusplus-notary
         run: |
-          # 发版流水线必须真的签名，凭据缺失就直接失败，不要静默退回 ad-hoc
-          # 然后发一个用户打不开的包出去。
-          if [ -z "${MACOS_SIGNING_IDENTITY:-}" ]; then
-            echo "error: MACOS_SIGNING_IDENTITY 未配置，拒绝产出未签名的发布包" >&2
-            exit 1
+          # 仅用户明确授权的 fork 沿用未公证发布；上游仍要求正式签名和公证。
+          if [ -z "${MACOS_SIGNING_IDENTITY:-}" ] || [ -z "${MACOS_NOTARY_PROFILE:-}" ]; then
+            if [ "$GITHUB_REPOSITORY" != "A6083450/CodexPlusPlus" ]; then
+              echo "error: 正式发布必须配置 Apple 签名和公证凭据" >&2
+              exit 1
+            fi
+            echo "::warning::Fork 发布未公证包；未配置证书时使用 ad-hoc 签名。"
           fi
           VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#V}"
@@ -239,19 +244,15 @@ jobs:
             test -f "$app/Contents/PkgInfo"
             test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
             plutil -lint "$app/Contents/Info.plist" >/dev/null
-            codesign -dv "$app" >/dev/null 2>&1
-            # 真签名时额外校验签名有效性与 Gatekeeper 判定，防止"签了但无效"混过去。
-            if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
-              codesign --verify --deep --strict "$app"
+            codesign --verify --deep --strict "$app"
+            if [ -n "${MACOS_NOTARY_PROFILE:-}" ]; then
               spctl --assess --type execute "$app"
             fi
             echo "verified: $app"
           done
 
       - name: Verify DMG notarization
-        # 不加 if 条件：Build macOS DMG 已在凭据缺失时直接失败，
-        # 能走到这里就必然签名并公证过。此前用 if: env.MACOS_SIGNING_IDENTITY
-        # 判断，但该变量只存在于上一步的 env 里，这一步读不到，会永远跳过。
+        if: env.MACOS_NOTARY_PROFILE != ''
         run: |
           set -euo pipefail
           for dmg in dist/macos/*.dmg; do

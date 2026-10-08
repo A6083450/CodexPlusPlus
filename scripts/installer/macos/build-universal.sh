@@ -27,7 +27,10 @@ for target in x86_64-apple-darwin aarch64-apple-darwin; do
   cargo build --release --target "$target"
 done
 
-rm -rf "$UNIVERSAL_DIR"
+if [ -e "$UNIVERSAL_DIR" ]; then
+  echo "error: 通用构建目录已存在，拒绝覆盖：$UNIVERSAL_DIR" >&2
+  exit 1
+fi
 mkdir -p "$UNIVERSAL_DIR"
 
 for bin in "${BINARIES[@]}"; do

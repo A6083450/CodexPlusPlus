@@ -182,3 +182,27 @@ test("release workflow configures macOS signing and notarization once", async ()
     assert.equal(workflow.split(`- name: ${name}`).length - 1, 1, name);
   }
 });
+
+
+test("only the approved fork can publish without Apple credentials", async () => {
+  const workflow = await readFile(new URL("../../../.github/workflows/release-assets.yml", import.meta.url), "utf8");
+  const build = workflow.split("- name: Build universal macOS DMG")[1].split("- name: Verify macOS bundle structure")[0];
+  const guard = build.split("run: |\n")[1].split('          VERSION=')[0].replace(/^          /gm, "");
+  for (const [repo, identity, profile, status] of [
+    ["A6083450/CodexPlusPlus", "", "", 0],
+    ["BigPizzaV3/CodexPlusPlus", "", "", 1],
+    ["BigPizzaV3/CodexPlusPlus", "Developer ID fixture", "", 1],
+    ["BigPizzaV3/CodexPlusPlus", "Developer ID fixture", "notary-fixture", 0],
+    ["other/CodexPlusPlus", "", "", 1],
+  ] as const) {
+    const result = spawnSync(bash, ["-c", guard], { encoding: "utf8", env: { ...process.env, GITHUB_REPOSITORY: repo, MACOS_SIGNING_IDENTITY: identity, MACOS_NOTARY_PROFILE: profile } });
+    assert.equal(result.status, status, `${repo}: ${result.stderr}`);
+  }
+  assert.match(workflow, /- name: Import Developer ID certificate\n        if: env\.MACOS_SIGNING_IDENTITY != ''/);
+  assert.match(workflow, /- name: Store notarization credentials\n        if: env\.MACOS_NOTARY_PROFILE != ''/);
+  assert.match(workflow, /- name: Verify DMG notarization\n        if: env\.MACOS_NOTARY_PROFILE != ''/);
+  assert.match(workflow, /codesign --verify --deep --strict "\$app"/);
+  const universal = await readFile(new URL("../../../scripts/installer/macos/build-universal.sh", import.meta.url), "utf8");
+  assert.doesNotMatch(universal, /rm -rf/);
+  assert.match(universal, /if \[ -e "\$UNIVERSAL_DIR" \]/);
+});
