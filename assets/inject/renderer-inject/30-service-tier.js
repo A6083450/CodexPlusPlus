@@ -201,7 +201,13 @@
       return;
     }
     const activeThreadId = validThreadScrollSessionKey(currentSessionRef().session_id);
-    if (activeThreadId) bindDraftServiceTierToThread(activeThreadId);
+    if (activeThreadId) {
+      bindDraftServiceTierToThread(activeThreadId);
+      // 界面判 Fast 用「当前线程的模型」，不再回落全局 catalog：线程中途换模型后
+      // 全局值可能是旧的，会让 UI 落后一拍（issue #1463）。
+      const activeModel = codexServiceTierUiModelName(activeThreadId);
+      if (activeModel) codexServiceTierRememberThreadModel(activeThreadId, activeModel);
+    }
     const storedState = readThreadServiceTierState();
     const controlMode = normalizeCodexServiceTierControlMode(storedState.mode);
     const defaultMode = normalizeCodexThreadServiceTierMode(storedState.defaultMode);
@@ -452,6 +458,9 @@
     const threadId = codexServiceTierThreadIdForRequest(method, params, threadIdHint);
     const requestedFast = isFastServiceTierValue(requestedServiceTier);
     const modelName = codexServiceTierModelForRequest(params, modelHint);
+    // 请求路径是唯一能拿到「本 turn 真正用的模型」的地方，顺手记下来供界面判定使用，
+    // 这样线程中途换模型后 UI 下一次刷新就跟得上（issue #1463）。
+    codexServiceTierRememberThreadModel(threadId, modelName);
     const fastSupported = !requestedFast || codexServiceTierFastSupportedForModel(modelName);
     return {
       threadId,
@@ -1033,77 +1042,39 @@
     serviceTierDispatcherPatchPromise = patch();
   }
 
-  // --- Dictation / Voice patch for apikey (ported from v1.2.34 preload) ---
-  const codexDictationSupportVersion = "1";
-  function codexDictationSupportModuleCandidates() {
-    const prefixes = ["use-is-dictation-supported-", "use-dictation-", "app-initial-", "setting-storage-", "vscode-api-"];
-    return prefixes;
-  }
-  async function installDictationSupportPatch() {
-    if (window.__codexDictationSupportPatched === codexDictationSupportVersion) return;
-    for (const prefix of codexDictationSupportModuleCandidates()) {
-      try {
-        const module = await loadOptionalCodexAppModule(prefix);
-        if (!module) continue;
-        for (const key of Object.keys(module)) {
-          const fn = module[key];
-          if (typeof fn !== "function") continue;
-          let src = "";
-          try { src = String(fn); } catch {}
-          if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
-          if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
-          const original = fn;
-          const wrapped = function(...args) {
-            try {
-              const result = original.apply(this, args);
-              if (result === false) {
-                const hasApikey = args.some(arg => arg && typeof arg === "object" && (arg.authMethod === "apikey" || arg.authMethod === "apiKey"));
-                if (hasApikey) return true;
-                if (typeof codexPlusSettings === "function" && codexPlusSettings().serviceTierControls) return true;
-              }
-              return result;
-            } catch (e) {
-              return original.apply(this, args);
-            }
-          };
-          wrapped.__codexDictationPatched = codexDictationSupportVersion;
-          try { module[key] = wrapped; } catch {}
-          sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
-          window.__codexDictationSupportPatched = codexDictationSupportVersion;
-          return;
-        }
-      } catch {}
-    }
-    // Fallback: DOM enforcement for voice button when module patch not found
-    try {
-      if (!window.__codexDictationDomPatched) {
-        window.__codexDictationDomPatched = true;
-        const enforceVoice = () => {
-          const selectors = ['button[aria-label*="Voice"]','button[aria-label*="Dictation"]','button[aria-label*="voice"]','[data-testid*="voice"]','[data-testid*="dictation"]','button:has(svg)'];
-          // generic: find buttons with microphone icon
-          document.querySelectorAll('button').forEach(btn => {
-            const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
-            if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
-              if (btn.hasAttribute("disabled")) {
-                btn.removeAttribute("disabled");
-                btn.setAttribute("aria-disabled","false");
-                btn.style.opacity = "";
-                btn.style.pointerEvents = "";
-              }
-            }
-          });
-        };
-        setInterval(enforceVoice, 1500);
-        enforceVoice();
-      }
-    } catch {}
+  // 保留旧调用入口，语音能力由独立的 opt-in 控件提供。
+  function installDictationSupportPatch() {
+    installCodexPlusDictation();
   }
 
-  async function loadBackendSettingsState() {
+  const codexAppServerPreparationTimeoutMs = 2000;
+
+  // 发送前只读取辅助配置；桥接无回包时及时降级，迟到的结果也不再应用。
+  // 写 RPC（尤其 thread/resume）不能这样竞速，否则会在 turn/start 后迟到修改会话。
+  async function readCodexAppServerPreparation(path, payload, timeoutMs = codexAppServerPreparationTimeoutMs) {
+    let timeoutId;
+    try {
+      return await Promise.race([
+        postJson(path, payload),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            sendCodexPlusDiagnostic("app_server_preparation_read_timeout", { path, timeoutMs });
+            reject(new Error(`Codex++ preparation read timed out: ${path}`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async function loadBackendSettingsState(timeoutMs = 0) {
     const seq = codexPlusBackendSettingsSeq;
     try {
-      const settings = await postJson("/settings/get", {});
-      if (!settings || typeof settings !== "object" || (!("launchMode" in settings) && !("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
+      const settings = await (timeoutMs > 0
+        ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
+        : postJson("/settings/get", {}));
+      if (!settings || typeof settings !== "object" || (!("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
         throw new Error("invalid backend settings response");
       }
       if (seq !== codexPlusBackendSettingsSeq) {
@@ -1111,8 +1082,11 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
-      return true;
     } catch (_) {
       return false;
     }
+    // 设置已加载成功；语音 UI 的异常不应使 provider/Fast 刷新误判为失败。
+    // service-tier harness 在 70 分片提前返回，尚未初始化 93 分片的录音状态。
+    if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__) runScanStep(installCodexPlusDictation);
+    return true;
   }

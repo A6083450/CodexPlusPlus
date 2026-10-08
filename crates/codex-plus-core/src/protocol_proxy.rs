@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,6 +15,99 @@ use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+
+/// 工具调用上需要跨 turn 原样带回的供应商附带数据，按 `call_id` 索引。
+///
+/// Gemini 3 系在 functionCall 上要求回传 `thought_signature`（OpenAI 兼容层放在
+/// tool_call 的 `extra_content.google.thought_signature`），缺失时整轮 400
+/// （issue #332 / #1012）。这类字段由上游产生、本仓不理解其语义，因此不硬编码
+/// 任何字段名，而是把整个 `extra_content` 原样记住，下一轮构造请求时挂回对应
+/// tool_call。只做透传，解析失败/无该字段时行为与改动前完全一致。
+///
+/// 键是 call_id：上游保证同一次调用内唯一，跨 turn 也由客户端原样回传。
+fn tool_call_extra_content_cache() -> &'static Mutex<ExtraContentCache> {
+    static CACHE: OnceLock<Mutex<ExtraContentCache>> = OnceLock::new();
+    // 缓存上限：一次会话里同时活跃的工具调用远小于此数；超出后按插入序淘汰最旧的，
+    // 避免长时间运行时无界增长。
+    CACHE.get_or_init(|| Mutex::new(ExtraContentCache::new(256)))
+}
+
+#[derive(Debug)]
+struct ExtraContentCache {
+    entries: BTreeMap<String, Value>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl ExtraContentCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn remember(&mut self, call_id: &str, extra_content: Value) {
+        if call_id.is_empty() {
+            return;
+        }
+        if self.entries.insert(call_id.to_string(), extra_content).is_none() {
+            self.order.push_back(call_id.to_string());
+        }
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                // 只有仍是最旧那一条时才删，避免把刚更新过的键误删。
+                if !self.order.contains(&oldest) {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn recall(&self, call_id: &str) -> Option<Value> {
+        self.entries.get(call_id).cloned()
+    }
+}
+
+/// 从 chat 侧的 tool_call 里取出需要透传的附带数据。
+///
+/// `extra_content` 是 OpenAI 兼容层的通用扩展位（Gemini 的 thought_signature 在此）；
+/// 部分供应商也会用 `thought_signature` / `thoughtSignature` 直接挂在 tool_call 上，
+/// 两种形态都收。
+fn tool_call_extra_content(tool_call: &Value) -> Option<Value> {
+    if let Some(value) = tool_call.get("extra_content") {
+        if value.is_object() && !value.as_object().is_some_and(Map::is_empty) {
+            return Some(value.clone());
+        }
+    }
+    for key in ["thought_signature", "thoughtSignature"] {
+        if let Some(value) = tool_call.get(key) {
+            if !value.is_null() {
+                return Some(json!({ "google": { "thought_signature": value } }));
+            }
+        }
+    }
+    None
+}
+
+/// 记住本次上游返回的工具调用附带数据（按 call_id）。
+fn remember_tool_call_extra_content(call_id: &str, tool_call: &Value) {
+    let Some(extra) = tool_call_extra_content(tool_call) else {
+        return;
+    };
+    if let Ok(mut cache) = tool_call_extra_content_cache().lock() {
+        cache.remember(call_id, extra);
+    }
+}
+
+/// 取回该 call_id 之前记住的附带数据，用于下一轮请求回传。
+fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
+    tool_call_extra_content_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.recall(call_id))
+}
 
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
@@ -197,6 +292,16 @@ impl CodexToolContext {
             == Some(CodexCustomToolKind::ToolSearch)
     }
 
+    /// 上游把 codex 的原生 `web_search` 工具当成普通自定义工具回传时，中转层
+    /// 此前一律产出 `custom_tool_call`，而客户端只认 `web_search_call`
+    /// （issue #1209 / #586：web_search 被错译成 custom_tool_call 后，客户端
+    /// 拿不到搜索结果，表现为「工具调用后无反应」或上游报 tool 名不识别）。
+    fn is_builtin_web_search_proxy(&self, upstream_name: &str) -> bool {
+        self.custom_tools.get(upstream_name).is_some_and(|spec| {
+            spec.kind == CodexCustomToolKind::BuiltIn && spec.openai_name == "web_search"
+        })
+    }
+
     fn original_custom_tool_name(&self, upstream_name: &str) -> String {
         self.custom_tools
             .get(upstream_name)
@@ -256,10 +361,10 @@ pub fn responses_to_chat_completions_with_options(
     relocate_tool_output_images(&mut messages);
     ensure_tool_call_reasoning_content(&mut messages);
     normalize_chat_messages(&mut messages);
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    normalize_image_data_urls_for_model(&mut messages, model);
     let messages = collapse_system_messages_to_head(messages);
     result["messages"] = json!(messages);
-
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     if let Some(value) = body.get("max_output_tokens") {
         if is_openai_o_series(model) {
             result["max_completion_tokens"] = value.clone();
@@ -417,6 +522,14 @@ pub struct UpstreamProxyResponse {
     pub compaction: bool,
     pub response: reqwest::Response,
     pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
+}
+
+/// 客户端会话头白名单；不接受鉴权或任意其他客户端请求头。
+#[derive(Clone, Copy, Default)]
+pub struct ProxySessionHeaders<'a> {
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub opencode_session: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -870,6 +983,14 @@ impl Default for ChatSseToResponsesConverter {
 }
 
 impl ChatSseToResponsesConverter {
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn has_terminal_event(&self) -> bool {
+        self.failed || self.state.completed || self.state.finish_reason.is_some()
+    }
+
     pub fn with_request(original_request: &Value) -> Self {
         Self {
             state: ChatSseState::with_request(original_request),
@@ -1045,6 +1166,23 @@ pub async fn open_responses_proxy_request_for_path_with_beta(
     request_path: &str,
     beta_features: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_for_path_with_session_headers(
+        body,
+        original_user_agent,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_for_path_with_session_headers(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
@@ -1052,6 +1190,7 @@ pub async fn open_responses_proxy_request_for_path_with_beta(
         original_user_agent,
         request_path,
         beta_features,
+        session_headers,
     )
     .await
 }
@@ -1066,6 +1205,7 @@ pub async fn open_responses_proxy_request_with_settings(
         None,
         "/responses",
         None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1081,6 +1221,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
         None,
         request_path,
         None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1091,12 +1232,30 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_beta(
     request_path: &str,
     beta_features: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        body,
+        settings,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_settings_for_path_and_session_headers(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
         None,
         request_path,
         beta_features,
+        session_headers,
     )
     .await
 }
@@ -1107,6 +1266,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     original_user_agent: Option<&str>,
     request_path: &str,
     beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
@@ -1192,6 +1352,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             is_stream,
             &upstream_body,
         );
+        builder = with_client_session_headers(builder, &relay, session_headers);
         if wire_api == UpstreamWireApi::Responses {
             if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
                 builder = builder.header("x-codex-beta-features", value);
@@ -1838,6 +1999,34 @@ fn with_relay_auth(
 ) -> reqwest::RequestBuilder {
     // 认证（API Key / 无认证）+ 供应商自定义请求头，统一在 relay_headers 里决定优先级。
     crate::relay_headers::apply(request, relay)
+}
+
+fn with_client_session_headers(
+    mut builder: reqwest::RequestBuilder,
+    relay: &crate::settings::RelayProfile,
+    headers: ProxySessionHeaders<'_>,
+) -> reqwest::RequestBuilder {
+    for (name, value) in [
+        ("session-id", headers.session_id),
+        ("thread-id", headers.thread_id),
+        ("x-opencode-session", headers.opencode_session),
+    ] {
+        // 显式供应商配置优先，避免 reqwest 追加出两个同名头。
+        if relay
+            .custom_headers
+            .iter()
+            .any(|header| header.key.trim().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(value) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -2537,6 +2726,11 @@ impl ChatSseState {
             if let Some(id) = id_delta {
                 state.call_id = id;
             }
+            // 流式场景下 thought_signature/extra_content 通常随首个分片到达，
+            // 此时 call_id 已就位；按 call_id 记住，供下一轮回传（issue #332/#1012）。
+            if !state.call_id.is_empty() {
+                remember_tool_call_extra_content(&state.call_id, tool_call);
+            }
             if let Some(name) = name_delta {
                 if !name.is_empty() {
                     state.name = name;
@@ -3189,6 +3383,13 @@ fn append_responses_item(
                     "arguments": responses_arguments_to_chat(item.get("arguments").unwrap_or(&json!({})))
                 }
             }));
+            // 把上一轮上游附带的透传数据挂回（Gemini thought_signature 等）。
+            // 缺失时保持原样，不影响其它供应商。
+            if let Some(extra) = recall_tool_call_extra_content(call_id) {
+                if let Some(last) = pending_tool_calls.last_mut() {
+                    last["extra_content"] = extra;
+                }
+            }
         }
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -3748,18 +3949,42 @@ fn normalize_chat_messages(messages: &mut [Value]) {
     }
 }
 
+/// 把所有 system 消息折叠成一条、前置到数组头部。
+///
+/// 之前只处理 content 是字符串的 system 消息：数组形态（content parts）与 null
+/// 的会原样留在**原位**，于是出现「system 不在最前」——MiniMax 这类上游会直接
+/// 拒绝（issue #1394 / #410）；空内容的 system 也照样发出去。
+/// 现在无论 content 是什么形态都统一收拢，空的直接丢弃。
+/// 取出 system 消息的纯文本：字符串直接返回，content parts 数组把 text 段拼起来，
+/// 其余形态（null / 对象）按空处理。
+fn system_message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
 fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     let mut system_chunks = Vec::new();
     let mut rest = Vec::with_capacity(messages.len());
 
     for message in messages {
         if message.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(text) = message.get("content").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    system_chunks.push(text.to_string());
-                }
-                continue;
+            let text = system_message_text(message.get("content"));
+            if !text.trim().is_empty() {
+                system_chunks.push(text);
             }
+            continue;
         }
         rest.push(message);
     }
@@ -5097,6 +5322,9 @@ fn chat_tool_call_to_response_item(
     let function = tool_call.get("function").unwrap_or(&Value::Null);
     let name = function.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = responses_arguments_to_chat(function.get("arguments").unwrap_or(&json!({})));
+    // 记住供应商在本轮工具调用上附带的透传数据（Gemini thought_signature 等），
+    // 下一轮构造请求时挂回，否则整轮 400（issue #332 / #1012）。
+    remember_tool_call_extra_content(&call_id, tool_call);
     response_tool_call_item(&call_id, name, &arguments, tool_context)
 }
 
@@ -5123,6 +5351,21 @@ fn tool_call_added_item(
     output_index: u32,
     tool_context: &CodexToolContext,
 ) -> Value {
+    if tool_context.is_builtin_web_search_proxy(&state.name) {
+        // 客户端只认 web_search_call；用 custom_tool_call 会被当作未知工具丢弃，
+        // 上游那轮的搜索结果就再也回不到会话里（issue #1209 / #586）。
+        return json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": web_search_item_id(&state.call_id),
+                "type": "web_search_call",
+                "status": "in_progress",
+                "call_id": state.call_id,
+                "action": web_search_action_from_arguments(&state.arguments)
+            }
+        });
+    }
     if tool_context.is_custom_tool_proxy(&state.name) {
         if tool_context.is_tool_search_proxy(&state.name) {
             return json!({
@@ -5177,8 +5420,11 @@ fn push_tool_call_delta_sse(
     delta: &str,
     tool_context: &CodexToolContext,
 ) {
-    if tool_context.is_tool_search_proxy(&state.name) {
-        // tool_search 走 function 参数流，客户端按 tool_search_call.arguments 聚合。
+    if tool_context.is_tool_search_proxy(&state.name)
+        || tool_context.is_builtin_web_search_proxy(&state.name)
+    {
+        // tool_search 与原生 web_search 都走 function 参数流，客户端按
+        // tool_search_call.arguments / web_search_call 聚合。
         push_sse(
             output,
             "response.function_call_arguments.delta",
@@ -5264,6 +5510,16 @@ fn response_tool_call_item(
     arguments: &str,
     tool_context: &CodexToolContext,
 ) -> Value {
+    if tool_context.is_builtin_web_search_proxy(name) {
+        // 客户端只认 web_search_call，custom_tool_call 会被当作未知工具丢弃。
+        return json!({
+            "id": web_search_item_id(call_id),
+            "type": "web_search_call",
+            "status": "completed",
+            "call_id": call_id,
+            "action": web_search_action_from_arguments(arguments)
+        });
+    }
     if tool_context.is_custom_tool_proxy(name) {
         if tool_context.is_tool_search_proxy(name) {
             // 官方客户端的 tool_search handler 只接受 tool_search_call item，
@@ -5302,7 +5558,61 @@ fn response_tool_call_item(
     item
 }
 
+/// 官方客户端给 `web_search_call` 分配的 item id 前缀（见 codex id_prefix）。
+fn web_search_item_id(call_id: &str) -> String {
+    format!("ws_{call_id}")
+}
+
+/// 把上游 web_search 工具调用的 arguments 映射成客户端 action 结构。
+///
+/// 客户端 rollout 里的形态是 `{"type":"search","query":…,"queries":[…]}` 或
+/// `{"type":"open_page","url":…}`。上游各家字段名不一（query / queries / url），
+/// 这里按存在性择一，都取不到就退化成 `{"type":"search"}`，让客户端自己判空。
+fn web_search_action_from_arguments(arguments: &str) -> Value {
+    let parsed = responses_arguments_to_chat_parse(arguments);
+    let query = parsed
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let url = parsed
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if let Some(url) = url {
+        return json!({ "type": "open_page", "url": url });
+    }
+    let queries = parsed
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| json!(value))
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty());
+    match (query, queries) {
+        (Some(query), Some(queries)) => {
+            json!({ "type": "search", "query": query, "queries": queries })
+        }
+        (Some(query), None) => json!({ "type": "search", "query": query }),
+        (None, Some(queries)) => {
+            let first = queries
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            json!({ "type": "search", "query": first, "queries": queries })
+        }
+        (None, None) => json!({ "type": "search" }),
+    }
+}
+
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
+    if tool_context.is_builtin_web_search_proxy(name) {
+        return web_search_item_id(call_id);
+    }
     let prefix = if tool_context.is_custom_tool_proxy(name) {
         if tool_context.is_tool_search_proxy(name) {
             // 官方客户端给 tool_search_call 分配的 item id 前缀（见 codex id_prefix）。
@@ -5614,6 +5924,60 @@ fn response_output_text(value: &Value) -> String {
 }
 
 const IMAGE_DATA_URL_PREFIX: &str = "data:image/";
+
+/// 这些上游只接受**纯 base64**，不认 `data:image/png;base64,` 前缀，收到就 400
+/// （issue #2031：GLM-5.3-Flash 的本地图片被拒）。只对这类供应商剥离前缀，
+/// 标准 data URL 上游（OpenAI 等）保持原样，免得把能用的改坏。
+fn upstream_needs_bare_base64(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("glm-") || model.starts_with("zhipu") || model.contains("/glm-")
+}
+
+/// 就地改写 messages 里 `image_url` 的 url：对需要纯 base64 的模型剥掉 data URL 前缀。
+fn normalize_image_data_urls_for_model(messages: &mut [Value], model: &str) {
+    if !upstream_needs_bare_base64(model) {
+        return;
+    }
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if !is_image_part(part) {
+                continue;
+            }
+            let Some(url) = part
+                .get_mut("image_url")
+                .and_then(|value| {
+                    if value.is_object() {
+                        value.get_mut("url")
+                    } else {
+                        Some(value)
+                    }
+                })
+                .and_then(|value| value.as_str().map(str::to_string))
+            else {
+                continue;
+            };
+            let Some(bare) = strip_data_url_prefix(&url) else {
+                continue;
+            };
+            let target = part.get_mut("image_url").expect("checked above");
+            if target.is_object() {
+                target["url"] = json!(bare);
+            } else {
+                *target = json!(bare);
+            }
+        }
+    }
+}
+
+/// `data:image/png;base64,AAAA` → `AAAA`；不是 data URL 则返回 `None`。
+fn strip_data_url_prefix(url: &str) -> Option<String> {
+    let rest = url.strip_prefix(IMAGE_DATA_URL_PREFIX)?;
+    let (_, payload) = rest.split_once(";base64,")?;
+    Some(payload.to_string())
+}
 
 /// 若 `text` 含 base64 图片 data URL，返回替换成占位符后的文本；否则 `None`。
 fn redact_image_data_urls(text: &str) -> Option<String> {

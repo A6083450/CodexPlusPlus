@@ -1,19 +1,20 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, CompactionSseConverter, audio_transcriptions_url,
-    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
-    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, image_edits_url,
-    image_generations_url, is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path,
-    is_image_edits_proxy_path, is_image_generations_proxy_path, is_models_proxy_path,
-    is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
-    open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
-    open_image_edits_proxy_request, open_image_generations_proxy_request,
-    open_models_proxy_request, open_responses_proxy_request,
+    ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders,
+    audio_transcriptions_url, chat_completion_to_response,
+    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
+    chat_sse_to_responses_sse_with_request, image_edits_url, image_generations_url,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_image_edits_proxy_path,
+    is_image_generations_proxy_path, is_models_proxy_path, is_responses_compact_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
+    open_chat_completions_proxy_request, open_image_edits_proxy_request,
+    open_image_generations_proxy_request, open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings,
-    open_responses_proxy_request_with_settings_for_path, request_has_compaction_trigger,
-    responses_compact_url, responses_error_from_upstream, responses_to_chat_completions,
-    responses_to_chat_completions_with_options, send_upstream_request_with_header_timeout,
-    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
-    wrap_non_stream_response_as_compaction,
+    open_responses_proxy_request_with_settings_for_path,
+    open_responses_proxy_request_with_settings_for_path_and_session_headers,
+    request_has_compaction_trigger, responses_compact_url, responses_error_from_upstream,
+    responses_to_chat_completions, responses_to_chat_completions_with_options,
+    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
+    upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
 };
 use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::settings::{
@@ -483,6 +484,76 @@ async fn chat_compaction_v2_request_routes_to_summary_endpoint_and_flags_respons
     // 标记为压缩请求，交给响应包装层重组。
     assert!(result.compaction);
     assert_eq!(result.status_code, 200);
+}
+
+/// #2031：GLM 系上游只接受纯 base64，不认 `data:image/...;base64,` 前缀。
+#[test]
+fn glm_image_urls_are_stripped_to_bare_base64() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "看图" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][1]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "QUJD");
+}
+
+/// 标准 data URL 上游（OpenAI 等）不能被这层改写波及。
+#[test]
+fn non_glm_image_urls_keep_data_url_prefix() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5-mini",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "data:image/png;base64,QUJD");
+}
+
+/// 远端 https 图片既没有前缀可剥，也不该被改动。
+#[test]
+fn remote_image_urls_are_untouched_for_glm() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "https://example.com/a.png" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "https://example.com/a.png");
 }
 
 #[test]
@@ -2620,6 +2691,116 @@ fn chat_completion_response_maps_reasoning_tool_calls_and_usage_details() {
     );
 }
 
+/// #332 / #1012：Gemini 3 系要求 functionCall 回传 thought_signature，否则整轮 400。
+/// 签名由上游产生、本仓不理解其语义，因此原样透传 `extra_content`：
+/// 上游返回时记住（按 call_id），下一轮构造请求时挂回对应的 tool_call。
+#[test]
+fn gemini_thought_signature_is_carried_back_across_turns() {
+    // 第一轮：上游在 tool_call 上带了 extra_content
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_sig",
+        "created": 123,
+        "model": "gemini-3.5-flash",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_sig",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+                    "extra_content": { "google": { "thought_signature": "SIG-ABC" } }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"]
+        .as_str()
+        .expect("tool call survives")
+        .to_string();
+
+    // 第二轮：客户端把这个 function_call 作为历史带回来
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gemini-3.5-flash",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "天气" }] },
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Tokyo\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "sunny"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed into chat history");
+    assert_eq!(
+        tool_call["extra_content"]["google"]["thought_signature"],
+        "SIG-ABC",
+        "签名字段必须原样回到下一轮请求"
+    );
+}
+
+/// 无 extra_content 时不得凭空造字段（其它供应商不受影响）。
+#[test]
+fn tool_call_without_extra_content_replays_without_the_field() {
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_plain",
+        "created": 123,
+        "model": "gpt-5.4",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_plain",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"].as_str().unwrap().to_string();
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gpt-5.4",
+        "input": [
+            { "type": "function_call", "call_id": call_id, "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+            { "type": "function_call_output", "call_id": call_id, "output": "sunny" }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed");
+    assert!(
+        tool_call.get("extra_content").is_none(),
+        "没有附带数据时不应凭空造 extra_content"
+    );
+}
+
 #[test]
 fn chat_completion_response_defaults_missing_reasoning_tokens_to_zero() {
     // Kimi 等上游在一次响应无 reasoning 时会省略 completion_tokens_details
@@ -3264,7 +3445,10 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
         send_upstream_request_with_header_timeout(request, Duration::from_millis(100)).await;
 
     assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // 断言意图：客户端在 header 超时（100ms）后放弃等待，而不是傻等上游那 2 秒。
+    // 上限取 1.5s：既与「傻等 2 秒」有明确区分，又给满负载下的调度抖动留出余量。
+    // 原先写 1s，跑全量测试（几十个 target 并发）时会间歇性越界。
+    assert!(started.elapsed() < Duration::from_millis(1500));
     server.abort();
 }
 
@@ -4106,6 +4290,208 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 
     let request = server.finish();
     assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+}
+
+fn captured_header_values<'a>(headers: &'a str, expected_name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim())
+        })
+        .collect()
+}
+
+fn session_header_settings(protocol: RelayProtocol, base_url: String) -> BackendSettings {
+    BackendSettings {
+        relay_profiles_enabled: true,
+        active_relay_id: "session-headers".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "session-headers".to_string(),
+            base_url,
+            api_key: "sk-upstream".to_string(),
+            protocol,
+            relay_mode: RelayMode::PureApi,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_preserves_session_headers_through_both_protocols() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        // 连续两次请求携带不同的客户端会话，不能混成供应商级固定值。
+        for (session_id, thread_id, opencode_session) in [
+            ("session-a", "thread-a", "opencode-a"),
+            ("session-b", "thread-b", "opencode-b"),
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(capture_request_with_response(
+                listener,
+                "application/json",
+                "{}".to_string(),
+            ));
+            let settings = session_header_settings(protocol, format!("http://{address}/v1"));
+            let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                r#"{"model":"session-probe","input":"hello","stream":false}"#,
+                settings,
+                "/v1/responses",
+                Some("remote_compaction_v2"),
+                ProxySessionHeaders {
+                    session_id: Some(session_id),
+                    thread_id: Some(thread_id),
+                    opencode_session: Some(opencode_session),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.status_code, 200);
+            let (headers, _) = server.await.unwrap();
+            let endpoint = if protocol == RelayProtocol::Responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            };
+            assert!(headers.starts_with(&format!("POST {endpoint} HTTP/1.1")));
+            assert_eq!(
+                captured_header_values(&headers, "session-id"),
+                vec![session_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "thread-id"),
+                vec![thread_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-opencode-session"),
+                vec![opencode_session]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "authorization"),
+                vec!["Bearer sk-upstream"]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-codex-beta-features"),
+                if protocol == RelayProtocol::Responses {
+                    vec!["remote_compaction_v2"]
+                } else {
+                    vec![]
+                },
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_session_headers_keep_custom_headers_authoritative() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let mut settings = session_header_settings(protocol, format!("http://{address}/v1"));
+        let relay = &mut settings.relay_profiles[0];
+        relay.custom_headers = vec![
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "Session-ID".to_string(),
+                value: "configured-session".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "THREAD-id".to_string(),
+                value: "configured-thread".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "X-OpenCode-Session".to_string(),
+                value: String::new(),
+            },
+        ];
+        let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+            r#"{"model":"session-probe","input":"hello","stream":false}"#,
+            settings,
+            "/v1/responses",
+            None,
+            ProxySessionHeaders {
+                session_id: Some("client-session"),
+                thread_id: Some("client-thread"),
+                opencode_session: Some("client-opencode"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        assert_eq!(
+            captured_header_values(&headers, "session-id"),
+            vec!["configured-session"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "thread-id"),
+            vec!["configured-thread"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "x-opencode-session"),
+            vec![""]
+        );
+        assert!(!headers.contains("client-"));
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_omits_empty_or_invalid_session_headers_and_keeps_legacy_api() {
+    for legacy_api in [false, true] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let settings =
+            session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+        let body = r#"{"model":"session-probe","input":"hello","stream":false}"#;
+        let result = if legacy_api {
+            open_responses_proxy_request_with_settings_for_path(body, settings, "/v1/responses")
+                .await
+        } else {
+            open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                body,
+                settings,
+                "/v1/responses",
+                None,
+                ProxySessionHeaders {
+                    session_id: Some("   "),
+                    thread_id: Some("invalid\r\nx-injected: value"),
+                    opencode_session: None,
+                },
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        for name in [
+            "session-id",
+            "thread-id",
+            "x-opencode-session",
+            "x-injected",
+        ] {
+            assert!(
+                captured_header_values(&headers, name).is_empty(),
+                "unexpected header: {name}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

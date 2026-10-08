@@ -2,19 +2,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use codex_plus_core::app_paths::{
-    build_codex_executable, codex_app_version, find_bundled_codex_cli, find_latest_codex_app_dir,
-    find_latest_codex_app_dir_from_roots, find_linux_codex_app, find_macos_codex_app,
-    normalize_codex_app_path, packaged_app_user_model_id, resolve_codex_app_dir_with_saved,
-    user_data_candidates_from,
+    build_codex_executable, codex_app_version, derive_packaged_app_user_model_id,
+    find_bundled_codex_cli, find_latest_codex_app_dir, find_latest_codex_app_dir_from_roots,
+    find_linux_codex_app, find_macos_codex_app, normalize_codex_app_path,
+    resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
 use codex_plus_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
     MacosDebugLaunchAction, browser_identity_changed, build_codex_arguments,
-    build_codex_arguments_for_settings, build_codex_arguments_with_native_menu_inspector,
-    build_codex_command, build_codex_command_with_native_menu_inspector,
-    build_macos_cleanup_command, build_macos_open_command,
-    build_macos_open_command_with_native_menu_inspector, build_packaged_activation,
-    build_packaged_activation_with_native_menu_inspector, launch_and_inject_with_hooks,
+    build_codex_arguments_for_settings, build_codex_command, build_macos_cleanup_command,
+    build_macos_open_command, build_packaged_activation, launch_and_inject_with_hooks,
     select_macos_debug_launch_action,
 };
 #[cfg(windows)]
@@ -77,7 +74,7 @@ fn app_paths_find_latest_windows_package_accepts_chatgpt_desktop_migration() {
         Some("2026.514.421.0")
     );
     assert_eq!(
-        packaged_app_user_model_id(&latest).as_deref(),
+        derive_packaged_app_user_model_id(&latest).as_deref(),
         Some("OpenAI.ChatGPT-Desktop_abc!App")
     );
 }
@@ -100,7 +97,7 @@ fn app_paths_find_latest_windows_package_detects_beta_package() {
     );
     assert_eq!(codex_app_version(&latest).as_deref(), Some("26.527.7698.0"));
     assert_eq!(
-        packaged_app_user_model_id(&latest).as_deref(),
+        derive_packaged_app_user_model_id(&latest).as_deref(),
         Some("OpenAI.CodexBeta_2p2nqsd0c76g0!App")
     );
 }
@@ -423,7 +420,7 @@ fn app_paths_normalizes_chatgpt_desktop_executable_and_builds_it() {
     );
     assert_eq!(build_codex_executable(&app), app.join("ChatGPT.exe"));
     assert_eq!(
-        packaged_app_user_model_id(&app).as_deref(),
+        derive_packaged_app_user_model_id(&app).as_deref(),
         Some("OpenAI.Codex_abc!App")
     );
 }
@@ -445,16 +442,102 @@ fn app_paths_rejects_codex_plus_plus_install_dir_as_codex_app() {
     let temp = tempfile::tempdir().unwrap();
     let manager = temp.path().join("Programs").join("Codex++");
     std::fs::create_dir_all(&manager).unwrap();
-    std::fs::write(manager.join("Codex++ Manager.exe"), "").unwrap();
+    // 真实安装根里是产品自己的文件：管理工具二进制 + 卸载器（见 install/windows.rs）。
+    std::fs::write(manager.join("codex-plus-plus-manager.exe"), "").unwrap();
+    std::fs::write(manager.join("uninstall.exe"), "").unwrap();
 
     assert_eq!(normalize_codex_app_path(&manager), None);
     assert_eq!(
-        normalize_codex_app_path(&manager.join("Codex++ Manager.exe")),
+        normalize_codex_app_path(&manager.join("codex-plus-plus-manager.exe")),
         None
     );
 
     let resolved = resolve_codex_app_dir_with_saved(None, Some(&manager.to_string_lossy()));
     assert_ne!(resolved.as_deref(), Some(manager.as_path()));
+}
+
+#[test]
+fn app_paths_accepts_real_codex_inside_a_codex_plus_plus_named_directory() {
+    // issue #1036：用户把真正的 Codex 放在 C:\codex++ 下，按目录名一刀切会连真
+    // Codex 一起拒掉（版本为 null、启动报 failed to launch）。目录名只是线索，
+    // 没有本产品文件时应当放行。
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("codex++");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+
+    assert_eq!(
+        normalize_codex_app_path(&app_dir).as_deref(),
+        Some(app_dir.as_path())
+    );
+    assert_eq!(
+        normalize_codex_app_path(&app_dir.join("Codex.exe")).as_deref(),
+        Some(app_dir.as_path())
+    );
+}
+
+#[test]
+fn app_paths_rejects_codex_plus_plus_app_bundle_by_its_macos_executable() {
+    // macOS 布局：安装根下是 Codex++.app，Contents/MacOS 里是 bundle 可执行文件名。
+    let temp = tempfile::tempdir().unwrap();
+    let bundle = temp.path().join("Applications").join("Codex++.app");
+    let macos_dir = bundle.join("Contents").join("MacOS");
+    std::fs::create_dir_all(&macos_dir).unwrap();
+    std::fs::write(macos_dir.join("CodexPlusPlusManager"), "").unwrap();
+
+    assert_eq!(normalize_codex_app_path(&bundle), None);
+    assert_eq!(
+        normalize_codex_app_path(&macos_dir.join("CodexPlusPlusManager")),
+        None
+    );
+}
+
+#[test]
+fn app_paths_reads_version_from_unpacked_manifest_file_name() {
+    // issue #1160：免安装/自解包目录（…\Codex\app）没有 MSIX 包目录名也没有
+    // version 文件，只有以版本号命名的清单文件。
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex").join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    std::fs::write(app_dir.join("149.0.7827.115.manifest"), "").unwrap();
+
+    assert_eq!(
+        codex_app_version(&app_dir).as_deref(),
+        Some("149.0.7827.115")
+    );
+}
+
+#[test]
+fn app_paths_manifest_version_picks_numerically_highest_and_ignores_noise() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex").join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    // 字符串比较会把 "115" 判成小于 "20"，必须按数值比较。
+    std::fs::write(app_dir.join("149.0.7827.20.manifest"), "").unwrap();
+    std::fs::write(app_dir.join("149.0.7827.115.manifest"), "").unwrap();
+    // 非版本号命名的清单不能吞进来。
+    std::fs::write(app_dir.join("app.manifest"), "").unwrap();
+    std::fs::write(app_dir.join("uninstall.manifest"), "").unwrap();
+
+    assert_eq!(
+        codex_app_version(&app_dir).as_deref(),
+        Some("149.0.7827.115")
+    );
+}
+
+#[test]
+fn app_paths_manifest_version_does_not_override_explicit_version_file() {
+    // version 文件是更明确的信号，manifest 只是兜底。
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("versions").join("current");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    std::fs::write(app_dir.join("version"), "42.1.0\n").unwrap();
+    std::fs::write(app_dir.join("149.0.7827.115.manifest"), "").unwrap();
+
+    assert_eq!(codex_app_version(&app_dir).as_deref(), Some("42.1.0"));
 }
 
 #[test]
@@ -661,64 +744,36 @@ fn launcher_appends_extra_codex_arguments_after_debug_arguments() {
 }
 
 #[test]
-fn launcher_fast_startup_adds_statsig_fast_fail_argument_when_enabled() {
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
+fn launcher_ignores_retired_fast_startup_and_preserves_manual_extra_arguments() {
+    for old_value in [
+        serde_json::json!(true),
+        serde_json::json!(false),
+        serde_json::json!("legacy"),
+    ] {
+        let settings: BackendSettings = serde_json::from_value(serde_json::json!({
+            "codexAppFastStartup": old_value,
+        }))
+        .unwrap();
+        let args = build_codex_arguments_for_settings(9229, &settings);
+        assert_eq!(args, build_codex_arguments(9229, &[]));
+        assert!(
+            serde_json::to_value(&settings)
+                .unwrap()
+                .get("codexAppFastStartup")
+                .is_none()
+        );
+    }
 
-    assert!(args.iter().any(|arg| {
-        arg.starts_with("--host-resolver-rules=")
-            && arg.contains("MAP ab.chatgpt.com 127.0.0.1")
-            && arg.contains("MAP featureassets.org 127.0.0.1")
-            && arg.contains("MAP cloudflare-dns.com 127.0.0.1")
-    }));
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        codex_extra_args: vec!["--host-resolver-rules=MAP example.test 127.0.0.1".to_string()],
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
+    let manual_argument = "--host-resolver-rules=MAP example.test 127.0.0.1";
+    let settings: BackendSettings = serde_json::from_value(serde_json::json!({
+        "codexAppFastStartup": true,
+        "codexExtraArgs": [manual_argument],
+    }))
+    .unwrap();
     assert_eq!(
-        args.iter()
-            .filter(|arg| arg.starts_with("--host-resolver-rules="))
-            .count(),
-        1
+        build_codex_arguments_for_settings(9229, &settings),
+        build_codex_arguments(9229, &[manual_argument.to_string()])
     );
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: false,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-    assert!(
-        !args
-            .iter()
-            .any(|arg| arg.starts_with("--host-resolver-rules="))
-    );
-}
-
-#[test]
-fn launcher_native_menu_inspector_arguments_are_added_before_extra_args() {
-    let app_dir = PathBuf::from(r"C:\Codex\app");
-    let extra_args = vec!["--force_high_performance_gpu".to_string()];
-
-    assert_eq!(
-        build_codex_arguments_with_native_menu_inspector(9229, 9329, &extra_args),
-        vec![
-            "--remote-debugging-port=9229".to_string(),
-            "--remote-allow-origins=http://127.0.0.1:9229".to_string(),
-            "--inspect=127.0.0.1:9329".to_string(),
-            "--force_high_performance_gpu".to_string(),
-        ]
-    );
-    let command = build_codex_command_with_native_menu_inspector(&app_dir, 9229, 9329, &extra_args);
-    assert_eq!(command[1], "--remote-debugging-port=9229");
-    assert_eq!(command[2], "--remote-allow-origins=http://127.0.0.1:9229");
-    assert_eq!(command[3], "--inspect=127.0.0.1:9329");
-    assert_eq!(command[4], "--force_high_performance_gpu");
 }
 
 #[test]
@@ -727,12 +782,12 @@ fn launcher_constructs_windows_packaged_activation_without_real_app() {
         r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
     );
 
+    // 这里验证的是「目录名 → AUMID」这条推导规则；包是否已在系统注册属于另一层
+    // （packaged_app_user_model_id，见 app_paths.rs 的单元测试），测试机上无从构造。
+    let aumid = derive_packaged_app_user_model_id(&app_dir).unwrap();
+    assert_eq!(aumid, "OpenAI.Codex_2p2nqsd0c76g0!App");
     assert_eq!(
-        packaged_app_user_model_id(&app_dir).unwrap(),
-        "OpenAI.Codex_2p2nqsd0c76g0!App"
-    );
-    assert_eq!(
-        build_packaged_activation(&app_dir, 9229, &[]).unwrap(),
+        build_packaged_activation(&aumid, 9229, &[]),
         CodexLaunch::PackagedActivation {
             app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
             arguments: "--remote-debugging-port=9229 --remote-allow-origins=http://127.0.0.1:9229"
@@ -743,7 +798,7 @@ fn launcher_constructs_windows_packaged_activation_without_real_app() {
 }
 
 #[test]
-fn packaged_app_user_model_id_reads_application_id_from_manifest() {
+fn derive_packaged_app_user_model_id_reads_application_id_from_manifest() {
     // 新版 ChatGPT Desktop 可能调整 manifest 中的 Application Id（见 issue #2148）。
     // 这段校验曾被 #2202 的 799ef0c9 静默回退掉，导致 #2308/#2310 的「该进程没有
     // 程序包标识符」；恢复实现时一并恢复测试，避免再次无声丢失。
@@ -766,13 +821,13 @@ fn packaged_app_user_model_id_reads_application_id_from_manifest() {
     .unwrap();
 
     assert_eq!(
-        packaged_app_user_model_id(&app_dir).as_deref(),
+        derive_packaged_app_user_model_id(&app_dir).as_deref(),
         Some("OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0!ChatGPTDesktop")
     );
 }
 
 #[test]
-fn packaged_app_user_model_id_falls_back_to_default_id_without_manifest() {
+fn derive_packaged_app_user_model_id_falls_back_to_default_id_without_manifest() {
     // manifest 缺失/不可读时保持旧行为（仍使用历史默认值 "App"）。
     let temp = tempfile::tempdir().unwrap();
     let package_dir = temp
@@ -782,7 +837,7 @@ fn packaged_app_user_model_id_falls_back_to_default_id_without_manifest() {
     std::fs::create_dir_all(&app_dir).unwrap();
 
     assert_eq!(
-        packaged_app_user_model_id(&app_dir).as_deref(),
+        derive_packaged_app_user_model_id(&app_dir).as_deref(),
         Some("OpenAI.Codex_2p2nqsd0c76g0!App")
     );
 }
@@ -793,9 +848,10 @@ fn launcher_packaged_activation_appends_extra_codex_arguments() {
         r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
     );
     let extra_args = vec!["--force_high_performance_gpu".to_string()];
+    let aumid = derive_packaged_app_user_model_id(&app_dir).unwrap();
 
     assert_eq!(
-        build_packaged_activation(&app_dir, 9229, &extra_args).unwrap(),
+        build_packaged_activation(&aumid, 9229, &extra_args),
         CodexLaunch::PackagedActivation {
             app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
             arguments:
@@ -807,24 +863,7 @@ fn launcher_packaged_activation_appends_extra_codex_arguments() {
 }
 
 #[test]
-fn launcher_packaged_activation_adds_native_menu_inspector_argument() {
-    let app_dir = PathBuf::from(
-        r"C:\Program Files\WindowsApps\OpenAI.Codex_26.506.2212.0_x64__2p2nqsd0c76g0\app",
-    );
 
-    assert_eq!(
-        build_packaged_activation_with_native_menu_inspector(&app_dir, 9229, 9329, &[]).unwrap(),
-        CodexLaunch::PackagedActivation {
-            app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
-            arguments:
-                "--remote-debugging-port=9229 --remote-allow-origins=http://127.0.0.1:9229 --inspect=127.0.0.1:9329"
-                    .to_string(),
-            process_id: None,
-        }
-    );
-}
-
-#[test]
 fn launcher_packaged_activation_can_preserve_process_id() {
     let launch = CodexLaunch::PackagedActivation {
         app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
@@ -858,11 +897,30 @@ fn launcher_no_longer_contains_mobile_control_runtime() {
 }
 
 #[test]
-fn launcher_plugin_marketplace_unlock_repairs_role_specific_plugins() {
+fn retired_plugin_cache_features_have_no_command_or_startup_entrypoints() {
     let launcher_source = include_str!("../src/launcher.rs");
+    let core_source = include_str!("../src/lib.rs");
+    let launcher_binary_source = include_str!("../../../apps/codex-plus-launcher/src/main.rs");
+    let relay_source = include_str!("../src/relay_config.rs");
+    let command_source = include_str!("../../../apps/codex-plus-manager/src-tauri/src/commands.rs");
+    let command_registry = include_str!("../../../apps/codex-plus-manager/src-tauri/src/lib.rs");
 
-    assert!(launcher_source.contains("ensure_openai_curated_marketplace_config(&home)"));
-    assert!(launcher_source.contains("ensure_role_specific_plugins_marketplace_config(&home)"));
+    assert!(!core_source.contains("pub mod plugin_marketplace;"));
+    assert!(!launcher_source.contains("ensure_plugin_marketplace_config"));
+    assert!(!launcher_binary_source.contains("ensure_plugin_marketplace_config"));
+    assert!(!launcher_source.contains("plugin_marketplace::"));
+    assert!(!relay_source.contains("plugin_marketplace::"));
+    for command in [
+        "plugin_marketplace_status",
+        "repair_plugin_marketplace",
+        "remote_plugin_marketplace_status",
+        "repair_remote_plugin_marketplace",
+    ] {
+        assert!(!command_source.contains(command));
+        assert!(!command_registry.contains(command));
+    }
+    assert!(core_source.contains("pub mod skills;"));
+    assert!(relay_source.contains("preserve_live_marketplace_configs"));
 }
 
 #[test]
@@ -941,29 +999,6 @@ fn launcher_macos_open_command_appends_extra_codex_arguments_after_args() {
 }
 
 #[test]
-fn launcher_macos_open_command_adds_native_menu_inspector_argument() {
-    let command = build_macos_open_command_with_native_menu_inspector(
-        Path::new("/Applications/Codex.app"),
-        9229,
-        9329,
-        &[],
-    );
-    let args_index = command
-        .iter()
-        .position(|part| part == "--args")
-        .expect("macOS command should contain --args");
-
-    assert_eq!(
-        &command[args_index + 1..],
-        &[
-            "--remote-debugging-port=9229".to_string(),
-            "--remote-allow-origins=http://127.0.0.1:9229".to_string(),
-            "--inspect=127.0.0.1:9329".to_string(),
-        ]
-    );
-}
-
-#[test]
 fn ports_windows_falls_back_to_ephemeral_when_requested_is_busy() {
     let selected = select_platform_loopback_port_with(9229, true, |_| false, || 43001);
 
@@ -971,18 +1006,33 @@ fn ports_windows_falls_back_to_ephemeral_when_requested_is_busy() {
 }
 
 #[test]
-fn ports_windows_packaged_debug_falls_back_to_ephemeral_when_requested_is_busy() {
-    let selected =
-        select_packaged_codex_debug_port_with(9229, true, |_| false, |_| false, || 43001);
+fn ports_packaged_debug_falls_back_to_ephemeral_when_requested_is_busy() {
+    let selected = select_packaged_codex_debug_port_with(9229, |_| false, |_| false, || 43001);
 
     assert_eq!(selected, 43001);
 }
 
 #[test]
-fn ports_windows_packaged_debug_keeps_requested_when_existing_cdp_is_available() {
-    let selected = select_packaged_codex_debug_port_with(9229, true, |_| false, |_| true, || 43001);
+fn ports_packaged_debug_keeps_requested_when_existing_cdp_is_available() {
+    let selected = select_packaged_codex_debug_port_with(9229, |_| false, |_| true, || 43001);
 
     assert_eq!(selected, 9229);
+}
+
+#[test]
+fn ports_packaged_debug_keeps_requested_when_bindable() {
+    let selected = select_packaged_codex_debug_port_with(9229, |_| true, |_| false, || 43001);
+
+    assert_eq!(selected, 9229);
+}
+
+/// #247：调试端口被第三方进程（如 macOS 上的 SkyComputerUseService）占用时，
+/// 非 Windows 平台也必须改用空闲端口，而不是把请求端口原样交给 Codex。
+#[test]
+fn ports_packaged_debug_falls_back_even_on_non_windows() {
+    let selected = select_packaged_codex_debug_port_with(9229, |_| false, |_| false, || 43001);
+
+    assert_eq!(selected, 43001);
 }
 
 #[test]
@@ -1192,49 +1242,18 @@ async fn launch_lifecycle_syncs_model_capabilities_when_fast_button_is_disabled(
 }
 
 #[tokio::test]
-async fn launch_lifecycle_passes_native_menu_localization_switch_to_codex_launch() {
+async fn launch_lifecycle_keeps_js_injection_with_legacy_launch_mode() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        codex_app_native_menu_localization: false,
-        ..BackendSettings::default()
-    });
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
-            status_store,
-        },
-        &hooks,
-    )
-    .await
+    let legacy_settings: BackendSettings = serde_json::from_value(serde_json::json!({
+        "launchMode": "relay",
+        "enhancementsEnabled": true,
+    }))
     .unwrap();
-    handle.wait_for_codex_exit().await.unwrap();
-
-    assert!(
-        events
-            .lock()
-            .unwrap()
-            .contains(&"launch:9229:native-menu-off".to_string())
-    );
-}
-
-#[tokio::test]
-async fn launch_lifecycle_keeps_js_injection_in_relay_mode() {
-    let temp = tempfile::tempdir().unwrap();
-    let app_dir = temp.path().join("Codex.app");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
-    let events = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
-        launch_mode: codex_plus_core::settings::LaunchMode::Relay,
-        ..BackendSettings::default()
-    });
+    let hooks = FakeHooks::new(events.clone()).with_settings(legacy_settings);
 
     let handle = launch_and_inject_with_hooks(
         LaunchOptions {
@@ -1545,7 +1564,11 @@ async fn a_transient_forbidden_protocol_proxy_port_retries_until_it_can_bind() {
     );
     assert!(events.contains(&"start-helper:57321".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
-    assert!(!events.iter().any(|event| event.starts_with("start-helper:58123")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("start-helper:58123"))
+    );
 }
 
 /// 与占用/保留都无关的其他 bind 失败：错误原样冒泡，不误贴「被占用」「被保留」的标签。
@@ -1946,7 +1969,8 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             standard_openai_protocol: false,
             rate_limit_cooldown_enabled: false,
             channel_queue_enabled: false,
-            channel_requests_per_minute: codex_plus_core::settings::default_channel_requests_per_minute(),
+            channel_requests_per_minute:
+                codex_plus_core::settings::default_channel_requests_per_minute(),
             cooldown_error_statuses: codex_plus_core::settings::default_cooldown_error_statuses(),
         }],
         active_relay_id: "relay-chat".to_string(),
@@ -2146,41 +2170,6 @@ async fn default_provider_sync_enabled_fails_instead_of_silently_skipping() {
     );
 }
 
-#[tokio::test]
-async fn launch_continues_when_plugin_marketplace_config_fails() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let hooks = FakeHooks::new(events.clone())
-        .with_plugin_marketplace_error("config.toml TOML parse failed");
-
-    let handle = launch_and_inject_with_hooks(
-        LaunchOptions {
-            app_dir: Some(PathBuf::from("/Applications/Codex.app")),
-            debug_port: 9229,
-            helper_port: 57321,
-            status_store: StatusStore::new(tempfile::tempdir().unwrap().path().join("status.json")),
-        },
-        &hooks,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(handle.debug_port, 9229);
-    assert_eq!(
-        events.lock().unwrap().as_slice(),
-        [
-            "select-debug:9229",
-            "select-helper:57321",
-            "load-settings",
-            "sync-service-tier-catalog",
-            "plugin-marketplace",
-            "start-helper:57321",
-            "launch:9229",
-            "inject:9229:57321",
-            "status:running"
-        ]
-    );
-}
-
 #[test]
 fn launcher_macos_cleanup_command_targets_specific_app_bundle() {
     let command = build_macos_cleanup_command(
@@ -2273,17 +2262,33 @@ async fn native_browser_lifecycle_uses_one_settings_snapshot_and_stops_on_succes
                 ..LaunchOptions::default()
             },
             &hooks,
-        ).await;
+        )
+        .await;
         if fail {
             assert!(result.is_err());
         } else {
             result.unwrap().wait_for_codex_exit().await.unwrap();
         }
         let events = events.lock().unwrap();
-        assert_eq!(events.iter().filter(|event| *event == "load-settings").count(), 1);
-        let start = events.iter().position(|event| event == "native-browser:start:true").unwrap();
-        let launch = events.iter().position(|event| event == "launch:9229").unwrap();
-        let stop = events.iter().position(|event| event == "native-browser:stop").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "load-settings")
+                .count(),
+            1
+        );
+        let start = events
+            .iter()
+            .position(|event| event == "native-browser:start:true")
+            .unwrap();
+        let launch = events
+            .iter()
+            .position(|event| event == "launch:9229")
+            .unwrap();
+        let stop = events
+            .iter()
+            .position(|event| event == "native-browser:stop")
+            .unwrap();
         assert!(start < launch && launch < stop);
     }
 }
@@ -2296,7 +2301,6 @@ struct FakeHooks {
     launch_error: Option<String>,
     inject_error: Option<String>,
     provider_sync_unsupported: bool,
-    plugin_marketplace_error: Option<String>,
     has_pending_remote_control_session_recoveries: bool,
     /// 还需要让 `start_helper` 报几次「端口被占用」，用来模拟旧 helper 尚未交还监听。
     remaining_helper_bind_conflicts: Arc<Mutex<u32>>,
@@ -2320,7 +2324,6 @@ impl FakeHooks {
             launch_error: None,
             inject_error: None,
             provider_sync_unsupported: false,
-            plugin_marketplace_error: None,
             has_pending_remote_control_session_recoveries: false,
             remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
             remaining_helper_bind_forbidden: Arc::new(Mutex::new(0)),
@@ -2372,11 +2375,6 @@ impl FakeHooks {
         self
     }
 
-    fn with_plugin_marketplace_error(mut self, message: &str) -> Self {
-        self.plugin_marketplace_error = Some(message.to_string());
-        self
-    }
-
     fn with_pending_remote_control_session_recoveries(mut self) -> Self {
         self.has_pending_remote_control_session_recoveries = true;
         self
@@ -2423,12 +2421,18 @@ impl LaunchHooks for FakeHooks {
 
     async fn start_native_browser_compatibility(&self, settings: &BackendSettings) {
         if settings.codex_app_native_browser_require_identification {
-            self.event(format!("native-browser:start:{}", settings.enhancements_enabled));
+            self.event(format!(
+                "native-browser:start:{}",
+                settings.enhancements_enabled
+            ));
         }
     }
 
     async fn stop_native_browser_compatibility(&self) {
-        if self.settings.codex_app_native_browser_require_identification {
+        if self
+            .settings
+            .codex_app_native_browser_require_identification
+        {
             self.event("native-browser:stop");
         }
     }
@@ -2466,17 +2470,6 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn ensure_plugin_marketplace_config(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        if let Some(message) = &self.plugin_marketplace_error {
-            self.event("plugin-marketplace");
-            anyhow::bail!(message.clone());
-        }
-        Ok(())
-    }
-
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         {
             let mut remaining = self.remaining_helper_bind_conflicts.lock().unwrap();
@@ -2501,17 +2494,20 @@ impl LaunchHooks for FakeHooks {
                 self.event(format!("start-helper-forbidden:{helper_port}"));
                 // raw_os_error(10013) 在 Windows 上是 WSAEACCES，跨平台都能命中
                 // `port_bind_forbidden` 的判定，测试行为一致。
-                return Err(anyhow::Error::new(std::io::Error::from_raw_os_error(10013)).context(
-                    format!("failed to bind helper runtime on 127.0.0.1:{helper_port}"),
-                ));
+                return Err(
+                    anyhow::Error::new(std::io::Error::from_raw_os_error(10013)).context(format!(
+                        "failed to bind helper runtime on 127.0.0.1:{helper_port}"
+                    )),
+                );
             }
         }
         if let Some(message) = &self.helper_bind_other_error {
             self.event(format!("start-helper-error:{helper_port}"));
-            return Err(anyhow::Error::new(std::io::Error::other(message.clone()))
-                .context(format!(
+            return Err(
+                anyhow::Error::new(std::io::Error::other(message.clone())).context(format!(
                     "failed to bind helper runtime on 127.0.0.1:{helper_port}"
-                )));
+                )),
+            );
         }
         self.event(format!("start-helper:{helper_port}"));
         Ok(())
@@ -2521,7 +2517,7 @@ impl LaunchHooks for FakeHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
-        settings: &BackendSettings,
+        _settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         assert!(app_dir.ends_with("Codex.app"));
@@ -2530,11 +2526,7 @@ impl LaunchHooks for FakeHooks {
         } else {
             format!("launch:{debug_port}:{}", extra_args.join(","))
         };
-        if settings.codex_app_native_menu_localization {
-            self.event(launch_detail);
-        } else {
-            self.event(format!("{launch_detail}:native-menu-off"));
-        }
+        self.event(launch_detail);
         if let Some(message) = &self.launch_error {
             anyhow::bail!(message.clone());
         }

@@ -59,3 +59,13 @@ fn text_only_stream_is_byte_exact() {
     output.extend(stream.finish());
     assert_eq!(input.as_slice(), output);
 }
+
+#[test]
+fn responses_proxy_stream_retains_image_delivery_after_upstream_refactor() {
+    let source = include_str!("../src/launcher.rs");
+    let body = source.split("async fn forward_protocol_proxy_stream(").nth(1).unwrap();
+    let responses = body.split("    let mut converter = request").next().unwrap();
+    assert!(responses.contains("ImageDeliveryStream::new("));
+    assert!(responses.contains("delivery.push(&bytes)?"));
+    assert!(responses.contains("delivery.finish()"));
+}

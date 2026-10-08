@@ -118,6 +118,7 @@ pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
         None
     }
 
+
 }
 #[cfg(windows)]
 fn find_latest_codex_app_dir_from_appx_package() -> anyhow::Result<Option<PathBuf>> {
@@ -284,15 +285,79 @@ pub fn find_macos_codex_app(search_roots: &[PathBuf]) -> Option<PathBuf> {
             }
         }
     }
+    // 固定名字都没命中时按 bundle id 兜底：应用被改名（`Codex 2.app`）或
+    // 装在子目录（`/Applications/OpenAI/Codex.app`）时名字判据失效，但
+    // Info.plist 里的 CFBundleIdentifier 仍然是权威身份（issue #2204）。
+    #[cfg(not(windows))]
+    for root in search_roots {
+        if let Some(app) = find_macos_codex_app_by_bundle_id(root, 0) {
+            return Some(app);
+        }
+    }
     None
 }
 
+/// 递归深度上限：一层子目录足够覆盖 `/Applications/OpenAI/Codex.app` 这类
+/// 分组安装，又不会在大目录树上耗时。
+#[cfg(not(windows))]
+const MACOS_BUNDLE_SEARCH_MAX_DEPTH: usize = 1;
+
+#[cfg(not(windows))]
+fn find_macos_codex_app_by_bundle_id(root: &Path, depth: usize) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut directories: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    // 目录顺序由文件系统给出，不保证稳定；排序让同一棵树上的结果可复现。
+    directories.sort();
+    for path in &directories {
+        if path.extension() == Some(OsStr::new("app")) && is_codex_bundle_identifier(path) {
+            return Some(path.clone());
+        }
+    }
+    if depth >= MACOS_BUNDLE_SEARCH_MAX_DEPTH {
+        return None;
+    }
+    for path in &directories {
+        if path.extension() == Some(OsStr::new("app")) {
+            continue;
+        }
+        if let Some(app) = find_macos_codex_app_by_bundle_id(path, depth + 1) {
+            return Some(app);
+        }
+    }
+    None
+}
+
+/// 官方桌面应用的 bundle id。Codex 已并入 ChatGPT Desktop，两个都认
+/// （与 APP_PACKAGE_SPECS 里的 identity 列表保持一致）。
+#[cfg(not(windows))]
+const MACOS_CODEX_BUNDLE_IDENTIFIERS: &[&str] =
+    &["com.openai.codex", "com.openai.chat", "com.openai.chatgpt"];
+
+#[cfg(not(windows))]
+fn is_codex_bundle_identifier(app_dir: &Path) -> bool {
+    let Some(bundle_id) = macos_app_plist_value(app_dir, "CFBundleIdentifier") else {
+        return false;
+    };
+    MACOS_CODEX_BUNDLE_IDENTIFIERS
+        .iter()
+        .any(|known| bundle_id.trim().eq_ignore_ascii_case(known))
+}
+
 pub fn find_macos_codex_app_default() -> Option<PathBuf> {
+    find_macos_codex_app(&macos_default_search_roots())
+}
+
+/// 默认探测根，也用于失败文案里「都找过哪些地方」的自述。
+pub fn macos_default_search_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications")];
     if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
         roots.push(home.join("Applications"));
     }
-    find_macos_codex_app(&roots)
+    roots
 }
 
 
@@ -434,6 +499,100 @@ fn standalone_cli_in_dir(dir: &Path) -> Option<PathBuf> {
     ["codex.exe", "codex", "Codex.exe", "Codex"].iter().map(|name| dir.join(name)).find(|path| path.is_file())
 }
 
+/// `normalize_codex_app_path` 拒绝一个已存在路径时，说明具体卡在哪一条判据。
+///
+/// issue #2204：失败时四个平台四种原因共用一句「Codex App directory not found」，
+/// 用户与维护者都无法判断是「路径不存在」「误选了 Codex++」还是「目录里没有可执行
+/// 文件」。这里只做归因，不改变接受/拒绝结果。
+pub fn describe_codex_app_dir_rejection(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return "路径为空".to_string();
+    }
+    if is_codex_plus_plus_path(path) {
+        return "该路径是 Codex++ 自己的安装目录，不是 Codex 桌面应用".to_string();
+    }
+    if !path.exists() {
+        return "路径不存在".to_string();
+    }
+    if path.is_file() {
+        return "这是一个文件；请选择 Codex 应用目录或目录内的可执行文件".to_string();
+    }
+    if path.join("app").is_dir() {
+        return "目录中没有找到 Codex 可执行文件（Codex.exe / ChatGPT.exe），且目录名也不像 MSIX 包".to_string();
+    }
+    "目录中没有找到 Codex 可执行文件（Codex.exe / ChatGPT.exe）".to_string()
+}
+
+/// 自动探测全部落空时的失败文案，按「显式传入 / 已保存 / 纯自动」三种来源分别给出
+/// 可操作提示，并列出实际搜索过的根目录（issue #2204）。
+pub fn describe_codex_app_dir_not_found(
+    explicit_app_dir: Option<&Path>,
+    saved_app_path: Option<&str>,
+) -> String {
+    if let Some(app_dir) = explicit_app_dir {
+        return format!(
+            "Codex App directory not found: 传入的 --app-path {} 不可用（{}），\
+             且显式路径无效时不会回退自动探测。",
+            app_dir.display(),
+            describe_codex_app_dir_rejection(app_dir)
+        );
+    }
+    let saved = saved_app_path
+        .map(str::trim)
+        .filter(|saved| !saved.is_empty());
+    if let Some(saved) = saved {
+        let path = Path::new(saved);
+        return format!(
+            "Codex App directory not found: 已保存的路径 {} 不可用（{}），\
+             自动探测也未找到 Codex 桌面应用（{}）。\
+             请在管理工具的「Codex 应用路径」里重新选择。",
+            path.display(),
+            describe_codex_app_dir_rejection(path),
+            describe_default_search_roots()
+        );
+    }
+    format!(
+        "Codex App directory not found: 没有配置应用路径，自动探测也未找到 Codex 桌面应用\
+         （已搜索：{}）。请在管理工具里手动选择 Codex 应用目录。",
+        describe_default_search_roots()
+    )
+}
+
+/// 各平台默认探测面，用于失败文案自述「找过哪里」。
+fn describe_default_search_roots() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_default_search_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return ["/usr/lib", "/opt", "~/Applications", "~/.local/share"].join(", ");
+    }
+    #[cfg(windows)]
+    {
+        let mut roots: Vec<String> = windows_app_package_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(
+                PathBuf::from(local)
+                    .join("OpenAI")
+                    .join("Codex")
+                    .display()
+                    .to_string(),
+            );
+        }
+        return roots.join(", ");
+    }
+    #[allow(unreachable_code)]
+    String::new()
+}
+
 #[cfg(test)]
 mod standalone_cli_tests {
     use super::find_standalone_codex_cli_in;
@@ -478,32 +637,18 @@ pub fn resolve_codex_app_dir_with_saved(
         .map(str::trim)
         .filter(|saved| !saved.is_empty())
     {
-        // 已保存路径无效（例如误选 Codex++）时回退自动探测
+        // 用户显式保存的路径优先（issue #2394）。此前 Store 包目录会被注册表查询
+        // 结果无条件覆盖，表现为「保存了但重启后没用」——用户特意选中的目录又被
+        // 换回自动探测到的那个。
+        //
+        // 这里仍然只在保存路径**有效**时优先：normalize_codex_app_path 对已不存在的
+        // 目录返回 None（Store 更新会删掉旧版本目录），此时自然落到下面的自动探测，
+        // 由注册表给出当前版本，不会把用户卡在失效路径上。
         if let Some(path) = normalize_codex_app_path(Path::new(saved)) {
-            #[cfg(windows)]
-            if is_codex_store_package_dir(&path) {
-                // Store 更新会生成新的版本目录；注册查询成功时选择当前最高版本，
-                // 查询失败则保留已保存路径，兼容离线或受限环境。
-                return Some(resolve_saved_store_path(
-                    path,
-                    find_latest_codex_app_dir_from_appx_package(),
-                ));
-            }
             return Some(path);
         }
     }
     resolve_codex_app_dir(None)
-}
-
-#[cfg(windows)]
-fn resolve_saved_store_path(
-    saved_path: PathBuf,
-    current: anyhow::Result<Option<PathBuf>>,
-) -> PathBuf {
-    match current {
-        Ok(Some(current)) => current,
-        Ok(None) | Err(_) => saved_path,
-    }
 }
 
 pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
@@ -554,7 +699,20 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// Codex++ 管理控制台/安装根，绝不能当作 OpenAI Codex 桌面应用。
+///
+/// 目录名只是线索，不能单独作为判据：用户完全可能把真正的 Codex 放在
+/// `C:\codex++` 这类目录下（issue #1036），此时按名字一刀切会连真 Codex 一起拒掉，
+/// 表现为「能找到 codex_app 但版本为 null、启动报 failed to launch」。
+/// 因此只有目录里确实带着本产品自身的文件（管理工具可执行文件 / 卸载器）时才排除。
 fn is_codex_plus_plus_path(path: &Path) -> bool {
+    if !codex_plus_plus_name_path(path) {
+        return false;
+    }
+    has_codex_plus_plus_marker(path)
+}
+
+/// 路径中是否存在「像 Codex++ 安装目录」的目录名。
+fn codex_plus_plus_name_path(path: &Path) -> bool {
     for component in path.components() {
         let std::path::Component::Normal(name) = component else {
             continue;
@@ -562,10 +720,16 @@ fn is_codex_plus_plus_path(path: &Path) -> bool {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let lower = name.to_ascii_lowercase();
+        // macOS 下安装根是 `Codex++.app`，去掉 bundle 扩展名再比对，
+        // 否则 `codex++` 这一档永远命不中。
+        let lower = name
+            .strip_suffix(".app")
+            .unwrap_or(name)
+            .to_ascii_lowercase();
         if lower == "codex++"
             || lower == "codexplusplus"
             || lower == "codex-plus-plus"
+            || lower == "codex++ manager"
             || lower.contains("codex-plus-manager")
         {
             return true;
@@ -578,6 +742,47 @@ fn is_codex_plus_plus_path(path: &Path) -> bool {
     normalized.contains("\\programs\\codex++")
         || normalized.contains("\\codex++\\")
         || normalized.ends_with("\\codex++")
+}
+
+/// 目录里是否存在本产品自己铺设的文件。用于确认「这个名字像 Codex++ 的目录」
+/// 确实是 Codex++ 的安装位置，而不是用户恰好这样命名的普通 Codex 目录。
+fn has_codex_plus_plus_marker(path: &Path) -> bool {
+    // 沿祖先链向上看：调用方可能传入安装根，也可能传入根里的可执行文件，还可能
+    // 传入 .app 包内的 Contents/MacOS/<exe>。安装器把 MANAGER_BINARY /
+    // uninstall.exe 放在安装根，macOS 则把 bundle 可执行文件放在 Contents/MacOS。
+    let mut roots: Vec<&Path> = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(current) = cursor {
+        roots.push(current);
+        cursor = current.parent();
+    }
+    // macOS 的 .app 包把可执行文件放在 Contents/MacOS 下，名字取自 bundle 的
+    // CFBundleExecutable（CodexPlusPlus / CodexPlusPlusManager），与安装根里的
+    // 二进制名不同，因此两条都列。
+    const MARKERS: &[&str] = &[
+        "codex-plus-plus-manager.exe",
+        "uninstall.exe",
+        "codex-plus-plus-manager",
+        "codex-plus-plus",
+        "CodexPlusPlusManager",
+        "CodexPlusPlus",
+    ];
+    for root in roots {
+        for marker in MARKERS {
+            if root.join(marker).is_file() {
+                return true;
+            }
+        }
+        let macos_dir = root.join("Contents").join("MacOS");
+        if macos_dir.is_dir()
+            && MARKERS
+                .iter()
+                .any(|marker| macos_dir.join(marker).is_file())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_codex_store_package_dir(path: &Path) -> bool {
@@ -688,12 +893,89 @@ pub fn codex_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| codex_directory_version(app_dir))
         .or_else(|| codex_version_file(package_dir))
         .or_else(|| codex_version_file(app_dir))
+        // 免安装/自解包布局（如 …\Codex\app）既没有 MSIX 包目录名，也没有 version
+        // 文件，只在目录里留一个以版本号命名的清单，如 `149.0.7827.115.manifest`。
+        // 少了这一档，版本解析为空 → 健康检查显示「未检测到」、插件解锁策略退化成
+        // unknown（issue #1160）。
+        .or_else(|| codex_manifest_version(package_dir))
+        .or_else(|| codex_manifest_version(app_dir))
+}
+
+/// 从解包目录里形如 `149.0.7827.115.manifest` 的清单文件名取版本号。
+///
+/// 按 is_version_like 校验文件名主干，避免把无关的 `*.manifest` 误当成版本；
+/// 同时命中多个时取版本最高的一个。
+fn codex_manifest_version(app_dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(app_dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".manifest")?;
+            is_version_like(stem).then(|| stem.to_string())
+        })
+        .max_by(|left, right| compare_version_strings(left, right))
+}
+
+/// 按点分数字段逐个比较版本号；字段数不同时先比公共前缀，
+/// 完全相同再按字段数多者为大（`149.0` < `149.0.0`）。
+///
+/// 逐字段按数值比较，不能按字符串比较：`"115"` 在字典序上小于 `"20"`，
+/// 会把 `…7827.115` 判成低于 `…7827.20`。
+fn compare_version_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    let parts = |version: &str| {
+        version
+            .split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Vec<_>>()
+    };
+    let (left, right) = (parts(left), parts(right));
+    for (left_part, right_part) in left.iter().zip(right.iter()) {
+        let ordering = left_part.cmp(right_part);
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
+    packaged_app_user_model_id_when_registered(app_dir, app_dir_is_registered_package)
+}
+
+/// 只做推导：从目录名与 manifest 得出 AUMID，**不校验**包是否已在系统注册。
+///
+/// 生产路径请用 [`packaged_app_user_model_id`]，它会先确认包确实已注册。目录名长得
+/// 像 MSIX 包不等于该包已注册（用户把 Store 包目录整体搬走后路径形状依旧成立），拿
+/// 未注册包的 AUMID 去激活会报 0x80073CF1（issue #2140）。
+///
+/// 之所以公开：注册校验依赖真实的 Store 注册表状态（测试机上无处构造，且非 Windows
+/// 平台恒真），而推导规则本身——目录名到包身份、manifest 到 Application Id、缺
+/// manifest 时回落历史默认值——与平台无关，值得独立验证。
+pub fn derive_packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
+    packaged_app_user_model_id_when_registered(app_dir, |_| true)
+}
+
+/// `packaged_app_user_model_id` 的核心，注册判定以闭包注入，便于测试。
+///
+/// 目录名像 MSIX 包（`OpenAI.Codex_<版本>_x64__<publisher>`）不等于该包已注册：
+/// 用户把 Store 包目录整体复制/搬移到 `D:\aitool\...` 后，路径形状依旧成立，于是
+/// 反推出的 AUMID 指向一个未注册的包，`ActivateApplication` 报 0x80073CF1
+/// （issue #2140）。未注册时返回 None，调用方回落到按路径启动。
+fn packaged_app_user_model_id_when_registered(
+    app_dir: &Path,
+    mut is_registered: impl FnMut(&Path) -> bool,
+) -> Option<String> {
     let package_name = package_name_from_app_dir(app_dir)?;
     let (spec, _, publisher_id) = codex_package_parts(&package_name)?;
     if publisher_id.is_empty() {
+        return None;
+    }
+    // 注册判定针对包目录本身（`…\OpenAI.Codex_<版本>_x64__<publisher>`），
+    // 而不是它下面的 `app` 子目录——MSIX 注册记录的是安装位置。
+    let package_dir = packaged_package_dir(app_dir)?;
+    if !is_registered(package_dir) {
         return None;
     }
     // 新版 ChatGPT-Desktop 可能改变包内 Application Id（参见 #2148 的 0x80270254 报错），
@@ -705,15 +987,56 @@ pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {
     Some(format!("{}_{publisher_id}!{app_id}", spec.identity))
 }
 
-fn packaged_manifest_app_id(app_dir: &Path) -> Option<String> {
-    let package_dir = if app_dir
+/// 包目录（`…/OpenAI.Codex_<版本>_x64__<publisher>`，可含 `app` 尾段）。
+fn packaged_package_dir(app_dir: &Path) -> Option<&Path> {
+    if app_dir
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("app"))
     {
-        app_dir.parent()?
+        app_dir.parent()
     } else {
-        app_dir
+        Some(app_dir)
+    }
+}
+
+/// 非 Windows 平台没有 MSIX 注册概念，包身份判定交给平台自身的启动方式。
+#[cfg(not(windows))]
+fn app_dir_is_registered_package(_package_dir: &Path) -> bool {
+    true
+}
+
+/// 该包目录是否确实是当前用户下已注册的 Store 包安装位置。
+///
+/// 判据取 `GetPackagesByPackageFamily` 返回的 install location（系统权威来源），
+/// 而不是路径末段的名字：搬移过的同名目录必须被判为未注册。
+/// 查询本身失败时保守返回 true——离线/受限环境下不能因为探测失败就
+/// 让正常的 Store 安装丢掉 AUMID 激活（#2308/#2310）。
+#[cfg(windows)]
+fn app_dir_is_registered_package(package_dir: &Path) -> bool {
+    let Ok(packages) = registered_windows_packages() else {
+        return true;
     };
+    packages
+        .iter()
+        .any(|package| same_windows_path(&package.install_location, package_dir))
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> String {
+        // 先用 canonicalize 归一化 `..`、短名与符号链接；失败（WindowsApps 的 ACL
+        // 常让第三方进程读不到）时退回字符串比较，去掉分隔符差异与尾部分隔符。
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    normalize(left) == normalize(right)
+}
+
+fn packaged_manifest_app_id(app_dir: &Path) -> Option<String> {
+    let package_dir = packaged_package_dir(app_dir)?;
     let manifest = std::fs::read_to_string(package_dir.join("AppxManifest.xml")).ok()?;
     manifest_first_application_id(&manifest)
 }
@@ -854,15 +1177,29 @@ fn macos_app_candidates(root: &Path) -> Vec<PathBuf> {
     if root.extension() == Some(OsStr::new("app")) {
         return vec![root.to_path_buf()];
     }
-    [
+    const NAMES: &[&str] = &[
         "Codex.app",
         "OpenAI Codex.app",
         "OpenAI.Codex.app",
         "ChatGPT.app",
-    ]
-    .into_iter()
-    .map(|name| root.join(name))
-    .collect()
+    ];
+    let mut candidates: Vec<PathBuf> = NAMES.iter().map(|name| root.join(name)).collect();
+    // 一级子目录：用户常把应用归到 `/Applications/OpenAI/Codex.app` 这类分组目录下，
+    // 只拼四个固定文件名会漏掉（issue #2204）。
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut subdirs: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        subdirs.sort();
+        for subdir in subdirs {
+            for name in NAMES {
+                candidates.push(subdir.join(name));
+            }
+        }
+    }
+    candidates
 }
 
 fn version_tuple(path: &Path) -> Option<Vec<u32>> {
@@ -982,28 +1319,98 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
     head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
-#[cfg(all(test, windows))]
-mod tests {
-    use super::resolve_saved_store_path;
-    use std::path::PathBuf;
+#[cfg(test)]
+mod registered_package_tests {
+    use super::packaged_app_user_model_id_when_registered;
+    use std::path::{Path, PathBuf};
 
+    fn store_package_app_dir(root: &Path) -> PathBuf {
+        root.join("OpenAI.Codex_26.901.6511.0_x64__2p2nqsd0c76g0")
+            .join("app")
+    }
+
+    /// issue #2140：目录名像 MSIX 包但系统未注册时必须返回 None，
+    /// 否则 launcher 会拿这个 AUMID 去激活一个不存在的包（0x80073CF1）。
     #[test]
-    fn saved_store_path_prefers_current_registered_package() {
-        let saved = PathBuf::from(r"C:\old\app");
-        let current = PathBuf::from(r"C:\new\app");
+    fn unregistered_package_dir_yields_no_aumid() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = store_package_app_dir(&temp.path().join("aitool"));
+        std::fs::create_dir_all(&app).unwrap();
+
         assert_eq!(
-            resolve_saved_store_path(saved, Ok(Some(current.clone()))),
-            current
+            packaged_app_user_model_id_when_registered(&app, |_| false),
+            None
         );
     }
 
+    /// 已注册时仍按 manifest / 硬编码给出 AUMID，守住 #2308/#2310 的修复。
     #[test]
-    fn saved_store_path_falls_back_when_registration_is_unavailable() {
-        let saved = PathBuf::from(r"C:\old\app");
-        assert_eq!(resolve_saved_store_path(saved.clone(), Ok(None)), saved);
+    fn registered_package_dir_keeps_manifest_application_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = store_package_app_dir(temp.path());
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.parent().unwrap().join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Id="AppX" Executable="ChatGPT.exe"/></Applications></Package>"#,
+        )
+        .unwrap();
+
         assert_eq!(
-            resolve_saved_store_path(saved.clone(), Err(anyhow::anyhow!("query failed"))),
-            saved
+            packaged_app_user_model_id_when_registered(&app, |_| true).as_deref(),
+            Some("OpenAI.Codex_2p2nqsd0c76g0!AppX")
+        );
+    }
+
+    /// 注册判定收到的是包目录而不是 `app` 子目录——比较的是安装位置本身。
+    #[test]
+    fn registration_probe_receives_package_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = store_package_app_dir(temp.path());
+        std::fs::create_dir_all(&app).unwrap();
+
+        let mut probed = None;
+        let _ = packaged_app_user_model_id_when_registered(&app, |dir| {
+            probed = Some(dir.to_path_buf());
+            true
+        });
+        assert_eq!(probed.as_deref(), app.parent());
+    }
+}
+
+#[cfg(test)]
+mod saved_path_tests {
+    use super::resolve_codex_app_dir_with_saved;
+    use std::path::PathBuf;
+
+    fn store_package_app_dir(root: &std::path::Path) -> PathBuf {
+        root.join("OpenAI.Codex_26.901.6511.0_x64__2p2nqsd0c76g0")
+            .join("app")
+    }
+
+    /// issue #2394：保存的 Store 包目录仍然存在时必须原样返回，
+    /// 不能被注册表查询结果覆盖（否则「保存了但重启后没用」）。
+    #[test]
+    fn saved_store_package_dir_wins_over_registry_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = store_package_app_dir(temp.path());
+        std::fs::create_dir_all(&app).unwrap();
+
+        assert_eq!(
+            resolve_codex_app_dir_with_saved(None, Some(&app.to_string_lossy())).as_deref(),
+            Some(app.as_path())
+        );
+    }
+
+    /// 保存路径已被删除（Store 更新删掉旧版本目录）时不再返回它，
+    /// 由自动探测接手——这条保证「优先」不会把用户卡在失效路径上。
+    #[test]
+    fn removed_saved_store_package_dir_falls_back_to_detection() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = store_package_app_dir(temp.path());
+
+        assert_ne!(
+            resolve_codex_app_dir_with_saved(None, Some(&missing.to_string_lossy())).as_deref(),
+            Some(missing.as_path())
         );
     }
 }
@@ -1080,5 +1487,124 @@ mod cli_path_tests {
             "/Applications/ChatGPT.app/Contents/Resources/codex"
         ));
         assert!(!is_windows_store_cli_path("codex"));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod macos_discovery_tests {
+    use super::{
+        describe_codex_app_dir_not_found, describe_codex_app_dir_rejection, find_macos_codex_app,
+    };
+    use std::path::Path;
+
+    fn write_bundle(app: &Path, bundle_id: &str) {
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>{bundle_id}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// issue #2204：应用装在根目录下的一层子目录里（如
+    /// `/Applications/OpenAI/Codex.app`）时也要能找到。
+    #[test]
+    fn finds_app_one_level_below_search_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        let app = root.join("OpenAI").join("Codex.app");
+        write_bundle(&app, "com.openai.codex");
+
+        assert_eq!(
+            find_macos_codex_app(&[root]).as_deref(),
+            Some(app.as_path())
+        );
+    }
+
+    /// bundle 被改名（`Codex 2.app`）时按 CFBundleIdentifier 兜底。
+    #[test]
+    fn finds_renamed_bundle_by_identifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        let app = root.join("OpenAI").join("Codex 2.app");
+        write_bundle(&app, "com.openai.codex");
+
+        assert_eq!(
+            find_macos_codex_app(&[root]).as_deref(),
+            Some(app.as_path())
+        );
+    }
+
+    /// 无关 bundle 不能被误认——bundle id 判据必须真的比对。
+    #[test]
+    fn ignores_unrelated_bundles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        write_bundle(
+            &root.join("OpenAI").join("Some Tool.app"),
+            "com.example.tool",
+        );
+
+        assert_eq!(find_macos_codex_app(&[root]), None);
+    }
+
+    /// 固定名字仍然优先于 bundle id 兜底，避免改动探测顺序影响既有选择。
+    #[test]
+    fn fixed_names_still_win_over_bundle_id_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        let named = root.join("Codex.app");
+        std::fs::create_dir_all(&named).unwrap();
+        // 同根下还有一个 bundle id 匹配但名字陌生的候选。
+        write_bundle(&root.join("OpenAI").join("Mystery.app"), "com.openai.codex");
+
+        assert_eq!(
+            find_macos_codex_app(&[root]).as_deref(),
+            Some(named.as_path())
+        );
+    }
+
+    /// 四种失败原因要能分辨，且都保留既有英文前缀便于日志检索（issue #2204）。
+    #[test]
+    fn rejection_reasons_are_distinguishable() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let missing = temp.path().join("nope");
+        assert_eq!(describe_codex_app_dir_rejection(&missing), "路径不存在");
+
+        let empty_dir = temp.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert!(describe_codex_app_dir_rejection(&empty_dir).contains("可执行文件"));
+
+        let manager = temp.path().join("Programs").join("Codex++");
+        std::fs::create_dir_all(&manager).unwrap();
+        std::fs::write(manager.join("codex-plus-plus-manager.exe"), "").unwrap();
+        assert!(describe_codex_app_dir_rejection(&manager).contains("Codex++"));
+    }
+
+    #[test]
+    fn not_found_message_names_the_source_of_the_path() {
+        let explicit = Path::new("/nope/Codex.app");
+        let message = describe_codex_app_dir_not_found(Some(explicit), None);
+        assert!(message.starts_with("Codex App directory not found"));
+        assert!(message.contains("--app-path"));
+
+        let saved = describe_codex_app_dir_not_found(None, Some("/nope/Codex.app"));
+        assert!(saved.contains("已保存的路径"));
+
+        let none = describe_codex_app_dir_not_found(None, None);
+        assert!(none.contains("没有配置应用路径"));
+        // 纯自动探测的文案要自述搜索面，用户才知道该把应用放到哪里。
+        assert!(none.contains("已搜索"));
     }
 }

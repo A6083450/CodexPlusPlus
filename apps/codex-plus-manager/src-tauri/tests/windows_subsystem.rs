@@ -208,22 +208,34 @@ fn macos_packager_hides_silent_launcher_but_not_manager() {
 }
 
 #[test]
-fn github_release_workflow_builds_separate_macos_x64_and_arm64_dmgs() {
+fn github_release_workflow_builds_one_universal_macos_dmg() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workflow = manifest_dir
+    let root = manifest_dir
         .parent()
         .and_then(std::path::Path::parent)
         .and_then(std::path::Path::parent)
-        .unwrap()
-        .join(".github/workflows/release-assets.yml");
-    let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
+        .unwrap();
+    for name in ["release-assets.yml", "pr-build.yml"] {
+        let workflow = std::fs::read_to_string(root.join(".github/workflows").join(name))
+            .expect("read macOS build workflow");
 
-    assert!(workflow.contains("macos-15-intel"));
-    assert!(workflow.contains("x86_64-apple-darwin"));
-    assert!(workflow.contains("macos-14"));
-    assert!(workflow.contains("aarch64-apple-darwin"));
-    assert!(workflow.contains("package-dmg.sh \"$VERSION\" \"${{ matrix.arch }}\""));
-    assert!(workflow.contains("target/${{ matrix.target }}/release"));
+        // 构建与 fork 的包结构校验必须使用同一个通用包目录。
+        assert!(workflow.contains("macos-14"), "{name}");
+        assert!(
+            workflow.contains("x86_64-apple-darwin,aarch64-apple-darwin"),
+            "{name}"
+        );
+        assert!(
+            workflow.contains("build-universal.sh \"$VERSION\""),
+            "{name}"
+        );
+        assert!(
+            workflow.contains("STAGE=\"dist/macos/stage-${VERSION}-universal\""),
+            "{name}"
+        );
+        assert!(!workflow.contains("matrix.arch"), "{name}");
+        assert!(!workflow.contains("macos-15-intel"), "{name}");
+    }
 }
 
 #[test]

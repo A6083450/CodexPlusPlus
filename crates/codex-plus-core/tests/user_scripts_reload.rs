@@ -3,6 +3,28 @@ use serde_json::json;
 use std::{fs, process::Command};
 
 #[test]
+fn global_switch_preserves_individual_script_choices_after_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("user");
+    fs::create_dir_all(&user).unwrap();
+    fs::write(user.join("enabled.js"), "window.enabledScript = true;").unwrap();
+    fs::write(user.join("disabled.js"), "window.disabledScript = true;").unwrap();
+    let config_path = temp.path().join("config.json");
+    let manager = UserScriptManager::new(temp.path().join("builtin"), &user, &config_path);
+    manager.set_script_enabled("user:disabled.js", false).unwrap();
+    manager.set_global_enabled(false).unwrap();
+
+    let reloaded = UserScriptManager::new(temp.path().join("builtin"), &user, &config_path);
+    assert!(!reloaded.load_config().enabled);
+    let config = reloaded.set_global_enabled(true).unwrap();
+    assert!(config.enabled);
+    assert_eq!(config.scripts.get("user:disabled.js"), Some(&false));
+    let bundle = reloaded.build_initial_bundle().unwrap();
+    assert!(bundle.contains("window.enabledScript = true"));
+    assert!(!bundle.contains("window.disabledScript = true"));
+}
+
+#[test]
 fn reload_cleans_resources_and_applies_current_files_and_switches() {
     let temp = tempfile::tempdir().unwrap();
     let user = temp.path().join("user");
@@ -90,10 +112,10 @@ assert.equal(window.active, 0);
 
 // 新页面启动只请求一次当前脚本，且不在子框架执行。
 let requests = 0;
-const fresh = { location: window.location, electronBridge: {},
-  __codexSessionDeleteBridge(path) { assert.equal(path, '/user-scripts/load'); requests++; return Promise.resolve({}); } };
+const fresh = Object.assign(new EventTarget(), { location: window.location, electronBridge: {},
+  __codexSessionDeleteBridge(path) { assert.equal(path, '/user-scripts/load'); requests++; return Promise.resolve({}); } });
 fresh.self = fresh.top = fresh;
-const startup = vm.createContext({window: fresh, document: {readyState: 'complete'}, console});
+const startup = vm.createContext({window: fresh, document: {readyState: 'complete'}, console, Event});
 vm.runInContext(bundles.bootstrap, startup);
 vm.runInContext(bundles.bootstrap, startup);
 assert.equal(requests, 1);

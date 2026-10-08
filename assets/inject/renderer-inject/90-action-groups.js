@@ -513,11 +513,12 @@
     const anchored = document.querySelector(conversationViewContentAnchorSelector);
     if (anchored) return anchored;
     const scroller = conversationViewScrollContainer();
-    const structural = conversationViewCollectThreadWidthBoxes(scroller || document)
+    // 非聊天页也继承线程宽度变量，兜底查找不能扩大到应用根节点。
+    const structural = conversationViewCollectThreadWidthBoxes(scroller)
       // 页脚包裹层（data-thread-scroll-footer）也带同样的宽度工具类，必须排掉。
       .find((el) => !conversationViewIsInsideFooter(el));
     if (structural) return structural;
-    return conversationViewFindByThreadWidthVariable(scroller || document);
+    return conversationViewFindByThreadWidthVariable(scroller);
   }
 
   function conversationViewFindComposerEl() {
@@ -528,14 +529,14 @@
     // 新版作曲器在页脚包裹层内部——页脚自身也是 max-w 盒子，得往里再找一层。
     const insideFooter = conversationViewCollectThreadWidthBoxes(footer)[0];
     if (insideFooter) return insideFooter;
-    // 老版本作曲器不在页脚里；退回整棵文档，但只认页脚缺席时的候选，
+    // 老版本作曲器不在页脚里；退回聊天滚动区域，不能误选设置等非聊天页面，
     // 且排除内容容器（两者宽度工具类同形）。
-    const scroller = conversationViewScrollContainer() || document;
+    const scroller = conversationViewScrollContainer();
     const anywhere = conversationViewCollectThreadWidthBoxes(scroller)
       .find((el) => !conversationViewIsContentCandidate(el));
     if (anywhere) return anywhere;
     if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer);
-    return conversationViewFindByThreadWidthVariable(document, (el) => !conversationViewIsContentCandidate(el));
+    return conversationViewFindByThreadWidthVariable(scroller, (el) => !conversationViewIsContentCandidate(el));
   }
 
   // 内容容器的判定（锚点或全等类名），供作曲器查找排除同形节点用。

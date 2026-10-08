@@ -1,190 +1,56 @@
-  function patchPluginMarketplaceRequestParams(method, params) {
-    if (method === "list-plugins") {
-      if (!params || typeof params !== "object") return params;
-    } else {
-      return params;
-    }
-    const next = { ...params };
-    const requestProfile = pluginMarketplaceRequestProfile(next);
-    const requestCwds = Array.isArray(next.cwds)
-      ? next.cwds.filter((cwd) => typeof cwd === "string" && cwd.trim())
-      : [];
-    if (requestCwds.length > 0) {
-      window.__codexPluginMarketplaceLastCwds = Array.from(new Set(requestCwds));
-    } else if (!requestProfile.remoteOnly && Array.isArray(window.__codexPluginMarketplaceLastCwds) && window.__codexPluginMarketplaceLastCwds.length > 0) {
-      next.cwds = [...window.__codexPluginMarketplaceLastCwds];
-    }
-    const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
-    const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
-      && (!hadMarketplaceKinds || next.marketplaceKinds == null);
-    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
-    if (broadCatalogRequest && !remoteCatalogUnavailable) {
-      sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
-        hadMarketplaceKinds,
-        marketplaceKinds: hadMarketplaceKinds ? next.marketplaceKinds : null,
-        broadCatalogPreserved: true,
-        cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
-        cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
-        remoteCatalogUnavailable,
-        remoteOnly: requestProfile.remoteOnly,
+  // 结构式匹配 `<arr>.filter(p => !<list>.includes(p.name))`：
+  // list 标识符每版都换名，写死会失效（历史写死过 "!t.includes(e.name)"）。
+  // 必须锚定 filter 箭头形态且箭头参数与 `.name` 的宿主同名，
+  // 否则会误伤 bundle 里 `!w4.includes(t.name)` 这类与插件无关的守卫（实测存在）。
+  const codexPluginHiddenFilterSourcePattern =
+    /filter\s*\(\s*([A-Za-z_$][\w$]*)\s*=>\s*!\s*[A-Za-z_$][\w$]*\s*\.includes\s*\(\s*\1\s*\.name\s*\)/;
+
+  function isCodexPluginMarketplaceHiddenFilter(callback, sample, filtered = null) {
+    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
+    if (!sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name))) return false;
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source) return false;
+    if (!codexPluginHiddenFilterSourcePattern.test(source)) return false;
+    return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name)
+      && (Array.isArray(filtered) ? !filtered.includes(marketplace) : !callback(marketplace)));
+  }
+
+  function installPluginBuildFlavorFilterPatch() {
+    if (window.__codexPluginBuildFlavorFilterPatch === codexPluginMarketplaceUnlockVersion) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
+    const originalFilter = Array.prototype.__codexPluginBuildFlavorOriginalFilter || Array.prototype.filter;
+    if (!Array.prototype.__codexPluginBuildFlavorOriginalFilter) {
+      Object.defineProperty(Array.prototype, "__codexPluginBuildFlavorOriginalFilter", {
+        value: originalFilter,
+        configurable: true,
+        writable: true,
       });
-      return next;
     }
-    let nextKinds = Array.isArray(next.marketplaceKinds)
-      ? next.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))
-      : ["local"];
-    if (!requestProfile.remoteOnly && remoteCatalogUnavailable) {
-      nextKinds = nextKinds.filter((kind) => kind !== "created-by-me-remote" && kind !== "shared-with-me");
+    if (Array.prototype.filter.__codexPluginBuildFlavorPatched === codexPluginMarketplaceUnlockVersion) {
+      window.__codexPluginBuildFlavorFilterPatch = codexPluginMarketplaceUnlockVersion;
+      return;
     }
-    if (!requestProfile.remoteOnly) {
-      if (!nextKinds.includes("local")) nextKinds.push("local");
-      if (!nextKinds.includes("vertical")) nextKinds.push("vertical");
-    }
-    next.marketplaceKinds = Array.from(new Set(nextKinds));
-    sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
-      hadMarketplaceKinds,
-      marketplaceKinds: next.marketplaceKinds,
-      broadCatalogPreserved: false,
-      cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
-      cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
-      remoteCatalogUnavailable,
-      remoteOnly: requestProfile.remoteOnly,
-    });
-    return next;
-  }
-
-  function displayNameForPluginMarketplaceName(name, fallback) {
-    if (name === "openai-bundled") return "OpenAI插件1(Codex++)";
-    if (name === "openai-curated") return "OpenAI插件2(Codex++)";
-    if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
-    if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
-    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
-    // 尚未升级的配置。
-    if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
-    return fallback;
-  }
-
-  function patchPluginMarketplaceObject(marketplace) {
-    if (!marketplace || typeof marketplace !== "object" || marketplace.__codexPlusMarketplaceUnlockPatched) return false;
-    const displayName = displayNameForPluginMarketplaceName(marketplace.name, marketplace.displayName || marketplace.title || marketplace.label || marketplace.name);
-    if (!displayName || displayName === marketplace.name) return false;
-    marketplace.displayName = displayName;
-    marketplace.title = displayName;
-    marketplace.label = displayName;
-    if (marketplace.interface && typeof marketplace.interface === "object") {
-      marketplace.interface = {
-        ...marketplace.interface,
-        displayName,
-        name: displayName,
-        title: displayName,
-        label: displayName,
-      };
-    } else {
-      marketplace.interface = { displayName, name: displayName, title: displayName, label: displayName };
-    }
-    marketplace.__codexPlusMarketplaceUnlockPatched = true;
-    return true;
-  }
-
-  function cloneCodexPluginMarketplace(value) {
-    if (!value || typeof value !== "object") return null;
-    try {
-      return JSON.parse(JSON.stringify(value));
-    } catch {
-      return null;
-    }
-  }
-
-  function pluginMarketplacePluginKey(plugin) {
-    if (!plugin || typeof plugin !== "object") return "";
-    return String(plugin.name || plugin.id || plugin.pluginName || "").trim();
-  }
-
-  function normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName) {
-    const cloned = cloneCodexPluginMarketplace(plugin);
-    if (!cloned || typeof cloned !== "object") return null;
-    const name = String(cloned.name || cloned.id || cloned.pluginName || "").trim();
-    if (!name) return null;
-    if (!cloned.name) cloned.name = name;
-    if (!cloned.id) cloned.id = `${name}@${marketplaceName}`;
-    if (!cloned.marketplaceName) cloned.marketplaceName = marketplaceName;
-    if (!cloned.marketplacePath) cloned.marketplacePath = marketplaceName;
-    if (!cloned.interface || typeof cloned.interface !== "object") cloned.interface = {};
-    if (!cloned.interface.displayName) cloned.interface.displayName = name;
-    if (!Array.isArray(cloned.keywords)) cloned.keywords = [];
-    return cloned;
-  }
-
-  function mergePluginMarketplacePlugins(target, source) {
-    if (!target || !source || !Array.isArray(source.plugins)) return 0;
-    if (!Array.isArray(target.plugins)) target.plugins = [];
-    const marketplaceName = restorePluginMarketplaceName(target.name || source.name || "");
-    const existing = new Set(target.plugins.map(pluginMarketplacePluginKey).filter(Boolean));
-    let added = 0;
-    source.plugins.forEach((plugin) => {
-      const key = pluginMarketplacePluginKey(plugin);
-      if (!key || existing.has(key)) return;
-      const cloned = normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName);
-      if (!cloned) return;
-      target.plugins.push(cloned);
-      existing.add(key);
-      added += 1;
-    });
-    return added;
-  }
-
-  function mergeLocalPluginMarketplaces(result) {
-    if (!result || typeof result !== "object" || !Array.isArray(result.marketplaces)) {
-      return { addedMarketplaces: 0, addedPlugins: 0 };
-    }
-    const localMarketplaces = Array.isArray(window.__CODEX_PLUS_PLUGIN_MARKETPLACES__)
-      ? window.__CODEX_PLUS_PLUGIN_MARKETPLACES__
-      : [];
-    if (!localMarketplaces.length) return { addedMarketplaces: 0, addedPlugins: 0 };
-    const byName = new Map();
-    result.marketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (name) byName.set(name, marketplace);
-    });
-    let addedMarketplaces = 0;
-    let addedPlugins = 0;
-    localMarketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (!name) return;
-      const existing = byName.get(name);
-      if (existing) {
-        addedPlugins += mergePluginMarketplacePlugins(existing, marketplace);
-        return;
+    const patchedFilter = function codexPluginBuildFlavorFilterPatch(callback, thisArg) {
+      const filtered = originalFilter.call(this, callback, thisArg);
+      if (filtered.length === this.length) return filtered;
+      if (isCodexPluginBuildFlavorFilter(callback, this, filtered)) {
+        sendCodexPlusDiagnostic("plugin_build_flavor_filter_bypassed", { pluginCount: this.length });
+        return Array.from(this);
       }
-      const cloned = cloneCodexPluginMarketplace(marketplace);
-      if (!cloned) return;
-      cloned.plugins = Array.isArray(cloned.plugins)
-        ? cloned.plugins.map((plugin) => normalizeLocalPluginMarketplacePlugin(plugin, name)).filter(Boolean)
-        : [];
-      result.marketplaces.push(cloned);
-      byName.set(name, cloned);
-      addedMarketplaces += 1;
-      addedPlugins += Array.isArray(cloned.plugins) ? cloned.plugins.length : 0;
-    });
-    if (addedMarketplaces > 0 || addedPlugins > 0) {
-      sendCodexPlusDiagnostic("plugin_marketplace_local_merged", { addedMarketplaces, addedPlugins });
-    }
-    return { addedMarketplaces, addedPlugins };
-  }
-
-  function restorePluginMarketplaceName(name) {
-    if (name === "codex-plus-openai-bundled") return "openai-bundled";
-    if (name === "codex-plus-openai-curated") return "openai-curated";
-    if (name === "codex-plus-openai-primary-runtime") return "openai-primary-runtime";
-    if (name === "codex-plus-openai-api-curated") return "openai-api-curated";
-    if (name === "codex-plus-openai-curated-remote") return "openai-curated-remote";
-    return name;
-  }
-
-  function codexPluginOfficialMarketplaceName(name) {
-    const restored = restorePluginMarketplaceName(name);
-    return restored === "openai-bundled" || restored === "openai-curated" || restored === "openai-primary-runtime" || restored === "openai-api-curated" || restored === "openai-curated-remote";
+      if (isCodexPluginMarketplaceHiddenFilter(callback, this, filtered)) {
+        sendCodexPlusDiagnostic("plugin_marketplace_hidden_filter_bypassed", { marketplaceCount: this.length });
+        return Array.from(this);
+      }
+      if (isCodexPluginFeaturedFilter(callback, this, filtered)) {
+        sendCodexPlusDiagnostic("plugin_featured_filter_bypassed", { featuredCount: this.length });
+        return Array.from(this);
+      }
+      return filtered;
+    };
+    patchedFilter.__codexPluginBuildFlavorPatched = codexPluginMarketplaceUnlockVersion;
+    Array.prototype.filter = patchedFilter;
+    window.__codexPluginBuildFlavorFilterPatch = codexPluginMarketplaceUnlockVersion;
+    sendCodexPlusDiagnostic("plugin_build_flavor_filter_patch_installed", {});
   }
 
   function restorePluginMarketplaceRequestParams(params, method = "") {
@@ -209,14 +75,12 @@
     return next;
   }
 
-  function patchPluginMarketplaceResult(method, result, options = {}) {
+  function patchPluginMarketplaceResult(method, result) {
     if (method !== "list-plugins") return result;
-    const mergeLocal = options.mergeLocal !== false;
     let patchedCount = 0;
     try {
       const pluginMarketplaceCounts = {};
       if (Array.isArray(result?.marketplaces)) {
-        if (mergeLocal) mergeLocalPluginMarketplaces(result);
         result.marketplaces.forEach((marketplace) => {
           if (Array.isArray(marketplace?.plugins)) {
             marketplace.plugins.forEach((plugin) => {
@@ -235,7 +99,6 @@
             remoteMarketplaceName: marketplace?.remoteMarketplaceName || null,
           })),
           pluginMarketplaceCounts,
-          mergeLocal,
         });
       }
       if (patchedCount > 0) {
@@ -277,20 +140,20 @@
     });
   }
 
-  function pluginMarketplaceFallbackResult(mergeLocal = true) {
+  function pluginMarketplaceFallbackResult() {
     return patchPluginMarketplaceResult("list-plugins", {
       marketplaces: [],
       marketplaceLoadErrors: [],
       featuredPluginIds: [],
-    }, { mergeLocal });
+    });
   }
 
   function localPluginMarketplaceFallbackResult() {
-    return pluginMarketplaceFallbackResult(true);
+    return pluginMarketplaceFallbackResult();
   }
 
   function remoteOnlyPluginMarketplaceFallbackResult() {
-    return pluginMarketplaceFallbackResult(false);
+    return pluginMarketplaceFallbackResult();
   }
 
   function patchPluginMarketplaceRequestClient(client) {
@@ -320,7 +183,7 @@
       }
       try {
         const result = await originalSendRequest(method, requestParams, options);
-        return patchPluginMarketplaceResult(requestMethod, result, { mergeLocal: !requestProfile.remoteOnly });
+        return patchPluginMarketplaceResult(requestMethod, result);
       } catch (error) {
         if (requestMethod === "list-plugins" && pluginMarketplaceRemoteAuthError(error)) {
           markPluginMarketplaceRemoteCatalogUnavailable(error);
@@ -447,9 +310,8 @@
             result = fallback;
           }
         } else if (result && typeof result === "object") {
-          const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
-          patchPluginMarketplaceResult("list-plugins", result, patchOptions);
-          patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
+          patchPluginMarketplaceResult("list-plugins", result);
+          patchPluginMarketplaceResult("list-plugins", result.data);
         }
         data.bodyJsonString = JSON.stringify(result);
         return true;
@@ -486,9 +348,8 @@
     }
     const result = message?.result;
     if (!result || typeof result !== "object") return false;
-    const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
-    patchPluginMarketplaceResult("list-plugins", result, patchOptions);
-    patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
+    patchPluginMarketplaceResult("list-plugins", result);
+    patchPluginMarketplaceResult("list-plugins", result.data);
     return true;
   }
 
@@ -501,6 +362,8 @@
       localFallback: localPluginMarketplaceFallbackResult,
       remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
       requestProfile: pluginMarketplaceRequestProfile,
+      isBuildFlavorFilter: isCodexPluginBuildFlavorFilter,
+      isHiddenMarketplaceFilter: isCodexPluginMarketplaceHiddenFilter,
       setCodexAppVersion: (version) => {
         codexPlusBackendSettings.codexAppVersion = String(version || "");
       },
@@ -529,8 +392,7 @@
 
   function installPluginMarketplaceBridgePatch() {
     if (window.__codexPluginMarketplaceBridgePatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     installPluginMarketplaceWindowEventPatchOnly();
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -559,8 +421,7 @@
 
   function installPluginMarketplaceWindowEventPatchOnly() {
     if (window.__codexPluginMarketplaceWindowEventPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     const originalDispatchEvent = window.__codexPluginMarketplaceOriginalDispatchEvent || window.dispatchEvent;
     if (!window.__codexPluginMarketplaceOriginalDispatchEvent) {
       window.__codexPluginMarketplaceOriginalDispatchEvent = originalDispatchEvent;
@@ -632,8 +493,7 @@
 
   function installPluginMarketplaceRequestPatch() {
     if (window.__codexPluginMarketplaceUnlockInstalled === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     if (pluginMarketplaceRequestPatchDisabled) return;
     // 上一轮还没跑完就不要再起一轮:loadAppServerRequestCandidates() 会把所有 app asset 拉一遍,
     // 没有这道去重时 scan 的频率直接变成并发 fetch 的频率。
@@ -675,11 +535,8 @@
     pluginMarketplaceRequestPatchPromise = patch();
   }
 
-  function pluginPatchDisabledInRelayMode() {
-    return !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.launchMode === "relay";
-  }
-
-  function clearPluginPatchArtifacts() {
+  function codexPluginMarketplacePatchEnabled() {
+    return codexPlusBackendSettingsLoaded && !!codexPlusSettings().pluginMarketplaceUnlock;
   }
 
   let cachedSessionRows = [];
@@ -766,6 +623,7 @@
     const href = row.getAttribute("href") || row.querySelector("a")?.getAttribute("href") || "";
     const idMatch = href.match(/(?:session|conversation|thread)[=/:-]([A-Za-z0-9_.-]+)/i) || href.match(/([A-Za-z0-9_-]{8,})$/);
     const codexThreadId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
+    const scopedThread = codexThreadId.match(/^(.+):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
     const fallbackId = row.getAttribute("data-session-id") || row.getAttribute("data-testid") || "";
     const placeholderThreadId = isClientNewThreadId(codexThreadId);
     const hrefId = idMatch && idMatch[1];
@@ -776,6 +634,7 @@
     const sessionId = placeholderThreadId
       ? canonicalHrefId || (!hrefIsTemporary ? reactConversationIdFromRow(row) : "")
       : normalizedCodexThreadUuid(codexThreadId)
+        || (scopedThread ? scopedThread[2] : "")
         || canonicalHrefId
         || codexThreadId
         || hrefId
@@ -783,13 +642,147 @@
     const titleNode = row.querySelector(`${selectors.threadTitle}, .truncate.select-none, .truncate.text-base`);
     const rawTitle = (titleNode?.textContent || (titleNode ? "" : (row.textContent || "Untitled session")));
     const title = (titleNode ? rawTitle : rawTitle.replace(/\s*(导出|删除|移动|移出项目)(\s*(导出|删除|移动|移出项目))*$/g, "")).trim().slice(0, 160);
-    return { session_id: sessionId, title };
+    return { session_id: sessionId, title, host_id: sessionHostIdFromRow(row, sessionId, scopedThread?.[1]) };
+  }
+
+  function sessionHostIdFromRow(row, sessionId, scopedHost) {
+    const hosts = new Set();
+    const add = (value) => {
+      if (typeof value === "string" && value.trim()) hosts.add(value.trim());
+    };
+    add(row.getAttribute("data-app-action-sidebar-thread-host-id"));
+    add(scopedHost);
+    // 仅接受和当前会话 ID 同一份 React props 中的 hostId。
+    // UUID 本身不能说明本地归属，祖先上另一个会话的 hostId 也不能拿来猜。
+    const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+    let fiber = fiberKey ? row[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 16; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps, fiber.pendingProps?.children?.props, fiber.memoizedProps?.children?.props]) {
+        const conversationId = props?.conversationId;
+        if (conversationId === sessionId || (normalizedCodexThreadUuid(conversationId) && normalizedCodexThreadUuid(conversationId) === sessionId)) {
+          add(props.hostId);
+          if (typeof conversationId === "string" && conversationId.startsWith("local:")) add("local");
+        }
+      }
+    }
+    return hosts.size === 1 ? [...hosts][0] : null;
   }
 
   if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
     window.__codexPlusSessionRefTest = {
       fromRow: sessionRefFromRow,
     };
+  }
+
+  // 注册数据跨重注入保留；只存弱引用，不缓存会重建的 sidebar DOM。
+  const codexNativeHostClients = window.__codexPlusNativeHostClients instanceof Map
+    ? window.__codexPlusNativeHostClients
+    : (window.__codexPlusNativeHostClients = new Map());
+  const codexNativeHostClientLimit = 32;
+
+  function bindNativeHostClient(hostId, client, getterBound = false) {
+    if (typeof hostId !== "string" || !hostId.trim() || !client || typeof client.sendRequest !== "function") return false;
+    hostId = hostId.trim();
+    if (typeof client.hostId === "string" && client.hostId !== hostId) return false;
+    if (!getterBound && client.hostId !== hostId) return false;
+    codexNativeHostClients.delete(hostId);
+    codexNativeHostClients.set(hostId, {
+      hostId, getterBound,
+      ref: typeof WeakRef === "function" ? new WeakRef(client) : { deref: () => client },
+    });
+    while (codexNativeHostClients.size > codexNativeHostClientLimit) {
+      codexNativeHostClients.delete(codexNativeHostClients.keys().next().value);
+    }
+    return true;
+  }
+
+  function registerNativeHostClient(client) {
+    try {
+      // 已安装客户端的 RequestClient 构造器把 hostId 绑定到 dispatcher。
+      // 普通 HTTP/IPC duck-type sendRequest 对象不能充当这个删除客户端。
+      if (!Function.prototype.toString.call(client?.constructor).includes(codexAppServerClientCaptureMarker)) return false;
+      return bindNativeHostClient(client.hostId, client);
+    } catch { return false; }
+  }
+
+  function nativeHostClient(hostId) {
+    const entry = codexNativeHostClients.get(hostId);
+    const client = entry?.ref?.deref();
+    // AppScope 的 forHost RPC proxy 每次操作现取，避免跨账号/树重建复用旧 scope。
+    if (entry?.getterBound) return null;
+    if (!client || client.disposed === true || (typeof client.hostId === "string" && client.hostId !== hostId)
+        || (!entry.getterBound && client.hostId !== hostId)) {
+      codexNativeHostClients.delete(hostId);
+      return null;
+    }
+    return client;
+  }
+
+  async function discoverNativeHostClient(ref) {
+    // 原生 DeleteThreadDialog 的实装：getter(scope, hostId).sendRequest("thread/delete", {threadId})。
+    // getter 读取 AppScope 的 manager RPC，再 forHost(hostId)。只接受这个已验证的签名。
+    const module = await loadOptionalCodexAppModule("app-shared-");
+    const values = Object.values(module || {});
+    const getters = values.filter((value) => {
+      if (typeof value !== "function") return false;
+      const source = Function.prototype.toString.call(value);
+      return source.includes("AppServerManager RPC is not connected") && /\.forHost\(/.test(source);
+    });
+    if (!getters.length) return null;
+    for (const row of sessionRows(true)) {
+      const rowRef = sessionRefFromRow(row);
+      if (rowRef.session_id !== ref.session_id || rowRef.host_id !== ref.host_id) continue;
+      const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+      let fiber = fiberKey ? row[fiberKey] : null;
+      for (let depth = 0; fiber && depth < 16; depth += 1, fiber = fiber.return) {
+        let hook = fiber.memoizedState;
+        for (let index = 0; hook && index < 64; index += 1, hook = hook.next) {
+          const scope = hook.memoizedState?.current;
+          if (!scope || typeof scope.get !== "function" || !values.includes(scope.scope)) continue;
+          for (const getter of getters) {
+            try {
+              const client = getter(scope, ref.host_id);
+              if (bindNativeHostClient(ref.host_id, client, true)) return client;
+            } catch {}
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function deletePayloadHost(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const parse = (value) => typeof value === "string" && value.trim() ? value.trim() : null;
+    const snake = parse(payload?.host_id);
+    const camel = parse(payload?.hostId);
+    if (payload && "host_id" in payload && "hostId" in payload && snake !== camel) return null;
+    return snake || camel;
+  }
+
+  async function deleteRemoteSession(ref) {
+    const failed = (message) => ({ status: "failed", session_id: ref.session_id, message, undo_token: null, backup_path: null });
+    if (!ref.host_id || ref.host_id === "local" || !normalizedCodexThreadUuid(ref.session_id)) {
+      return failed("无法安全确定远端会话归属，未进行本地删除");
+    }
+    try {
+      let client = null;
+      try { client = await discoverNativeHostClient(ref); } catch {}
+      client = client || nativeHostClient(ref.host_id);
+      if (!client) return failed("当前未找到对应主机的原生删除客户端；请使用 Codex 原生删除，未进行本地回退");
+      const result = await client.sendRequest("thread/delete", { threadId: ref.session_id });
+      if (result?.error || result?.status === "failed") throw new Error("native deletion failed");
+      // 原生 thread/deleted 通知由同 host manager 清理缓存；这里不碰本地库或伪造 undo。
+      return { status: "server_deleted", session_id: ref.session_id, message: "远端任务及子任务已永久删除，无法撤销", undo_token: null, backup_path: null };
+    } catch {
+      return failed("远端删除结果未确认，未进行本地回退；请先刷新远端状态再决定是否重试");
+    }
+  }
+
+  if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
+    Object.assign(window.__codexPlusSessionRefTest, {
+      registerNativeHostClient, deleteRemoteSession, deletePayloadHost,
+    });
   }
 
   function threadIdBadgeTitleNode(row) {
@@ -827,25 +820,31 @@
     };
   }
 
-  function wrapThreadTitleForBadge(row, titleNode) {
-    const parent = titleNode?.parentElement;
-    if (!parent) return null;
-    if (parent.dataset?.codexThreadIdBadgeWrap === "true") return parent;
-    const wrapper = document.createElement("span");
-    wrapper.dataset.codexThreadIdBadgeWrap = "true";
-    parent.insertBefore(wrapper, titleNode);
-    wrapper.appendChild(titleNode);
-    return wrapper;
+  // issue #2180：过去这里把官方 React 管理的标题节点塞进自建的 wrapper 里
+  // （parent.insertBefore(wrapper, titleNode) + wrapper.appendChild(titleNode)）。
+  // 标题节点一旦被搬走，React 的移除链路就会对着自己记录的旧父节点做
+  // removeChild，抛 `NotFoundError: The node to be removed is not a child of this node`。
+  // 新建对话几分钟后标题从临时名转正式名、侧栏重排时正好命中，页面直接进错误页。
+  // 现在不搬动任何 React 节点：徽章作为 titleNode 的**兄弟**插在它前面，
+  // 行的 flex 布局本来就按顺序排（徽章自带 flex:0 0 auto + margin-right）。
+  function threadIdBadgeInsertBefore(titleNode) {
+    return titleNode?.parentElement || titleNode?.parentNode || null;
   }
 
-  function removeThreadIdBadges(root = document) {
-    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+  // 存量数据清理：旧版留下的 wrapper 需要还原一次，否则标题会一直被困在里面。
+  // 只做还原，不再新建任何 wrapper。
+  function unwrapThreadIdBadgeWrappers(root = document) {
     root.querySelectorAll?.('[data-codex-thread-id-badge-wrap="true"]').forEach((wrapper) => {
       const parent = wrapper.parentElement;
       if (!parent) return;
       while (wrapper.firstChild) parent.insertBefore(wrapper.firstChild, wrapper);
       wrapper.remove();
     });
+  }
+
+  function removeThreadIdBadges(root = document) {
+    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+    unwrapThreadIdBadgeWrappers(root);
     const rows = root.matches?.(selectors.sidebarThread) ? [root] : Array.from(root.querySelectorAll?.(selectors.sidebarThread) || []);
     rows.forEach((row) => {
       delete row.dataset.codexThreadIdBadge;
@@ -866,14 +865,19 @@
       return;
     }
 
-    const wrapper = wrapThreadTitleForBadge(row, titleNode);
-    if (!wrapper) return;
+    // 旧 wrapper 先还原，保证 badge 与 titleNode 在同一个父节点下做兄弟。
+    unwrapThreadIdBadgeWrappers(row);
 
-    let badge = wrapper.querySelector(`.${threadIdBadgeClass}`);
-    if (!badge) {
+    const parent = threadIdBadgeInsertBefore(titleNode);
+    if (!parent) return;
+
+    let badge = row.querySelector(`.${threadIdBadgeClass}`);
+    if (!badge || badge.parentElement !== parent) {
+      badge?.remove();
       badge = document.createElement("span");
       badge.className = threadIdBadgeClass;
-      wrapper.insertBefore(badge, titleNode);
+      // 只插自己的节点，不碰官方节点。
+      parent.insertBefore(badge, titleNode);
     }
 
     badge.dataset.codexThreadIdBadgeVersion = codexThreadIdBadgeVersion;
@@ -1578,6 +1582,11 @@
   }
 
   async function postJson(path, payload) {
+    if (path === "/delete") {
+      const hostId = deletePayloadHost(payload);
+      if (!hostId) return { status: "failed", message: "无法确定会话主机归属，未删除", session_id: payload?.session_id || "" };
+      if (hostId !== "local") return deleteRemoteSession({ ...payload, host_id: hostId });
+    }
     async function fetchBackendStatusFromHelper(path, payload) {
       const controller = typeof AbortController === "function" ? new AbortController() : null;
       const timeoutId = setTimeout(() => controller?.abort(), 2000);
@@ -1735,13 +1744,37 @@
     if (assetPrefix.startsWith("app-initial-")) {
       return typeof module?.qut === "function" ? module.qut : null;
     }
+    if (assetPrefix.startsWith("app-shared-")) {
+      return codexStateCallByCapability(module);
+    }
     return null;
+  }
+
+  // issue #2399：26.930 起 state API 随 AppServerRequestClient 一起搬进 app-shared-*，
+  // 而这批产物每次构建都会重排压缩导出名（旧版是 qut），按字面量取必然落空。
+  // 改成按能力找：函数源码里带 get-global-state / set-global-state 的就是它。
+  function codexStateCallByCapability(module) {
+    const values = module && typeof module === "object" ? Object.values(module) : [];
+    return values.find((candidate) => {
+      if (typeof candidate !== "function") return false;
+      let source = "";
+      try {
+        source = String(candidate);
+      } catch {
+        return false;
+      }
+      return source.includes("get-global-state")
+        && source.includes("set-global-state")
+        && source.includes("params");
+    }) || null;
   }
 
   async function codexStateApi() {
     codexStateApiPromise = codexStateApiPromise || (async () => {
       const errors = [];
-      for (const assetPrefix of ["vscode-api-", "app-initial-"]) {
+      // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
+      // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
+      for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);

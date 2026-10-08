@@ -15,12 +15,65 @@ use codex_plus_core::settings::{
 };
 use codex_plus_core::status::{LaunchStatus, StatusStore};
 use codex_plus_core::user_scripts::UserScriptManager;
-use codex_plus_core::zed_remote::{ZedOpenStrategy, ZedRemoteProject};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::Emitter;
 
 use crate::install::{self, InstallActionResult, InstallOptions};
+
+// 扫描快照仅驻留后端内存，不接受前端指定磁盘路径，不开放给扩展路由。
+static AGENT_CACHE_PLAN: OnceLock<Mutex<Option<codex_plus_core::agent_cache::CachePlan>>> =
+    OnceLock::new();
+
+#[tauri::command]
+pub async fn scan_agent_cache() -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<Value> {
+        let mut slot = AGENT_CACHE_PLAN
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("缓存扫描状态不可用"))?;
+        *slot = None;
+        let plan = codex_plus_core::agent_cache::scan_default()?;
+        let report = serde_json::to_value(&plan.report)?;
+        *slot = Some(plan);
+        Ok(json!({ "report": report }))
+    })
+    .await;
+    match result {
+        Ok(Ok(payload)) => ok("缓存扫描完成。", payload),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("缓存扫描失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn clean_agent_cache(
+    scan_id: String,
+    group_ids: Vec<String>,
+    confirmed: bool,
+) -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<Value> {
+        anyhow::ensure!(confirmed, "尚未确认清理。");
+        let mut slot = AGENT_CACHE_PLAN
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("缓存扫描状态不可用"))?;
+        let plan = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("请先扫描缓存。"))?;
+        plan.validate_selection(&scan_id, &group_ids, SystemTime::now())?;
+        // 持锁消费快照，阻止并行扫描/清理和重复执行。
+        let plan = slot.take().unwrap();
+        let result = plan.clean(&scan_id, &group_ids, confirmed)?;
+        Ok(json!({ "result": result }))
+    })
+    .await;
+    match result {
+        Ok(Ok(payload)) => ok("缓存清理完成。", payload),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("缓存清理失败：{error}"), json!({})),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandResult<T>
@@ -150,36 +203,6 @@ struct ManagedDreamSkinImageBackup {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PluginMarketplaceRepairPayload {
-    pub codex_home: String,
-    pub marketplace_root: Option<String>,
-    pub initialized: bool,
-    pub configured: bool,
-    pub needs_repair: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginMarketplaceStatusPayload {
-    pub codex_home: String,
-    pub marketplace_root: Option<String>,
-    pub config_registered: bool,
-    pub needs_repair: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemotePluginMarketplacePayload {
-    pub codex_home: String,
-    pub marketplace_root: Option<String>,
-    pub config_registered: bool,
-    pub needs_repair: bool,
-    pub plugin_count: usize,
-    pub skill_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImagegenSkillPayload {
     pub codex_home: String,
     pub skill_dir: String,
@@ -251,19 +274,6 @@ pub struct ListLocalSessionsRequest {
     pub offset: usize,
     #[serde(default = "default_local_sessions_page_size")]
     pub limit: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ZedRemoteProjectsPayload {
-    pub projects: Vec<ZedRemoteProject>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ZedRemoteOpenPayload {
-    pub url: String,
-    pub strategy: ZedOpenStrategy,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -420,6 +430,8 @@ pub struct SaveRelayFileRequest {
 pub struct BackfillRelayProfileRequest {
     pub settings: BackendSettings,
     pub profile_id: String,
+    #[serde(default)]
+    pub adopt_provider_identity: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -916,6 +928,21 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Ok(snapshot) => snapshot,
         Err(error) => return failed(&format!("无法确认旧启动器身份，未执行重启：{error}"), json!({})),
     };
+    #[cfg(windows)]
+    let forced_launcher_process_ids = std::cell::Cell::new(Vec::new());
+    // 停止阶段要先等 Codex 进程退出，再等原生浏览器恢复，最后等旧启动器退出，合计
+    // 可能接近 20 秒且全程阻塞。先落一条「正在停止」状态，让「最近启动」在等待期间
+    // 就有反馈，而不是整整 20 秒界面毫无动静（issue #2403）。
+    // 该状态带的是当前时间戳，早于后面返回给前端的 launch_started_at_ms，
+    // 因此等待完成度判定时会被视作 stale，不会误报成最终结果。
+    let _ = StatusStore::default().save_latest(&requested_launch_status_with_phase(
+        &request,
+        "stopping",
+        "正在停止旧实例（Codex 进程 / 原生浏览器 / 旧启动器），最多约 20 秒…",
+        current_timestamp_ms(),
+        "restart_stopping",
+        10,
+    ));
     let native_browser_shutdown = match stop_codex_plus_for_restart(
         || {
             codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
@@ -926,7 +953,23 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         || codex_plus_core::native_browser::wait_for_monitor_shutdown(std::time::Duration::from_secs(10)),
         || {
             #[cfg(windows)]
-            launchers.wait_for_exit(std::time::Duration::from_secs(10))?;
+            {
+                // 超时不再直接失败：先带进程身份校验强制结束残留启动器，否则用户会
+                // 落到「重启失败、没有任何可用实例、还要手工结束进程」的境地。
+                let outcome = launchers.wait_for_exit_or_force(std::time::Duration::from_secs(10));
+                if outcome.still_running {
+                    anyhow::bail!(
+                        "旧启动器强制结束后仍未退出（进程：{}）",
+                        outcome
+                            .forced_process_ids
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                forced_launcher_process_ids.set(outcome.forced_process_ids);
+            }
             #[cfg(not(windows))]
             codex_plus_core::watcher::stop_launcher_processes_and_wait();
             Ok(())
@@ -982,18 +1025,33 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
+    // 本次重启是否强制结束了残留启动器，用于给用户一个明确交代。
+    // 取用 take() 而非 get()：Cell::get 要求 T: Copy，而 Vec<u32> 不是 Copy。
+    // 这里本来也只需要消费一次，take 顺带把 Cell 清空。
+    #[cfg(windows)]
+    let forced_launcher_process_count = forced_launcher_process_ids.take().len();
+    #[cfg(not(windows))]
+    let forced_launcher_process_count = 0usize;
+    let restart_message = if forced_launcher_process_count > 0 {
+        format!(
+            "Codex 已请求重启；旧启动器超时未退出，已强制结束 {forced_launcher_process_count} 个残留实例。"
+        )
+    } else {
+        "Codex 已请求重启，启动任务正在后台运行。".to_string()
+    };
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), |request| {
         spawn_after_provider_guard_release(provider_guard, request, spawn_silent_launcher)
     }) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
-            message: "Codex 已请求重启，启动任务正在后台运行。".to_string(),
+            message: restart_message,
             payload: json!({
                 "debugPort": request.debug_port,
                 "helperPort": request.helper_port,
                 "syncActiveRelay": request.sync_active_relay,
                 "launchStartedAtMs": launch_started_at_ms,
-                "nativeBrowserRestoreFailed": native_browser_restore_failed
+                "nativeBrowserRestoreFailed": native_browser_restore_failed,
+                "forcedStoppedLauncherCount": forced_launcher_process_count
             }),
         },
         Err(error) => {
@@ -1350,6 +1408,25 @@ fn requested_launch_status(
         codex_app: (!request.app_path.trim().is_empty())
             .then(|| request.app_path.trim().to_string()),
         aumid: None,
+        phase: None,
+        progress: None,
+    }
+}
+
+/// 停止阶段的状态：带 `phase`/`progress`，让界面在阻塞的十几秒里有明确中间态
+/// （issue #2403：此前只有 `starting`，看不出是在处理还是卡死）。
+fn requested_launch_status_with_phase(
+    request: &LaunchRequest,
+    status: &str,
+    message: &str,
+    started_at_ms: u64,
+    phase: &str,
+    progress: u8,
+) -> LaunchStatus {
+    LaunchStatus {
+        phase: Some(phase.to_string()),
+        progress: Some(progress.min(100)),
+        ..requested_launch_status(request, status, message, started_at_ms)
     }
 }
 
@@ -2978,79 +3055,6 @@ pub async fn import_session_url(url: String) -> CommandResult<SessionImportPaylo
 }
 
 #[tauri::command]
-pub fn list_zed_remote_projects() -> CommandResult<ZedRemoteProjectsPayload> {
-    let result = codex_plus_core::zed_remote::list_zed_remote_projects_response(&json!({}));
-    if result.get("status").and_then(Value::as_str) == Some("ok") {
-        let projects = serde_json::from_value::<Vec<ZedRemoteProject>>(
-            result
-                .get("projects")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .unwrap_or_default();
-        return ok(
-            &format!("已读取 {} 个 Zed 远程项目。", projects.len()),
-            ZedRemoteProjectsPayload { projects },
-        );
-    }
-    failed(
-        result
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("读取 Zed 远程项目失败。"),
-        ZedRemoteProjectsPayload {
-            projects: Vec::new(),
-        },
-    )
-}
-
-#[tauri::command]
-pub fn open_zed_remote(payload: Value) -> CommandResult<ZedRemoteOpenPayload> {
-    let result = codex_plus_core::zed_remote::open_zed_remote(&payload);
-    let strategy = result
-        .get("strategy")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ZedOpenStrategy>(value).ok())
-        .unwrap_or_default();
-    let url = result
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if result.get("status").and_then(Value::as_str) == Some("ok") {
-        return ok(
-            "已在 Zed Remote 打开项目。",
-            ZedRemoteOpenPayload { url, strategy },
-        );
-    }
-    failed(
-        result
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("无法在 Zed Remote 打开项目。"),
-        ZedRemoteOpenPayload { url, strategy },
-    )
-}
-
-#[tauri::command]
-pub fn forget_zed_remote_project(id: String) -> CommandResult<ZedRemoteProjectsPayload> {
-    let result =
-        codex_plus_core::zed_remote::forget_zed_remote_project_response(&json!({ "id": id }));
-    if result.get("status").and_then(Value::as_str) != Some("ok") {
-        return failed(
-            result
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("移除 Zed 远程项目失败。"),
-            ZedRemoteProjectsPayload {
-                projects: Vec::new(),
-            },
-        );
-    }
-    list_zed_remote_projects()
-}
-
-#[tauri::command]
 pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult<DeleteResult> {
     let session_id = request.session_id.trim();
     if session_id.is_empty() {
@@ -3068,6 +3072,7 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
     let session = SessionRef {
         session_id: session_id.to_string(),
         title: request.title,
+        host_id: Some("local".into()),
     };
     let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
     let mut candidate_paths = Vec::new();
@@ -3590,6 +3595,49 @@ pub async fn apply_session_index_cleanup(
 
 const PROVIDER_SYNC_PROGRESS_EVENT: &str = "provider-sync-progress";
 
+/// issue #240：执行前先给「会动到什么、备份在哪」的只读预览。
+///
+/// 用户报「修复历史会话后会话从列表消失」，所以真实执行前要先看影响范围。
+/// 这条命令不写盘：不开锁、不备份、不改 sqlite，只统计。
+#[tauri::command]
+pub async fn preview_provider_sync() -> CommandResult<Value> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        codex_plus_data::provider_sync::preview_provider_sync(None)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("provider sync preview task failed: {error}"))
+    .and_then(|result| result);
+    match result {
+        Ok(preview) => {
+            let audit = &preview.audit;
+            let message = if audit.catalog_only_sessions > 0 {
+                format!(
+                    "预览：审计发现 {} 条仅存在于会话目录的记录，其中 {} 条仍有当前 rollout、{} 条只能从历史备份恢复、{} 条没有恢复来源。执行时的备份目录：{}",
+                    audit.catalog_only_sessions,
+                    audit.catalog_only_with_current_rollout,
+                    audit.catalog_only_with_backup_database,
+                    audit.catalog_only_without_recovery_source,
+                    preview.backup_root.to_string_lossy(),
+                )
+            } else {
+                format!(
+                    "预览：未发现仅存在于会话目录的记录。执行时的备份目录：{}",
+                    preview.backup_root.to_string_lossy(),
+                )
+            };
+            ok(
+                &message,
+                json!({
+                    "targetProvider": preview.target_provider,
+                    "repairAudit": preview.audit,
+                    "backupRoot": preview.backup_root,
+                }),
+            )
+        }
+        Err(error) => failed(&format!("预览历史会话修复失败：{error}"), json!({})),
+    }
+}
+
 #[tauri::command]
 pub async fn sync_providers_now(
     window: tauri::WebviewWindow,
@@ -3615,9 +3663,12 @@ pub async fn sync_providers_now(
     };
     let target_for_settings = target_provider.clone();
     let home = codex_plus_core::relay_config::default_codex_home_dir();
-    prepare_codex_app_state_before_provider_switch(&home, "manager.sync_providers_now.before");
     let progress_window = window.clone();
+    let before_home = home.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // issue #1341：快照要读整份 app state 文件，属阻塞 IO，必须留在阻塞线程里，
+        // 否则同步一跑起来就把 async 运行时的那条工作线程占住，界面卡死。
+        prepare_codex_app_state_before_provider_switch(&before_home, "manager.sync_providers_now.before");
         codex_plus_data::run_provider_sync_with_target_and_progress(
             None,
             target_provider.as_deref(),
@@ -3700,6 +3751,13 @@ fn provider_sync_command_result(sync: codex_plus_data::ProviderSyncResult) -> Co
             String::new()
         }
     );
+    // issue #240：改动了记录就把备份位置一并告诉用户，出事时能自己找回。
+    let success_message = match sync.backup_dir.as_ref() {
+        Some(path) if sync.changed_session_files > 0 || sync.sqlite_catalog_rows_inserted > 0 => {
+            format!("{success_message} 备份目录：{}", path.to_string_lossy())
+        }
+        _ => success_message,
+    };
     let failure_message = format!("历史会话修复未执行：{}", sync.message);
     let payload = json!({
         "syncStatus": sync.status,
@@ -3902,6 +3960,25 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
 }
 
 #[tauri::command]
+pub fn set_user_scripts_enabled(enabled: bool) -> CommandResult<SettingsPayload> {
+    let manager = default_user_script_manager();
+    match manager.set_global_enabled(enabled) {
+        Ok(_) => settings_payload(
+            if enabled {
+                "本地拓展整体已开启。"
+            } else {
+                "本地拓展整体已关闭。"
+            },
+            "本地拓展整体开关设置失败",
+        ),
+        Err(error) => failed(
+            &format!("本地拓展整体开关设置失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn set_user_script_enabled(key: String, enabled: bool) -> CommandResult<SettingsPayload> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
@@ -3982,10 +4059,10 @@ pub async fn refresh_skill_catalog() -> CommandResult<SkillsPayload> {
 #[tauri::command]
 pub fn list_installed_skills() -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
-    let remote = all_cached_repo_skills();
+    let payload = skills_payload(&manager, &[], Vec::new());
     ok(
         "已加载本地 Skills。",
-        skills_payload(&manager, &remote, Vec::new()),
+        payload,
     )
 }
 
@@ -4143,7 +4220,7 @@ fn skills_payload(
     repo_errors: Vec<String>,
 ) -> SkillsPayload {
     SkillsPayload {
-        skills: manager.merge_entries(remote),
+        skills: if remote.is_empty() { manager.local_inventory() } else { manager.merge_entries(remote) },
         repos: manager.list_repos(),
         backups: manager.list_backups(),
         repo_errors,
@@ -4267,73 +4344,6 @@ pub async fn repair_shortcuts() -> InstallActionResult {
 }
 
 #[tauri::command]
-pub fn plugin_marketplace_status() -> CommandResult<PluginMarketplaceStatusPayload> {
-    let home = codex_plus_core::codex_home::default_codex_home_dir();
-    let status = codex_plus_core::plugin_marketplace::openai_curated_marketplace_status(&home);
-    ok(
-        if status.needs_repair() {
-            "插件市场需要初始化或注册。"
-        } else {
-            "插件市场已可用。"
-        },
-        PluginMarketplaceStatusPayload {
-            codex_home: home.to_string_lossy().to_string(),
-            marketplace_root: status
-                .marketplace_root
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            config_registered: status.config_registered,
-            needs_repair: status.needs_repair(),
-        },
-    )
-}
-
-#[tauri::command]
-pub async fn repair_plugin_marketplace() -> CommandResult<PluginMarketplaceRepairPayload> {
-    let home = codex_plus_core::codex_home::default_codex_home_dir();
-    match codex_plus_core::plugin_marketplace::initialize_openai_curated_marketplace_and_configure(
-        &home,
-    )
-    .await
-    {
-        Ok(result) => ok(
-            if result.initialized {
-                "插件市场已从 openai/plugins 初始化并注册。"
-            } else if result.configured {
-                "已注册本地插件市场。"
-            } else {
-                "插件市场已可用，无需修复。"
-            },
-            PluginMarketplaceRepairPayload {
-                codex_home: home.to_string_lossy().to_string(),
-                marketplace_root:
-                    codex_plus_core::plugin_marketplace::openai_curated_marketplace_status(&home)
-                        .marketplace_root
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string()),
-                initialized: result.initialized,
-                configured: result.configured,
-                needs_repair: false,
-            },
-        ),
-        Err(error) => failed(
-            &format!("插件市场修复失败：{error}"),
-            PluginMarketplaceRepairPayload {
-                codex_home: home.to_string_lossy().to_string(),
-                marketplace_root:
-                    codex_plus_core::plugin_marketplace::openai_curated_marketplace_status(&home)
-                        .marketplace_root
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string()),
-                initialized: false,
-                configured: false,
-                needs_repair: true,
-            },
-        ),
-    }
-}
-
-#[tauri::command]
 pub fn imagegen_skill_status() -> CommandResult<ImagegenSkillStatusPayload> {
     let home = codex_plus_core::codex_home::default_codex_home_dir();
     let status = codex_plus_core::imagegen_skill::bundled_imagegen_skill_status(&home);
@@ -4387,130 +4397,6 @@ pub fn overwrite_imagegen_skill() -> CommandResult<ImagegenSkillPayload> {
 }
 
 #[tauri::command]
-pub fn remote_plugin_marketplace_status() -> CommandResult<RemotePluginMarketplacePayload> {
-    let home = codex_plus_core::codex_home::default_codex_home_dir();
-    let status =
-        codex_plus_core::plugin_marketplace::openai_curated_remote_marketplace_status(&home);
-    let (plugin_count, skill_count) =
-        remote_plugin_marketplace_counts(status.marketplace_root.as_deref());
-    ok(
-        if status.needs_repair() {
-            "官方远端插件缓存需要释放或注册。"
-        } else {
-            "官方远端插件缓存已可用。"
-        },
-        RemotePluginMarketplacePayload {
-            codex_home: home.to_string_lossy().to_string(),
-            marketplace_root: status
-                .marketplace_root
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            config_registered: status.config_registered,
-            needs_repair: status.needs_repair(),
-            plugin_count,
-            skill_count,
-        },
-    )
-}
-
-#[tauri::command]
-pub fn repair_remote_plugin_marketplace() -> CommandResult<RemotePluginMarketplacePayload> {
-    let home = codex_plus_core::codex_home::default_codex_home_dir();
-    match codex_plus_core::plugin_marketplace::ensure_openai_curated_remote_marketplace_available(
-        &home,
-    ) {
-        Ok(result) => {
-            let status =
-                codex_plus_core::plugin_marketplace::openai_curated_remote_marketplace_status(
-                    &home,
-                );
-            let (plugin_count, skill_count) =
-                remote_plugin_marketplace_counts(status.marketplace_root.as_deref());
-            ok(
-                if result.initialized {
-                    "已释放并注册内置官方远端插件缓存。"
-                } else if result.configured {
-                    "已注册官方远端插件缓存。"
-                } else {
-                    "官方远端插件缓存已可用，无需修复。"
-                },
-                RemotePluginMarketplacePayload {
-                    codex_home: home.to_string_lossy().to_string(),
-                    marketplace_root: status
-                        .marketplace_root
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    config_registered: status.config_registered,
-                    needs_repair: status.needs_repair(),
-                    plugin_count,
-                    skill_count,
-                },
-            )
-        }
-        Err(error) => {
-            let status =
-                codex_plus_core::plugin_marketplace::openai_curated_remote_marketplace_status(
-                    &home,
-                );
-            let (plugin_count, skill_count) =
-                remote_plugin_marketplace_counts(status.marketplace_root.as_deref());
-            failed(
-                &format!("官方远端插件缓存修复失败：{error}"),
-                RemotePluginMarketplacePayload {
-                    codex_home: home.to_string_lossy().to_string(),
-                    marketplace_root: status
-                        .marketplace_root
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    config_registered: status.config_registered,
-                    needs_repair: status.needs_repair(),
-                    plugin_count,
-                    skill_count,
-                },
-            )
-        }
-    }
-}
-
-fn remote_plugin_marketplace_counts(root: Option<&Path>) -> (usize, usize) {
-    let Some(root) = root else {
-        return (0, 0);
-    };
-    let marketplace_path = root
-        .join(".agents")
-        .join("plugins")
-        .join("marketplace.json");
-    let plugin_count = std::fs::read_to_string(&marketplace_path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|marketplace| {
-            marketplace
-                .get("plugins")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-        })
-        .unwrap_or(0);
-    let skill_count = count_skill_files(&root.join("plugins")).unwrap_or(0);
-    (plugin_count, skill_count)
-}
-
-fn count_skill_files(root: &Path) -> std::io::Result<usize> {
-    if !root.is_dir() {
-        return Ok(0);
-    }
-    let mut total = 0;
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            total += count_skill_files(&path)?;
-        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-            total += 1;
-        }
-    }
-    Ok(total)
-}
-
-#[tauri::command]
 pub async fn check_update() -> CommandResult<Value> {
     match codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await {
         Ok(update) => {
@@ -4552,8 +4438,33 @@ pub async fn check_update() -> CommandResult<Value> {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tauri::command]
 pub async fn perform_update(
+    app: tauri::AppHandle,
+    release: Option<codex_plus_core::update::Release>,
+) -> CommandResult<Value> {
+    let result = perform_update_inner(release).await;
+    if result.status == "ok" {
+        // 先返回准备结果，再正常退出；独立更新进程等待当前管理工具结束。
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+            app.exit(0);
+        });
+    }
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn perform_update(
+    release: Option<codex_plus_core::update::Release>,
+) -> CommandResult<Value> {
+    perform_update_inner(release).await
+}
+
+// 无需 app runtime 的业务核心；其它平台测试不应引入 Wry 析构依赖。
+async fn perform_update_inner(
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
     let Some(release) = release else {
@@ -4567,17 +4478,23 @@ pub async fn perform_update(
     };
     let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
     match codex_plus_core::update::perform_update(&release, &download_dir).await {
-        Ok(result) => ok(
-            "安装包已下载并启动，请按安装向导完成更新。",
-            json!({
+        Ok(result) => {
+            ok(
+                if cfg!(target_os = "macos") {
+                    "安装包已验证，管理工具将关闭以安装更新，完成后自动重启；失败时保留旧版。"
+                } else {
+                    "安装包已下载并启动，请按安装向导完成更新。"
+                },
+                json!({
                 "currentVersion": codex_plus_core::version::VERSION,
                 "latestVersion": result.release.version,
                 "releaseSummary": result.release.body,
                 "installedPath": result.installer_path.to_string_lossy(),
                 "launched": result.launched,
                 "progress": 100
-            }),
-        ),
+                }),
+            )
+        },
         Err(error) => failed(
             &format!("安装更新失败：{error}"),
             json!({
@@ -4946,6 +4863,35 @@ pub fn write_diagnostic_event(event: String, detail: Value) -> CommandResult<Val
     }
 }
 
+/// 预检 live config.toml 能否被回填流程解析（issue #618）。
+///
+/// core 侧的 `backfill_relay_profile_from_home_with_common` 会先做重复表头/重复
+/// 根键的语义归一化（`normalize_duplicate_toml_text`，公开入口是
+/// `normalize_config_text`），再对归一化结果做整份 TOML 解析。所以这里必须走同一
+/// 条归一化路径，否则会对「只是有重复表头」的文件误报语法错误。
+///
+/// 返回 `Some(错误描述)` 表示回填注定失败：要么读文件失败，要么归一化后仍不是合法
+/// TOML。返回 `None` 表示可以继续回填。文件不存在等同于空文件，属可回填。
+fn live_config_backfill_blocking_error(home: &Path) -> Option<String> {
+    let config_path = home.join("config.toml");
+    let contents = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        // 不存在按空文件处理，与 core 的 read_optional_text 一致。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("读取 {} 失败：{error}", config_path.display())),
+    };
+    // 与 core 的 parse_toml_document 一样先剥掉 BOM。
+    let contents = contents.trim_start_matches('\u{feff}');
+    if contents.trim().is_empty() {
+        return None;
+    }
+    let normalized = codex_plus_core::relay_config::normalize_config_text(contents);
+    match normalized.parse::<toml_edit::DocumentMut>() {
+        Ok(_) => None,
+        Err(error) => Some(format!("{error}")),
+    }
+}
+
 #[tauri::command]
 pub fn backfill_relay_profile_from_live(
     request: BackfillRelayProfileRequest,
@@ -4960,10 +4906,10 @@ pub fn backfill_relay_profile_from_live(
             "activeRelayId": settings.active_relay_id
         }),
     );
-    let Some(profile) = settings
+    let Some(profile_index) = settings
         .relay_profiles
-        .iter_mut()
-        .find(|profile| profile.id == request.profile_id)
+        .iter()
+        .position(|profile| profile.id == request.profile_id)
     else {
         log_manager_event(
             "manager.backfill_relay_profile_from_live.missing_profile",
@@ -4977,12 +4923,60 @@ pub fn backfill_relay_profile_from_live(
         );
     };
 
-    match codex_plus_core::relay_config::backfill_relay_profile_from_home_with_common(
+    // live 的 config.toml 只要有一处手写语法错误，core 的整份 TOML 解析就会失败
+    // （relay_config.rs 的 parse_toml_document），回填因此无法进行。但「回填」只是
+    // 切换前的一次快照采集，不是切换到新供应商的必要条件；让整条切换流程失败会
+    // 把用户卡死在中转态（issue #618）。这里比照同文件 2089 / 2350 两处既有写法，
+    // 在解析失败时降级：保留原 settings 不动、只提示用户先修 config.toml 语法。
+    if let Some(error) = live_config_backfill_blocking_error(&home) {
+        log_manager_event(
+            "manager.backfill_relay_profile_from_live.degraded",
+            json!({
+                "profileId": requested_profile_id,
+                "error": error
+            }),
+        );
+        return degraded(
+            &format!("config.toml 有语法错误，已跳过回填并保留原有配置（切换照常进行）：{error}"),
+            SettingsBackfillPayload { settings },
+        );
+    }
+
+    if !request.adopt_provider_identity {
+        match codex_plus_core::relay_config::live_config_matches_other_profile_in_home(
+            &home, &settings, &request.profile_id,
+        ) {
+            Ok(true) => return ok(
+                "实时配置属于其它已保存供应商，已保留原快照。",
+                SettingsBackfillPayload { settings },
+            ),
+            Ok(false) => {}
+            Err(error) => return failed(
+                &format!("读取实时配置归属失败，已保留原配置：{error}"),
+                SettingsBackfillPayload { settings },
+            ),
+        }
+    }
+
+    // 回填会就地改写 profile 与公共配置。先在副本上跑，成功才提交，避免中途
+    // 失败时留下「改了一半」的 profile 被后续切换流程用上。
+    let mut next_profile = settings.relay_profiles[profile_index].clone();
+    let mut next_context = settings.relay_context_config_contents.clone();
+    match codex_plus_core::relay_config::backfill_relay_profile_from_home_with_common_and_policy(
         &home,
-        profile,
-        &mut settings.relay_context_config_contents,
+        &mut next_profile,
+        &mut next_context,
+        if request.adopt_provider_identity {
+            codex_plus_core::relay_config::RelayBackfillPolicy::AdoptLiveIdentity
+        } else {
+            codex_plus_core::relay_config::RelayBackfillPolicy::PreserveIdentity
+        },
     ) {
         Ok(()) => {
+            let changed = next_profile != settings.relay_profiles[profile_index]
+                || next_context != settings.relay_context_config_contents;
+            settings.relay_profiles[profile_index] = next_profile;
+            settings.relay_context_config_contents = next_context;
             log_manager_event(
                 "manager.backfill_relay_profile_from_live.ok",
                 json!({
@@ -4990,7 +4984,13 @@ pub fn backfill_relay_profile_from_live(
                 }),
             );
             ok(
-                "当前供应商配置已从 live 文件回填。",
+                if !changed {
+                    "实时配置没有需要回填的内容，已保留当前供应商快照。"
+                } else if request.adopt_provider_identity {
+                    "已采纳当前 URL 与认证，并重置旧自定义请求头。"
+                } else {
+                    "当前供应商配置已从 live 文件回填。"
+                },
                 SettingsBackfillPayload { settings },
             )
         }
@@ -5414,20 +5414,20 @@ pub async fn test_stepwise_settings(
             if error.is_empty() {
                 ok(
                     &format!(
-                        "Stepwise 连接正常（{}），测试返回 {item_count} 条建议。",
+                        "下一步建议连接正常（{}），测试返回 {item_count} 条建议。",
                         stepwise_protocol_label(&protocol)
                     ),
                     StepwiseTestPayload { item_count, error },
                 )
             } else {
                 failed(
-                    &format!("Stepwise 测试失败：{error}"),
+                    &format!("下一步建议测试失败：{error}"),
                     StepwiseTestPayload { item_count, error },
                 )
             }
         }
         Err(error) => failed(
-            &format!("Stepwise 测试失败：{error}"),
+            &format!("下一步建议测试失败：{error}"),
             StepwiseTestPayload {
                 item_count: 0,
                 error: error.to_string(),
@@ -6698,6 +6698,16 @@ fn failed<T: Serialize>(message: &str, payload: T) -> CommandResult<T> {
     }
 }
 
+/// 「功能降级但流程可继续」：与 `failed` 区分开，让调用方能继续走后面的步骤，
+/// 同时仍然把原因提示给用户（issue #618 的回填跳过即属此列）。
+fn degraded<T: Serialize>(message: &str, payload: T) -> CommandResult<T> {
+    CommandResult {
+        status: "degraded".to_string(),
+        message: message.to_string(),
+        payload,
+    }
+}
+
 // Hold ownership across stop and config sync, then release before the successor starts.
 fn ensure_provider_sync_is_idle_before_stop() -> Result<codex_plus_data::ProviderSyncLifecycleGuard, String> {
     codex_plus_data::try_acquire_provider_sync_lifecycle_guard(None).map_err(|error| {
@@ -6785,6 +6795,119 @@ mod tests {
         let status = requested_launch_status(&request, "starting", "starting", 1);
 
         assert_eq!(status.codex_app, None);
+    }
+
+    /// issue #2403：停止阶段要给出可判断的中间态（phase + progress），
+    /// 否则十几秒的阻塞等待在界面上和「卡死」无法区分。
+    #[test]
+    fn stopping_status_carries_phase_and_progress() {
+        let request = launch_request(false);
+
+        let status = requested_launch_status_with_phase(
+            &request,
+            "stopping",
+            "正在停止旧实例",
+            12345,
+            "restart_stopping",
+            10,
+        );
+
+        assert_eq!(status.status, "stopping");
+        assert_eq!(status.phase.as_deref(), Some("restart_stopping"));
+        assert_eq!(status.progress, Some(10));
+        // 中间态仍要带上请求标识，供「最近启动」判断是否属于本次重启。
+        assert_eq!(status.started_at_ms, 12345);
+        assert_eq!(status.debug_port, Some(request.debug_port));
+        assert_eq!(status.helper_port, Some(request.helper_port));
+    }
+
+    /// 进度百分比必须收敛到 0~100，越界值不能写进状态文件。
+    #[test]
+    fn stopping_status_clamps_progress() {
+        let request = launch_request(false);
+
+        let status =
+            requested_launch_status_with_phase(&request, "stopping", "msg", 1, "phase", 250);
+
+        assert_eq!(status.progress, Some(100));
+    }
+
+    /// 普通启动状态不带阶段信息，保持既有行为（进度字段为 None）。
+    #[test]
+    fn plain_launch_status_has_no_phase() {
+        let status = requested_launch_status(&launch_request(false), "starting", "starting", 1);
+
+        assert_eq!(status.phase, None);
+        assert_eq!(status.progress, None);
+    }
+
+    /// issue #618：live config.toml 有语法错误时必须被判成「可降级」，而不是让
+    /// 整条供应商切换流程失败。缺失文件等同于空文件，同样不阻断。
+    #[test]
+    fn live_config_backfill_blocking_error_only_flags_unparseable_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+
+        // 文件不存在（全新安装）→ 不阻断。
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 空文件 / 只有空白 → 不阻断。
+        std::fs::write(home.join("config.toml"), "  \n").unwrap();
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 正常 TOML → 不阻断。
+        std::fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://relay.example/v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(live_config_backfill_blocking_error(home), None);
+
+        // 手写坏掉的 TOML（未闭合数组）→ 必须阻断并带上位置信息。
+        std::fs::write(
+            home.join("config.toml"),
+            "model_provider = \"custom\"\nmodel_list = [\"a\", \n",
+        )
+        .unwrap();
+        let error = live_config_backfill_blocking_error(home)
+            .expect("unparseable live config must be reported as blocking");
+        assert!(!error.is_empty(), "error detail must not be empty");
+    }
+
+    /// 重复表头/重复根键属于 core 归一层能修好的形态，预检不能误报成语法错误——
+    /// 否则 #618 的降级路径会吃掉本来能成功的回填。
+    #[test]
+    fn live_config_backfill_blocking_error_tolerates_duplicate_tables_and_root_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "\
+model = \"a\"
+model = \"b\"
+
+[mcp_servers.node_repl]
+command = \"node\"
+
+[mcp_servers.node_repl]
+cwd = \"/tmp\"
+",
+        )
+        .unwrap();
+
+        assert_eq!(live_config_backfill_blocking_error(temp.path()), None);
+    }
+
+    /// 预检必须与 core 的读取路径同样剥掉 BOM，否则带 BOM 的正常文件会被误判。
+    #[test]
+    fn live_config_backfill_blocking_error_ignores_utf8_bom() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "\u{feff}model_provider = \"openai\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(live_config_backfill_blocking_error(temp.path()), None);
     }
 
     #[test]
@@ -6878,6 +7001,43 @@ mod tests {
             encrypted_content_warning: None,
             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
         }
+    }
+
+    #[test]
+    fn provider_sync_success_reports_backup_directory_when_something_changed() {
+        let mut sync = provider_sync_result_for_test(
+            codex_plus_data::ProviderSyncStatus::Synced,
+            "Provider sync complete",
+        );
+        sync.changed_session_files = 3;
+        sync.backup_dir = Some(std::path::PathBuf::from("/tmp/backups/provider-sync/run-1"));
+
+        let result = provider_sync_command_result(sync);
+
+        assert_eq!(result.status, "ok");
+        assert!(
+            result.message.contains("/tmp/backups/provider-sync/run-1"),
+            "有改动时应告知备份目录：{}",
+            result.message
+        );
+    }
+
+    /// 什么都没改的时候不该多出一行备份目录，避免噪音。
+    #[test]
+    fn provider_sync_success_omits_backup_hint_without_changes() {
+        let sync = provider_sync_result_for_test(
+            codex_plus_data::ProviderSyncStatus::Synced,
+            "Provider sync already up to date",
+        );
+
+        let result = provider_sync_command_result(sync);
+
+        assert_eq!(result.status, "ok");
+        assert!(
+            !result.message.contains("备份目录："),
+            "无改动时不该提示备份目录：{}",
+            result.message
+        );
     }
 
     #[test]
@@ -7054,7 +7214,7 @@ base_url = "https://example.invalid/v1"
 
     #[test]
     fn update_install_requires_release_payload() {
-        let result = tauri::async_runtime::block_on(perform_update(None));
+        let result = tauri::async_runtime::block_on(perform_update_inner(None));
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("请先检查更新"));
@@ -7447,6 +7607,7 @@ base_url = "https://example.invalid/v1"
 
     /// 回归（issue #1604）：用户点「重启 Codex++」走的就是这条同步路径。
     /// 现场遗留的 0 字节 auth.json 必须被修复成合法 JSON，否则仍然停在登录页。
+    #[test]
     fn active_aggregate_sync_repairs_empty_auth_json() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("auth.json"), "").unwrap();
@@ -8050,6 +8211,7 @@ enabled = true
     /// 只按 exe 扩展名过滤，拦不住。以前无效路径会原样存进 settings.json，而
     /// launcher 拿到显式无效 --app-path 又不回退自动探测，于是启动永久失败，
     /// 只能手改配置文件才能恢复。
+    #[test]
     fn normalize_settings_before_save_drops_an_invalid_codex_app_path() {
         let codex_plus_own_exe = if cfg!(windows) {
             r"D:\Codex++\codex-plus-plus.exe"
@@ -8083,6 +8245,19 @@ enabled = true
                 .codex_app_path
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn backfill_request_preserves_identity_unless_explicitly_adopted() {
+        let settings = serde_json::to_value(BackendSettings::default()).unwrap();
+        let request: BackfillRelayProfileRequest = serde_json::from_value(json!({
+            "settings": settings, "profileId": "profile-a"
+        })).unwrap();
+        assert!(!request.adopt_provider_identity);
+        let request: BackfillRelayProfileRequest = serde_json::from_value(json!({
+            "settings": settings, "profileId": "profile-a", "adoptProviderIdentity": true
+        })).unwrap();
+        assert!(request.adopt_provider_identity);
     }
 
     #[test]
@@ -8122,25 +8297,16 @@ enabled = true
         );
     }
 
+
     #[test]
-    fn normalize_settings_before_save_preserves_manual_relay_mode_for_pure_api_profile() {
-        let settings = BackendSettings {
-            active_relay_id: "api".to_string(),
-            launch_mode: codex_plus_core::settings::LaunchMode::Relay,
-            relay_profiles: vec![RelayProfile {
-                id: "api".to_string(),
-                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
-                ..RelayProfile::default()
-            }],
-            ..BackendSettings::default()
-        };
-
+    fn normalize_settings_before_save_ignores_legacy_launch_mode_and_preserves_provider_mode() {
+        let settings: BackendSettings = serde_json::from_value(json!({
+            "activeRelayId": "api", "launchMode": "relay",
+            "relayProfiles": [{ "id": "api", "name": "API", "relayMode": "pureApi" }],
+        })).unwrap();
         let normalized = normalize_settings_before_save(settings);
-
-        assert_eq!(
-            normalized.launch_mode,
-            codex_plus_core::settings::LaunchMode::Relay
-        );
+        assert_eq!(normalized.relay_profiles[0].relay_mode, codex_plus_core::settings::RelayMode::PureApi);
+        assert!(serde_json::to_value(&normalized).unwrap().get("launchMode").is_none());
     }
 
     #[test]

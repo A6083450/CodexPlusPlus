@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -9,15 +9,6 @@ use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
 
 use crate::tools::{ToolConfig, ToolId};
-use crate::zed_remote::ZedOpenStrategy;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum LaunchMode {
-    #[default]
-    Patch,
-    Relay,
-}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -456,8 +447,48 @@ impl Default for DreamSkinThemeConfig {
     }
 }
 
+/// 独立的听写服务配置；不复用编码供应商的密钥。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DictationSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub api_key_env: String,
+    pub model: String,
+    pub language: String,
+    pub timeout_seconds: u64,
+}
+
+impl Default for DictationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+            model: "whisper-large-v3-turbo".to_string(),
+            language: String::new(),
+            timeout_seconds: 120,
+        }
+    }
+}
+
+impl DictationSettings {
+    pub fn normalize(&mut self) {
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.api_key_env = self.api_key_env.trim().to_string();
+        self.model = self.model.trim().to_string();
+        self.language = self.language.trim().to_string();
+        self.timeout_seconds = self.timeout_seconds.clamp(1, 600);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
+    #[serde(default)]
+    pub dictation: DictationSettings,
     #[serde(rename = "codexAppPath", default)]
     pub codex_app_path: String,
     #[serde(rename = "codexExtraArgs", default)]
@@ -486,32 +517,15 @@ pub struct BackendSettings {
     pub codex_app_markdown_export: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
-    #[serde(rename = "codexAppForceChineseLocale", default = "default_true")]
-    pub codex_app_force_chinese_locale: bool,
-    #[serde(rename = "codexAppFastStartup", default)]
-    pub codex_app_fast_startup: bool,
-    #[serde(rename = "codexAppProjectMove", default = "default_true")]
-    pub codex_app_project_move: bool,
+
     #[serde(rename = "codexAppThreadIdBadge", default)]
     pub codex_app_thread_id_badge: bool,
     #[serde(rename = "codexAppConversationView", default)]
     pub codex_app_conversation_view: bool,
     #[serde(rename = "codexAppThreadScrollRestore", default = "default_true")]
     pub codex_app_thread_scroll_restore: bool,
-    #[serde(rename = "codexAppZedRemoteOpen", default = "default_true")]
-    pub codex_app_zed_remote_open: bool,
-    #[serde(rename = "zedRemoteOpenStrategy", default)]
-    pub zed_remote_open_strategy: ZedOpenStrategy,
-    #[serde(rename = "zedRemoteProjectRegistryEnabled", default = "default_true")]
-    pub zed_remote_project_registry_enabled: bool,
-    #[serde(rename = "zedRemoteSyncToZedSettings", default)]
-    pub zed_remote_sync_to_zed_settings: bool,
-    #[serde(rename = "codexAppUpstreamWorktreeCreate", default = "default_true")]
-    pub codex_app_upstream_worktree_create: bool,
     #[serde(rename = "codexAppNativeMenuPlacement", default = "default_true")]
     pub codex_app_native_menu_placement: bool,
-    #[serde(rename = "codexAppNativeMenuLocalization", default = "default_true")]
-    pub codex_app_native_menu_localization: bool,
     #[serde(rename = "codexAppNativeBrowserRequireIdentification", default)]
     pub codex_app_native_browser_require_identification: bool,
     #[serde(rename = "codexAppServiceTierControls", default)]
@@ -630,8 +644,6 @@ pub struct BackendSettings {
     pub weixin_connect_sandbox: String,
     #[serde(rename = "weixinConnectCodexPath", default)]
     pub weixin_connect_codex_path: String,
-    #[serde(rename = "launchMode", default)]
-    pub launch_mode: LaunchMode,
     #[serde(rename = "relayBaseUrl", default = "default_relay_base_url")]
     pub relay_base_url: String,
     #[serde(rename = "relayApiKey", default)]
@@ -662,6 +674,7 @@ pub struct BackendSettings {
 impl Default for BackendSettings {
     fn default() -> Self {
         Self {
+            dictation: DictationSettings::default(),
             codex_app_path: String::new(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
@@ -676,19 +689,11 @@ impl Default for BackendSettings {
             codex_app_session_delete: true,
             codex_app_markdown_export: true,
             codex_app_paste_fix: false,
-            codex_app_force_chinese_locale: true,
-            codex_app_fast_startup: false,
-            codex_app_project_move: true,
+
             codex_app_thread_id_badge: false,
             codex_app_conversation_view: false,
             codex_app_thread_scroll_restore: true,
-            codex_app_zed_remote_open: true,
-            zed_remote_open_strategy: ZedOpenStrategy::AddToFocusedWorkspace,
-            zed_remote_project_registry_enabled: true,
-            zed_remote_sync_to_zed_settings: false,
-            codex_app_upstream_worktree_create: true,
             codex_app_native_menu_placement: true,
-            codex_app_native_menu_localization: true,
             codex_app_native_browser_require_identification: false,
             codex_app_service_tier_controls: false,
             codex_app_pet_real_mouse_look: false,
@@ -725,7 +730,6 @@ impl Default for BackendSettings {
             weixin_connect_model: String::new(),
             weixin_connect_sandbox: default_weixin_connect_sandbox(),
             weixin_connect_codex_path: String::new(),
-            launch_mode: LaunchMode::Patch,
             relay_base_url: default_relay_base_url(),
             relay_api_key: String::new(),
             relay_profiles: default_relay_profiles(),
@@ -1276,6 +1280,31 @@ pub struct SettingsStore {
     path: PathBuf,
 }
 
+/// 配置不应承载无界的转义膨胀或文件内容。超限时只报错，不覆盖原文件。
+pub const MAX_SETTINGS_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+fn serialize_settings_bounded(value: &impl serde::Serialize) -> anyhow::Result<Vec<u8>> {
+    struct BoundedWriter(Vec<u8>);
+    impl Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_SETTINGS_FILE_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other(
+                    "settings 超过 16 MiB 上限，原文件未修改",
+                ));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = BoundedWriter(Vec::new());
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    Ok(writer.0)
+}
+
 impl Default for SettingsStore {
     fn default() -> Self {
         Self::new(crate::paths::default_settings_path())
@@ -1288,16 +1317,12 @@ impl SettingsStore {
     }
 
     pub fn load(&self) -> anyhow::Result<BackendSettings> {
-        let contents = match fs::read_to_string(&self.path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let contents = match self.read_contents()? {
+            Some(contents) => contents,
+            None => {
                 let mut settings = BackendSettings::default();
                 settings.sync_tool_shards();
                 return Ok(settings);
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read settings {}", self.path.display()));
             }
         };
 
@@ -1314,16 +1339,12 @@ impl SettingsStore {
         // `save()` 是整体覆盖写，manager 的 save_settings 走的就是这条路。
         // 历史事故：load 失败退回默认设置（只剩 1 条默认 profile），前端把它原样
         // 回写，用户的 N 条供应商配置被清空。这里在写盘前比一次条数。
-        // 读不到旧文件（不存在/解析失败）时按 0 处理，不拦——整体覆盖语义下
-        // 不能因为旧文件读不出来就拒绝写入。
+        // 旧文件超限、不可读或 JSON 损坏时拒绝写入，不能把读取失败当成空配置。
         let existing_profile_count = self
-            .load_raw_object()
-            .ok()
-            .and_then(|raw| {
-                raw.get("relayProfiles")
-                    .and_then(Value::as_array)
-                    .map(|items| items.len())
-            })
+            .load_raw_object()?
+            .get("relayProfiles")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
             .unwrap_or(0);
         if settings.relay_profiles.is_empty() && existing_profile_count > 0 {
             anyhow::bail!(
@@ -1337,10 +1358,40 @@ impl SettingsStore {
                 existing_profile_count
             );
         }
+        // 先限制输入序列化大小，再复制/归一化；转义后的体积也计入预算。
+        serialize_settings_bounded(settings)?;
         let mut settings = normalize_settings_config_sections(settings.clone());
         settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
-        let bytes = serde_json::to_vec_pretty(&settings)?;
+        let bytes = serialize_settings_bounded(&settings)?;
         atomic_write(&self.path, &bytes)
+    }
+
+    /// 切换事务的原始字节快照，保留未识别字段；不得把读错伪装成缺失文件。
+    pub(crate) fn snapshot_raw_bytes(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(contents) = self.read_contents()? else {
+            return Ok(None);
+        };
+        let bytes = contents.into_bytes();
+        validate_settings_snapshot(&bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// 仅供已捕获原始状态的内部事务回滚，不经过普通保存的供应商塌缩判断。
+    /// None 只能来自事务开始时文件不存在的快照，删除本次新建的 settings 文件。
+    pub(crate) fn restore_raw_snapshot(&self, snapshot: Option<&[u8]>) -> anyhow::Result<()> {
+        // 本操作写出的文件也受预算约束；超限的当前文件可能是外部新写入，不能覆盖。
+        self.read_contents()?;
+        match snapshot {
+            Some(bytes) => {
+                validate_settings_snapshot(bytes)?;
+                atomic_write(&self.path, bytes)
+            }
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).context("恢复缺失 settings 文件状态失败"),
+            },
+        }
     }
 
     pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
@@ -1348,13 +1399,29 @@ impl SettingsStore {
             return self.load();
         };
 
+        serialize_settings_bounded(&payload)?;
         let mut raw = self.load_raw_object()?;
         let existing_profile_count = raw
             .get("relayProfiles")
             .and_then(Value::as_array)
             .map(|items| items.len())
             .unwrap_or(0);
+        // 已移除的增强项不再接受更新；顺便清理旧版本留下的开关。
+        for key in [
+            "launchMode",
+            "codexAppFastStartup",
+            "codexAppForceChineseLocale",
+            "codexAppZedRemoteOpen",
+            "zedRemoteOpenStrategy",
+            "zedRemoteProjectRegistryEnabled",
+            "zedRemoteSyncToZedSettings",
+            "codexAppUpstreamWorktreeCreate",
+            "codexAppNativeMenuLocalization",
+        ] {
+            raw.remove(key);
+        }
         merge_known_setting_fields(&mut raw, &payload);
+        serialize_settings_bounded(&raw)?;
         let settings = normalize_settings_config_sections(
             serde_json::from_value(Value::Object(raw.clone())).unwrap_or_default(),
         );
@@ -1383,20 +1450,16 @@ impl SettingsStore {
                 existing_profile_count
             );
         }
-        let bytes = serde_json::to_vec_pretty(&Value::Object(raw))?;
+        let bytes = serialize_settings_bounded(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         Ok(settings)
     }
 
     fn load_raw_object(&self) -> anyhow::Result<Map<String, Value>> {
-        let contents = match fs::read_to_string(&self.path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let contents = match self.read_contents()? {
+            Some(contents) => contents,
+            None => {
                 return Ok(settings_to_object(&BackendSettings::default()));
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read settings {}", self.path.display()));
             }
         };
 
@@ -1414,9 +1477,70 @@ impl SettingsStore {
             }),
         }
     }
+
+    fn read_contents(&self) -> anyhow::Result<Option<String>> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("failed to open settings"),
+        };
+        let reject_large_file = || {
+            anyhow::anyhow!(
+                "settings {} 超过 16 MiB 上限，拒绝读取或覆盖；请保留原文件并先修复",
+                self.path.display()
+            )
+        };
+        let length = file.metadata()?.len();
+        if length > MAX_SETTINGS_FILE_BYTES as u64 {
+            return Err(reject_large_file());
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        // metadata 检查后文件仍可能增长，实际读取也必须有上限。
+        file.take(MAX_SETTINGS_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_SETTINGS_FILE_BYTES {
+            return Err(reject_large_file());
+        }
+        Ok(Some(
+            String::from_utf8(bytes).context("settings 不是有效 UTF-8，原文件未修改")?,
+        ))
+    }
+}
+
+fn validate_settings_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.len() > MAX_SETTINGS_FILE_BYTES {
+        anyhow::bail!("settings 快照超过 16 MiB 上限，原文件未修改");
+    }
+    if !serde_json::from_slice::<Value>(bytes)
+        .context("settings 快照不是有效 JSON，原文件未修改")?
+        .is_object()
+    {
+        anyhow::bail!("settings 快照顶层不是 JSON 对象，原文件未修改");
+    }
+    Ok(())
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    if let Some(patch) = source.get("dictation").and_then(Value::as_object) {
+        let mut dictation = target
+            .get("dictation")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        merge_bool_setting(&mut dictation, patch, "enabled");
+        for key in ["baseUrl", "apiKey", "apiKeyEnv", "model", "language"] {
+            if let Some(value) = patch.get(key).and_then(Value::as_str) {
+                dictation.insert(key.to_string(), Value::String(value.trim().to_string()));
+            }
+        }
+        if let Some(value) = patch.get("timeoutSeconds").and_then(Value::as_u64) {
+            dictation.insert(
+                "timeoutSeconds".to_string(),
+                Value::from(value.clamp(1, 600)),
+            );
+        }
+        target.insert("dictation".to_string(), Value::Object(dictation));
+    }
     target.remove("codexAppPluginAutoExpand");
     target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
@@ -1458,23 +1582,11 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppSessionDelete");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppPasteFix");
-    merge_bool_setting(target, source, "codexAppForceChineseLocale");
-    merge_bool_setting(target, source, "codexAppFastStartup");
-    merge_bool_setting(target, source, "codexAppProjectMove");
+
     merge_bool_setting(target, source, "codexAppThreadIdBadge");
     merge_bool_setting(target, source, "codexAppConversationView");
     merge_bool_setting(target, source, "codexAppThreadScrollRestore");
-    merge_bool_setting(target, source, "codexAppZedRemoteOpen");
-    if let Some(value) = source.get("zedRemoteOpenStrategy") {
-        if serde_json::from_value::<ZedOpenStrategy>(value.clone()).is_ok() {
-            target.insert("zedRemoteOpenStrategy".to_string(), value.clone());
-        }
-    }
-    merge_bool_setting(target, source, "zedRemoteProjectRegistryEnabled");
-    merge_bool_setting(target, source, "zedRemoteSyncToZedSettings");
-    merge_bool_setting(target, source, "codexAppUpstreamWorktreeCreate");
     merge_bool_setting(target, source, "codexAppNativeMenuPlacement");
-    merge_bool_setting(target, source, "codexAppNativeMenuLocalization");
     merge_bool_setting(target, source, "codexAppNativeBrowserRequireIdentification");
     merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
@@ -1644,11 +1756,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     ] {
         if let Some(value) = source.get(key).and_then(Value::as_str) {
             target.insert(key.to_string(), Value::String(value.trim().to_string()));
-        }
-    }
-    if let Some(value) = source.get("launchMode").and_then(Value::as_str) {
-        if matches!(value, "patch" | "relay") {
-            target.insert("launchMode".to_string(), Value::String(value.to_string()));
         }
     }
     if let Some(value) = source.get("relayBaseUrl").and_then(Value::as_str) {
@@ -1870,6 +1977,7 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
 }
 
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
+    settings.dictation.normalize();
     settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
     let (common, extracted_context) =
         split_context_config_sections(&settings.relay_common_config_contents);
@@ -2145,18 +2253,9 @@ mod tests {
         assert!(settings.enhancements_enabled);
         assert!(settings.codex_app_plugin_marketplace_unlock);
         assert!(!settings.codex_app_thread_id_badge);
-        assert!(settings.codex_app_force_chinese_locale);
         assert!(!settings.codex_goals_enabled);
         assert!(settings.codex_app_path.is_empty());
         assert!(settings.codex_extra_args.is_empty());
-        assert_eq!(
-            settings.zed_remote_open_strategy,
-            ZedOpenStrategy::AddToFocusedWorkspace
-        );
-        assert!(settings.zed_remote_project_registry_enabled);
-        assert!(!settings.zed_remote_sync_to_zed_settings);
-        assert!(settings.codex_app_native_menu_localization);
-        assert_eq!(settings.launch_mode, LaunchMode::Patch);
         assert_eq!(settings.relay_base_url, default_relay_base_url());
         assert!(settings.relay_api_key.is_empty());
         assert_eq!(settings.relay_profiles[0].relay_mode, RelayMode::Official);
@@ -2822,12 +2921,90 @@ experimental_bearer_token = "sk-existing""#
         std::fs::write(&path, "{bad json").unwrap();
         let store = SettingsStore::new(path.clone());
 
-        let error = store.load().expect_err("坏 JSON 必须报错，而不是退回默认值");
+        let error = store
+            .load()
+            .expect_err("坏 JSON 必须报错，而不是退回默认值");
         assert!(
             error.to_string().contains("解析失败"),
             "错误信息应指出解析失败，实际是: {error}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{bad json");
+        assert!(store.save(&BackendSettings::default()).is_err());
+        assert!(store.update(json!({"providerSyncEnabled": false})).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{bad json");
+    }
+
+    #[test]
+    fn settings_store_rejects_oversized_existing_file_without_overwriting() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"keep-original").unwrap();
+        file.set_len(MAX_SETTINGS_FILE_BYTES as u64 + 1).unwrap();
+        let store = SettingsStore::new(path.clone());
+
+        for error in [
+            store.load().unwrap_err(),
+            store.save(&BackendSettings::default()).unwrap_err(),
+            store
+                .update(json!({"providerSyncEnabled": false}))
+                .unwrap_err(),
+            store.snapshot_raw_bytes().unwrap_err(),
+            store
+                .restore_raw_snapshot(Some(b"{}".as_slice()))
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("16 MiB"));
+        }
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            MAX_SETTINGS_FILE_BYTES as u64 + 1
+        );
+        let mut prefix = [0_u8; 13];
+        File::open(&path).unwrap().read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"keep-original");
+    }
+
+    #[test]
+    fn settings_store_serialized_size_limit_counts_json_escaping() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let original = r#"{"providerSyncEnabled":false,"customField":"keep"}"#;
+        fs::write(&path, original).unwrap();
+        let store = SettingsStore::new(path.clone());
+        let mut settings = BackendSettings::default();
+        settings.codex_app_image_overlay_path = "\\".repeat(MAX_SETTINGS_FILE_BYTES / 2);
+
+        assert!(
+            store
+                .save(&settings)
+                .unwrap_err()
+                .to_string()
+                .contains("16 MiB")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let error = store
+            .update(json!({
+                "codexAppImageOverlayPath": settings.codex_app_image_overlay_path,
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("16 MiB"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn settings_store_reads_file_at_size_limit() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let mut bytes = b"{\"providerSyncEnabled\":false}".to_vec();
+        bytes.resize(MAX_SETTINGS_FILE_BYTES, b' ');
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            !SettingsStore::new(path)
+                .load()
+                .unwrap()
+                .provider_sync_enabled
+        );
     }
 
     /// 回归：一次把 relayProfiles 传空的 update，不得清掉磁盘上已有的供应商配置。
@@ -3136,7 +3313,6 @@ experimental_bearer_token = "sk-existing""#
             "codexAppSessionDelete": false,
             "codexAppConversationView": true,
             "codexAppThreadIdBadge": true,
-            "codexAppNativeMenuLocalization": false,
             "codexAppServiceTierControls": true,
             "codexAppPetRealMouseLook": true,
             "codexGoalsEnabled": true,
@@ -3153,7 +3329,6 @@ experimental_bearer_token = "sk-existing""#
         assert!(!updated.codex_app_session_delete);
         assert!(updated.codex_app_conversation_view);
         assert!(updated.codex_app_thread_id_badge);
-        assert!(!updated.codex_app_native_menu_localization);
         assert!(updated.codex_app_service_tier_controls);
         assert!(updated.codex_app_pet_real_mouse_look);
         assert!(updated.codex_goals_enabled);
@@ -3358,17 +3533,61 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_update_persists_launch_mode() {
+    fn legacy_launch_mode_is_ignored_without_changing_provider_modes() {
+        for value in [
+            json!("relay"),
+            json!("patch"),
+            json!("obsolete"),
+            json!(true),
+        ] {
+            let mut old = serde_json::to_value(BackendSettings::default()).unwrap();
+            old["launchMode"] = value;
+            old["relayProfiles"][0]["relayMode"] = json!("pureApi");
+            let loaded: BackendSettings = serde_json::from_value(old).unwrap();
+            assert!(loaded.enhancements_enabled);
+            assert_eq!(loaded.relay_profiles[0].relay_mode, RelayMode::PureApi);
+            assert!(
+                serde_json::to_value(loaded)
+                    .unwrap()
+                    .get("launchMode")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn settings_update_cleans_legacy_launch_mode_and_preserves_provider_and_voice_configuration() {
         let dir = temp_dir();
-        let store = SettingsStore::new(dir.join("settings.json"));
-
-        let updated = store.update(json!({"launchMode": "relay"})).unwrap();
-        let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
-                .unwrap();
-
-        assert_eq!(updated.launch_mode, LaunchMode::Relay);
-        assert_eq!(saved["launchMode"], json!("relay"));
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let mut old = serde_json::to_value(BackendSettings::default()).unwrap();
+        old["launchMode"] = json!("relay");
+        old["relayProfiles"][0]["relayMode"] = json!("pureApi");
+        old["dictation"]["enabled"] = json!(true);
+        old["dictation"]["apiKey"] = json!("fake-asr-private-key");
+        old["preservedUnknownSetting"] = json!("keep");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.relay_profiles[0].relay_mode, RelayMode::PureApi);
+        assert!(
+            serde_json::to_value(&loaded)
+                .unwrap()
+                .get("launchMode")
+                .is_none()
+        );
+        let updated = store
+            .update(json!({"launchMode": "relay", "enhancementsEnabled": false}))
+            .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("launchMode").is_none());
+        assert_eq!(saved["preservedUnknownSetting"], "keep");
+        assert_eq!(updated.relay_profiles[0].relay_mode, RelayMode::PureApi);
+        assert!(updated.dictation.enabled);
+        assert_eq!(updated.dictation.api_key, "fake-asr-private-key");
+        assert!(!updated.enhancements_enabled);
+        store.save(&updated).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("launchMode").is_none());
     }
 
     #[test]
@@ -3663,6 +3882,37 @@ experimental_bearer_token = "sk-existing""#
             .remove("standardOpenaiProtocol");
         let profile: RelayProfile = serde_json::from_value(legacy).unwrap();
         assert!(!profile.standard_openai_protocol);
+    }
+
+    #[test]
+    fn raw_settings_snapshot_restores_original_bytes_and_rejects_invalid_input() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let original = b"{\n \"providerSyncEnabled\":false,\"unknownFutureField\":{\"x\":1}}\n";
+        fs::write(&path, original).unwrap();
+        let store = SettingsStore::new(path.clone());
+        let snapshot = store.snapshot_raw_bytes().unwrap();
+        fs::write(&path, b"{\"providerSyncEnabled\":true}").unwrap();
+        store.restore_raw_snapshot(snapshot.as_deref()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        for invalid in [b"{broken".as_slice(), b"[]".as_slice()] {
+            assert!(store.restore_raw_snapshot(Some(invalid)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+        let oversized = vec![b' '; MAX_SETTINGS_FILE_BYTES + 1];
+        assert!(store.restore_raw_snapshot(Some(&oversized)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn raw_settings_snapshot_restores_a_previously_absent_file() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        assert!(store.snapshot_raw_bytes().unwrap().is_none());
+        store.save(&BackendSettings::default()).unwrap();
+        store.restore_raw_snapshot(None).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -3,18 +3,36 @@ name: Release assets
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已发布的版本标签，例如 v1.6.0"
+        required: true
+        type: string
+      platform:
+        description: "需要重新构建的平台"
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 permissions:
   contents: write
 
 jobs:
   windows-installer:
+    if: github.event_name == 'release' || inputs.platform != 'macos'
     runs-on: windows-latest
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -25,7 +43,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install NSIS
-        run: choco install nsis -y
+        shell: pwsh
+        run: |
+          $makensis = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install nsis -y --no-progress
+            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止发布构建。" }
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -48,48 +88,108 @@ jobs:
       - name: Build Windows zip asset
         shell: pwsh
         run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $version = ($env:RELEASE_TAG).TrimStart("v", "V")
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
 
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $version = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
-          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) {
-            $makensis = "makensis"
+          $version = ($env:RELEASE_TAG).TrimStart("v", "V")
+          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) {
+            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
           }
           Push-Location scripts/installer/windows
-          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
-          Pop-Location
+          try {
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload Windows installer
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/windows/*.exe
             dist/windows/*.zip
 
   macos-dmg:
-    name: macOS DMG (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - arch: arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
+    if: github.event_name == 'release' || inputs.platform != 'windows'
+    # 单个通用包（universal）同时支持 Intel 与 Apple Silicon，
+    # 用户不必再自己判断架构，Release 也只多一个而不是两个产物。
+    name: macOS DMG (universal)
+    runs-on: macos-14
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # 用临时钥匙串，不碰 runner 自带的，job 结束随机器销毁。
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+
+          # 少了这一步，codesign 会弹 GUI 授权框然后挂住直到超时。
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          # 必须把新钥匙串加进搜索列表，否则 codesign 找不到身份。
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Install Developer ID intermediate certificate
+        run: |
+          set -euo pipefail
+          # runner 的系统钥匙串里没有 Developer ID G2 中间证书，
+          # 缺了它身份会报 CSSMERR_TP_NOT_TRUSTED、find-identity 一条都列不出来。
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            -k "$RUNNER_TEMP/signing.keychain-db" -T /usr/bin/codesign
+
+          security find-identity -v -p codesigning
+
+      - name: Store notarization credentials
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_P8" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          xcrun notarytool store-credentials "codexplusplus-notary" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID"
+
+          rm -f "$KEY_PATH"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -99,7 +199,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          # 通用包需要两个架构的 std，构建脚本会各编一遍再 lipo 合并。
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -109,31 +210,28 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build binaries
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build macOS DMG
+      - name: Build universal macOS DMG
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_PROFILE: codexplusplus-notary
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          # 发版流水线必须真的签名，凭据缺失就直接失败，不要静默退回 ad-hoc
+          # 然后发一个用户打不开的包出去。
+          if [ -z "${MACOS_SIGNING_IDENTITY:-}" ]; then
+            echo "error: MACOS_SIGNING_IDENTITY 未配置，拒绝产出未签名的发布包" >&2
+            exit 1
+          fi
+          VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#V}"
-          BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
-
-      - name: Build macOS zip asset
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION#V}"
-          mkdir -p dist/macos/app-${{ matrix.arch }}
-          cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
-          cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
-          (cd dist/macos && zip -r "CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.zip" "app-${{ matrix.arch }}")
+          # 构建脚本自己编两个架构、lipo 合并、再调 package-dmg.sh 打包。
+          bash scripts/installer/macos/build-universal.sh "$VERSION"
 
       - name: Verify macOS bundle structure
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION#V}"
-          STAGE="dist/macos/stage-${VERSION}-${{ matrix.arch }}"
+          STAGE="dist/macos/stage-${VERSION}-universal"
           test -L "$STAGE/Applications"
           test "$(readlink "$STAGE/Applications")" = "/Applications"
           for app in "$STAGE/Codex++.app" "$STAGE/Codex++ 管理工具.app"; do
@@ -142,19 +240,36 @@ jobs:
             test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
             plutil -lint "$app/Contents/Info.plist" >/dev/null
             codesign -dv "$app" >/dev/null 2>&1
+            # 真签名时额外校验签名有效性与 Gatekeeper 判定，防止"签了但无效"混过去。
+            if [ -n "${MACOS_SIGNING_IDENTITY:-}" ]; then
+              codesign --verify --deep --strict "$app"
+              spctl --assess --type execute "$app"
+            fi
             echo "verified: $app"
+          done
+
+      - name: Verify DMG notarization
+        # 不加 if 条件：Build macOS DMG 已在凭据缺失时直接失败，
+        # 能走到这里就必然签名并公证过。此前用 if: env.MACOS_SIGNING_IDENTITY
+        # 判断，但该变量只存在于上一步的 env 里，这一步读不到，会永远跳过。
+        run: |
+          set -euo pipefail
+          for dmg in dist/macos/*.dmg; do
+            xcrun stapler validate "$dmg"
+            echo "notarized: $dmg"
           done
 
       - name: Upload macOS DMG
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/macos/*.dmg
-            dist/macos/*.zip
 
   latest-json:
     name: Upload static latest.json
+    # 单平台补跑时另一个 job 会跳过；成功或跳过才允许更新元数据。
+    if: always() && (needs.windows-installer.result == 'success' || needs.windows-installer.result == 'skipped') && (needs.macos-dmg.result == 'success' || needs.macos-dmg.result == 'skipped')
     runs-on: ubuntu-latest
     needs:
       - windows-installer
@@ -164,7 +279,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         shell: bash
         run: |
           set -euo pipefail
@@ -175,6 +290,16 @@ jobs:
           const repo = process.env.REPO;
           const tag = release.tagName || process.env.TAG;
           const version = tag.replace(/^v/i, "");
+          const required = [
+            "CodexPlusPlus-" + version + "-windows-x64-setup.exe",
+            "CodexPlusPlus-" + version + "-windows-x64.zip",
+            "CodexPlusPlus-" + version + "-macos-universal.dmg"
+          ];
+          for (const name of required) {
+            if (!(release.assets || []).some((asset) => asset.name === name && asset.size > 0)) {
+              throw new Error("发布附件缺失或为空：" + name);
+            }
+          }
           const baseUrl = `https://github.com/${repo}/releases/download/${tag}`;
           const assets = (release.assets || [])
             .map((asset) => asset.name)
@@ -193,7 +318,7 @@ jobs:
       - name: Upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           REPO: ${{ github.repository }}
         shell: bash
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"

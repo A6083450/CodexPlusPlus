@@ -15,6 +15,16 @@ const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
 const REMOTE_CONTROL_CREATION_WINDOW_SECS: i64 = 15 * 60;
 const PROVIDER_SYNC_PROGRESS_INTERVAL: usize = 32;
+/// 全局状态的旁路备份名；解析失败时指向它作为恢复来源（issue #2160）。
+const GLOBAL_STATE_BACKUP_FILE_NAME: &str = ".codex-global-state.json.bak";
+/// 删除墓碑（issue #2199）。放在 `tmp/` 下，和同步锁同级：
+/// 既不属于会话数据，也不在 `rollout_files` 的扫描范围（只扫 sessions/archived_sessions）里，
+/// 因此不会被同步逻辑当成会话读取。
+const THREAD_TOMBSTONE_RELATIVE_PATH: &str = "tmp/provider-sync-tombstones.json";
+/// 墓碑只增不删，长期使用会攒条目；超过这个数量就丢掉最旧的一批。
+/// 丢墓碑最坏的结果是「被删的会话可能被重建回来」，与不记墓碑时一致，
+/// 不会损坏任何数据，所以这里的上限不必设得很大。
+const MAX_THREAD_TOMBSTONES: usize = 4096;
 
 /// `create_lock` 先建目录再写 `owner.json`，两步之间被强杀会留下没有 owner 的锁目录。
 /// 该窗口只有几毫秒，因此超过这个时长仍缺 owner 的锁一定是中断残留，可以安全回收；
@@ -273,6 +283,24 @@ pub struct ProviderSyncAudit {
     pub catalog_only_with_current_rollout: usize,
     pub catalog_only_with_backup_database: usize,
     pub catalog_only_without_recovery_source: usize,
+    // issue #982：以下为「可诊断性」字段。用户报「同步一次：0 个会话文件，0 行索引」时，
+    // 光看两个 0 分不清是「目录里本来就没有会话文件」还是「筛选条件把它们全漏掉了」。
+    // 把实际扫描到的范围一并带出来，下一次报障就能自助定位，不必再索要目录结构。
+    /// 本次实际扫描到的 rollout 会话文件数。
+    #[serde(default)]
+    pub scanned_rollout_files: usize,
+    /// 其中 session_meta 的 model_provider 已等于目标、本来就不需要改写的文件数。
+    #[serde(default)]
+    pub rollout_files_already_on_target: usize,
+    /// canonical `threads` 表行数（跨所有候选库去重）。
+    #[serde(default)]
+    pub canonical_thread_rows: usize,
+    /// catalog（用户可见侧边栏索引）行数（跨所有候选库去重）。
+    #[serde(default)]
+    pub catalog_thread_rows: usize,
+    /// 实际存在并被扫描的会话目录名（sessions / archived_sessions）。
+    #[serde(default)]
+    pub scanned_session_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +418,10 @@ struct BulkSessionScan {
     thread_ids_with_user_events: HashSet<String>,
     cwd_by_thread_id: HashMap<String, String>,
     total_rollout_files: usize,
+    /// issue #982：扫描中顺手统计的「已带 session_meta 且 model_provider 已是目标、
+    /// 本来就不需要改写」的文件数。用来把「没有会话文件」和「会话文件都已在目标供应商上」
+    /// 这两种同样表现为 0 改动的情形区分开。
+    rollout_files_already_on_target: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -432,6 +464,8 @@ struct SqliteUpdateCounts {
     cwd_rows: usize,
     catalog_insert_rows: usize,
     catalog_remove_rows: usize,
+    /// issue #240：补建的 canonical `threads` 行数（只增不删）。
+    thread_rows_rebuilt: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +547,7 @@ impl SqliteUpdateCounts {
             + self.cwd_rows
             + self.catalog_insert_rows
             + self.catalog_remove_rows
+            + self.thread_rows_rebuilt
     }
 
     fn add(&mut self, other: Self) {
@@ -526,6 +561,51 @@ impl SqliteUpdateCounts {
 
 pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
     run_provider_sync_with_target(codex_home, None)
+}
+
+/// issue #240：只审计、不写盘的预览。
+///
+/// 用户报「修复历史会话后会话从列表消失」时，需要先看到「这次会动到多少条记录、
+/// 备份在哪」，再决定要不要真的执行。这里刻意不做任何写入：不开锁、不改
+/// rollout、不碰 sqlite，只复用审计函数统计受影响范围。
+///
+/// 返回值里的 `backup_root` 是执行同步时备份会落到的目录，供 UI 提示用户保留。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSyncDryRunPreview {
+    pub target_provider: String,
+    pub audit: ProviderSyncAudit,
+    pub backup_root: PathBuf,
+}
+
+pub fn preview_provider_sync(codex_home: Option<&Path>) -> anyhow::Result<ProviderSyncDryRunPreview> {
+    let home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_codex_home_dir);
+    let config_path = home.join("config.toml");
+    let target_provider =
+        match resolve_provider_sync_target_snapshot(&config_path, None) {
+            Ok(snapshot) => snapshot.target_provider,
+            // 预览不该因为目标解析失败就报错——那会让用户在真正执行前拿不到审计信息。
+            // 退回默认 provider，只影响展示。
+            Err(_) => DEFAULT_PROVIDER.to_string(),
+        };
+    let sqlite_paths = provider_sync_db_paths(&home);
+    let audit = match audit_provider_sync_state(&home, &sqlite_paths) {
+        Ok(audit) => audit,
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "provider_sync.preview_audit_failed",
+                json!({ "error": error.to_string() }),
+            );
+            ProviderSyncAudit::default()
+        }
+    };
+    Ok(ProviderSyncDryRunPreview {
+        target_provider,
+        audit,
+        backup_root: home.join("backups_state/provider-sync"),
+    })
 }
 
 pub fn remote_control_session_recovery_candidate_exists(
@@ -960,7 +1040,12 @@ where
             thread_ids_with_user_events,
             cwd_by_thread_id: scanned_cwd_by_thread_id,
             total_rollout_files,
+            rollout_files_already_on_target: scanned_already_on_target,
         } = scan;
+        // issue #982：扫描已经逐个读过这些文件，这里直接复用其结果，不再二次读盘。
+        let mut repair_audit = repair_audit;
+        repair_audit.scanned_rollout_files = total_rollout_files;
+        repair_audit.rollout_files_already_on_target = scanned_already_on_target;
         let mut subagent_thread_ids = thread_kinds.subagent_thread_ids;
         subagent_thread_ids.extend(scanned_subagent_thread_ids);
         let encrypted_content_warning =
@@ -989,10 +1074,15 @@ where
             count_local_thread_catalog_repairs(&home, &sqlite_paths, &target_provider)?;
         let global_state_update_count =
             count_global_state_updates(&home.join(".codex-global-state.json"))?;
+        // issue #240：待补建的 canonical 行也算「有活要干」，否则会被下面这条
+        // 「already up to date」短路掉，明明缺行却不修。
+        let canonical_rebuild_count =
+            collect_rebuildable_canonical_threads(&home, &sqlite_paths, &target_provider)?.len();
         if rewrite_plans.is_empty()
             && sqlite_update_count == 0
             && catalog_repair_count == 0
             && global_state_update_count == 0
+            && canonical_rebuild_count == 0
         {
             revalidate_provider_sync_target_snapshot(
                 &config_path,
@@ -1070,6 +1160,13 @@ where
                 repair_missing_local_thread_catalog_rows(&home, &sqlite_paths, &target_provider)?;
             sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
             sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
+            // issue #240：canonical `threads` 行缺失时补建。
+            //
+            // 只 INSERT，不 UPDATE、不 DELETE。用户报「修复后会话从列表消失」，
+            // 而列表读的是 canonical `threads`；这里补上「rollout 还在、但
+            // threads 行没了」的会话，属纯增量加固。
+            sqlite_updates.thread_rows_rebuilt =
+                rebuild_missing_canonical_thread_rows(&home, &sqlite_paths, &target_provider)?;
             let updated_workspace_roots =
                 apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
@@ -1161,6 +1258,241 @@ fn report_provider_sync_progress(
     });
 }
 
+/// issue #240：补建缺失的 canonical `threads` 行（只 INSERT）。
+///
+/// 背景：列表读的是 `threads` 表，而同步此前只会删 `local_thread_catalog` 的投影行，
+/// 从不重建 `threads`。一旦某会话只剩投影行，同步后它就彻底从列表消失。
+///
+/// 这里只处理「rollout 文件仍在」的记录——文件不在的会话即使补行也打不开，
+/// 反而制造点开就报错的假条目；那部分留给审计报告，由用户决定怎么处理。
+///
+/// 安全性：按目标库实际存在的列构造 INSERT，且用 `INSERT OR IGNORE`，
+/// 已存在的行不会被覆盖；任何一条失败都不影响其余会话。
+fn rebuild_missing_canonical_thread_rows(
+    home: &Path,
+    sqlite_paths: &[PathBuf],
+    target_provider: &str,
+) -> anyhow::Result<usize> {
+    let mut rebuilt = 0usize;
+    for thread in collect_rebuildable_canonical_threads(home, sqlite_paths, target_provider)? {
+        for path in sqlite_paths {
+            if !path.exists() {
+                continue;
+            }
+            let Ok(mut db) = Connection::open(path) else {
+                continue;
+            };
+            let Ok(columns) = table_columns(&db, "threads") else {
+                continue;
+            };
+            // 只往「本来就该有这些列」的库补行；列不全说明不是目标 schema，跳过。
+            if !columns.contains("id") {
+                continue;
+            }
+            let insert_columns = canonical_thread_insert_columns(&columns);
+            if !insert_columns.contains(&"id") {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", insert_columns.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT OR IGNORE INTO threads ({}) VALUES ({})",
+                insert_columns.join(", "),
+                placeholders
+            );
+            let values = canonical_thread_insert_values(&insert_columns, &thread);
+            let Ok(tx) = db.transaction() else {
+                continue;
+            };
+            match tx.execute(&sql, params_from_iter(values)) {
+                Ok(affected) => {
+                    if tx.commit().is_ok() {
+                        rebuilt += affected;
+                    }
+                }
+                // 单条失败不影响其余会话；缺列/约束不符是预期内情况。
+                Err(_) => continue,
+            }
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// 找出「catalog 里有、canonical `threads` 里没有、但 rollout 还在」的用户会话。
+///
+/// 字段直接取自 `local_thread_catalog` 那一行：catalog-only 的会话在 `threads` 里
+/// 本来就没有行，不能指望从 `threads` 扫描结果里拿到 title/cwd。
+fn collect_rebuildable_canonical_threads(
+    home: &Path,
+    sqlite_paths: &[PathBuf],
+    target_provider: &str,
+) -> anyhow::Result<Vec<CatalogRepairThread>> {
+    let mut canonical_thread_ids = HashSet::new();
+    for path in sqlite_paths {
+        canonical_thread_ids.extend(sqlite_table_ids(path, "threads", "id")?);
+    }
+    let current_rollout_ids = rollout_files(home)?
+        .into_iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(rollout_thread_id_from_filename)
+        })
+        .collect::<HashSet<_>>();
+
+    // issue #2199：这是「删了又回来」的另一条重建入口——catalog 里还有行、canonical
+    // `threads` 里没有、rollout 文件还在，就会被补回列表。已被删除的会话要排除在外。
+    let thread_tombstones = load_thread_tombstones(home);
+    let mut rebuildable = Vec::new();
+    for path in sqlite_paths {
+        for thread in catalog_only_threads_for_path(path, &canonical_thread_ids)? {
+            if thread_tombstones.contains(&thread.id) {
+                continue;
+            }
+            if current_rollout_ids.contains(&thread.id) {
+                rebuildable.push(CatalogRepairThread {
+                    model_provider: target_provider.to_string(),
+                    ..thread
+                });
+            }
+        }
+    }
+    Ok(rebuildable)
+}
+
+/// 读出某个库里「canonical `threads` 表没有对应行」的用户会话。
+fn catalog_only_threads_for_path(
+    path: &Path,
+    canonical_thread_ids: &HashSet<String>,
+) -> anyhow::Result<Vec<CatalogRepairThread>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let db = Connection::open(path)?;
+    let columns = table_columns(&db, "local_thread_catalog")?;
+    if !columns.contains("thread_id") {
+        return Ok(Vec::new());
+    }
+    let source_kind = text_expr(&columns, "source_kind", "'cli'");
+    let source_detail = text_expr(&columns, "source_detail", "''");
+    let thread_source = text_expr(&columns, "thread_source", "NULL");
+    let display_title = text_expr(&columns, "display_title", "''");
+    let cwd = text_expr(&columns, "cwd", "''");
+    let git_branch = text_expr(&columns, "git_branch", "NULL");
+    let created_at = text_expr(&columns, "source_created_at", "0");
+    let updated_at = text_expr(&columns, "source_updated_at", "0");
+    let sql = format!(
+        "SELECT thread_id, {display_title}, {created_at}, {updated_at}, {cwd}, \
+         {source_kind}, {source_detail}, {git_branch}, {thread_source} \
+         FROM local_thread_catalog WHERE COALESCE(thread_id, '') <> ''"
+    );
+    let mut stmt = db.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, f64>(2).unwrap_or_default(),
+            row.get::<_, f64>(3).unwrap_or_default(),
+            row.get::<_, String>(4).unwrap_or_default(),
+            row.get::<_, String>(5).unwrap_or_default(),
+            row.get::<_, String>(6).unwrap_or_default(),
+            row.get::<_, Option<String>>(7).unwrap_or(None),
+            row.get::<_, Option<String>>(8).unwrap_or(None),
+        ))
+    })?;
+    let mut threads = Vec::new();
+    for row in rows {
+        let (
+            thread_id,
+            display_title,
+            source_created_at,
+            source_updated_at,
+            cwd,
+            source_kind,
+            source_detail,
+            git_branch,
+            thread_source,
+        ) = row?;
+        if canonical_thread_ids.contains(&thread_id) {
+            continue;
+        }
+        // 子代理/非根线程不补：它们本来就不该出现在用户会话列表里。
+        if thread_source_marks_non_root(thread_source.as_deref())
+            || source_marks_non_root_agent(&source_kind)
+        {
+            continue;
+        }
+        threads.push(CatalogRepairThread {
+            id: thread_id,
+            display_title,
+            source_created_at,
+            source_updated_at,
+            cwd,
+            source_kind,
+            source_detail,
+            model_provider: String::new(),
+            git_branch,
+            thread_source,
+        });
+    }
+    Ok(threads)
+}
+
+/// 只挑选 `threads` 表真实拥有的列，缺列不补默认值（交给库自身约束）。
+fn canonical_thread_insert_columns(columns: &HashSet<String>) -> Vec<&'static str> {
+    [
+        "id",
+        "model_provider",
+        "archived",
+        "has_user_event",
+        "cwd",
+        "title",
+        "rollout_path",
+        "source",
+        "created_at_ms",
+        "updated_at_ms",
+        "git_branch",
+        "thread_source",
+    ]
+    .into_iter()
+    .filter(|column| columns.contains(*column))
+    .collect()
+}
+
+fn canonical_thread_insert_values(
+    columns: &[&str],
+    thread: &CatalogRepairThread,
+) -> Vec<SqlValue> {
+    columns
+        .iter()
+        .map(|column| match *column {
+            "id" => SqlValue::Text(thread.id.clone()),
+            "model_provider" => SqlValue::Text(thread.model_provider.clone()),
+            // archived 一定是 0：只补「能出现在列表里」的会话。
+            "archived" => SqlValue::Integer(0),
+            "has_user_event" => SqlValue::Integer(1),
+            "cwd" => SqlValue::Text(thread.cwd.clone()),
+            "title" => SqlValue::Text(thread.display_title.clone()),
+            "rollout_path" => SqlValue::Text(thread.source_detail.clone()),
+            "source" => SqlValue::Text(thread.source_kind.clone()),
+            "created_at_ms" => SqlValue::Real(thread.source_created_at * 1000.0),
+            "updated_at_ms" => SqlValue::Real(thread.source_updated_at * 1000.0),
+            "git_branch" => thread
+                .git_branch
+                .clone()
+                .map(SqlValue::Text)
+                .unwrap_or(SqlValue::Null),
+            "thread_source" => thread
+                .thread_source
+                .clone()
+                .map(SqlValue::Text)
+                .unwrap_or(SqlValue::Null),
+            _ => SqlValue::Null,
+        })
+        .collect()
+}
+
 fn result(
     status: ProviderSyncStatus,
     message: impl Into<String>,
@@ -1189,11 +1521,27 @@ fn result(
 }
 
 fn provider_sync_message_with_audit(message: &str, audit: &ProviderSyncAudit) -> String {
+    // issue #982：把本次实际扫描范围附在结果后面。用户看到「0 个会话文件，0 行索引」
+    // 时，这条诊断能直接说明是「目录里没有会话文件」还是「有文件但都已就绪」，
+    // 以及 canonical/catalog 两侧各有多少行可对齐。
+    let scanned_dirs = if audit.scanned_session_dirs.is_empty() {
+        "无（sessions 与 archived_sessions 均不存在）".to_string()
+    } else {
+        audit.scanned_session_dirs.join(", ")
+    };
+    let diagnostics = format!(
+        "本次扫描：会话目录 [{}]，rollout 文件 {} 个（其中 {} 个已指向目标供应商无需改写），canonical 行 {} 条，catalog 行 {} 条。",
+        scanned_dirs,
+        audit.scanned_rollout_files,
+        audit.rollout_files_already_on_target,
+        audit.canonical_thread_rows,
+        audit.catalog_thread_rows,
+    );
     if audit.catalog_only_sessions == 0 {
-        return message.to_string();
+        return format!("{message}；{diagnostics}");
     }
     format!(
-        "{message}；审计发现 {} 条仅存在于本地会话目录的记录，其中 {} 条仍有当前 rollout、{} 条只能在历史数据库备份中找到，{} 条没有可用恢复来源；未自动重建缺失的 canonical 会话。",
+        "{message}；审计发现 {} 条仅存在于本地会话目录的记录，其中 {} 条仍有当前 rollout、{} 条只能在历史数据库备份中找到，{} 条没有可用恢复来源；未自动重建缺失的 canonical 会话（rollout 文件仍在、可安全补建的那些本次已补建）。{diagnostics}",
         audit.catalog_only_sessions,
         audit.catalog_only_with_current_rollout,
         audit.catalog_only_with_backup_database,
@@ -1222,22 +1570,42 @@ fn audit_provider_sync_state(
         catalog_thread_ids.extend(sqlite_user_thread_ids(path)?);
     }
 
-    let catalog_only = catalog_thread_ids
-        .difference(&canonical_thread_ids)
-        .cloned()
-        .collect::<HashSet<_>>();
-    if catalog_only.is_empty() {
-        return Ok(ProviderSyncAudit::default());
-    }
-
-    let current_rollout_ids = rollout_files(home)?
-        .into_iter()
+    // issue #982：可诊断字段无论有没有 catalog-only 记录都要填。
+    // 原来的实现一进 catalog_only.is_empty() 就返回 default()，于是
+    // 「0 个会话文件，0 行索引」背后到底是「目录里真没文件」还是「库是空的」
+    // 全都看不出来，正是报障时卡住的那一步。
+    let scanned_session_dirs = SESSION_DIRS
+        .iter()
+        .filter(|dirname| home.join(dirname).exists())
+        .map(|dirname| (*dirname).to_string())
+        .collect::<Vec<_>>();
+    let rollout_paths = rollout_files(home)?;
+    let scanned_rollout_files = rollout_paths.len();
+    let current_rollout_ids = rollout_paths
+        .iter()
         .filter_map(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(rollout_thread_id_from_filename)
         })
         .collect::<HashSet<_>>();
+    let mut audit = ProviderSyncAudit {
+        scanned_rollout_files,
+        rollout_files_already_on_target: 0,
+        canonical_thread_rows: canonical_thread_ids.len(),
+        catalog_thread_rows: catalog_thread_ids.len(),
+        scanned_session_dirs,
+        ..ProviderSyncAudit::default()
+    };
+
+    let catalog_only = catalog_thread_ids
+        .difference(&canonical_thread_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    if catalog_only.is_empty() {
+        return Ok(audit);
+    }
+
     let backup_database_ids = backup_database_thread_ids(home)?;
     let with_current_rollout = catalog_only
         .iter()
@@ -1250,19 +1618,18 @@ fn audit_provider_sync_state(
         })
         .count();
 
-    Ok(ProviderSyncAudit {
-        catalog_only_sessions: catalog_only.len(),
-        catalog_only_with_current_rollout: with_current_rollout,
-        catalog_only_with_backup_database: with_backup_database,
-        catalog_only_without_recovery_source: catalog_only
-            .iter()
-            .filter(|thread_id| {
-                !current_rollout_ids.contains(*thread_id)
-                    && !backup_database_ids.contains(*thread_id)
-            })
-            .count(),
-    })
+    audit.catalog_only_sessions = catalog_only.len();
+    audit.catalog_only_with_current_rollout = with_current_rollout;
+    audit.catalog_only_with_backup_database = with_backup_database;
+    audit.catalog_only_without_recovery_source = catalog_only
+        .iter()
+        .filter(|thread_id| {
+            !current_rollout_ids.contains(*thread_id) && !backup_database_ids.contains(*thread_id)
+        })
+        .count();
+    Ok(audit)
 }
+
 
 fn backup_database_thread_ids(home: &Path) -> anyhow::Result<HashSet<String>> {
     let root = home.join("backups_state/provider-sync");
@@ -1914,6 +2281,12 @@ fn scan_bulk_session_rewrites(
         }
 
         if session_meta_count > 0 {
+            // issue #982：带 session_meta 且无需改写的文件计入「已就绪」，仅用于诊断。
+            // 放在子任务/显式用户筛选之前，表示「这个文件本身已经是目标供应商」，
+            // 与它是否参与本次改写无关。
+            if !rewrite_needed {
+                scan.rollout_files_already_on_target += 1;
+            }
             let is_explicit_user = thread_id
                 .as_ref()
                 .is_some_and(|id| explicit_user_thread_ids.contains(id));
@@ -2080,18 +2453,56 @@ fn resolve_active_rollout_path(home: &Path, value: &str) -> Option<PathBuf> {
     if raw.is_empty() {
         return None;
     }
-    let path = PathBuf::from(raw);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        home.join(path)
-    };
-    let canonical = fs::canonicalize(path).ok()?;
     let sessions_root = fs::canonicalize(home.join("sessions")).ok()?;
-    if !canonical.starts_with(sessions_root) {
-        return None;
+    // issue #1424：WSL 智能体环境下 codex 写进 threads.rollout_path 的是 WSL 视角
+    // 路径（/mnt/c/...），Windows 侧进程按原样读不到；删除链路早已做视角互转（#162），
+    // 会话修复这里也要回退一次，否则 WSL 下找不到 rollout 直接判定会话不可修复。
+    for candidate in rollout_path_candidates(home, raw) {
+        let Some(canonical) = fs::canonicalize(&candidate).ok() else {
+            continue;
+        };
+        if canonical.starts_with(&sessions_root) {
+            return Some(canonical);
+        }
     }
-    Some(canonical)
+    None
+}
+
+/// 按「原样」再「另一种视角」的顺序给出 rollout 路径候选（issue #1424）。
+fn rollout_path_candidates(home: &Path, raw: &str) -> Vec<PathBuf> {
+    let raw = raw.trim();
+    let mut candidates = Vec::new();
+    for view in [Some(raw.to_string()), crate::storage::wsl_path_alternative(raw)]
+        .into_iter()
+        .flatten()
+    {
+        let path = PathBuf::from(&view);
+        let path = if rollout_view_is_absolute(&view) {
+            path
+        } else {
+            home.join(path)
+        };
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
+/// 判断某一路径视角是否本身就是绝对路径（issue #1424）。
+///
+/// 不能直接用 `Path::is_absolute()`：它按**当前宿主**的规则判断，而这里两种视角
+/// 天生来自不同宿主——`C:/...` 在 Unix 上不算绝对、`/mnt/c/...` 在 Windows 上不算绝对，
+/// 用宿主规则会把另一种视角的绝对路径错误地拼到 home 后面。这两种形式各自在自己的
+/// 环境里都是绝对路径，这里显式认出来。
+fn rollout_view_is_absolute(view: &str) -> bool {
+    let normalized = view.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let drive_prefixed = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/';
+    drive_prefixed || normalized.starts_with("/") || Path::new(view).is_absolute()
 }
 
 fn rollout_provider_state_for_path(
@@ -2681,6 +3092,14 @@ pub fn restore_thread_sidebar_references(
         .unwrap_or_default();
     let mut restored = restore_thread_to_global_state(codex_home, thread_id, snapshot)?;
     restored += restore_thread_to_catalog_dbs(codex_home, thread_id, snapshot)?;
+    // issue #2199：撤销删除要连墓碑一起撤，否则恢复的会话在下次修复时又被跳过。
+    // 放在恢复之后：恢复本身可能失败，但用户的「恢复」意图已经明确表达。
+    if !thread_id.is_empty() {
+        clear_thread_tombstones(
+            codex_home,
+            &HashSet::from([thread_id.strip_prefix("local:").unwrap_or(thread_id).to_string()]),
+        );
+    }
     Ok(restored)
 }
 
@@ -3028,11 +3447,81 @@ fn sidebar_atom_key_matches(key: &str, thread_id: &str) -> bool {
     .any(|candidate| key == candidate)
 }
 
+fn thread_tombstone_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(THREAD_TOMBSTONE_RELATIVE_PATH)
+}
+
+/// 读取删除墓碑（已删除、不得被索引重建复活的 thread id）。
+///
+/// 墓碑只是「修复时跳过」的抑制信息，不是用户数据：文件缺失、读不动、内容坏了都
+/// 一律按「没有墓碑」处理——最坏结果是退回旧行为（可能复活），绝不因为墓碑本身
+/// 让同步或删除失败。见 issue #2199。
+fn load_thread_tombstones(codex_home: &Path) -> HashSet<String> {
+    let path = thread_tombstone_path(codex_home);
+    let Ok(bytes) = fs::read(&path) else {
+        return HashSet::new();
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// 记一条删除墓碑。顺序按写入先后保留，超出上限时丢掉最旧的一批。
+///
+/// 只写不删（除了上限淘汰），因此不存在「墓碑误删会话数据」的路径；
+/// 调用方在删除流程中尽力而为，失败只影响「将来会不会复活」。
+fn record_thread_tombstone(codex_home: &Path, thread_id: &str) -> anyhow::Result<()> {
+    let path = thread_tombstone_path(codex_home);
+    let mut ids = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default();
+    ids.retain(|existing| existing != thread_id);
+    ids.push(thread_id.to_string());
+    if ids.len() > MAX_THREAD_TOMBSTONES {
+        ids.drain(..ids.len() - MAX_THREAD_TOMBSTONES);
+    }
+    codex_plus_core::settings::atomic_write(&path, serde_json::to_vec(&ids)?.as_slice())
+}
+
+/// 撤销删除时清除墓碑，否则刚恢复的会话会被重建流程一直挡在列表外。
+fn clear_thread_tombstones(codex_home: &Path, thread_ids: &HashSet<String>) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    let path = thread_tombstone_path(codex_home);
+    let Ok(bytes) = fs::read(&path) else {
+        return;
+    };
+    let Ok(mut ids) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+        return;
+    };
+    let before = ids.len();
+    ids.retain(|id| !thread_ids.contains(id));
+    if ids.len() == before {
+        return;
+    }
+    // 清墓碑是尽力而为：写失败只意味着恢复出来的会话仍被跳过，不影响已恢复的数据。
+    if let Ok(bytes) = serde_json::to_vec(&ids) {
+        let _ = codex_plus_core::settings::atomic_write(&path, &bytes);
+    }
+}
+
 pub fn remove_thread_sidebar_references(
     codex_home: &Path,
     thread_id: &str,
 ) -> anyhow::Result<ThreadSidebarCleanupResult> {
     let thread_id = thread_id.strip_prefix("local:").unwrap_or(thread_id);
+    // issue #2199：删除侧只有「清理」，重建侧却只看资格判定（rollout 还在就补回来），
+    // 于是删掉的会话切个页面又出现，而归档（archived=1）反而真的消失。
+    // 这里在清理之前先记墓碑：后面两个清理步骤可能失败，但「用户删过这条」这件事
+    // 必须先落盘，否则重建还会把它写回来。墓碑只抑制修复、不删数据。
+    if let Err(error) = record_thread_tombstone(codex_home, thread_id) {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "provider_sync.thread_tombstone_write_failed",
+            json!({ "thread_id": thread_id, "error": error.to_string() }),
+        );
+    }
     let (global_state_entries_removed, global_error) =
         match remove_thread_from_global_state(codex_home, thread_id) {
             Ok(count) => (count, None),
@@ -3200,11 +3689,15 @@ pub fn restore_session_index_entries(codex_home: &Path, lines: &[String]) -> any
         next_text.push('\n');
     }
     let mut appended = 0usize;
+    // issue #2199：撤销删除等于用户明确要求「把这条会话还给我」，所以这里要撤掉墓碑，
+    // 否则恢复出来的会话会被重建路径一直挡在列表外——撤销看起来没生效。
+    let mut restored_ids = HashSet::new();
     for line in lines {
         if let Some(candidate) = known_session_index_candidate(line) {
             if existing_ids.contains(&candidate.id) {
                 continue;
             }
+            restored_ids.insert(candidate.id.clone());
             existing_ids.insert(candidate.id);
         }
         next_text.push_str(line);
@@ -3218,6 +3711,7 @@ pub fn restore_session_index_entries(codex_home: &Path, lines: &[String]) -> any
         return Ok(0);
     }
     codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
+    clear_thread_tombstones(codex_home, &restored_ids);
     Ok(appended)
 }
 
@@ -4656,6 +5150,9 @@ fn collect_catalog_repair_plan(
     thread_ids: Option<&HashSet<String>>,
 ) -> anyhow::Result<CatalogRepairPlan> {
     let spawned_child_ids = collect_spawned_child_thread_ids(paths)?;
+    // issue #2199：删除墓碑一票否决。这里的候选会被 INSERT 回 `local_thread_catalog`，
+    // 是「删了又回来」的重建入口之一。
+    let thread_tombstones = load_thread_tombstones(home);
     let mut catalog_non_root_thread_ids =
         collect_catalog_marked_non_root_thread_ids(paths, &spawned_child_ids)?;
     let mut observed_threads = HashMap::new();
@@ -4717,6 +5214,12 @@ fn collect_catalog_repair_plan(
         })?;
         for item in rows {
             let (thread, archived, has_user_content, agent_role) = item?;
+            // issue #2199：删除墓碑一票否决。资格判定里没有「删除态」，只要 rollout
+            // 文件还在（删除失败或被别的进程锁住等），被删的会话就会被重新插回 catalog。
+            // 在收集阶段直接跳过，它既不进候选，也不会在下面的择优平局里胜出。
+            if thread_tombstones.contains(&thread.id) {
+                continue;
+            }
             let marked_non_user = columns.contains("thread_source")
                 && thread.thread_source.as_deref().is_some_and(|value| {
                     let value = value.trim();
@@ -4798,12 +5301,11 @@ fn catalog_rollout_path_exists(home: &Path, rollout_path: &str) -> bool {
     if rollout_path.is_empty() {
         return true;
     }
-    let rollout_path = Path::new(rollout_path);
-    if rollout_path.is_absolute() {
-        rollout_path.is_file()
-    } else {
-        home.join(rollout_path).is_file()
-    }
+    // issue #1424：WSL 视角路径（/mnt/c/...）在 Windows 侧读不到，放宽到两种视角
+    // 都试一次。这个函数只影响「会话是否算可修复候选」，放宽只会多保留记录、不删数据。
+    rollout_path_candidates(home, rollout_path)
+        .iter()
+        .any(|path| path.is_file())
 }
 
 fn collect_spawned_child_thread_ids(paths: &[PathBuf]) -> anyhow::Result<HashSet<String>> {
@@ -5218,11 +5720,25 @@ fn global_state_snapshot(path: &Path) -> anyhow::Result<(Vec<u8>, Map<String, Va
         }
         Err(error) => return Err(error.into()),
     };
-    let state = serde_json::from_slice::<Value>(&bytes)?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    // issue #2160：这里是全局状态唯一的解析入口。以前的报错是 serde_json 原文
+    // （空文件/被截断时报 `expected value at line 1 column 1`），既没说是哪个文件，
+    // 也没说怎么办；这条消息会一路冒到启动器的提示里，用户完全无法自助。
+    // 这里统一补上文件路径和可操作建议。
+    let state = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "{error}。{} 不是合法 JSON（常见于文件为空或被写了一半）；\
+             请把它改成合法 JSON——内容丢了可以从同目录的 {} 恢复",
+            global_state_path_display(path),
+            GLOBAL_STATE_BACKUP_FILE_NAME,
+        )
+    })?;
+    let state = state.as_object().cloned().unwrap_or_default();
     Ok((bytes, state))
+}
+
+/// 报错里的路径按用户视角展示，Windows 上 `C:\Users\x\.codex\...` 太具体也容易看错。
+fn global_state_path_display(path: &Path) -> String {
+    format!("{}（全局状态文件）", path.display())
 }
 
 fn load_global_state(path: &Path) -> anyhow::Result<Map<String, Value>> {
@@ -5510,6 +6026,63 @@ mod provider_target_snapshot_tests {
         write_config(&home, "relay-alpha", &["relay-alpha", "relay-beta"]);
 
         revalidate_provider_sync_target_snapshot(&config_path, None, &snapshot).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod provider_sync_preview_tests {
+    use super::*;
+
+    fn write_config(home: &Path, current: &str) {
+        fs::write(
+            home.join("config.toml"),
+            format!("model_provider = {current:?}\n\n[model_providers.{current:?}]\nname = {current:?}\n"),
+        )
+        .unwrap();
+    }
+
+    /// issue #240：预览必须只读——不建锁、不建备份、不改任何文件。
+    #[test]
+    fn preview_is_read_only_and_reports_backup_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+
+        let preview = preview_provider_sync(Some(&home)).unwrap();
+
+        assert_eq!(preview.target_provider, "relay-alpha");
+        assert_eq!(preview.backup_root, home.join("backups_state/provider-sync"));
+        assert!(!home.join("tmp/provider-sync.lock").exists(), "预览不该建锁");
+        assert!(!preview.backup_root.exists(), "预览不该建备份目录");
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+    }
+
+    /// home 不存在时预览也不该报错中断，只是审计为空。
+    #[test]
+    fn preview_survives_missing_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join(".codex");
+
+        let preview = preview_provider_sync(Some(&missing)).unwrap();
+
+        assert_eq!(preview.audit, ProviderSyncAudit::default());
+        assert!(!missing.join("tmp/provider-sync.lock").exists());
+    }
+
+    /// 没有 catalog-only 记录时，审计字段全为 0，不该虚报。
+    #[test]
+    fn preview_audit_is_zero_without_catalog_only_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+
+        let preview = preview_provider_sync(Some(&home)).unwrap();
+
+        assert_eq!(preview.audit.catalog_only_sessions, 0);
+        assert_eq!(preview.audit.catalog_only_without_recovery_source, 0);
     }
 }
 
@@ -6052,5 +6625,851 @@ mod rollout_scan_performance_tests {
         let end = source[start..].find("fn report_scan_progress(").unwrap() + start;
         assert!(!source[start..end].contains("serde_json::from_str::<Value>(record_line)"));
         assert!(source[start..end].contains("BufReader::with_capacity(64 * 1024, file)"));
+    }
+}
+
+#[cfg(test)]
+mod rollout_path_view_tests {
+    use super::*;
+
+    /// issue #1424：rollout 路径要按「原样 → 另一种视角」给候选，两种都试。
+    #[test]
+    fn candidates_include_both_path_views() {
+        let home = Path::new("/home/user/.codex");
+
+        let windows = rollout_path_candidates(home, "C:/work/sessions/rollout-a.jsonl");
+        assert_eq!(
+            windows,
+            vec![
+                PathBuf::from("C:/work/sessions/rollout-a.jsonl"),
+                PathBuf::from("/mnt/c/work/sessions/rollout-a.jsonl"),
+            ],
+            "Windows 视角应同时给出 WSL 互转视角"
+        );
+
+        let wsl = rollout_path_candidates(home, "/mnt/d/work/sessions/rollout-b.jsonl");
+        assert_eq!(
+            wsl,
+            vec![
+                PathBuf::from("/mnt/d/work/sessions/rollout-b.jsonl"),
+                PathBuf::from("D:/work/sessions/rollout-b.jsonl"),
+            ],
+            "WSL 视角应同时给出 Windows 互转视角"
+        );
+    }
+
+    /// 相对路径按 home 拼接，仍然给出两种视角。
+    #[test]
+    fn candidates_join_relative_paths_to_home() {
+        let home = Path::new("/home/user/.codex");
+
+        assert_eq!(
+            rollout_path_candidates(home, "sessions/rollout-c.jsonl"),
+            vec![PathBuf::from("/home/user/.codex/sessions/rollout-c.jsonl")],
+            "普通相对路径只有一种视角"
+        );
+    }
+
+    /// 不属于两种视角形式的路径不会凭空造出第二个候选。
+    #[test]
+    fn candidates_keep_single_view_for_plain_paths() {
+        let home = Path::new("/home/user/.codex");
+
+        assert_eq!(
+            rollout_path_candidates(home, "/var/data/rollout-d.jsonl"),
+            vec![PathBuf::from("/var/data/rollout-d.jsonl")]
+        );
+    }
+
+    /// 空 rollout_path 视为「没有 rollout 信息」，按旧行为返回 true（不算缺失候选）。
+    #[test]
+    fn catalog_rollout_path_exists_treats_blank_as_present() {
+        let home = Path::new("/home/user/.codex");
+
+        assert!(catalog_rollout_path_exists(home, ""));
+        assert!(catalog_rollout_path_exists(home, "   "));
+    }
+
+    /// 两侧视角都确实不存在时才返回 false。
+    #[test]
+    fn catalog_rollout_path_exists_is_false_when_both_views_missing() {
+        let home = Path::new("/definitely/not/here");
+
+        assert!(!catalog_rollout_path_exists(
+            home,
+            "/mnt/z/nonexistent/rollout-e.jsonl"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod canonical_thread_rebuild_tests {
+    use super::*;
+
+    fn write_config(home: &Path, provider: &str) {
+        fs::write(
+            home.join("config.toml"),
+            format!("model_provider = {provider:?}\n\n[model_providers.{provider:?}]\nname = {provider:?}\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_rollout(home: &Path, thread_id: &str, provider: &str) {
+        let path = home
+            .join("sessions/2026/10/03")
+            .join(format!("rollout-2026-10-03T10-00-00-{thread_id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "model_provider": provider,
+                        "cwd": "C:/workspace"
+                    }
+                }),
+                json!({"type": "event_msg", "payload": {"type": "user_message"}}),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn create_catalog_db(path: &Path, rows: &[(&str, &str)]) {
+        let db = Connection::open(path).unwrap();
+        db.execute(
+            "CREATE TABLE local_thread_catalog (
+                host_id TEXT NOT NULL, thread_id TEXT NOT NULL, display_title TEXT NOT NULL,
+                source_created_at REAL NOT NULL, source_updated_at REAL NOT NULL,
+                cwd TEXT NOT NULL, source_kind TEXT NOT NULL, source_detail TEXT,
+                model_provider TEXT NOT NULL, git_branch TEXT,
+                observation_sequence INTEGER NOT NULL,
+                missing_candidate INTEGER NOT NULL DEFAULT 0, thread_source TEXT,
+                PRIMARY KEY (host_id, thread_id))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE local_thread_catalog_hosts (host_id TEXT PRIMARY KEY, host_kind TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO local_thread_catalog_hosts VALUES ('local', 'local')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE local_thread_catalog_metadata (id INTEGER PRIMARY KEY, catalog_revision INTEGER NOT NULL DEFAULT 0)",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO local_thread_catalog_metadata VALUES (1, 0)", [])
+            .unwrap();
+        for (index, (thread_id, provider)) in rows.iter().enumerate() {
+            db.execute(
+                "INSERT INTO local_thread_catalog
+                 (host_id, thread_id, display_title, source_created_at, source_updated_at,
+                  cwd, source_kind, source_detail, model_provider, git_branch,
+                  observation_sequence, missing_candidate, thread_source)
+                 VALUES ('local', ?1, ?1, 100.0, 200.0, 'C:/workspace', 'vscode', ?2,
+                         ?3, 'main', ?4, 0, 'user')",
+                rusqlite::params![thread_id, "", provider, index as i64 + 1],
+            )
+            .unwrap();
+        }
+    }
+
+    fn create_threads_db(path: &Path, ids: &[&str]) {
+        let db = Connection::open(path).unwrap();
+        db.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER,
+                has_user_event INTEGER, cwd TEXT, title TEXT, rollout_path TEXT,
+                source TEXT, created_at_ms INTEGER, updated_at_ms INTEGER,
+                git_branch TEXT, thread_source TEXT)",
+            [],
+        )
+        .unwrap();
+        for id in ids {
+            db.execute(
+                "INSERT INTO threads VALUES (?1, 'custom', 0, 1, 'C:/workspace', ?1, '', 'vscode', 100, 200, 'main', 'user')",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn thread_ids(path: &Path) -> Vec<String> {
+        let db = Connection::open(path).unwrap();
+        let mut ids = db
+            .prepare("SELECT id FROM threads ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids.sort();
+        ids
+    }
+
+    /// rollout 还在、canonical 行缺失时补建，只增不删。
+    #[test]
+    fn rebuilds_canonical_row_when_rollout_still_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+        write_rollout(&home, thread_id, "custom");
+        create_threads_db(&home.join("state_5.sqlite"), &["already-there"]);
+        create_catalog_db(&sqlite_dir.join("codex-dev.db"), &[(thread_id, "custom")]);
+
+        let state_db = home.join("state_5.sqlite");
+        let before = thread_ids(&state_db);
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(
+            result.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            result.message
+        );
+        let after = thread_ids(&state_db);
+        assert!(after.contains(&thread_id.to_string()), "缺失的 canonical 行应被补建：{after:?}");
+        for id in before {
+            assert!(after.contains(&id), "原有行不允许丢失：{id}");
+        }
+    }
+
+    /// rollout 文件已不在时**不**补建——否则会造出点开就报错的假条目。
+    #[test]
+    fn does_not_rebuild_without_a_rollout_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21f9";
+        create_threads_db(&home.join("state_5.sqlite"), &[]);
+        create_catalog_db(&sqlite_dir.join("codex-dev.db"), &[(thread_id, "custom")]);
+
+        let state_db = home.join("state_5.sqlite");
+        let _ = run_provider_sync(Some(&home));
+
+        assert!(
+            !thread_ids(&state_db).contains(&thread_id.to_string()),
+            "没有 rollout 的会话不该被补成 canonical 行"
+        );
+    }
+
+    /// issue #240 关键回归：别的计数器都为 0、只有「缺 canonical 行」这一件事可做时，
+    /// 不能被「already up to date」提前 return 掉。
+    #[test]
+    fn rebuilds_even_when_nothing_else_needs_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21fb";
+        write_rollout(&home, thread_id, "custom");
+        // threads 表存在但一行都没有：没有 provider/cwd 可改，也没有可删的 catalog 行。
+        create_threads_db(&home.join("state_5.sqlite"), &[]);
+        create_catalog_db(&sqlite_dir.join("codex-dev.db"), &[(thread_id, "custom")]);
+
+        let state_db = home.join("state_5.sqlite");
+        let result = run_provider_sync(Some(&home));
+
+        assert!(
+            thread_ids(&state_db).contains(&thread_id.to_string()),
+            "只有补建这一件事可做时也必须执行（消息：{}）",
+            result.message
+        );
+    }
+
+    /// 已有 canonical 行的会话不会被补建成第二行（INSERT OR IGNORE + 只补缺失 id）。
+    #[test]
+    fn does_not_duplicate_existing_canonical_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21fa";
+        write_rollout(&home, thread_id, "custom");
+        let state_db = home.join("state_5.sqlite");
+        create_threads_db(&state_db, &[thread_id]);
+        // 该会话同时出现在 catalog 里，但它已有 canonical 行，不该被补。
+        create_catalog_db(&sqlite_dir.join("codex-dev.db"), &[(thread_id, "custom")]);
+
+        let _ = run_provider_sync(Some(&home));
+
+        let count: i64 = Connection::open(&state_db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "已存在的 canonical 行不能被补成两行");
+    }
+}
+
+#[cfg(test)]
+mod sync_diagnostics_tests {
+    use super::*;
+
+    fn write_config(home: &Path, provider: &str) {
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "model_provider = {provider:?}\n\n[model_providers.{provider:?}]\nname = {provider:?}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_rollout(home: &Path, dirname: &str, thread_id: &str, provider: &str) {
+        let path = home
+            .join(dirname)
+            .join("2026/10/03")
+            .join(format!("rollout-2026-10-03T10-00-00-{thread_id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "model_provider": provider,
+                        "cwd": "C:/workspace"
+                    }
+                }),
+                json!({"type": "event_msg", "payload": {"type": "user_message"}}),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// issue #982：没有任何会话文件时，结果必须说明「扫了哪些目录、扫到 0 个文件」，
+    /// 而不是只留一句无从下手的「0 个会话文件，0 行索引」。
+    #[test]
+    fn audit_reports_scanned_scope_without_rollout_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(result.repair_audit.scanned_rollout_files, 0);
+        assert!(result.repair_audit.scanned_session_dirs.is_empty());
+        assert!(
+            result.message.contains("均不存在"),
+            "{}",
+            result.message
+        );
+        assert!(
+            result.message.contains("rollout 文件 0 个"),
+            "{}",
+            result.message
+        );
+    }
+
+    /// issue #982：会话文件已全部指向目标供应商时，诊断要能区分出
+    /// 「有文件、但都已就绪」，不能和「一个文件都没有」显示成同一个样子。
+    #[test]
+    fn audit_distinguishes_already_on_target_from_no_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+        // 两个文件都已指向 relay-alpha，同步后无任何改写计划。
+        write_rollout(
+            &home,
+            "sessions",
+            "01a01579-4a5d-77e3-89c0-751d38ad21fa",
+            "relay-alpha",
+        );
+        write_rollout(
+            &home,
+            "archived_sessions",
+            "01a01579-4a5d-77e3-89c0-751d38ad21fb",
+            "relay-alpha",
+        );
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(result.repair_audit.scanned_rollout_files, 2);
+        assert_eq!(result.repair_audit.rollout_files_already_on_target, 2);
+        assert_eq!(result.changed_session_files, 0);
+        assert_eq!(
+            result.repair_audit.scanned_session_dirs,
+            vec!["sessions".to_string(), "archived_sessions".to_string()]
+        );
+        assert!(
+            result.message.contains("其中 2 个已指向目标供应商无需改写"),
+            "{}",
+            result.message
+        );
+    }
+
+    /// 诊断字段只统计「已就绪」的文件，真正需要改写的不该被算进去。
+    #[test]
+    fn already_on_target_count_excludes_files_needing_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+        write_rollout(
+            &home,
+            "sessions",
+            "01a01579-4a5d-77e3-89c0-751d38ad21fa",
+            "relay-alpha",
+        );
+        write_rollout(
+            &home,
+            "sessions",
+            "01a01579-4a5d-77e3-89c0-751d38ad21fb",
+            "openai",
+        );
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(result.repair_audit.scanned_rollout_files, 2);
+        assert_eq!(
+            result.repair_audit.rollout_files_already_on_target, 1,
+            "只有已是 relay-alpha 的那个文件算已就绪"
+        );
+        assert_eq!(result.changed_session_files, 1);
+    }
+
+    /// 全局状态解析失败时，给用户的必须是「哪个文件 + 怎么修」，
+    /// 不能只说一句 serde_json 的 `expected value at line 1 column 1`（issue #2160）。
+    #[test]
+    fn global_state_parse_failure_names_the_file_and_the_fix() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+        let global_state = home.join(".codex-global-state.json");
+        assert_eq!(global_state.file_name().unwrap(), ".codex-global-state.json");
+        // 空文件 / 被截断的文件：解析报 `expected value at line 1 column 1`。
+        fs::write(&global_state, "{\"projectless-thread-ids\": [").unwrap();
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(result.status, ProviderSyncStatus::Skipped);
+        assert!(
+            result.message.contains(".codex-global-state.json"),
+            "报错要带上文件路径：{}",
+            result.message
+        );
+        assert!(
+            result.message.contains("合法 JSON"),
+            "报错要给出可操作建议：{}",
+            result.message
+        );
+        assert!(
+            result.message.contains(GLOBAL_STATE_BACKUP_FILE_NAME),
+            "报错要指出恢复来源：{}",
+            result.message
+        );
+    }
+
+    /// 预览同样要带上诊断字段，且依旧只读。
+    #[test]
+    fn preview_reports_scanned_scope_and_stays_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+        write_rollout(
+            &home,
+            "sessions",
+            "01a01579-4a5d-77e3-89c0-751d38ad21fa",
+            "openai",
+        );
+
+        let preview = preview_provider_sync(Some(&home)).unwrap();
+
+        assert_eq!(preview.audit.scanned_rollout_files, 1);
+        assert_eq!(preview.audit.scanned_session_dirs, vec!["sessions".to_string()]);
+        assert!(!home.join("tmp/provider-sync.lock").exists());
+        assert!(!preview.backup_root.exists());
+    }
+
+    /// 可诊断字段不改变既有审计语义：没有 catalog-only 记录时仍然全为 0。
+    #[test]
+    fn diagnostics_do_not_change_catalog_only_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+        write_config(&home, "relay-alpha");
+
+        let result = run_provider_sync(Some(&home));
+
+        assert_eq!(result.repair_audit.catalog_only_sessions, 0);
+        assert_eq!(result.repair_audit.catalog_only_without_recovery_source, 0);
+    }
+}
+
+#[cfg(test)]
+mod deleted_thread_tombstone_tests {
+    use super::*;
+
+    fn write_config(home: &Path, provider: &str) {
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "model_provider = {provider:?}\n\n[model_providers.{provider:?}]\nname = {provider:?}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_rollout(home: &Path, thread_id: &str, provider: &str) {
+        let path = home
+            .join("sessions/2026/10/03")
+            .join(format!("rollout-2026-10-03T10-00-00-{thread_id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "model_provider": provider,
+                        "cwd": "C:/workspace"
+                    }
+                }),
+                json!({"type": "event_msg", "payload": {"type": "user_message"}}),
+            ),
+        )
+        .unwrap();
+    }
+
+    fn create_catalog_db(path: &Path, thread_id: &str, provider: &str) {
+        let db = Connection::open(path).unwrap();
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS local_thread_catalog (
+                host_id TEXT NOT NULL, thread_id TEXT NOT NULL, display_title TEXT NOT NULL,
+                source_created_at REAL NOT NULL, source_updated_at REAL NOT NULL,
+                cwd TEXT NOT NULL, source_kind TEXT NOT NULL, source_detail TEXT,
+                model_provider TEXT NOT NULL, git_branch TEXT,
+                observation_sequence INTEGER NOT NULL,
+                missing_candidate INTEGER NOT NULL DEFAULT 0, thread_source TEXT,
+                PRIMARY KEY (host_id, thread_id))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS local_thread_catalog_hosts (host_id TEXT PRIMARY KEY, host_kind TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO local_thread_catalog_hosts VALUES ('local', 'local')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS local_thread_catalog_metadata (id INTEGER PRIMARY KEY, catalog_revision INTEGER NOT NULL DEFAULT 0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO local_thread_catalog_metadata VALUES (1, 0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO local_thread_catalog
+             (host_id, thread_id, display_title, source_created_at, source_updated_at,
+              cwd, source_kind, source_detail, model_provider, git_branch,
+              observation_sequence, missing_candidate, thread_source)
+             VALUES ('local', ?1, ?1, 100.0, 200.0, 'C:/workspace', 'vscode', ?2,
+                     'custom', 'main', 1, 0, 'user')",
+            rusqlite::params![thread_id, ""],
+        )
+        .unwrap();
+    }
+
+    fn create_threads_db(path: &Path) {
+        let db = Connection::open(path).unwrap();
+        db.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER,
+                has_user_event INTEGER, cwd TEXT, title TEXT, rollout_path TEXT,
+                source TEXT, created_at_ms INTEGER, updated_at_ms INTEGER,
+                git_branch TEXT, thread_source TEXT)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn canonical_ids(path: &Path) -> Vec<String> {
+        let db = Connection::open(path).unwrap();
+        let mut ids = db
+            .prepare("SELECT id FROM threads ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids.sort();
+        ids
+    }
+
+    fn catalog_ids(path: &Path) -> Vec<String> {
+        let db = Connection::open(path).unwrap();
+        let mut ids = db
+            .prepare("SELECT thread_id FROM local_thread_catalog ORDER BY thread_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids.sort();
+        ids
+    }
+
+    /// issue #2199 回归：删掉的会话不会在下一次索引重建里复活。
+    ///
+    /// 复现的是真实场景：删除只清掉了 catalog 行，canonical `threads` 行（或 rollout
+    /// 文件）因为删除失败/被占用留了下来。旧实现的重建只看资格判定（rollout 还在
+    /// 就算数），于是重建把行写回去，用户切页面回来会话又出现了。
+    #[test]
+    fn deleted_thread_stays_deleted_after_a_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+        write_rollout(&home, thread_id, "custom");
+        let state_db = home.join("state_5.sqlite");
+        let catalog_db = sqlite_dir.join("codex-dev.db");
+        create_threads_db(&state_db);
+        create_catalog_db(&catalog_db, thread_id, "custom");
+
+        // 第一次同步把 canonical 行补齐（既有行为，不该被墓碑影响）。
+        let first = run_provider_sync(Some(&home));
+        assert_eq!(
+            first.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            first.message
+        );
+        assert!(
+            canonical_ids(&state_db).contains(&thread_id.to_string()),
+            "同步正常补建 canonical 行"
+        );
+
+        // 用户删除：清侧边栏引用（catalog 行），并记下墓碑。
+        remove_thread_sidebar_references(&home, thread_id).unwrap();
+        assert!(
+            !catalog_ids(&catalog_db).contains(&thread_id.to_string()),
+            "删除应清掉 catalog 行"
+        );
+
+        // 重建：rollout 文件仍在，canonical 行仍在，旧实现会把它写回列表。
+        let second = run_provider_sync(Some(&home));
+        assert_eq!(
+            second.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            second.message
+        );
+
+        // catalog 行不能回来（这是列表的数据源），canonical 行也不该被当成待补建项。
+        assert!(
+            !catalog_ids(&catalog_db).contains(&thread_id.to_string()),
+            "被删的会话不得被重建回 catalog：{:?}",
+            second.message
+        );
+        assert!(
+            collect_rebuildable_canonical_threads(&home, &[state_db.clone()], "custom")
+                .unwrap()
+                .iter()
+                .all(|thread| thread.id != thread_id),
+            "被删的会话不得进入 canonical 补建候选"
+        );
+
+        // 再同步一次，反复重建也不会复活。
+        let third = run_provider_sync(Some(&home));
+        assert_eq!(
+            third.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            third.message
+        );
+        assert!(
+            !catalog_ids(&catalog_db).contains(&thread_id.to_string()),
+            "反复重建依然不得复活被删的会话"
+        );
+    }
+
+    /// 墓碑只挡「被删的那条」：同一批同步里的其他会话照常补建。
+    #[test]
+    fn tombstone_only_suppresses_the_deleted_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let deleted = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+        let kept = "01a01579-4a5d-77e3-89c0-751d38ad21f9";
+        write_rollout(&home, deleted, "custom");
+        write_rollout(&home, kept, "custom");
+        let state_db = home.join("state_5.sqlite");
+        let catalog_db = sqlite_dir.join("codex-dev.db");
+        create_threads_db(&state_db);
+        create_catalog_db(&catalog_db, deleted, "custom");
+        create_catalog_db(&catalog_db, kept, "custom");
+
+        remove_thread_sidebar_references(&home, deleted).unwrap();
+
+        let result = run_provider_sync(Some(&home));
+        assert_eq!(
+            result.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            result.message
+        );
+        let ids = catalog_ids(&catalog_db);
+        assert!(!ids.contains(&deleted.to_string()), "被删的不复活：{ids:?}");
+        assert!(ids.contains(&kept.to_string()), "未删的照常补建：{ids:?}");
+    }
+
+    /// 撤销删除（undo）必须清掉墓碑，否则恢复出来的会话会被一直挡在列表外。
+    #[test]
+    fn undo_clears_the_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        fs::write(home.join("session_index.jsonl"), "").unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+        write_rollout(&home, thread_id, "custom");
+        let state_db = home.join("state_5.sqlite");
+        let catalog_db = sqlite_dir.join("codex-dev.db");
+        create_threads_db(&state_db);
+        create_catalog_db(&catalog_db, thread_id, "custom");
+        // 先做一次同步，让会话的 canonical 行就位（这是「已经在列表里」的状态）。
+        let _ = run_provider_sync(Some(&home));
+        assert!(canonical_ids(&state_db).contains(&thread_id.to_string()));
+
+        remove_thread_sidebar_references(&home, thread_id).unwrap();
+        assert!(
+            load_thread_tombstones(&home).contains(thread_id),
+            "删除应写下墓碑"
+        );
+
+        // undo 走的是恢复 session_index 这一条（storage 的恢复流程）。
+        let line = json!({
+            "id": thread_id,
+            "thread_name": thread_id,
+            "updated_at": "2026-10-03T10:00:00Z"
+        })
+        .to_string();
+        assert_eq!(restore_session_index_entries(&home, &[line]).unwrap(), 1);
+
+        assert!(
+            !load_thread_tombstones(&home).contains(thread_id),
+            "撤销删除后墓碑必须清掉"
+        );
+
+        // 撤销之后重建能把会话写回列表——墓碑不残留，撤销看起来才是生效的。
+        // （canonical 行本来就没被删除流程碰过，这里验证的是它不再被墓碑压制。）
+        let result = run_provider_sync(Some(&home));
+        assert_eq!(
+            result.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            result.message
+        );
+        assert!(
+            canonical_ids(&state_db).contains(&thread_id.to_string()),
+            "撤销后会话应回到列表"
+        );
+    }
+
+    /// 墓碑文件损坏 / 不存在都不能让同步失败——最坏只是退回「可能复活」。
+    #[test]
+    fn damaged_tombstone_file_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let sqlite_dir = home.join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        write_config(&home, "custom");
+
+        let thread_id = "01a01579-4a5d-77e3-89c0-751d38ad21f8";
+        write_rollout(&home, thread_id, "custom");
+        create_threads_db(&home.join("state_5.sqlite"));
+        create_catalog_db(&sqlite_dir.join("codex-dev.db"), thread_id, "custom");
+
+        // 写一半的墓碑文件。
+        fs::create_dir_all(home.join("tmp")).unwrap();
+        fs::write(home.join(THREAD_TOMBSTONE_RELATIVE_PATH), "[{\"thr").unwrap();
+
+        assert!(load_thread_tombstones(&home).is_empty());
+        let result = run_provider_sync(Some(&home));
+        assert_eq!(
+            result.status,
+            ProviderSyncStatus::Synced,
+            "{}",
+            result.message
+        );
+    }
+
+    /// 墓碑按上限裁剪，只丢最旧的；裁剪不会删除任何会话数据。
+    #[test]
+    fn tombstones_are_capped_by_dropping_the_oldest() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+
+        for index in 0..MAX_THREAD_TOMBSTONES + 3 {
+            record_thread_tombstone(&home, &format!("thread-{index:05}")).unwrap();
+        }
+
+        let ids = load_thread_tombstones(&home);
+        assert_eq!(ids.len(), MAX_THREAD_TOMBSTONES);
+        assert!(!ids.contains("thread-00000"), "最旧的墓碑先被丢掉");
+        assert!(ids.contains(&format!("thread-{:05}", MAX_THREAD_TOMBSTONES + 2)));
+    }
+
+    /// 同一条会话重复删除只留一条墓碑。
+    #[test]
+    fn repeated_deletion_records_a_single_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        fs::create_dir_all(&home).unwrap();
+
+        record_thread_tombstone(&home, "thread-1").unwrap();
+        record_thread_tombstone(&home, "thread-1").unwrap();
+
+        let ids: Vec<String> =
+            serde_json::from_slice(&fs::read(thread_tombstone_path(&home)).unwrap()).unwrap();
+        assert_eq!(ids, vec!["thread-1".to_string()]);
     }
 }

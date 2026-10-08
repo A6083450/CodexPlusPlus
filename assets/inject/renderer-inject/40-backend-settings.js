@@ -426,7 +426,7 @@
     const publisherLine = [
       author ? escapeHtml(author) : "",
       version ? `v${escapeHtml(version)}` : "",
-      local ? `${local.source === "builtin" ? "内置" : "用户"} · ${escapeHtml(userScriptStatusLabel(local.status))}` : "",
+      local ? `${local.source === "builtin" ? "内置" : local.market_id ? "市场" : "用户"} · ${escapeHtml(userScriptStatusLabel(local.status))}` : "",
     ].filter(Boolean).join('<span class="codex-plus-extensions-detail-sep">·</span>');
 
     const actions = [];
@@ -545,6 +545,13 @@
     // 左面板也要跟着刷新，否则脚本的启停/状态变化不会反映到列表上。
     if (codexPlusActiveEntry() === "extensions") refreshCodexPlusPageNav(codexPlusExtensionsTab);
   }
+
+  // 异步脚本加载完成后，刷新已经打开的拓展页面；重注入时替换旧监听。
+  window.removeEventListener("codex-plus-user-scripts-loaded", window.__codexPlusUserScriptsLoadedHandler);
+  window.__codexPlusUserScriptsLoadedHandler = () => {
+    if (codexPlusActiveEntry() === "extensions") void loadUserScripts();
+  };
+  window.addEventListener("codex-plus-user-scripts-loaded", window.__codexPlusUserScriptsLoadedHandler);
 
   async function loadUserScripts(path = "/user-scripts/list", payload = {}) {
     const requestPayload = path === "/user-scripts/list"
@@ -759,7 +766,49 @@
     const layoutLeft = zoom === 1 ? left : left / zoom;
     overlay.style.setProperty("--codex-plus-page-left", `${layoutLeft}px`);
     overlay.style.left = `${layoutLeft}px`;
-    overlay.style.top = "0px";
+    // 官方顶部有一条 header（返回/前进/隐藏侧边栏），图标栏与侧边栏都从它的下沿开始。
+    // 我们的 overlay 若从 y=0 铺满就会把整条 header 盖住——用户反馈「比官方少了一条顶部栏」
+    // 就是这个原因。这里同样量图标栏的顶边（而非硬编码高度），让 overlay 从 header 下沿开始。
+    const top = railRect && railRect.height > 0
+      ? Math.max(0, railRect.top)
+      : (rect && rect.height > 0 ? Math.max(0, rect.top) : 0);
+    const layoutTop = zoom === 1 ? top : top / zoom;
+    overlay.style.setProperty("--codex-plus-page-top", `${layoutTop}px`);
+    overlay.style.top = `${layoutTop}px`;
+    // 右侧与下方官方各留了一圈槽：整行的 [data-app-shell-workspace-row] 比视口小
+    // （真机 1715x984 / 视口 1719x988，即右、下各 4px），官方内容面板正好收在行的右下角。
+    // 我们原先 right/bottom 都贴 0，于是比官方多占这 4px。这里量取而不是硬编码 4。
+    const row = document.querySelector("[data-app-shell-workspace-row]");
+    const rowRect = row?.getBoundingClientRect?.();
+    const rightGutter = rowRect && rowRect.width > 0 ? Math.max(0, window.innerWidth - rowRect.right) : 0;
+    const bottomGutter = rowRect && rowRect.height > 0 ? Math.max(0, window.innerHeight - rowRect.bottom) : 0;
+    const layoutRight = zoom === 1 ? rightGutter : rightGutter / zoom;
+    const layoutBottom = zoom === 1 ? bottomGutter : bottomGutter / zoom;
+    overlay.style.setProperty("--codex-plus-page-right", `${layoutRight}px`);
+    overlay.style.setProperty("--codex-plus-page-bottom", `${layoutBottom}px`);
+    overlay.style.right = `${layoutRight}px`;
+    overlay.style.bottom = `${layoutBottom}px`;
+    // 圆角同样量取官方面板自身的值，不写死 12px。
+    // 这里量的是 _PageSurface_：官方那个与我们 overlay 同格子的页面面板（rect 都是
+    // [52, 44, 1663, 940]），它四角同为 12px，左侧那一角也真实可见——真机像素扫描确认
+    // 官方左边缘从 y=44 的 x=62 收到 y=54 的 x=52，是一条完整的弧。
+    // 别改用 main[data-app-shell-main-surface] 的 --app-shell-main-surface-clip-start-radius：
+    // 那个元素左边缘在 362（缩在侧边栏后面），左侧还用 inset 负内缩把圆角裁掉，start 恒为 0，
+    // 会让人误判左侧不该圆——第一版就是这么写错的，用户反馈「少一个圆角」正是缺了左边两个角。
+    // 类名是 CSS Modules 的哈希名，但 _PageSurface_ 这个片段稳定，且不会命中 _PageSurfaceLayout_
+    //（其后紧跟 L 而非 _）。量到的是视觉值，同样折算成布局坐标。读不到就保持 0，不做猜测。
+    const pageSurface = document.querySelector('[class*="_PageSurface_"]');
+    const pageSurfaceStyle = pageSurface ? getComputedStyle(pageSurface) : null;
+    const mainSurfaceStyle = (() => {
+      const main = document.querySelector("main[data-app-shell-main-surface]");
+      return main ? getComputedStyle(main) : null;
+    })();
+    const radius =
+      parseFloat(pageSurfaceStyle?.borderTopLeftRadius || "") ||
+      parseFloat(mainSurfaceStyle?.getPropertyValue("--app-shell-main-surface-clip-end-radius") || "") ||
+      0;
+    const layoutRadius = zoom === 1 ? radius : radius / zoom;
+    overlay.style.setProperty("--codex-plus-page-radius", `${layoutRadius}px`);
   }
 
   function codexPlusHostUsesLightTheme() {
@@ -938,8 +987,8 @@
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">插件市场解锁</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强模式下无需开启；ChatGPT 登录态会保留官方插件市场。" : "API Key 模式下扩展插件市场请求，尽量显示完整插件列表。"}</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pluginMarketplaceUnlock" ${codexPlusBackendSettings.launchMode === "relay" ? 'disabled data-relay-unneeded="true"' : ""}><span></span></button>
+              <div><div class="codex-plus-row-title">插件市场解锁</div><div class="codex-plus-row-description">扩展插件市场请求，尽量显示完整插件列表。</div></div>
+              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pluginMarketplaceUnlock"><span></span></button>
             </div>
             <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">模型白名单解锁</div><div class="codex-plus-row-description">从环境变量和 Codex config.toml 中的中转站 /v1/models 拉取模型，并补进模型选择列表。</div></div>
@@ -954,7 +1003,7 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
             </div>` : ""}
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">悬浮球 · Stepwise</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
+              <div><div class="codex-plus-row-title">悬浮球 · 下一步建议</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
             </div>
             <div class="codex-plus-row">
@@ -1007,22 +1056,11 @@
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadScrollRestore"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Zed Remote open</div><div class="codex-plus-row-description">Open supported remote SSH file references in Zed without patching Codex.app.</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="zedRemoteOpen"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Upstream worktree</div><div class="codex-plus-row-description">Create a Git worktree from a fresh upstream branch, equivalent to git worktree add -b branch path upstream/base.</div></div>
-              <div class="codex-plus-worktree-actions">
-                <button type="button" class="codex-plus-action-button" data-codex-upstream-worktree-open="true">创建</button>
-                <button type="button" class="codex-plus-toggle" data-codex-plus-setting="upstreamWorktreeCreate"><span></span></button>
-              </div>
-            </div>
-            <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">历史会话修复</div><div class="codex-plus-row-description">切换官方登录、混合 API 或纯 API 后，让旧对话重新显示在当前模式下。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户拓展，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
+              <div><div class="codex-plus-row-title">管理工具</div><div class="codex-plus-row-description">配置增强功能、模型和语音服务。</div></div>
               <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
             </div>
             <div class="codex-plus-row">
@@ -1190,14 +1228,6 @@
         const [kind, ...rest] = extensionsSelect.getAttribute("data-codex-extensions-select").split(":");
         codexPlusExtensionsSelected = { kind, key: rest.join(":") };
         refreshCodexPlusExtensionsView();
-        return;
-      }
-      if (target?.closest("[data-codex-upstream-worktree-open]")) {
-        if (!codexPlusSettings().upstreamWorktreeCreate) {
-          showToast("Upstream worktree enhancement is disabled", null);
-          return;
-        }
-        openUpstreamWorktreeDialog();
         return;
       }
       const toggle = target?.closest("[data-codex-plus-setting]");
