@@ -456,6 +456,12 @@ impl Default for DefaultLaunchHooks {
             helper: Mutex::new(None),
             bridge_watchdog: Mutex::new(None),
             bridge_reinjector: Mutex::new(None),
+            #[cfg(windows)]
+            packaged_executable: Mutex::new(None),
+            #[cfg(windows)]
+            packaged_activation_process: Mutex::new(None),
+            #[cfg(windows)]
+            packaged_launch_identity: Mutex::new(None),
         }
     }
 }
