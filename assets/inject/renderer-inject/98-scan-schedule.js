@@ -34,6 +34,7 @@
       selectors.archiveNav,
       selectors.pluginNavButton,
       'aside.app-shell-left-panel nav[role="navigation"]',
+      'nav[data-app-navigation-rail]',
       ...(codexPluginMarketplacePatchEnabled() ? [selectors.disabledInstallButton] : []),
     ].join(", ");
   }

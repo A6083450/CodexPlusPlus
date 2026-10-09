@@ -873,6 +873,7 @@
         }
       }
     }
+    if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
     refreshDreamSkin();
     refreshThreadIdBadges();
     sessionRows().forEach(tryAttachButton);
@@ -880,13 +881,14 @@
     scheduleProjectMoveProjection();
     scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
+    if (typeof installCodexPlusCustomLayout === "function") runScanStep(installCodexPlusCustomLayout);
     refreshConversationView();
     removeCodexServiceTierBadges();
     syncCodexNativeServiceTierPicker();
     syncCodexNativeSolidFastIcon();
     installCodexNativeServiceTierSelectionSync();
     installCodexServiceTierMenu();
-    removeSessionShareButtons();
+    installSessionShareButton();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
   }

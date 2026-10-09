@@ -2694,17 +2694,13 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
     write_rollout(&rollout, "openai", "mobile", "C:/workspace");
     let state_db = home.join("state_5.sqlite");
     create_remote_control_state_db(&state_db, &[("mobile", "openai", 0, &rollout)]);
-    let db = Connection::open(&state_db).unwrap();
-    db.execute("CREATE TABLE backup_padding (data BLOB)", [])
-        .unwrap();
-    db.execute("INSERT INTO backup_padding VALUES (zeroblob(33554432))", [])
-        .unwrap();
-    drop(db);
     let catalog_db = sqlite_dir.join("codex-dev.db");
     create_local_thread_catalog_db(&catalog_db, &[]);
 
     let backup_root = home.join("backups_state/provider-sync");
-    let watched_rollout = rollout.clone();
+    // APFS 备份可瞬间完成；先持锁，确保修改发生前后都不能写回活跃 rollout。
+    let mut writer_file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+    fs2::FileExt::lock_exclusive(&writer_file).unwrap();
     let writer = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -2713,13 +2709,9 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
                     .map(|mut entries| entries.next().is_some())
                     .unwrap_or(false);
             if backup_started {
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&watched_rollout)
-                    .unwrap();
                 use std::io::Write as _;
                 writeln!(
-                    file,
+                    writer_file,
                     "{}",
                     json!({"type": "event_msg", "payload": {"type": "task_started"}})
                 )

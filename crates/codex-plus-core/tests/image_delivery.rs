@@ -68,4 +68,7 @@ fn responses_proxy_stream_retains_image_delivery_after_upstream_refactor() {
     assert!(responses.contains("ImageDeliveryStream::new("));
     assert!(responses.contains("delivery.push(&bytes)?"));
     assert!(responses.contains("delivery.finish()"));
+    assert!(responses.contains("NativeResponsesSseObserver::default()"));
+    assert!(responses.contains("observer.push_bytes(&bytes)"));
+    assert!(responses.contains("return Ok(observer.finish())"));
 }

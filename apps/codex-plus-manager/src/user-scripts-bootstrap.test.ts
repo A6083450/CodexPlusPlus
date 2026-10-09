@@ -109,6 +109,7 @@ it("uses the same source label in the extension list and detail", async () => {
     const context = vm.createContext({
       codexPlusExtensionsSelectionDetail: () => ({ sel: { kind: "installed", key: local.key }, local }),
       codexPlusUserScripts: { scripts: [local] }, codexPlusScriptMarket: { scripts: [] },
+      codexPlusExtensionsFilter: "market", codexPlusDiscoveryIcons: { back: "" },
       escapeHtml: String, extensionIconMarkup: () => "", userScriptStatusLabel: () => "已加载",
     });
     const detail = vm.runInContext(`${renderer.slice(start, end)}; renderCodexPlusExtensionsDetail()`, context);

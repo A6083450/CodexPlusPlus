@@ -2824,7 +2824,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -2836,7 +2836,7 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
     assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
@@ -2854,7 +2854,7 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
@@ -3147,6 +3147,24 @@ fn injection_script_loads_service_tier_after_startup_settings() {
     // Then: the service-tier state is loaded without requiring the menu to open.
     assert!(startup_body.contains("codexPlusSettings().serviceTierControls"));
     assert!(startup_body.contains("void loadCodexServiceTierState();"));
+}
+
+#[test]
+fn conversation_view_scope_regressions() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let output = Command::new("node")
+        .arg(repo.join("assets/inject/conversation-view.test.cjs"))
+        .output()
+        .expect("node should run the conversation view regression harness");
+    assert!(
+        output.status.success(),
+        "conversation view harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -7886,11 +7904,11 @@ global.sendCodexPlusDiagnostic = () => {};
 }
 
 #[test]
-fn renderer_removes_codexplus_share_button_without_touching_native_share() {
+fn renderer_keeps_codexplus_share_button_opt_in_and_preserves_native_share() {
     let script = assets::injection_script(57321);
-    assert!(!script.contains("installSessionShareButton"));
-    assert!(script.contains("removeSessionShareButtons();"));
-    let start = script.find("function removeSessionShareButtons()").unwrap();
+    assert!(script.contains("sessionShare: false"));
+    assert!(script.contains("installSessionShareButton();"));
+    let start = script.find("function installSessionShareButton()").unwrap();
     let end = start + script[start..].find("\n  function ").unwrap();
     let source = &script[start..end];
     let check = format!(r#"
@@ -7901,12 +7919,17 @@ const document = {{ querySelectorAll(selector) {{
   assert.equal(selector, '.codex-session-share-button');
   return [{{remove() {{ removed++; }} }}, {{remove() {{ removed++; }} }}];
 }} }};
+const codexPlusSettings = () => ({{sessionShare: false}});
+const currentSessionRef = () => ({{session_id: 'fixture'}});
+class HTMLElement {{}}
+function sessionSharePlacement() {{ throw Error('disabled sharing must not inspect placement'); }}
 {source}
-removeSessionShareButtons();
+installSessionShareButton();
 assert.equal(removed, 2);
 "#);
     let output = std::process::Command::new("node").args(["-e", &check]).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!codex_plus_core::settings::BackendSettings::default().codex_app_session_share);
 }
 
 #[test]

@@ -4,11 +4,20 @@
       const key = button.getAttribute("data-codex-plus-setting");
       const waitsForBackend = codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded;
       button.dataset.enabled = String(!!settings[key]);
+      button.setAttribute("aria-checked", button.dataset.enabled);
       button.dataset.pending = String(waitsForBackend);
       button.disabled = waitsForBackend || button.dataset.relayUnneeded === "true";
     });
     refreshConversationViewControls();
+    document.querySelectorAll("[data-codex-plus-layout-edit]").forEach((button) => {
+      button.disabled = !codexPlusBackendSettingsLoaded || settings.customLayout !== true;
+    });
     refreshCodexServiceTierControls();
+    document.querySelectorAll("[data-codex-plus-typing-effect]").forEach((select) => {
+      select.value = ["rainbow", "fireworks", "stars"].includes(settings.typingEffect) ? settings.typingEffect : "off";
+      select.disabled = !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.enhancementsEnabled === false;
+      if (typeof syncCodexPlusTypingEffectDropdown === "function") syncCodexPlusTypingEffectDropdown(select);
+    });
   }
 
   let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, codexAppVersion: "" };
