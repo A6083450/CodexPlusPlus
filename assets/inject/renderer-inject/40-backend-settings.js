@@ -7,7 +7,6 @@
     if (loaded) syncOfficialUsagePolicy();
     if (loaded) runScanStep(syncCodexPlusTypingEffects);
     if (loaded && typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-    if (loaded && typeof installCodexPlusCustomLayout === "function") runScanStep(installCodexPlusCustomLayout);
     return loaded;
   }
 
@@ -37,7 +36,6 @@
         syncOfficialUsagePolicy();
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-        if (typeof installCodexPlusCustomLayout === "function") runScanStep(installCodexPlusCustomLayout);
         if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
         renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
@@ -73,7 +71,6 @@
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-    if (typeof installCodexPlusCustomLayout === "function") runScanStep(installCodexPlusCustomLayout);
     if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
     renderCodexPlusMenu();
     scan();
@@ -709,16 +706,9 @@
       button.dataset.active = String(on);
       button.setAttribute("aria-current", on ? "page" : "false");
     }
-    const pluginButton = document.getElementById(codexPlusSidebarPluginMarketId)?.querySelector("button");
-    if (pluginButton) {
-      const on = Boolean(active) && entry === "plugin-market";
-      pluginButton.dataset.active = String(on);
-      pluginButton.setAttribute("aria-current", on ? "page" : "false");
-    }
     [
       [codexPlusRailNavId, "home"],
       [codexPlusRailExtensionsId, "extensions"],
-      [codexPlusRailPluginMarketId, "plugin-market"],
     ].forEach(([id, name]) => {
       const railButton = document.querySelector(`#${id} > button`);
       if (!railButton) return;
@@ -1204,13 +1194,6 @@
                   <div><div class="codex-plus-row-title">Codex 用量挂件</div><div class="codex-plus-row-description">显示当前 Codex 会话用量、任务状态与可用的供应商余额。可拖动、上传角色图片和设置提醒；默认静音。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="whaleWidget"><span></span></button>
                 </div>
-                <div class="codex-plus-row">
-                  <div><div class="codex-plus-row-title">自定义布局</div><div class="codex-plus-row-description">侧边图标与会话栏作为整体移动；拖动侧边栏、任务信息卡或输入框时，其他面板会弹性让位；支持磁吸和下次打开恢复。</div></div>
-                  <div class="codex-plus-width-control">
-                    <button type="button" class="codex-plus-action-button" data-codex-plus-layout-edit="true">编辑布局</button>
-                    <button type="button" class="codex-plus-toggle" data-codex-plus-setting="customLayout"><span></span></button>
-                  </div>
-                </div>
               </div>
             </section>
             <section class="codex-plus-settings-section" aria-label="工具与关于">
@@ -1353,15 +1336,6 @@
       }
       if (target?.closest("[data-codex-open-manager]")) {
         openManagerFromCodex();
-        return;
-      }
-      const layoutEdit = target?.closest("[data-codex-plus-layout-edit]");
-      if (layoutEdit) {
-        if (layoutEdit.disabled || codexPlusSettings().customLayout !== true) return;
-        installCodexPlusCustomLayout();
-        closeCodexPlusPage();
-        document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
-        window.__codexPlusCustomLayoutRuntime?.setEditing(true);
         return;
       }
       // 推荐卡片用 window.open 而非原生 <a target="_blank">：Codex 是 Electron
@@ -1573,7 +1547,7 @@
       navigation.dataset.codexPlusSidebarNavigationListener = "true";
       navigation.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-        if (target?.closest(`#${codexPlusSidebarNavId}, #${codexPlusSidebarPluginMarketId}`)) return;
+        if (target?.closest(`#${codexPlusSidebarNavId}`)) return;
         if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
       }, true);
     }
@@ -1609,7 +1583,6 @@
     }
     const status = wrapper.querySelector(".codex-plus-sidebar-nav-status");
     if (status) status.dataset.status = codexPlusBackendStatus.status || "checking";
-    installCodexPlusPluginMarketSidebarNavigation(parent, wrapper, insertionButton);
     const active = !!document.querySelector(`.${codexPlusPageClass}`);
     setCodexPlusSidebarNavActive(active, codexPlusActiveEntry() || "home");
   }
@@ -2052,7 +2025,6 @@
       rail.dataset.codexPlusRailNavigationListener = "true";
       rail.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-        if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailPluginMarketId}`)) return;
         // 拓展入口的 id 是动态生成的，不在上面三个之内。不排除它，点拓展入口会被
         // 当成「点了原生导航按钮」，刚打开的拓展页面立刻被关掉。
         if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
@@ -2071,24 +2043,19 @@
     const specs = [
       { id: codexPlusRailNavId, label: "Codex++", iconMarkup: icons.home, withStatus: true, onActivate: openCodexPlusPage },
       { id: codexPlusRailExtensionsId, label: "拓展", iconMarkup: icons.extensions, withStatus: false, onActivate: openCodexPlusExtensions },
-      { id: codexPlusRailPluginMarketId, label: "CodeX 插件市场", iconMarkup: codexPlusPluginMarketIconMarkup(), withStatus: false, onActivate: openCodexPlusNativePluginMarket },
     ];
 
-    const nativePluginEntry = codexPlusNativePluginNavigationEntry();
-    if (nativePluginEntry) document.getElementById(codexPlusRailPluginMarketId)?.remove();
     const anchor = codexPlusRailPrimaryAnchor(rail);
     // 插到锚点所在的父容器里，而不是 nav 顶层：原生按钮可能嵌在 nav 内部的分组 div 中，
     // 直接插顶层会破坏它的 flex 布局。
     const host = anchor?.parentElement || rail;
     let cursor = anchor;
     specs.forEach((spec) => {
-      if (spec.id === codexPlusRailPluginMarketId && nativePluginEntry) return;
       let wrapper = document.getElementById(spec.id);
       if (!wrapper || wrapper.parentElement !== host) {
         wrapper?.remove();
         wrapper = createCodexPlusRailButton({ ...spec, template });
         if (!wrapper) return;
-        if (spec.id === codexPlusRailPluginMarketId) markCodexPlusExtensionNode(wrapper, "builtin-plugin-market");
       }
       // 顺序：Codex++ 在前，「拓展」在后；紧跟在 primary 区锚点后面。
       if (cursor?.nextSibling) {
@@ -2103,7 +2070,6 @@
 
     const status = document.getElementById(codexPlusRailNavId)?.querySelector(".codex-plus-sidebar-nav-status");
     if (status) status.dataset.status = codexPlusBackendStatus.status || "checking";
-    if (codexPlusActiveEntry() === "plugin-market") setCodexPlusSidebarNavActive(true, "plugin-market");
     return true;
   }
 

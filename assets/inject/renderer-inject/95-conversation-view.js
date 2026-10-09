@@ -881,7 +881,6 @@
     scheduleProjectMoveProjection();
     scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
-    if (typeof installCodexPlusCustomLayout === "function") runScanStep(installCodexPlusCustomLayout);
     refreshConversationView();
     removeCodexServiceTierBadges();
     syncCodexNativeServiceTierPicker();

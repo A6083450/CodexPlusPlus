@@ -4,9 +4,9 @@ const { test } = require("node:test");
 const vm = require("node:vm");
 
 const fragment = name => readFileSync(`${__dirname}/renderer-inject/${name}`, "utf8");
-const ui = fragment("61-plugin-market-ui.js");
 const adapter = fragment("62-plugin-market-adapter.js");
 const navigation = fragment("40-backend-settings.js");
+const entryNavigation = fragment("50-navigation.js");
 const scheduler = fragment("98-scan-schedule.js");
 const extract = (source, name) => source.match(new RegExp(`^  function ${name}\\([^]*?^  \\}`, "m"))?.[0] || "";
 
@@ -88,40 +88,51 @@ function fixture(layout = "sidebar") {
     codexPluginMarketplacePatchEnabled: () => false, nodeOrAncestorLooksLikeCodexUserBubble: () => false, nodeLooksLikeCodexUserBubble: () => false,
   });
   const functions = [
-    extract(ui, "codexPlusPluginMarketIconMarkup"), extract(ui, "installCodexPlusPluginMarketSidebarNavigation"),
     extract(adapter, "codexPlusNativePluginNavigationEntry"), extract(adapter, "openCodexPlusNativePluginMarket"),
-    ...["codexPlusRailTemplateButton", "codexPlusRailPrimaryAnchor", "createCodexPlusRailButton", "installCodexPlusRailNavigation"].map(name => extract(navigation, name)),
+    ...["codexPlusRailTemplateButton", "codexPlusRailPrimaryAnchor", "createCodexPlusRailButton", "installCodexPlusRailNavigation", "installCodexPlusSidebarNavigation", "detachCodexPlusSidebarNavigation", "removeCodexPlusRailNavigation"].map(name => extract(navigation, name)),
+    extract(entryNavigation, "installCodexPlusNavigationEntries"),
     ...["scanRelevantSelector", "nodeSelfOrAncestorMatchesScanRelevance", "isScanRelevantNode", "isChatContentMutation", "shouldScheduleScan"].map(name => extract(scheduler, name)),
   ].join("\n");
   vm.runInContext(functions, context);
-  const install = () => layout === "rail" ? context.installCodexPlusRailNavigation()
-    : context.installCodexPlusPluginMarketSidebarNavigation(nav, sidebarAnchor, anchor);
+  const install = () => context.installCodexPlusNavigationEntries();
   const fallback = () => document.getElementById(layout === "rail" ? "codex-plus-rail-plugin-market" : "codex-plus-sidebar-plugin-market");
   const native = (attrs = {}) => nav.appendChild(new Element("button", { "data-sidebar-destination": "builtin:plugins", "aria-label": "Plugins", ...attrs }));
-  return { document, nav, context, calls, install, fallback, native };
+  const legacy = (kind = layout, parent = nav) => {
+    const wrapper = parent.appendChild(new Element("div", {
+      id: kind === "rail" ? "codex-plus-rail-plugin-market" : "codex-plus-sidebar-plugin-market",
+      "data-codex-plus-ext": "builtin-plugin-market",
+    }));
+    wrapper.appendChild(new Element("button", { "aria-label": "CodeX 插件市场" }));
+    return wrapper;
+  };
+  return { document, nav, context, calls, install, fallback, native, legacy };
 }
 
 for (const layout of ["sidebar", "rail"]) {
-  test(`${layout}: native entry suppresses fallback; late arrival, removal and repeated scans reconcile`, () => {
-    const f = fixture(layout); f.install(); const first = f.fallback();
-    assert.ok(first); assert.equal(first.getAttribute("data-codex-plus-ext"), "builtin-plugin-market");
+  test(`${layout}: retired injected stores stay absent through late native arrival, removal and repeated scans`, () => {
+    const f = fixture(layout);
+    const oldRail = f.legacy("rail"), oldSidebar = f.legacy("sidebar");
+    f.install();
+    assert.ok(!oldRail.isConnected && !oldSidebar.isConnected, "both exact legacy IDs are removed even before native navigation appears");
+    assert.ok(!f.fallback());
     for (let index = 0; index < 3; index++) f.install();
-    assert.equal(f.document.querySelectorAll(`#${first.id}`).length, 1);
+    assert.ok(!f.fallback(), "scanning must never recreate a duplicate store button");
     const native = f.native(); f.install(); assert.ok(!f.fallback());
-    native.remove(); f.install(); assert.ok(f.fallback());
+    assert.ok(native.isConnected, "native plugin navigation is preserved");
+    native.remove(); f.install(); assert.ok(!f.fallback());
     const rebuilt = f.native(); f.install(); assert.ok(!f.fallback());
     assert.equal(rebuilt.clicks, 0, "scanning must not navigate");
   });
 
-  test(`${layout}: rebuilt navigation refreshes fallback ownership without retaining old DOM`, () => {
+  test(`${layout}: rebuilt navigation removes stale stores and preserves the replacement native entry`, () => {
     const f = fixture(layout); f.install();
     const aside = f.nav.parentElement; f.nav.remove();
     const next = aside.appendChild(new Element("nav", layout === "rail" ? { "data-app-navigation-rail": "" } : { role: "navigation" }));
     const anchor = next.appendChild(new Element("button", { "data-sidebar-destination": "builtin:home", "aria-label": "Home" }));
     const entry = next.appendChild(new Element("div", { id: "codex-plus-sidebar-nav" }));
-    const install = () => layout === "rail" ? f.context.installCodexPlusRailNavigation()
-      : f.context.installCodexPlusPluginMarketSidebarNavigation(next, entry, anchor);
-    install(); assert.ok(f.fallback()); assert.ok(next.contains(f.fallback()));
+    const stale = f.legacy(layout, next);
+    const install = f.install;
+    install(); assert.ok(!f.fallback()); assert.equal(stale.isConnected, false);
     const native = next.appendChild(new Element("button", { "data-sidebar-destination": "plugins" }));
     install(); assert.ok(!f.fallback());
     f.context.openCodexPlusNativePluginMarket(); assert.equal(native.clicks, 1);
@@ -132,16 +143,16 @@ test("extension/self entries cannot impersonate native plugins or cause recursiv
   const f = fixture();
   const owned = f.native({ "data-codex-plus-ext": "example-script" });
   const registered = f.native(); registered.className = "registered-extension";
-  f.install(); assert.ok(f.fallback());
-  f.fallback().querySelector("button").click();
+  f.install(); assert.ok(!f.fallback());
+  f.context.openCodexPlusNativePluginMarket();
   assert.equal(owned.clicks, 0); assert.equal(registered.clicks, 0);
   assert.equal(f.calls.length, 1); assert.equal(f.calls[0].path, "/manager/open");
   assert.equal(f.calls[0].payload.page, "pluginMarket");
 });
 
 test("legacy injected IDs and non-navigation Plugins buttons cannot masquerade as native", () => {
-  const f = fixture(); f.install();
-  const fallback = f.fallback(); fallback.removeAttribute("data-codex-plus-ext");
+  const f = fixture();
+  const fallback = f.legacy(); fallback.removeAttribute("data-codex-plus-ext");
   const button = fallback.querySelector("button"); button.setAttribute("data-sidebar-destination", "plugins"); button.setAttribute("aria-label", "Plugins");
   const outside = f.document.body.appendChild(new Element("button", { "data-sidebar-destination": "plugins", "aria-label": "Plugins" }));
   f.context.openCodexPlusNativePluginMarket();
@@ -173,7 +184,10 @@ test("classic navigation without destination attributes recognizes Chinese and E
 
 test("native rail mutations schedule reconciliation while owned fallback writes stay ignored", () => {
   const f = fixture("rail"); f.install();
-  assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [f.fallback()], removedNodes: [] }]), false);
+  const stale = f.legacy();
+  assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [stale], removedNodes: [] }]), false);
+  f.install(); assert.equal(stale.isConnected, false);
+  assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [], removedNodes: [stale] }]), false);
   const native = f.native();
   assert.equal(f.context.shouldScheduleScan([{ target: f.nav, addedNodes: [native], removedNodes: [] }]), true);
   native.remove();

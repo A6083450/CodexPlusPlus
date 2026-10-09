@@ -1802,7 +1802,7 @@
     const targets = [
       conversationViewState.contentEl,
       conversationViewState.composerEl,
-    ].filter((el) => el?.isConnected && !(typeof codexPlusCustomLayoutOwnsElement === "function" && codexPlusCustomLayoutOwnsElement(el)));
+    ].filter((el) => el?.isConnected);
     if (!targets.length) {
       conversationViewReportMissingTargets();
       return;

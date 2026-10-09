@@ -241,8 +241,8 @@ fn detect_with(
 
 #[cfg(test)]
 pub(super) fn synthetic_runtime(temp: &tempfile::TempDir) -> (BrowserPaths, &'static str) {
-    // macOS 的 /var 临时目录是软链；测试夹具使用真实路径，保留生产路径的拒绝软链校验。
-    let root = temp.path().canonicalize().unwrap();
+    // 复用测试根目录归一化，避免 macOS /var 软链被生产路径保护正确拒绝。
+    let root = super::tests::temp_root(temp);
     let paths = BrowserPaths {
         codex_home: root.join("home"),
         runtime_root: root.join("runtimes"),
