@@ -25,3 +25,6 @@ assets/native-browser/inspector-NOTICE.txt text eol=lf
 assets/inject/upstream/**/*.js text eol=lf
 assets/inject/upstream/**/*.css text eol=lf
 assets/inject/upstream/skin-packs/packs/*/theme.json text eol=lf
+
+# 生图快照按原始字节校验摘要，禁止检出时转换换行符。
+extensions/imagegen/** -text
