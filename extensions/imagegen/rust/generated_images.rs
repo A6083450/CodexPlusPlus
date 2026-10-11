@@ -244,7 +244,15 @@ pub fn persist_generated_images_from_paths(
         let original = std::fs::read_to_string(&path)?;
         let output_dir = db_path.parent().unwrap().join("generated_images").join(&thread_id);
         // 模型可能复用历史里的本地图片路径；本轮生成结果才是该回复的图片来源。
-        let invalid = regex::Regex::new(&format!(r"!\[([^\]]*)\]\((?:<?/mnt/data/[^)]+|attachment://[^)]+|<?{}/[^)]+)\)", regex::escape(&output_dir.to_string_lossy())))?;
+        let directory = output_dir.join("");
+        // Windows Markdown 可能使用原生反斜杠或浏览器正斜杠，目录范围保持不变。
+        let directory_pattern = if cfg!(windows) {
+            directory.to_string_lossy().split(['/', '\\']).map(regex::escape)
+                .collect::<Vec<_>>().join(r"[\\/]")
+        } else {
+            regex::escape(&directory.to_string_lossy())
+        };
+        let invalid = regex::Regex::new(&format!(r"!\[([^\]]*)\]\((?:<?/mnt/data/[^)]+|attachment://[^)]+|<?{}[^)]+)\)", directory_pattern))?;
         let mut changed = 0;
         let mut repaired = String::with_capacity(original.len());
         for line in original.split_inclusive('\n') {

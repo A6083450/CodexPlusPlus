@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use codex_plus_core::model_suffix::builtin_model_metadata;
 use codex_plus_core::protocol_proxy::{local_responses_proxy_base_url, protocol_proxy_port};
 use codex_plus_core::relay_config::{
     RelayApplyResult, apply_relay_profile_config_to_home_with_context,
@@ -105,8 +106,13 @@ fn managed_responses_defaults_are_independent_of_session_identity() {
                         "{mode:?}, {identity}, {path_name}"
                     );
                     assert_eq!(model["supports_search_tool"], true);
-                    // fork 保留模板现有搜索类型，身份切换不得擅自增加图片搜索能力。
-                    assert_eq!(model["web_search_tool_type"], "text");
+                    // 搜索类型继承运行时缓存或 bundled 模板，不应随会话身份改变。
+                    let template = builtin_model_metadata(model["slug"].as_str().unwrap()).unwrap();
+                    assert_eq!(
+                        model["web_search_tool_type"].as_str().unwrap(),
+                        template.entry["web_search_tool_type"].as_str().unwrap(),
+                        "{mode:?}, {identity}, {path_name}"
+                    );
                     assert_eq!(model["tool_mode"], "code_mode_only");
                     assert_eq!(model["multi_agent_version"], "v2");
                     assert_eq!(model["context_window"], 272_000);

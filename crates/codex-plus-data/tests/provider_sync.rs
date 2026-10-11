@@ -2698,8 +2698,9 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
     create_local_thread_catalog_db(&catalog_db, &[]);
 
     let backup_root = home.join("backups_state/provider-sync");
-    // APFS 备份可瞬间完成；先持锁，确保修改发生前后都不能写回活跃 rollout。
+    // Unix 持锁；Windows 保持句柄打开，阻止生产代码以 share_mode(0) 改写。
     let mut writer_file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+    #[cfg(not(windows))]
     fs2::FileExt::lock_exclusive(&writer_file).unwrap();
     let writer = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2716,7 +2717,8 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
                     json!({"type": "event_msg", "payload": {"type": "task_started"}})
                 )
                 .unwrap();
-                return;
+                // 由 JoinHandle 保留句柄，直到 finalization 返回后再释放。
+                return writer_file;
             }
             assert!(Instant::now() < deadline, "backup did not start in time");
             std::thread::sleep(Duration::from_millis(1));
@@ -2728,7 +2730,7 @@ fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
         "mobile",
         "custom",
     );
-    writer.join().unwrap();
+    drop(writer.join().unwrap());
 
     assert_eq!(result.status, ProviderSyncStatus::Skipped);
     assert_eq!(result.changed_session_files, 0);

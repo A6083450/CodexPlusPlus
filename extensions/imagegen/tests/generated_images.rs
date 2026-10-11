@@ -331,7 +331,7 @@ fn archived_image_references_are_portable_and_keep_ordinals() {
     let repaired = fs::read_to_string(&rollout).unwrap();
     let rows: Vec<Value> = repaired.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.iter().map(|v| v["ordinal"].as_u64().unwrap()).collect::<Vec<_>>(), vec![0,3,1,2]);
-    let image = tmp.path().join("generated_images/portable/ig-portable.png");
+    let image = tmp.path().join("generated_images").join("portable").join("ig-portable.png");
     assert_eq!(fs::read(&image).unwrap(), b"image");
     assert!(rows[2]["payload"]["content"][0]["text"].as_str().unwrap().contains(image.to_str().unwrap()));
     assert!(!repaired.contains("/mnt/data/0.png"));
@@ -347,25 +347,28 @@ fn archived_image_references_are_portable_and_keep_ordinals() {
 
 #[test]
 fn new_generation_replaces_reused_local_image_reference() {
-    let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("state_5.sqlite");
-    let rollout = tmp.path().join("rollout.jsonl");
-    let old = tmp.path().join("generated_images/portable/ig-old.png");
-    let events = [
-        json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-new","status":"completed","result":"aW1hZ2U="}}),
-        json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"msg-new","content":[{"type":"Text","text":format!("![新图](<{}>)",old.display())}]}}}),
-        json!({"type":"response_item","payload":{"type":"message","id":"msg-new","role":"assistant","content":[{"type":"output_text","text":format!("![新图](<{}>)",old.display())}]}}),
-        json!({"type":"event_msg","payload":{"type":"task_complete"}}),
-    ];
-    fs::write(&rollout, events.iter().map(|e| format!("{e}\n")).collect::<String>()).unwrap();
-    create_thread_db(&db_path, &rollout, "portable");
-    Connection::open(&db_path).unwrap().execute("ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 1", []).unwrap();
-    let session = SessionRef::new("portable", "Image").unwrap();
-    assert_eq!(codex_plus_data::generated_images::persist_generated_images_from_paths([db_path.clone()], &session).unwrap(), 1);
-    let text = fs::read_to_string(&rollout).unwrap();
-    assert!(!text.contains("ig-old.png"));
-    assert_eq!(text.matches("ig-new.png").count(), 3);
-    assert!(generated_images_from_paths([db_path], &session).images.is_empty());
+    for browser_slashes in [false, true] {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("state_5.sqlite");
+        let rollout = tmp.path().join("rollout.jsonl");
+        let old = tmp.path().join("generated_images").join("portable").join("ig-old.png");
+        let old_reference = if browser_slashes { old.to_string_lossy().replace('\\', "/") } else { old.display().to_string() };
+        let events = [
+            json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-new","status":"completed","result":"aW1hZ2U="}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"msg-new","content":[{"type":"Text","text":format!("![新图](<{}>)",old_reference)}]}}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"msg-new","role":"assistant","content":[{"type":"output_text","text":format!("![新图](<{}>)",old_reference)}]}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ];
+        fs::write(&rollout, events.iter().map(|e| format!("{e}\n")).collect::<String>()).unwrap();
+        create_thread_db(&db_path, &rollout, "portable");
+        Connection::open(&db_path).unwrap().execute("ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 1", []).unwrap();
+        let session = SessionRef::new("portable", "Image").unwrap();
+        assert_eq!(codex_plus_data::generated_images::persist_generated_images_from_paths([db_path.clone()], &session).unwrap(), 1);
+        let text = fs::read_to_string(&rollout).unwrap();
+        assert!(!text.contains("ig-old.png"));
+        assert_eq!(text.matches("ig-new.png").count(), 3);
+        assert!(generated_images_from_paths([db_path], &session).images.is_empty());
+    }
 }
 
 #[test]
