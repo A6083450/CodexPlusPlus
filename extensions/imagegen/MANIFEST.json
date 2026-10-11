@@ -24,11 +24,11 @@
   "skill/scripts/remove_chroma_key.py": "3f7b9b14ad5c90f37618bc1c16a039a2076abca12ddc41b3ae470e2b1cad6c0e",
   "skill/scripts/responses_image_gen.py": "b18b0c8b8a0ebca7e38f43bc016dbf4098643f69285f2c5c968093610564991e",
   "skill/scripts/responses_transport.py": "312c2d174c0d09f6d52f1c434fab294892115bba58c06bf5e6d4571a622b6ea5",
-  "sync.py": "492f0729f2bae4979f9d6932136ed5c482e33798f5eb1e63971c1567a606090b",
+  "sync.py": "053885b2a79df7d7ea698f1fcfd22f3b935a6a7eaa294132229355ac3eb57160",
   "tests/generated_images.rs": "665ee39d217c0e551e9a3ae43b8700763b956f1ace962537a0dfb50b8699b234",
   "tests/imagegen_skill.rs": "c7af2df50af5d12603daf948eca1daf167edbc44cfa18e17118af5af0dd67205",
   "tests/integration.rs": "9712034c668f8cc60edf7acd47364de3abfed3a578de6954ad1ed909c5a9c8f1",
-  "tests/test_sync.py": "5f503f50ac07f1eb5f08d393b7e2bc296a7f886486fe5102e11fdc719b526f65",
+  "tests/test_sync.py": "5a1a75d3fe3e21e0a8742a6c6cf745db6c84e5283c53611123e4dd33d73538bd",
   "tests/turn-preparation.cjs": "6ca5e79d992c33a1ae2f9c6c36747e78a53f98e24303950f3a08f38f7492ca7a",
   "ui/generated-images-inject.js": "e72424fdcb4e2e3811fa695c568602859ea9b53e8193ff6ca310623a1bc79722",
   "ui/renderer-runtime.js": "4f402e136d9ebe2f9c409241b10ef60e57c54dd6d8ea424331028ac5544cf8a4"

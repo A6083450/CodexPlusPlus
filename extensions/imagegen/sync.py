@@ -17,12 +17,12 @@ def source_files(source):
 
 
 def check_hooks(source, host):
-    for line in (source / 'integration/hooks.tsv').read_text().splitlines():
+    for line in (source / 'integration/hooks.tsv').read_text(encoding='utf-8').splitlines():
         if not line or line.startswith('#'):
             continue
         name, marker = line.split('\t', 1)
         path = host / name
-        if not path.is_file() or marker not in path.read_text():
+        if not path.is_file() or marker not in path.read_text(encoding='utf-8'):
             raise ValueError(f'Missing host integration: {name}: {marker}')
 
 
@@ -30,7 +30,7 @@ def run(source, host, check):
     files = source_files(source)
     target = host / 'extensions/imagegen'
     manifest_path = target / 'MANIFEST.json'
-    old = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    old = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
     check_hooks(source, host)
     if check:
         expected = {name: digest(data) for name, data in files.items()}
@@ -56,9 +56,9 @@ def run(source, host, check):
                 temporary.write_bytes(data)
                 temporary.replace(path)
         manifest = json.dumps({name: digest(data) for name, data in sorted(files.items())}, indent=2) + '\n'
-        manifest_path.write_text(manifest)
+        manifest_path.write_text(manifest, encoding='utf-8')
         if source != target:
-            (source / 'MANIFEST.json').write_text(manifest)
+            (source / 'MANIFEST.json').write_text(manifest, encoding='utf-8')
     print(f'Imagegen {"verified" if check else "synchronized"}: {len(files)} files; host hooks intact')
 
 

@@ -1460,14 +1460,16 @@
       });
   }
 
+  const codexServiceTierComposerFooterSelector = ".composer-footer, [data-composer-footer-responsive]";
+
   function codexServiceTierVisibleComposerFooters(root = document) {
     const footers = [
-      ...(root?.matches?.(".composer-footer") ? [root] : []),
-      ...Array.from(root?.querySelectorAll?.(".composer-footer") || []),
+      ...(root?.matches?.(codexServiceTierComposerFooterSelector) ? [root] : []),
+      ...Array.from(root?.querySelectorAll?.(codexServiceTierComposerFooterSelector) || []),
       ...(root?.matches?.("[class*='_footer_']") ? [root] : []),
       ...Array.from(root?.querySelectorAll?.("[class*='_footer_']") || []),
     ].filter((footer, index, all) => all.indexOf(footer) === index)
-      .filter((footer) => footer.matches?.(".composer-footer") || footer.querySelector?.("[contenteditable='true']"));
+      .filter((footer) => footer.matches?.(codexServiceTierComposerFooterSelector) || footer.querySelector?.("[contenteditable='true']"));
     return footers
       .filter(codexServiceTierBadgeVisibleElement)
       .sort((left, right) => {
@@ -1484,8 +1486,8 @@
     if (providerNames.some((name) => name && text.includes(name))) score += 40;
     if (/完全访问权限|full access|model|超高|high|sub2api|provider/i.test(text)) score += 20;
     if (/本地模式|local mode|worktree|branch|codex\//i.test(text)) score -= 30;
-    if (composer.matches?.(".composer-footer")) score += 4;
-    if (composer.querySelector?.(".composer-footer")) score += 8;
+    if (composer.matches?.(codexServiceTierComposerFooterSelector)) score += 4;
+    if (composer.querySelector?.(codexServiceTierComposerFooterSelector)) score += 8;
     const buttons = Array.from(composer.querySelectorAll?.("button, [role='button']") || []).filter(codexServiceTierBadgeVisibleElement);
     if (buttons.some((button) => codexServiceTierLooksLikeProviderButton(button, providerNames))) score += 30;
     score += Math.min(10, buttons.length);
@@ -1493,17 +1495,12 @@
   }
 
   function codexServiceTierComposerCandidates() {
-    const candidates = new Set();
     const threadComposer = conversationViewFindComposerEl();
-    if (threadComposer && codexServiceTierBadgeVisibleElement(threadComposer)) candidates.add(threadComposer);
-    codexServiceTierVisibleComposerFooters().forEach((footer) => {
-      candidates.add(footer);
-      let node = footer.parentElement;
-      for (let depth = 0; node instanceof HTMLElement && depth < 6; depth += 1, node = node.parentElement) {
-        if (codexServiceTierBadgeVisibleElement(node)) candidates.add(node);
-      }
-    });
-    return Array.from(candidates);
+    if (threadComposer && codexServiceTierBadgeVisibleElement(threadComposer)) return [threadComposer];
+    const footers = codexServiceTierVisibleComposerFooters().filter((footer) =>
+      !footer.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`));
+    // 只认唯一的原生 footer；不能爬到页面/侧栏祖先，或把 review 的栏当成输入区。
+    return footers.length === 1 ? footers : [];
   }
 
   function codexServiceTierBestComposerFooter(root = document) {
@@ -1531,8 +1528,8 @@
   }
 
   function codexServiceTierComposerFooter(composer) {
-    if (composer?.matches?.(".composer-footer")) return composer;
-    return codexServiceTierBestComposerFooter(composer) || codexServiceTierBestComposerFooter() || null;
+    if (composer?.matches?.(codexServiceTierComposerFooterSelector)) return composer;
+    return codexServiceTierBestComposerFooter(composer) || null;
   }
 
   function codexServiceTierBadgeFooterGroup(composer) {
@@ -1588,7 +1585,7 @@
       existingBadges.forEach((badge) => badge.remove());
       return;
     }
-    let badge = existingBadges.find((node) => node.closest?.(".composer-footer") || node.closest?.("button") == null) || existingBadges[0];
+    let badge = existingBadges.find((node) => node.closest?.(codexServiceTierComposerFooterSelector) || node.closest?.("button") == null) || existingBadges[0];
     existingBadges.forEach((node) => {
       if (node !== badge) node.remove();
     });

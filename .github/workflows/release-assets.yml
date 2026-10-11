@@ -83,7 +83,7 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build binaries
+      - name: Build application
         run: cargo build --release
 
       - name: Stage Windows app files
@@ -91,7 +91,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
 
       - name: Build Windows zip asset
         shell: pwsh
@@ -250,10 +250,22 @@ jobs:
           STAGE="dist/macos/stage-${VERSION}-universal"
           test -L "$STAGE/Applications"
           test "$(readlink "$STAGE/Applications")" = "/Applications"
+          apps=($STAGE/*.app)
+          test "${#apps[@]}" = "2"
+          test -f "$STAGE/.hidden"
+          grep -qx "Codex++ 管理工具.app" "$STAGE/.hidden"
           for app in "$STAGE/Codex++.app" "$STAGE/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
             test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            if [[ "$app" == *"管理工具.app" ]]; then
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
+            else
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlus"
+            fi
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CodexPlusUnifiedApp' "$app/Contents/Info.plist")" = "true"
             plutil -lint "$app/Contents/Info.plist" >/dev/null
             codesign --verify --deep --strict "$app"
             if [ -n "${MACOS_NOTARY_PROFILE:-}" ]; then
@@ -320,7 +332,8 @@ jobs:
             .map((name) => ({ name, url: `${baseUrl}/${encodeURIComponent(name)}` }));
           const payload = {
             version: `v${version}`,
-            url: release.url || `https://github.com/${repo}/releases/tag/${tag}`,
+            // 草稿的 release.url 是临时 untagged 地址，静态元数据必须使用正式 tag 链接。
+            url: `https://github.com/${repo}/releases/tag/${tag}`,
             body: release.body || "",
             assets
           };

@@ -36,7 +36,6 @@
         syncOfficialUsagePolicy();
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-        if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
         renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
           refreshConversationView();
@@ -71,7 +70,6 @@
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-    if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
     renderCodexPlusMenu();
     scan();
   }
@@ -2025,8 +2023,8 @@
       rail.dataset.codexPlusRailNavigationListener = "true";
       rail.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-        // 拓展入口的 id 是动态生成的，不在上面三个之内。不排除它，点拓展入口会被
-        // 当成「点了原生导航按钮」，刚打开的拓展页面立刻被关掉。
+        if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailExtensionsId}`)) return;
+        // 第三方拓展入口使用动态 id，也要按归属标记排除，避免刚打开就被关闭。
         if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
         if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
       }, true);

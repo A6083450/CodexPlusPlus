@@ -3864,20 +3864,22 @@
   function codexServiceTierFastSupportedForModel(modelName) {
     const normalized = normalizeCodexServiceTierModelName(modelName);
     if (!normalized) return false;
-    if (codexServiceTierSupportedFastModels.has(normalized)) return true;
     // 不按名字猜：模型叫 deepseek 不代表它的中转站支持 priority tier。
     // 只认上游模型元数据里明确声明的 priority。
     try {
       const metadata = typeof codexPlusModelMetadata === "function" ? codexPlusModelMetadata(modelName) : null;
-      if (metadata && Array.isArray(metadata.serviceTiers) && metadata.serviceTiers.some((t) => String(t.id || t).toLowerCase() === "priority")) return true;
+      if (typeof metadata?.prioritySupportOverride === "boolean") return metadata.prioritySupportOverride;
+      const tierIs = (tier, expected) => String(typeof tier === "string" ? tier : tier?.id || "").trim().toLowerCase() === expected;
+      if (Array.isArray(metadata?.serviceTiers) && metadata.serviceTiers.some((tier) => tierIs(tier, "priority"))) return true;
+      if (Array.isArray(metadata?.additionalSpeedTiers) && metadata.additionalSpeedTiers.some((tier) => tierIs(tier, "fast"))) return true;
     } catch {}
-    // removed blanket apikey fallback to keep test contract (FAST only for known models)
-    return false;
+    // 未声明仍沿用已验证的内置模型；第三方模型不能因名字含 fast 就自动放行。
+    return codexServiceTierSupportedFastModels.has(normalized);
   }
 
   function codexServiceTierFastUnsupportedMessage(modelName = codexServiceTierCurrentModelName()) {
     const modelText = modelName ? `当前模型 ${modelName} 不支持` : "当前模型未读取";
-    return `Fast 仅支持 ${codexServiceTierFastModelListLabel()}，${modelText}`;
+    return `Fast 支持 ${codexServiceTierFastModelListLabel()} 或已声明 priority 的模型，${modelText}；可在供应商的模型配置中设置 Fast 支持`;
   }
 
   function codexServiceTierMaybeLoadModelCatalog(force = false) {
@@ -4191,7 +4193,7 @@
     const title = [
       `服务模式：${scope}`,
       "Standard：使用标准处理；不在请求上设置 priority。",
-      `Fast：仅支持 ${codexServiceTierFastModelListLabel()}；对支持模型使用 service_tier=\"priority\"，官方说明其延迟更低且更一致，但会按更高价格计费；rate limit 与 Standard 共享，流量快速上涨时可能回落到 Standard。`,
+      `Fast：支持 ${codexServiceTierFastModelListLabel()} 或已声明 priority 的模型；使用 service_tier=\"priority\"，实际支持与计费由供应商决定，可在模型配置中明确声明。`,
     ].join("\n");
     if (effectiveMode === "fast" && !fastAvailability.supported) {
       return { tier: "unsupported", label: "不支持", title: `${title}\n${codexServiceTierFastUnsupportedMessage(fastAvailability.modelName)}；当前请求会按 Standard 发送。` };
@@ -4547,10 +4549,9 @@
   }
 
   function codexRemoteSessionProviderRequestMethod(method) {
-    // app-server restores persisted model/provider/reasoning for thread/resume only
-    // when the caller supplies none of those overrides.
     return [
       "thread/start",
+      "thread/resume",
       "start-conversation",
       "start-thread-for-host",
       "thread-prewarm-start",
@@ -4566,6 +4567,8 @@
     if (!params || typeof params !== "object" || Array.isArray(params)) return params;
     const profile = codexRemoteSessionActiveProfile();
     const pureApi = String(profile?.relayMode || "") === "pureApi";
+    // Pure API 恢复旧会话时必须覆盖持久化的 openai；官登会话保留原生恢复语义。
+    if (requestMethod === "thread/resume" && !pureApi) return params;
     if (requestMethod === "turn/start" && !pureApi) return params;
     const hasModelProvider = Object.prototype.hasOwnProperty.call(params, "modelProvider")
       || Object.prototype.hasOwnProperty.call(params, "model_provider");
@@ -5072,7 +5075,6 @@
         syncOfficialUsagePolicy();
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-        if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
         renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
           refreshConversationView();
@@ -5107,7 +5109,6 @@
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
-    if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
     renderCodexPlusMenu();
     scan();
   }
@@ -7061,8 +7062,8 @@
       rail.dataset.codexPlusRailNavigationListener = "true";
       rail.addEventListener("click", (event) => {
         const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-        // 拓展入口的 id 是动态生成的，不在上面三个之内。不排除它，点拓展入口会被
-        // 当成「点了原生导航按钮」，刚打开的拓展页面立刻被关掉。
+        if (target?.closest(`#${codexPlusRailNavId}, #${codexPlusRailExtensionsId}`)) return;
+        // 第三方拓展入口使用动态 id，也要按归属标记排除，避免刚打开就被关闭。
         if (target?.closest(`[${codexPlusExtensionConstants.extensionAttribute}]`)) return;
         if (target?.closest("button, a")) closeCodexPlusPageAfterNativeNavigation();
       }, true);
@@ -7146,6 +7147,7 @@
       return params;
     }
     const next = { ...params };
+    if (next.forceRefetch === true) clearPluginMarketplaceRemoteCatalogUnavailable();
     const requestProfile = pluginMarketplaceRequestProfile(next);
     const requestCwds = Array.isArray(next.cwds)
       ? next.cwds.filter((cwd) => typeof cwd === "string" && cwd.trim())
@@ -7158,7 +7160,7 @@
     const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
     const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
       && (!hadMarketplaceKinds || next.marketplaceKinds == null);
-    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
+    const remoteCatalogUnavailable = pluginMarketplaceRemoteCatalogUnavailable();
     if (broadCatalogRequest && !remoteCatalogUnavailable) {
       sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
         hadMarketplaceKinds,
@@ -7429,8 +7431,32 @@
     return text.includes("chatgpt authentication required for remote plugin catalog") && text.includes("api key auth is not supported");
   }
 
+  const codexPluginRemoteAuthRetryMs = 60_000;
+
+  function clearPluginMarketplaceRemoteCatalogUnavailable() {
+    delete window.__codexPluginMarketplaceRemoteCatalogUnavailable;
+    delete window.__codexPluginMarketplaceRemoteCatalogRejectedAt;
+  }
+
+  function pluginMarketplaceRemoteCatalogUnavailable() {
+    if (window.__codexPluginMarketplaceRemoteCatalogUnavailable !== true) return false;
+    const now = Date.now();
+    const rejectedAt = window.__codexPluginMarketplaceRemoteCatalogRejectedAt;
+    // 兼容旧注入留下的标记；只暂时降级，下次浏览可重新验证登录态。
+    if (!Number.isFinite(rejectedAt)) {
+      window.__codexPluginMarketplaceRemoteCatalogRejectedAt = now;
+      return true;
+    }
+    if (now < rejectedAt || now - rejectedAt >= codexPluginRemoteAuthRetryMs) {
+      clearPluginMarketplaceRemoteCatalogUnavailable();
+      return false;
+    }
+    return true;
+  }
+
   function markPluginMarketplaceRemoteCatalogUnavailable(error) {
     window.__codexPluginMarketplaceRemoteCatalogUnavailable = true;
+    window.__codexPluginMarketplaceRemoteCatalogRejectedAt = Date.now();
     sendCodexPlusDiagnostic("plugin_marketplace_remote_auth_fallback", {
       errorMessage: pluginMarketplaceErrorText(error),
       rememberedCwdCount: Array.isArray(window.__codexPluginMarketplaceLastCwds)
@@ -7669,10 +7695,10 @@
       setCodexAppVersion: (version) => {
         codexPlusBackendSettings.codexAppVersion = String(version || "");
       },
-      remoteCatalogUnavailable: () => window.__codexPluginMarketplaceRemoteCatalogUnavailable === true,
+      remoteCatalogUnavailable: pluginMarketplaceRemoteCatalogUnavailable,
       reset: () => {
         delete window.__codexPluginMarketplaceLastCwds;
-        delete window.__codexPluginMarketplaceRemoteCatalogUnavailable;
+        clearPluginMarketplaceRemoteCatalogUnavailable();
         window.__codexPluginMarketplaceRequestIds = new Set();
         window.__codexPluginMarketplaceFetchRequestIds = new Set();
         window.__codexPluginMarketplaceRequestProfiles = new Map();
@@ -7683,6 +7709,7 @@
   }
 
   function clearPluginMarketplaceQueryCache() {
+    clearPluginMarketplaceRemoteCatalogUnavailable();
     try {
       const queryClient = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
       if (queryClient && typeof queryClient.invalidateQueries === "function") {
@@ -14191,14 +14218,16 @@
       });
   }
 
+  const codexServiceTierComposerFooterSelector = ".composer-footer, [data-composer-footer-responsive]";
+
   function codexServiceTierVisibleComposerFooters(root = document) {
     const footers = [
-      ...(root?.matches?.(".composer-footer") ? [root] : []),
-      ...Array.from(root?.querySelectorAll?.(".composer-footer") || []),
+      ...(root?.matches?.(codexServiceTierComposerFooterSelector) ? [root] : []),
+      ...Array.from(root?.querySelectorAll?.(codexServiceTierComposerFooterSelector) || []),
       ...(root?.matches?.("[class*='_footer_']") ? [root] : []),
       ...Array.from(root?.querySelectorAll?.("[class*='_footer_']") || []),
     ].filter((footer, index, all) => all.indexOf(footer) === index)
-      .filter((footer) => footer.matches?.(".composer-footer") || footer.querySelector?.("[contenteditable='true']"));
+      .filter((footer) => footer.matches?.(codexServiceTierComposerFooterSelector) || footer.querySelector?.("[contenteditable='true']"));
     return footers
       .filter(codexServiceTierBadgeVisibleElement)
       .sort((left, right) => {
@@ -14215,8 +14244,8 @@
     if (providerNames.some((name) => name && text.includes(name))) score += 40;
     if (/完全访问权限|full access|model|超高|high|sub2api|provider/i.test(text)) score += 20;
     if (/本地模式|local mode|worktree|branch|codex\//i.test(text)) score -= 30;
-    if (composer.matches?.(".composer-footer")) score += 4;
-    if (composer.querySelector?.(".composer-footer")) score += 8;
+    if (composer.matches?.(codexServiceTierComposerFooterSelector)) score += 4;
+    if (composer.querySelector?.(codexServiceTierComposerFooterSelector)) score += 8;
     const buttons = Array.from(composer.querySelectorAll?.("button, [role='button']") || []).filter(codexServiceTierBadgeVisibleElement);
     if (buttons.some((button) => codexServiceTierLooksLikeProviderButton(button, providerNames))) score += 30;
     score += Math.min(10, buttons.length);
@@ -14224,17 +14253,12 @@
   }
 
   function codexServiceTierComposerCandidates() {
-    const candidates = new Set();
     const threadComposer = conversationViewFindComposerEl();
-    if (threadComposer && codexServiceTierBadgeVisibleElement(threadComposer)) candidates.add(threadComposer);
-    codexServiceTierVisibleComposerFooters().forEach((footer) => {
-      candidates.add(footer);
-      let node = footer.parentElement;
-      for (let depth = 0; node instanceof HTMLElement && depth < 6; depth += 1, node = node.parentElement) {
-        if (codexServiceTierBadgeVisibleElement(node)) candidates.add(node);
-      }
-    });
-    return Array.from(candidates);
+    if (threadComposer && codexServiceTierBadgeVisibleElement(threadComposer)) return [threadComposer];
+    const footers = codexServiceTierVisibleComposerFooters().filter((footer) =>
+      !footer.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`));
+    // 只认唯一的原生 footer；不能爬到页面/侧栏祖先，或把 review 的栏当成输入区。
+    return footers.length === 1 ? footers : [];
   }
 
   function codexServiceTierBestComposerFooter(root = document) {
@@ -14262,8 +14286,8 @@
   }
 
   function codexServiceTierComposerFooter(composer) {
-    if (composer?.matches?.(".composer-footer")) return composer;
-    return codexServiceTierBestComposerFooter(composer) || codexServiceTierBestComposerFooter() || null;
+    if (composer?.matches?.(codexServiceTierComposerFooterSelector)) return composer;
+    return codexServiceTierBestComposerFooter(composer) || null;
   }
 
   function codexServiceTierBadgeFooterGroup(composer) {
@@ -14319,7 +14343,7 @@
       existingBadges.forEach((badge) => badge.remove());
       return;
     }
-    let badge = existingBadges.find((node) => node.closest?.(".composer-footer") || node.closest?.("button") == null) || existingBadges[0];
+    let badge = existingBadges.find((node) => node.closest?.(codexServiceTierComposerFooterSelector) || node.closest?.("button") == null) || existingBadges[0];
     existingBadges.forEach((node) => {
       if (node !== badge) node.remove();
     });
@@ -15504,6 +15528,42 @@
     return encoded;
   }
 
+  // SenseVoice 接收 16 kHz/单声道 PCM WAV；MediaRecorder 在 Chromium 中通常只提供 WebM/Opus，
+  // 因此只在选择本地 provider 时通过浏览器音频解码器做一次无损 PCM 转换。
+  async function codexPlusDictationSenseVoiceWav(blob, signal) {
+    if (signal.aborted) throw new DOMException("转写已取消", "AbortError");
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    const OfflineContextCtor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!AudioContextCtor || !OfflineContextCtor) throw new Error("当前环境无法转换本地 SenseVoice 音频");
+    const context = new AudioContextCtor();
+    try {
+      const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+      if (signal.aborted) throw new DOMException("转写已取消", "AbortError");
+      const frames = Math.max(1, Math.ceil(decoded.duration * 16000));
+      const offline = new OfflineContextCtor(1, frames, 16000);
+      const source = offline.createBufferSource();
+      source.buffer = decoded;
+      source.connect(offline.destination);
+      source.start();
+      const rendered = await offline.startRendering();
+      const samples = rendered.getChannelData(0);
+      const bytes = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(bytes);
+      const write = (offset, value) => { for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)); };
+      write(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); write(8, "WAVE");
+      write(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+      view.setUint32(24, 16000, true); view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+      write(36, "data"); view.setUint32(40, samples.length * 2, true);
+      for (let i = 0; i < samples.length; i++) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(44 + i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return new Blob([bytes], { type: "audio/wav" });
+    } finally {
+      void context.close?.();
+    }
+  }
+
   async function transcribeCodexPlusDictation() {
     if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
     if (!codexPlusDictation.blob) return;
@@ -15524,14 +15584,17 @@
         if (requestStarted) void postJson("/dictation/cancel", { requestId, helperToken: status.helperToken }).catch(() => {});
       };
       controller.signal.addEventListener("abort", cancelRequest, { once: true });
-      const audioBase64 = await codexPlusDictationAudioBase64(codexPlusDictation.blob, controller.signal);
+      const uploadBlob = status.provider === "sensevoice"
+        ? await codexPlusDictationSenseVoiceWav(codexPlusDictation.blob, controller.signal)
+        : codexPlusDictation.blob;
+      const audioBase64 = await codexPlusDictationAudioBase64(uploadBlob, controller.signal);
       if (revision !== codexPlusDictation.revision || controller.signal.aborted) return;
       if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
-      const extension = codexPlusDictation.blob.type.includes("mp4") ? "m4a" : "webm";
+      const extension = uploadBlob.type.includes("wav") ? "wav" : uploadBlob.type.includes("mp4") ? "m4a" : "webm";
       requestStarted = true;
       // app:// 的 CSP 不允许 renderer 直接 fetch localhost；音频经既有特权桥接交给 Rust。
       const result = await postJson("/dictation/transcribe", {
-        requestId, audioBase64, mimeType: codexPlusDictation.blob.type || "audio/webm",
+        requestId, audioBase64, mimeType: uploadBlob.type || "audio/webm",
         filename: `dictation.${extension}`, helperToken: status.helperToken,
       });
       controller.signal.removeEventListener("abort", cancelRequest);
@@ -16277,7 +16340,6 @@
     // 所以要每轮扫描都补一次（内部靠 id 幂等，不会重复插入）。
     refreshCodexPlusRailNavigation();
     installCodexPlusPageNavigationCloseHandler();
-    installSessionShareImportListener();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();
     updateThreadScrollHandlers();
@@ -16647,6 +16709,18 @@
     return hasRename || hasOtherSessionAction;
   }
 
+  function isNativeSessionRenameMenuItem(candidate) {
+    if (!(candidate instanceof HTMLElement) || !visibleElement(candidate)) return false;
+    const text = normalizedElementText(candidate);
+    const label = candidate.getAttribute("aria-label") || "";
+    const testid = candidate.getAttribute("data-testid") || "";
+    // Codex 26.1007 changed the visible label from the bare "重命名"/
+    // "Rename" to a longer localized label. Match the native semantic
+    // affordance while excluding Codex++'s own auto-rename entry.
+    if (/自动重命名当前会话|auto.?rename current session/i.test(`${text} ${label}`)) return false;
+    return /重命名|rename/i.test(`${text} ${label} ${testid}`);
+  }
+
   function rememberSessionActionTrigger(event) {
     const trigger = event.target?.closest?.('button[aria-label="聊天操作"], button[aria-label="Chat actions"]');
     if (trigger) lastSessionActionTrigger = trigger;
@@ -16810,14 +16884,14 @@
       return sessionCopyMenuScopes()
         .filter((menu) => visibleElement(menu) && looksLikeSessionActionMenu(menu))
         .flatMap((menu) => [...menu.querySelectorAll('[role="menuitem"]')])
-        .find((candidate) => /^(重命名|Rename)$/i.test(normalizedElementText(candidate))) || null;
+        .find(isNativeSessionRenameMenuItem) || null;
     }, 1200);
     if (!renameItem) {
       trigger.click();
       renameItem = await waitForSessionElement(() => {
         return [...document.querySelectorAll('[role="menuitem"]')]
           .filter(visibleElement)
-          .find((candidate) => /^(重命名|Rename)$/i.test(normalizedElementText(candidate))) || null;
+          .find(isNativeSessionRenameMenuItem) || null;
       }, 1200);
     }
     if (!(renameItem instanceof HTMLElement)) {
@@ -16971,7 +17045,6 @@
     syncCodexNativeSolidFastIcon();
     installCodexNativeServiceTierSelectionSync();
     installCodexServiceTierMenu();
-    installSessionShareButton();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
   }

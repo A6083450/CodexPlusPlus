@@ -14,6 +14,7 @@ export type RelayModelRouteProfile = {
   officialMixApiKey: boolean;
   noAuth?: boolean;
   imageGenerationProxy?: boolean;
+  webSearchHistoryCompat?: boolean;
   modelRoutes?: RelayModelRoute[];
   model?: string;
   modelList?: string;
@@ -81,6 +82,15 @@ export function imageGenerationUsesProxy(profile: RelayModelRouteProfile): boole
       .some(model => model.trim().toLowerCase().startsWith("gpt-image-"));
 }
 
+export function webSearchHistoryCompatEnabled(
+  profile: Pick<RelayModelRouteProfile, "protocol" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat">,
+): boolean {
+  return profile.webSearchHistoryCompat === true
+    && profile.protocol === "responses"
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+}
+
 export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): boolean {
   if (settings.enhancementsEnabled) return true;
   const active = settings.relayProfiles.find((profile) => profile.id === settings.activeRelayId)
@@ -91,6 +101,7 @@ export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): b
     || (active.relayMode === "pureApi" && active.noAuth === true)
     || (active.relayMode === "official" && active.officialMixApiKey)
     || imageGenerationUsesProxy(active)
+    || webSearchHistoryCompatEnabled(active)
     || normalizeRelayModelRoutes(active.modelRoutes).some(
       (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
     );

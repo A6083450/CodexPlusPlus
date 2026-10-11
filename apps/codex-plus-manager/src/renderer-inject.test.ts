@@ -210,29 +210,10 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(renderer, /\n\s*refreshSessionCopyMenuItems\(\);/);
   });
 
-  it("adds an encrypted session sharing button to the active Codex conversation", async () => {
+  it("does not install a session sharing button after sharing is retired", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
-    assert.match(renderer, /sessionShareButtonClass\s*=\s*"codex-session-share-button"/);
-    assert.match(renderer, /function installSessionShareButton\(\)/);
-    assert.match(renderer, /function sessionShareMarkdown\(\)/);
-    assert.match(renderer, /crypto\.subtle\.generateKey\(\{ name: "AES-GCM", length: 256 \}/);
-    assert.match(renderer, /https:\/\/share\.codexpp\.cc/);
-    assert.match(renderer, /postJson\("\/share\/create", payload\)/);
-    assert.match(renderer, /postJson\("\/session\/export"/);
-    assert.match(renderer, /postJson\("\/session\/import"/);
-    assert.match(renderer, /codex-rollout/);
-    assert.match(renderer, /function sessionImportMarkdown\(session\)/);
-    assert.match(renderer, /codexpp-import-session/);
-    assert.match(renderer, /nativeShare\?\.closest\?\.\("\.ms-auto"\)/);
-    assert.match(renderer, /function sessionSharePlacement\(\)/);
-    assert.match(renderer, /sessionShare: "codexAppSessionShare"/);
-    assert.match(renderer, /#k=\$\{encrypted\.key\}/);
-    assert.match(renderer, /navigator\.clipboard\.writeText\(shareUrl\)/);
-    assert.match(renderer, /data-testid\*=\"message\"/);
-    assert.match(renderer, /function sessionActionTrigger\(row\)/);
-    assert.match(renderer, /const sessionMenuEnabled = codexPlusBackendSettings\.enhancementsEnabled !== false/);
-    assert.doesNotMatch(renderer, /window\.location\.(?:href|assign)\s*=\s*[^;]*markdown/);
+    assert.doesNotMatch(renderer, /\n\s*installSessionShareButton\(\);/);
+    assert.doesNotMatch(renderer, /\n\s*installSessionShareImportListener\(\);/);
   });
 
   it("automatically renames a session through the native title suggestion", async () => {
@@ -244,6 +225,15 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /button\.classList\.contains\("text-info"\)/);
     assert.match(renderer, /\^\(保存\|Save\)\$/);
     assert.match(renderer, /Codex 未能生成新名称/);
+  });
+
+  it("accepts localized native rename labels introduced by newer Codex builds", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /function isNativeSessionRenameMenuItem\(candidate\)/);
+    assert.match(renderer, /data-testid/);
+    assert.match(renderer, /自动重命名当前会话\|auto\.\?rename current session/);
+    assert.match(renderer, /\.find\(isNativeSessionRenameMenuItem\)/);
   });
 
   it("removes the legacy Codex++ top-bar entry", async () => {
@@ -353,6 +343,63 @@ describe("renderer injection header compatibility", () => {
     // 图标栏是纯图标，不塞文字标签。
     assert.match(renderer, /class="codex-plus-rail-icon"/);
     assert.doesNotMatch(renderer, /codex-plus-rail-icon"[^]*?<span class="truncate">/);
+  });
+
+  it("keeps Codex++ and 拓展 pages open when their rail entries are clicked", async () => {
+    const source = await readFile(new URL("../../../assets/inject/renderer-inject/40-backend-settings.js", import.meta.url), "utf8");
+    const listener = source.match(/rail\.addEventListener\("click", (\(event\) => \{[\s\S]*?\n      \}), true\);/);
+    assert.ok(listener, "rail capture listener should exist");
+
+    class Element {
+      tag: string;
+      parentElement: Element | null;
+      id: string;
+      extension: boolean;
+
+      constructor(tag: string, parentElement: Element | null = null, id = "", extension = false) {
+        this.tag = tag;
+        this.parentElement = parentElement;
+        this.id = id;
+        this.extension = extension;
+      }
+
+      closest(selector: string): Element | null {
+        for (let node: Element | null = this; node; node = node.parentElement) {
+          const current = node;
+          if (selector.split(",").some(part => {
+            const value = part.trim();
+            return value === current.tag || value === `#${current.id}`
+              || (value === "[data-codex-plus-ext]" && current.extension);
+          })) return current;
+        }
+        return null;
+      }
+    }
+
+    let closes = 0;
+    const onClick = vm.runInNewContext(`(${listener[1]})`, {
+      Element,
+      codexPlusRailNavId: "codex-plus-rail-nav",
+      codexPlusRailExtensionsId: "codex-plus-rail-extensions",
+      codexPlusExtensionConstants: { extensionAttribute: "data-codex-plus-ext" },
+      closeCodexPlusPageAfterNativeNavigation: () => { closes++; },
+    }) as (event: { target: unknown }) => void;
+
+    for (const id of ["codex-plus-rail-nav", "codex-plus-rail-extensions"]) {
+      const button = new Element("button", new Element("div", null, id));
+      onClick({ target: button });
+      onClick({ target: new Element("path", new Element("svg", button)) });
+      onClick({ target: { parentElement: button } });
+      assert.equal(closes, 0, `${id} must not schedule its own page for closing`);
+    }
+    onClick({ target: new Element("button", new Element("div", null, "", true)) });
+    assert.equal(closes, 0, "third-party extension entries must remain excluded");
+    onClick({ target: new Element("span") });
+    assert.equal(closes, 0, "empty rail space must not close pages");
+    onClick({ target: new Element("path", new Element("button")) });
+    assert.equal(closes, 1, "native buttons must still close the injected page");
+    onClick({ target: new Element("a") });
+    assert.equal(closes, 2, "native links must still close the injected page");
   });
 
   it("falls back to the legacy sidebar entry when the rail is absent", async () => {
