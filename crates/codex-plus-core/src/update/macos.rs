@@ -1267,34 +1267,30 @@ mod tests {
 
     #[test]
     fn macos_update_accepts_unified_installation_and_requests_manual_legacy_migration() {
-        assert_eq!(
-            installed_root_from_executable(Path::new(
-                "/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus"
-            ))
-            .unwrap(),
-            PathBuf::from("/Applications")
-        );
-        assert_eq!(
-            installed_root_from_executable(Path::new(
-                "/Applications/codex++.app/Contents/MacOS/CodexPlusPlus"
-            ))
-            .unwrap(),
-            PathBuf::from("/Applications")
-        );
-        for executable in ["/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager"]
-        {
-            let error = installed_root_from_executable(Path::new(executable)).unwrap_err();
-            assert!(error.to_string().contains("手动迁移"));
-            assert!(
-                error
-                    .to_string()
-                    .contains("旧版自动更新器不支持单应用安装包")
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Applications");
+        // 使用宿主路径分隔符，避免 Windows 上的固定 macOS 路径与 join 结果不一致。
+        let executable =
+            |app: &str, binary: &str| root.join(app).join("Contents/MacOS").join(binary);
+        for app in ["Codex++.app", "codex++.app"] {
+            assert_eq!(
+                installed_root_from_executable(&executable(app, "CodexPlusPlus")).unwrap(),
+                root
             );
         }
-        let renamed = installed_root_from_executable(Path::new(
-            "/Applications/Codex++ 2.app/Contents/MacOS/CodexPlusPlus",
+        let error = installed_root_from_executable(&executable(
+            "Codex++ 管理工具.app",
+            "CodexPlusPlusManager",
         ))
         .unwrap_err();
+        assert!(error.to_string().contains("手动迁移"));
+        assert!(
+            error
+                .to_string()
+                .contains("旧版自动更新器不支持单应用安装包")
+        );
+        let renamed = installed_root_from_executable(&executable("Codex++ 2.app", "CodexPlusPlus"))
+            .unwrap_err();
         assert!(renamed.to_string().contains("标准应用目录"));
         assert!(!renamed.to_string().contains("旧双应用"));
     }
