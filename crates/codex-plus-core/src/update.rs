@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", test))]
 pub mod macos;
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+pub const DEFAULT_REPOSITORY: &str = "A6083450/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+    "https://github.com/A6083450/CodexPlusPlus/releases/latest/download/latest.json";
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -70,7 +70,18 @@ pub fn is_newer_version(candidate: &str, current: &str) -> anyhow::Result<bool> 
     let len = left.len().max(right.len());
     left.resize(len, 0);
     right.resize(len, 0);
-    Ok(left > right)
+    if left != right {
+        return Ok(left > right);
+    }
+    // fork 的同版重打包使用 +数字，基础版本相同时继续比较发布序号。
+    let build_number = |version: &str| {
+        version
+            .trim()
+            .split_once('+')
+            .and_then(|(_, build)| build.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    Ok(build_number(candidate) > build_number(current))
 }
 
 pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {

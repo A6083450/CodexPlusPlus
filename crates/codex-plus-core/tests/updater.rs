@@ -1,6 +1,7 @@
 use codex_plus_core::update::{
-    Release, download_asset_to, is_newer_version, parse_version_tag, release_from_github_payload,
-    release_from_latest_json_payload, safe_asset_name, select_update_asset,
+    DEFAULT_LATEST_JSON_URL, DEFAULT_REPOSITORY, Release, download_asset_to, is_newer_version,
+    parse_version_tag, release_from_github_payload, release_from_latest_json_payload,
+    safe_asset_name, select_update_asset,
 };
 use serde_json::json;
 
@@ -16,6 +17,26 @@ fn version_comparison_uses_numeric_segments() {
     assert!(is_newer_version("v1.0.10", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.4", "1.0.4").unwrap());
     assert!(!is_newer_version("v1.0.3", "1.0.4").unwrap());
+}
+
+#[test]
+fn default_update_feed_is_the_user_fork() {
+    assert_eq!(DEFAULT_REPOSITORY, "A6083450/CodexPlusPlus");
+    assert_eq!(
+        DEFAULT_LATEST_JSON_URL,
+        "https://github.com/A6083450/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+}
+
+#[test]
+fn version_comparison_recognizes_newer_fork_builds() {
+    assert!(is_newer_version("v1.7.6+57", "1.7.6+56").unwrap());
+    assert!(!is_newer_version("v1.7.6+56", "1.7.6+56").unwrap());
+    assert!(!is_newer_version("v1.7.6+55", "1.7.6+56").unwrap());
+    assert!(is_newer_version("v1.7.6+56", "1.7.6").unwrap());
+    assert!(!is_newer_version("v1.7.6", "1.7.6+56").unwrap());
+    assert!(is_newer_version("v1.7.7+1", "1.7.6+56").unwrap());
+    assert!(!is_newer_version("v1.7.5+99", "1.7.6+56").unwrap());
 }
 
 #[test]
