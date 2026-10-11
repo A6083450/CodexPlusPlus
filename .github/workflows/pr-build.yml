@@ -48,7 +48,7 @@ jobs:
         run: npm run vite:build
 
       - name: Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: Build release application
         run: cargo build --release
