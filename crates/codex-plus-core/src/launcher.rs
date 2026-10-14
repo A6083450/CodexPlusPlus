@@ -3598,6 +3598,10 @@ async fn bridge_health_ok(debug_port: u16) -> anyhow::Result<bool> {
         .web_socket_debugger_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
+    // 页面仍可访问不代表原桥接 socket 还在，尤其是灭屏待机恢复后。
+    if !crate::bridge::bridge_transport_is_active(websocket_url) {
+        return Ok(false);
+    }
     let result = crate::bridge::evaluate_script_with_await_promise(
         websocket_url,
         crate::bridge::bridge_health_check_script(),
@@ -4516,6 +4520,76 @@ mod tests {
             true,
             &mut failures
         ));
+    }
+
+    #[tokio::test]
+    async fn bridge_health_rejects_cached_hidden_page_after_transport_disconnects() {
+        use futures_util::SinkExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0; 4096];
+                let count = stream.peek(&mut header).await.unwrap();
+                if header[..count].starts_with(b"GET /json ") {
+                    stream.read(&mut header).await.unwrap();
+                    let body = serde_json::json!([{
+                        "id": "sleep-fixture", "type": "page", "url": "app://-/index.html",
+                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/sleep-fixture")
+                    }]).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let command: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    // 隐藏页还保留旧 JS 桥，旧健康脚本会返回 true，但 Rust 桥接已断开。
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::json!({
+                        "id": command["id"], "result": { "result": { "type": "boolean", "value": true } }
+                    }).to_string().into())).await.unwrap();
+                }
+            }
+        });
+        let healthy = bridge_health_ok(port).await.unwrap();
+        reinject_throttle().lock().await.reset();
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let mut failures = 0;
+        let mut backoff = BridgeReinjectBackoff::default();
+        let mut recovered = Vec::new();
+        for _ in 0..2 {
+            recovered.push(
+                check_and_reinject_bridge_inner(
+                    port,
+                    57321,
+                    false,
+                    Some(counted_reinjector(reconnects.clone())),
+                    &mut failures,
+                    &mut backoff,
+                )
+                .await,
+            );
+        }
+        reinject_throttle().lock().await.reset();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            !healthy,
+            "a cached JS bridge must not hide a disconnected Rust transport"
+        );
+        assert_eq!(
+            recovered,
+            [false, true],
+            "the watchdog must reconnect without a browser identity change"
+        );
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
     }
 
     #[test]

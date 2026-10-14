@@ -204,6 +204,13 @@ fn bridge_generation_is_current(generation: &BridgeGeneration) -> bool {
         .is_some_and(|current| *current == generation.id)
 }
 
+pub(crate) fn bridge_transport_is_active(websocket_url: &str) -> bool {
+    CURRENT_BRIDGE_GENERATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(websocket_url)
+}
+
 fn release_bridge_generation(generation: &BridgeGeneration) {
     let mut generations = CURRENT_BRIDGE_GENERATIONS
         .lock()
@@ -266,10 +273,10 @@ pub fn bridge_health_check_script() -> &'static str {
   const health = window.__codexPlusBridgeHealth;
   if (typeof bridge !== "function" || !health) return false;
   // 窗口隐藏时 Chromium 会把后台定时器钳到约每分钟一次，心跳时间戳必然过期。
-  // 此时桥接对象仍在，不判定失效，避免看门狗按失败阈值每分钟重注入整份脚本
-  // （issue #2330）。
+  // 未报告失败时不因心跳过期重注入；已断连不能因窗口隐藏而跳过恢复（issue #2330）。
   // 必须放在 bridge/health 存在性检查之后：页面重载后真丢桥时仍要能修复。
-  if (typeof document !== "undefined" && document.visibilityState === "hidden") return true;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden"
+      && window.__codexPlusBackendStatus?.status !== "failed") return true;
   const now = Date.now();
   const lastSuccessAt = Number(health.lastSuccessAt) || 0;
   const lastInjectionAt = Number(health.lastInjectionAt) || 0;
@@ -944,11 +951,12 @@ async fn install_bridge_impl(
                 _ = tokio::time::sleep(BRIDGE_GENERATION_POLL_INTERVAL) => {}
             }
         }
+        // 先标记断连，唤醒后的看门狗不能被旧页面的 hidden 状态挡住。
+        release_bridge_generation(&generation);
         session
             .remove_registered_scripts(&registered_script_ids)
             .await;
         session.close().await;
-        release_bridge_generation(&generation);
     });
 
     Ok(())
@@ -1513,6 +1521,58 @@ fn next_message_id() -> u64 {
 #[cfg(test)]
 mod app_server_capture_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bridge_transport_tracks_a_real_socket_close() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let target = format!(
+            "ws://{}/devtools/page/sleep-lifecycle",
+            listener.local_addr().unwrap()
+        );
+        let (close, closed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for _ in 0..5 {
+                let command: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                let result = if command["method"] == "Page.addScriptToEvaluateOnNewDocument" {
+                    json!({ "identifier": "sleep-bridge-script" })
+                } else {
+                    json!({})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({ "id": command["id"], "result": result })
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            closed.await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let handler: BridgeHandler =
+            Arc::new(|_, _| Box::pin(async { Ok(json!({ "status": "ok" })) }));
+        assert!(!bridge_transport_is_active(&target));
+        install_bridge(&target, BRIDGE_BINDING_NAME, handler, &[])
+            .await
+            .unwrap();
+        assert!(bridge_transport_is_active(&target));
+        close.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while bridge_transport_is_active(&target) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closed bridge socket must leave the active registry");
+    }
 
     #[derive(Clone, Copy)]
     enum CaptureCase {
