@@ -402,6 +402,25 @@ pub fn model_ui_metadata_with_override(slug: &str, user_override: Option<&Value>
             .cloned()
             .unwrap_or_else(|| json!([]))
     });
+    // 供应商分组身份（模型聚合在 catalog 条目上写的 `codex_plus_group` /
+    // `codex_plus_group_id`）：这份 UI 元数据是白名单结构，不在这里显式转发就流不到
+    // 前端。只在值是非空字符串时写——单供应商直连的目录没有这两个键，因此不会凭空
+    // 多出一个空分组；空串同样忽略，避免前端渲染出无名表头。
+    for key in ["codex_plus_group", "codex_plus_group_id"] {
+        if let Some(value) = metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ui[key] = json!(value);
+        }
+    }
+    // `codex_plus_default` 标的是"这个模型属于默认成员"，用于在选择器里给默认供应商
+    // 那一组打标志。只有显式 true 才转发，缺键/false 都不写，保持既有响应形态不变。
+    if metadata.get("codex_plus_default").and_then(Value::as_bool) == Some(true) {
+        ui["codex_plus_default"] = json!(true);
+    }
     if !has_builtin {
         // 单独声明 Fast 不能替原生描述符制造名称、描述或推理默认档。
         for (ui_field, source_field) in [
@@ -595,6 +614,10 @@ pub fn builtin_model_metadata_index() -> Vec<Value> {
                 .get("context_window")
                 .or_else(|| entry.get("max_context_window")),
             "auto_compact_token_limit": entry.get("auto_compact_token_limit"),
+            // 模型列表「思考等级」列的初值：内置声明直接展示（用户覆盖写进
+            // 自己的 model_metadata，不经这里）。
+            "supported_reasoning_levels": entry.get("supported_reasoning_levels"),
+            "default_reasoning_level": entry.get("default_reasoning_level"),
         }));
     };
     for slug in candidate_slugs {
@@ -606,7 +629,7 @@ pub fn builtin_model_metadata_index() -> Vec<Value> {
 }
 /// 构建 codex model_catalog_json 内容。
 ///
-/// 采用 cc-switch 的 template-clone 思路：取 codex 自带 bundled entry 做模板，
+/// 采用 template-clone 思路：取 codex 自带 bundled entry 做模板，
 /// 再覆盖 slug / display_name / description / context_window / max_context_window /
 /// effective_context_window_percent / priority / auto_compact_token_limit 等字段。
 /// 无后缀条目用 fallback_window；fallback 也无时回落 272000（codex 默认）。
@@ -700,6 +723,19 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
             if !has_model_metadata {
                 model["additional_speed_tiers"] = json!([]);
                 model["service_tiers"] = json!([]);
+            }
+            // Codex Beta 26.727 起每个 model entry 都必须带 base_instructions，
+            // 否则整份 model_catalog_json 解析失败并连带 config.toml 拒载（#2492）。
+            // bundled 模板首条（gpt-5.5）没有该字段，clone 后按 Codex 自身的
+            // legacy 序列化规则补齐：镜像条目里的 instructions_template。
+            if model.get("base_instructions").is_none_or(Value::is_null) {
+                let mirrored = model
+                    .get("model_messages")
+                    .and_then(|messages| messages.get("instructions_template"))
+                    .filter(|value| value.is_string())
+                    .cloned()
+                    .unwrap_or_else(|| json!(""));
+                model["base_instructions"] = mirrored;
             }
             model["availability_nux"] = Value::Null;
             model["upgrade"] = Value::Null;

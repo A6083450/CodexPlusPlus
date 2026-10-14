@@ -208,6 +208,26 @@
                 <li>拖动、缩放与更换角色图片</li>
               </ul>
             </article>
+
+            <article class="feature-card feature-blue" data-reveal>
+              <span class="feature-index">07</span>
+              <h3>多开互不打扰</h3>
+              <p>为每个供应商身份启动相互隔离的 Codex 实例：独立配置、会话和用户数据目录，可与其他单一供应商同时运行。</p>
+              <ul>
+                <li>主 Codex 与多开实例集中列出</li>
+                <li>单独重启或结束，不共享会话</li>
+              </ul>
+            </article>
+
+            <article class="feature-card feature-coral" data-reveal>
+              <span class="feature-index">08</span>
+              <h3>用量状态栏</h3>
+              <p>输入框下方实时显示生成速度、缓存命中率与上下文占用，数据取自本机 Codex 会话记录，口径与 Codex 一致。</p>
+              <ul>
+                <li>上下文占比按每模型窗口计算</li>
+                <li>默认开启，可在管理器关闭</li>
+              </ul>
+            </article>
           </div>
           <p class="section-note" data-reveal>微信连接支持扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。</p>
         </div>
@@ -260,6 +280,32 @@
               <figcaption>
                 <strong>社区拓展市场</strong>
                 <span>发现、安装和管理工作流工具</span>
+              </figcaption>
+            </figure>
+            <figure data-reveal style="grid-column: 1 / -1">
+              <img
+                src="images/usage-statusline.png"
+                alt="输入框下方的用量状态栏：51 tok/s、缓存命中 99.9%、上下文占用 19%"
+                width="1576"
+                height="270"
+                loading="lazy"
+              >
+              <figcaption>
+                <strong>用量状态栏</strong>
+                <span>生成速度、缓存命中与上下文占用，输入框下方一目了然</span>
+              </figcaption>
+            </figure>
+            <figure data-reveal style="grid-column: 1 / -1">
+              <img
+                src="images/codex-multi-launch.png"
+                alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例，可单独重启或结束"
+                width="1656"
+                height="756"
+                loading="lazy"
+              >
+              <figcaption>
+                <strong>Codex 多开</strong>
+                <span>每个供应商身份一个隔离实例，可单独重启或结束</span>
               </figcaption>
             </figure>
           </div>
@@ -371,6 +417,19 @@
             <pre aria-label="模型列表窗口后缀示例"><code>deepseek-v4-pro[1M]
 your-model[200K]
 another-model[128000]</code></pre>
+          </div>
+          <div class="model-example model-picker" data-reveal>
+            <div>
+              <h3>聚合模型的「分组折叠」选择器</h3>
+              <p>模型聚合会把多个成员的模型合进同一份目录。原生模型选择器按供应商折叠成组：表头显示供应商名与模型数量，默认成员带「默认」标志；右上角可「全部展开 / 全部折叠」，折叠状态按供应商记忆，打开时自动展开当前选中模型所在的分组。单供应商保持原生列表不动。</p>
+            </div>
+            <img
+              src="images/readme-preview/model-picker-groups.png"
+              alt="Codex 原生模型选择器按供应商分组折叠：供应商 4（默认，7 个模型）与 DeepSeek（2 个模型）"
+              width="584"
+              height="658"
+              loading="lazy"
+            >
           </div>
         </div>
       </section>

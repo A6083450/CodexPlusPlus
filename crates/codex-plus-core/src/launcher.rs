@@ -221,6 +221,17 @@ pub struct LaunchOptions {
     pub debug_port: u16,
     pub helper_port: u16,
     pub status_store: StatusStore,
+    /// 本次启动使用的 Codex++ 状态目录（多开实例隔离用）。
+    ///
+    /// 多开原先只靠给 worker 换 `HOME`，但 Windows 上 `directories` 走
+    /// `SHGetKnownFolderPath`、不读 `HOME`，导致实例会读写主实例的状态文件。
+    /// 这里显式传路径：既用于子进程环境（`CODEX_PLUS_STATE_DIR`），也用于
+    /// Windows 包上下文启动时选择 wrapper 落点。
+    pub state_dir: Option<PathBuf>,
+    /// Codex 配置目录（`CODEX_HOME`），多开实例各自独立；用于包上下文 wrapper。
+    pub codex_home: Option<PathBuf>,
+    /// Codex SQLite 目录（`CODEX_SQLITE_HOME`），多开实例各自独立。
+    pub sqlite_home: Option<PathBuf>,
 }
 
 impl Default for LaunchOptions {
@@ -230,6 +241,34 @@ impl Default for LaunchOptions {
             debug_port: 9229,
             helper_port: 57321,
             status_store: StatusStore::default(),
+            state_dir: None,
+            codex_home: None,
+            sqlite_home: None,
+        }
+    }
+}
+
+/// 本次启动所属的实例隔离上下文（多开用；单实例启动时全是 `None`）。
+///
+/// 刻意用参数传递而不是进程环境：多开 worker 复用管理器进程且已是多线程，
+/// edition 2024 下 `set_var` 属未定义行为；状态目录这种决定「数据写到哪」的
+/// 关键输入也不该走全局可变状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchInstance {
+    /// Codex++ 状态目录（`settings.json` / `latest-status.json` / 诊断日志）。
+    pub state_dir: Option<PathBuf>,
+    /// Codex 配置目录（`CODEX_HOME`）。
+    pub codex_home: Option<PathBuf>,
+    /// Codex SQLite 目录（`CODEX_SQLITE_HOME`）。
+    pub sqlite_home: Option<PathBuf>,
+}
+
+impl LaunchInstance {
+    pub fn from_options(options: &LaunchOptions) -> Self {
+        Self {
+            state_dir: options.state_dir.clone(),
+            codex_home: options.codex_home.clone(),
+            sqlite_home: options.sqlite_home.clone(),
         }
     }
 }
@@ -243,7 +282,48 @@ pub struct LaunchHandle {
     pub status_store: StatusStore,
     status_started_at_ms: u64,
     helper_started: bool,
+    isolated_quota_gate: Option<Arc<IsolatedQuotaGateRuntime>>,
     hooks: Arc<dyn LaunchHooks>,
+}
+
+struct IsolatedQuotaGateRuntime {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl IsolatedQuotaGateRuntime {
+    fn start(debug_port: u16) -> Arc<Self> {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(crate::bridge::supervise_isolated_api_quota_gate(
+            debug_port, receiver,
+        ));
+        Arc::new(Self {
+            shutdown,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    async fn stop(&self) {
+        self.shutdown.send_replace(true);
+        let mut owned_task = self.task.lock().await;
+        if let Some(mut task) = owned_task.take() {
+            // CDP 清理有自己的超时；最后兜底等待并终止任务，不能留下端口重连。
+            if tokio::time::timeout(std::time::Duration::from_secs(4), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+impl Drop for IsolatedQuotaGateRuntime {
+    fn drop(&mut self) {
+        // 最后一个会话 handle 被释放时也必须取消，包括等待 future 被提前丢弃。
+        self.shutdown.send_replace(true);
+    }
 }
 
 impl std::fmt::Debug for LaunchHandle {
@@ -260,11 +340,18 @@ impl std::fmt::Debug for LaunchHandle {
 }
 
 impl LaunchHandle {
+    pub async fn stop_isolated_api_quota_gate(&self) {
+        if let Some(runtime) = &self.isolated_quota_gate {
+            runtime.stop().await;
+        }
+    }
+
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
         let result = self
             .hooks
             .wait_for_codex_exit(&self.launch, self.debug_port)
             .await;
+        self.stop_isolated_api_quota_gate().await;
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
@@ -366,6 +453,18 @@ pub trait LaunchHooks: Send + Sync {
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch>;
+    // 新增实例入口，保持已有 LaunchHooks 实现和单实例调用兼容。
+    async fn launch_codex_for_instance(
+        &self,
+        app_dir: &Path,
+        debug_port: u16,
+        settings: &BackendSettings,
+        extra_args: &[String],
+        _instance: &LaunchInstance,
+    ) -> anyhow::Result<CodexLaunch> {
+        self.launch_codex(app_dir, debug_port, settings, extra_args)
+            .await
+    }
     async fn bridge_context(
         &self,
         _debug_port: u16,
@@ -785,8 +884,21 @@ where
         }
 
         timeline.mark("launch_codex", 70);
+        // 启动 Codex 之前清一遍选择器残留：换过模型目录之后，
+        // 「最近使用」里会留着上一个目录的模型 ID，用户点到就是必然 400 的模型。
+        crate::codex_app_state::prune_stale_model_references_after_switch_nonfatal(
+            &home,
+            &settings,
+            "launcher.before_launch_codex",
+        );
         let launch = hooks
-            .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
+            .launch_codex_for_instance(
+                &app_dir,
+                debug_port,
+                &settings,
+                &settings.codex_extra_args,
+                &LaunchInstance::from_options(&options),
+            )
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
@@ -842,6 +954,9 @@ where
             hooks.write_status("running").await;
         }
 
+        // 全部可失败的启动步骤完成后才创建，错误清理路径不会遗留监督任务。
+        let isolated_quota_gate = should_start_isolated_quota_gate(&settings)
+            .then(|| IsolatedQuotaGateRuntime::start(debug_port));
         Ok(LaunchHandle {
             debug_port,
             helper_port,
@@ -850,6 +965,7 @@ where
             status_store: status_store.clone(),
             status_started_at_ms,
             helper_started,
+            isolated_quota_gate,
             hooks: Arc::clone(&hooks),
         })
     }
@@ -876,6 +992,10 @@ where
     }
 }
 
+fn should_start_isolated_quota_gate(settings: &BackendSettings) -> bool {
+    !settings.enhancements_enabled && settings.codex_app_standalone_quota_unlock
+}
+
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
 }
@@ -885,6 +1005,13 @@ fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 
+fn active_relay_profile_is_official_mix(settings: &BackendSettings) -> bool {
+    if !settings.relay_profiles_enabled {
+        return false;
+    }
+    let profile = settings.active_relay_profile();
+    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
+}
 #[cfg(windows)]
 fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
     let icon_resource_path =
@@ -1112,11 +1239,67 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
-        _settings: &BackendSettings,
+        settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
+        self.launch_codex_for_instance(
+            app_dir,
+            debug_port,
+            settings,
+            extra_args,
+            &LaunchInstance::default(),
+        )
+        .await
+    }
+
+    async fn launch_codex_for_instance(
+        &self,
+        app_dir: &Path,
+        debug_port: u16,
+        _settings: &BackendSettings,
+        extra_args: &[String],
+        instance: &LaunchInstance,
+    ) -> anyhow::Result<CodexLaunch> {
         let launch_extra_args = normalize_codex_extra_args(extra_args);
-        if cfg!(windows) {
+        let isolated_multi_instance =
+            std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").is_some_and(|value| value == "1");
+        // 打包版（MSIX/Store）上的多开必须另走一条路。
+        //
+        // 主实例走 AUMID 激活，它是 Windows 上唯一能给进程包身份的方式；但 AUMID 激活
+        // 只会把已存在的主实例拉到前台，起不出第二份隔离实例。而绕开 AUMID 按路径
+        // `CreateProcess` 包内 exe 会丢包身份（APPMODEL_ERROR_NO_PACKAGE / Access denied），
+        // 进程秒退、CDP 永不监听——这正是多开在 Windows 上「点了没窗口」的原因。
+        //
+        // 所以多开改为「包上下文里跑 wrapper」：`Invoke-CommandInDesktopPackage
+        // -PreventBreakaway` 让 wrapper 及其子进程都带该 AppId 的包身份，wrapper 内再带
+        // 上实例自己的 CODEX_HOME / --user-data-dir / 调试端口拉起 exe。该 cmdlet 属
+        // 非契约接口，失败时按下面的 fallback 退回原有按路径启动（至少不比旧行为更差）。
+        if cfg!(windows) && isolated_multi_instance {
+            match launch_packaged_multi_instance(
+                app_dir,
+                debug_port,
+                &launch_extra_args,
+                instance.state_dir.as_deref(),
+                instance.codex_home.as_deref(),
+                instance.sqlite_home.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(launch)) => return Ok(launch),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.packaged_multi_instance_fallback",
+                        serde_json::json!({
+                            "app_dir": app_dir,
+                            "debug_port": debug_port,
+                            "message": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
+        }
+        if cfg!(windows) && !isolated_multi_instance {
             // AUMID 解析留在调用点：它要查系统里的 Store 注册表（#2140），是有副作用
             // 的一步；下面的构造函数只做纯拼接。解析不出来（目录名像包、但系统里没
             // 这个包）就不再走打包激活，继续往下按路径启动——与既有回退路径一致。
@@ -1139,19 +1322,20 @@ impl LaunchHooks for DefaultLaunchHooks {
                         {
                             let executable = crate::app_paths::build_codex_executable(app_dir);
                             // 立即持有激活 PID，不能在漫长注入之后再按旧 PID 打开进程。
-                            let process = match crate::windows_integration::TrackedWindowsProcess::capture(
-                                process_id,
-                                &executable,
-                            ) {
-                                Ok(process) => process,
-                                Err(error) => {
-                                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                                        "launcher.packaged_process_wait_failed_nonfatal",
-                                        serde_json::json!({ "process_id": process_id, "message": format!("{error:#}") }),
-                                    );
-                                    None
-                                }
-                            };
+                            let process =
+                                match crate::windows_integration::TrackedWindowsProcess::capture(
+                                    process_id,
+                                    &executable,
+                                ) {
+                                    Ok(process) => process,
+                                    Err(error) => {
+                                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                                            "launcher.packaged_process_wait_failed_nonfatal",
+                                            serde_json::json!({ "process_id": process_id, "message": format!("{error:#}") }),
+                                        );
+                                        None
+                                    }
+                                };
                             *self.packaged_executable.lock().await = Some(executable);
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
@@ -1195,7 +1379,9 @@ impl LaunchHooks for DefaultLaunchHooks {
             }
         }
 
-        if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
+        if app_dir.extension().and_then(|value| value.to_str()) == Some("app")
+            && !isolated_multi_instance
+        {
             let launch_action = select_macos_debug_launch_action(
                 is_macos_app_running(app_dir).await,
                 crate::cdp::endpoint_available(debug_port),
@@ -1244,6 +1430,11 @@ impl LaunchHooks for DefaultLaunchHooks {
             .args(&command[1..])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // 实例状态目录要显式传给子进程：多开原先只靠给 worker 换 HOME，
+        // 而 Windows 上 `directories` 走 SHGetKnownFolderPath、不读 HOME。
+        if let Some(state_dir) = instance.state_dir.as_deref() {
+            child_command.env(crate::paths::STATE_DIR_ENV, state_dir);
+        }
         #[cfg(windows)]
         child_command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let child = child_command
@@ -1264,13 +1455,20 @@ impl LaunchHooks for DefaultLaunchHooks {
         #[cfg(windows)]
         {
             let mut identity = self.packaged_launch_identity.lock().await;
-            if identity.is_some() { return; }
-            let Some(executable) = self.packaged_executable.lock().await.clone() else { return; };
+            if identity.is_some() {
+                return;
+            }
+            let Some(executable) = self.packaged_executable.lock().await.clone() else {
+                return;
+            };
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             let mut last_discovery_error = None;
             loop {
                 let browser_id = validated_codex_browser_id(debug_port).await;
-                let mut process = match crate::windows_integration::capture_debug_listener(debug_port, &executable) {
+                let mut process = match crate::windows_integration::capture_debug_listener(
+                    debug_port,
+                    &executable,
+                ) {
                     Ok(process) => process,
                     Err(error) => {
                         let message = format!("{error:#}");
@@ -1285,15 +1483,22 @@ impl LaunchHooks for DefaultLaunchHooks {
                     }
                 };
                 let activation = self.packaged_activation_process.lock().await;
-                let activation_matches = activation.as_ref().zip(process.as_ref()).is_some_and(|(activation, process)| {
-                    activation.process_id == process.process_id && activation.birth_id == process.birth_id
-                });
+                let activation_matches = activation.as_ref().zip(process.as_ref()).is_some_and(
+                    |(activation, process)| {
+                        activation.process_id == process.process_id
+                            && activation.birth_id == process.birth_id
+                    },
+                );
                 drop(activation);
                 // target 列表、UUID 和 listener 查询之间可能发生替换；只接受稳定的 Codex UUID。
                 let browser_still_matches = if let Some(initial) = browser_id.as_deref() {
                     validated_codex_browser_id(debug_port).await.as_deref() == Some(initial)
-                } else { false };
-                if browser_id.is_some() && !activation_matches && !browser_still_matches { process = None; }
+                } else {
+                    false
+                };
+                if browser_id.is_some() && !activation_matches && !browser_still_matches {
+                    process = None;
+                }
                 let browser_id = browser_id.filter(|_| browser_still_matches);
                 // 无 CDP 页时，已验证可执行文件和句柄的 listener 仍可作为本次进程身份。
                 if browser_id.is_some() || process.is_some() {
@@ -1306,10 +1511,15 @@ impl LaunchHooks for DefaultLaunchHooks {
                             "birth_id": process.as_ref().map(|process| process.birth_id),
                         }),
                     );
-                    *identity = Some(PackagedLaunchIdentity { browser_id, process });
+                    *identity = Some(PackagedLaunchIdentity {
+                        browser_id,
+                        process,
+                    });
                     return;
                 }
-                if tokio::time::Instant::now() >= deadline { return; }
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
@@ -1406,13 +1616,27 @@ impl LaunchHooks for DefaultLaunchHooks {
             CodexLaunch::PackagedActivation { process_id, .. } => {
                 #[cfg(windows)]
                 {
-                    let executable = self.packaged_executable.lock().await.take()
+                    let executable = self
+                        .packaged_executable
+                        .lock()
+                        .await
+                        .take()
                         .context("missing packaged Codex executable identity")?;
                     let activation = self.packaged_activation_process.lock().await.take();
-                    let identity = self.packaged_launch_identity.lock().await.take().unwrap_or_default();
+                    let identity = self
+                        .packaged_launch_identity
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap_or_default();
                     return wait_for_windows_packaged_exit(
-                        &executable, *process_id, activation, identity, debug_port,
-                    ).await;
+                        &executable,
+                        *process_id,
+                        activation,
+                        identity,
+                        debug_port,
+                    )
+                    .await;
                 }
                 #[cfg(not(windows))]
                 if let Some(process_id) = process_id {
@@ -1430,10 +1654,21 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
         // Another Codex process must not keep this launcher holding the native
         // browser monitor. Directly owned processes and this debug port can.
-        while owned_launcher_target_alive(
-            launcher_owned_process_alive(launch, debug_port),
-            crate::cdp::endpoint_available(debug_port),
-        ) {
+        //
+        // 单次探测失败不足以判定退出：macOS 的 `ps` 采样和 `/json` 探测都会在
+        // 进程换代/监听重建的空档里瞬断，而这里一旦返回就会关掉 helper，让写死在
+        // config.toml 里的 57321 失去对端（见 PackagedExitGrace 的注释）。
+        // 传入 Some(...) 包一层，是因为该宽限在 Windows 那条路径上把「进程身份
+        // 未知」表示为 None，语义是回落到 cdp_available。
+        let mut exit_grace = PackagedExitGrace::default();
+        loop {
+            let target_alive = owned_launcher_target_alive(
+                launcher_owned_process_alive(launch, debug_port),
+                crate::cdp::endpoint_available(debug_port),
+            );
+            if !exit_grace.keep_waiting(Some(target_alive), false, std::time::Instant::now()) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         Ok(())
@@ -1995,40 +2230,48 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let mut upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
-        request_body,
-        request_user_agent,
-        path,
-        request_beta_features,
-        session_headers,
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            let unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
-            let status = if unsupported.is_some() { "400 Bad Request" } else { "502 Bad Gateway" };
-            let body = serde_json::to_vec(&unsupported.map(|error| error.response_body()).unwrap_or_else(|| {
-                serde_json::json!({"status":"failed","message":error.to_string()})
-            }))?;
-            write_http_response(
-                stream,
-                status,
-                "application/json; charset=utf-8",
-                &body,
-            )
-            .await?;
-            log_helper_proxy_failure(
-                "helper.protocol_proxy_failed",
-                method,
-                path,
-                &error.to_string(),
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
+    let mut upstream =
+        match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
+            request_body,
+            request_user_agent,
+            path,
+            request_beta_features,
+            session_headers,
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let unsupported =
+                    error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
+                let search_unsupported =
+                    error.downcast_ref::<crate::protocol_proxy::UnsupportedNativeWebSearch>();
+                let status = if unsupported.is_some() || search_unsupported.is_some() {
+                    "400 Bad Request"
+                } else {
+                    "502 Bad Gateway"
+                };
+                let body = serde_json::to_vec(
+                    &unsupported
+                        .map(|error| error.response_body())
+                        .or_else(|| search_unsupported.map(|error| error.response_body()))
+                        .unwrap_or_else(
+                            || serde_json::json!({"status":"failed","message":error.to_string()}),
+                        ),
+                )?;
+                write_http_response(stream, status, "application/json; charset=utf-8", &body)
+                    .await?;
+                log_helper_proxy_failure(
+                    "helper.protocol_proxy_failed",
+                    method,
+                    path,
+                    &error.to_string(),
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        };
     if !upstream.is_success() {
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
@@ -3207,6 +3450,130 @@ pub fn build_packaged_activation(
 
 }
 
+/// 打包版（MSIX/Store）多开：在包上下文里拉起一个带独立数据目录的 Codex 实例。
+///
+/// 返回 `Ok(None)` 表示「这次不该走包上下文」（例如 app_dir 根本不是已注册包、
+/// 或缺少可用的状态目录），调用方按原路径继续；返回 `Err` 表示包上下文这条路
+/// 试过但失败了，调用方记录诊断后同样退回按路径启动。
+///
+/// 成功返回的 `CodexLaunch::Process` 里带的 `debug_port` 是**脚本实际使用**的端口：
+/// wrapper 里重新校验过一次端口可用性，极端竞争下可能与入参不同，注入必须打到
+/// 真正监听的那个端口上。
+async fn launch_packaged_multi_instance(
+    app_dir: &Path,
+    debug_port: u16,
+    extra_args: &[String],
+    state_dir: Option<&Path>,
+    codex_home: Option<&Path>,
+    sqlite_home: Option<&Path>,
+) -> anyhow::Result<Option<CodexLaunch>> {
+    let executable = crate::app_paths::build_codex_executable(app_dir);
+    // 只有「目录确实对应一个已注册的 MSIX 包」时才认为需要包上下文：
+    // 非打包安装（免安装/自解包）本来就能按路径直接启动，别把它拖进来。
+    let Some(app_user_model_id) = crate::app_paths::packaged_app_user_model_id(app_dir) else {
+        return Ok(None);
+    };
+    let Some(state_dir) = state_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
+        anyhow::bail!("多开实例缺少状态目录，无法准备包上下文 wrapper");
+    };
+
+    let arguments = build_codex_arguments(debug_port, extra_args);
+    let user_data_dir = multi_instance_user_data_dir_from_args(&arguments)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("user-data"));
+    let resolved_codex_home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| codex_plus_default_codex_home());
+    let resolved_sqlite_home = sqlite_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolved_codex_home.clone());
+
+    // 端口选择在写脚本之前定：脚本里的端口就是实例身份的一部分，必须能让调用方
+    // 知道（否则注入会打到旧端口）。
+    let known_ports = [debug_port, crate::ports::find_available_loopback_port()];
+    let Some(actual_port) = crate::packaged_launch::select_debug_port(debug_port, &known_ports)
+    else {
+        anyhow::bail!("找不到可用的回环调试端口（请求 {debug_port}）");
+    };
+
+    let wrapper_path = crate::packaged_launch::prepare_wrapper_script(
+        state_dir,
+        &executable,
+        &resolved_codex_home,
+        &resolved_sqlite_home,
+        &user_data_dir,
+        actual_port,
+        &known_ports,
+    )?;
+    match crate::packaged_launch::activate_in_package_context(&app_user_model_id, &wrapper_path)
+        .await
+    {
+        Ok(process_id) => {
+            let process_id =
+                (process_id != crate::packaged_launch::UNKNOWN_PROCESS_ID).then_some(process_id);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.packaged_multi_instance_activated",
+                serde_json::json!({
+                    "app_user_model_id": app_user_model_id,
+                    "wrapper_path": wrapper_path,
+                    "debug_port": actual_port,
+                    "process_id": process_id,
+                }),
+            );
+            Ok(Some(CodexLaunch::Process {
+                command: std::iter::once(executable.to_string_lossy().to_string())
+                    .chain(build_codex_arguments(actual_port, extra_args))
+                    .collect(),
+                wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
+                macos_cleanup_policy: None,
+            }))
+        }
+        Err(error) => {
+            // 包上下文不可用时退回按路径启动：打包版上它很可能仍会失败，
+            // 但至少不比改动前更差，而且失败会由多开 worker 的就绪校验如实报出。
+            match crate::packaged_launch::fallback_direct_launch(
+                &executable,
+                &build_codex_arguments(actual_port, extra_args),
+                state_dir,
+            ) {
+                Ok(pid) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.packaged_multi_instance_direct_fallback",
+                        serde_json::json!({
+                            "process_id": pid,
+                            "debug_port": actual_port,
+                            "message": format!("{error:#}"),
+                        }),
+                    );
+                    Ok(Some(CodexLaunch::Process {
+                        command: std::iter::once(executable.to_string_lossy().to_string())
+                            .chain(build_codex_arguments(actual_port, extra_args))
+                            .collect(),
+                        wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
+                        macos_cleanup_policy: None,
+                    }))
+                }
+                Err(fallback_error) => Err(error.context(format!(
+                    "包上下文激活失败，按路径兜底启动也失败：{fallback_error:#}"
+                ))),
+            }
+        }
+    }
+}
+
+/// 从启动参数里取出实例自己的 `--user-data-dir`（多开由管理器注入）。
+fn multi_instance_user_data_dir_from_args(args: &[String]) -> Option<String> {
+    args.iter()
+        .find_map(|arg| arg.strip_prefix("--user-data-dir="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_plus_default_codex_home() -> PathBuf {
+    crate::codex_home::default_codex_home_dir()
+}
+
 /// Attempts the full injection a bounded number of times with real backoff.
 ///
 /// Every attempt evaluates the ~1 MB bundle in the renderer; when the renderer is merely slow
@@ -3233,6 +3600,16 @@ async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
+}
+
+async fn try_inject_isolated_quota_gate(debug_port: u16) -> anyhow::Result<()> {
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
+    let websocket_url = target
+        .web_socket_debugger_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
+    crate::bridge::install_isolated_api_quota_gate(websocket_url).await
 }
 
 pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
@@ -3262,17 +3639,32 @@ fn owned_launcher_target_alive(owned_process_alive: bool, debug_port_open: bool)
 async fn validated_codex_browser_id(debug_port: u16) -> Option<String> {
     let targets = crate::cdp::list_targets(debug_port).await.ok()?;
     crate::cdp::pick_injectable_codex_page_target(&targets).ok()?;
-    crate::cdp::browser_identity(debug_port).await.ok()?.browser_id().ok()
+    crate::cdp::browser_identity(debug_port)
+        .await
+        .ok()?
+        .browser_id()
+        .ok()
 }
 
-#[cfg(any(windows, test))]
+/// 目标「探不到」时的宽限：连续不足 3 次探测失败、或距首次失败不足 10 秒，
+/// 都仍继续等待。
+///
+/// 起初只给 Windows 打包版用（AUMID 返回的中转进程会让探测闪断）。macOS 的
+/// 退出判定原先对单次失败零容忍，代价是：`ps` 恰好在进程换代空档里采样、
+/// 或者 `/json` 因监听重建短暂拒连，都会被判成「Codex 已退出」，而
+/// `wait_for_codex_exit` 一旦返回就会 `shutdown_helper`——57321 随之关闭，
+/// 可 Codex 还开着。此时 `config.toml` 里写死的
+/// `base_url = "http://127.0.0.1:57321/v1"` 就没了对端，页面停在启动壳上、
+/// 注入层还在但什么都发不出去。所以 macOS 的退出等待也走同一套宽限。
+///
+/// 「同端口的新实例不能为旧 launcher 续命」这条约束仍然成立：宽限是有限次的，
+/// 真退出只是晚约 10 秒被发现。
 #[derive(Default)]
 struct PackagedExitGrace {
     missing_since: Option<std::time::Instant>,
     missed_probes: u32,
 }
 
-#[cfg(any(windows, test))]
 impl PackagedExitGrace {
     fn keep_waiting(
         &mut self,
@@ -3308,10 +3700,15 @@ struct PackagedBrowserBinding {
 #[cfg(any(windows, test))]
 impl PackagedBrowserBinding {
     fn owns(&mut self, current_id: Option<&str>) -> bool {
-        if self.replaced { return false; }
+        if self.replaced {
+            return false;
+        }
         match (self.initial_id.as_deref(), current_id) {
             (Some(initial), Some(current)) if initial == current => true,
-            (Some(_), Some(_)) => { self.replaced = true; false }
+            (Some(_), Some(_)) => {
+                self.replaced = true;
+                false
+            }
             _ => false,
         }
     }
@@ -3327,7 +3724,10 @@ async fn wait_for_windows_packaged_exit(
 ) -> anyhow::Result<()> {
     use crate::windows_integration::{TrackedWindowsProcess, capture_debug_listener};
     let mut tracked = identity.process;
-    let mut browser = PackagedBrowserBinding { initial_id: identity.browser_id, replaced: false };
+    let mut browser = PackagedBrowserBinding {
+        initial_id: identity.browser_id,
+        replaced: false,
+    };
     let mut grace = PackagedExitGrace::default();
     let mut last_discovery_error: Option<String> = None;
     let started_waiting = std::time::Instant::now();
@@ -3335,27 +3735,38 @@ async fn wait_for_windows_packaged_exit(
         let mut owned_browser = false;
         if tracked.is_none() {
             let current_browser_id = if browser.initial_id.is_some() && !browser.replaced {
-                crate::cdp::browser_identity(debug_port).await.ok()
+                crate::cdp::browser_identity(debug_port)
+                    .await
+                    .ok()
                     .and_then(|identity| identity.browser_id().ok())
-            } else { None };
+            } else {
+                None
+            };
             owned_browser = browser.owns(current_browser_id.as_deref());
             let discovery = if browser.replaced {
                 Ok(None)
             } else {
-                capture_debug_listener(debug_port, executable).map(|process| process.filter(|process| {
-                    // 重新查询只能沿用初始 browser，或启动时已持有的同一个内核进程。
-                    owned_browser || activation.as_ref().is_some_and(|activation| {
-                        activation.process_id == process.process_id && activation.birth_id == process.birth_id
+                capture_debug_listener(debug_port, executable).map(|process| {
+                    process.filter(|process| {
+                        // 重新查询只能沿用初始 browser，或启动时已持有的同一个内核进程。
+                        owned_browser
+                            || activation.as_ref().is_some_and(|activation| {
+                                activation.process_id == process.process_id
+                                    && activation.birth_id == process.birth_id
+                            })
                     })
-                }))
+                })
             };
             let discovery = match discovery {
                 Ok(Some(process)) => {
                     let activation_matches = activation.as_ref().is_some_and(|activation| {
-                        activation.process_id == process.process_id && activation.birth_id == process.birth_id
+                        activation.process_id == process.process_id
+                            && activation.birth_id == process.birth_id
                     });
                     if !activation_matches {
-                        let confirmation = crate::cdp::browser_identity(debug_port).await.ok()
+                        let confirmation = crate::cdp::browser_identity(debug_port)
+                            .await
+                            .ok()
                             .and_then(|identity| identity.browser_id().ok());
                         owned_browser = browser.owns(confirmation.as_deref());
                     }
@@ -4217,6 +4628,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standalone_quota_unlock_is_opt_in_and_does_not_duplicate_full_enhancements() {
+        let mut settings = BackendSettings::default();
+        for enhancements in [false, true] {
+            for standalone in [false, true] {
+                settings.enhancements_enabled = enhancements;
+                settings.codex_app_standalone_quota_unlock = standalone;
+                assert_eq!(
+                    should_start_isolated_quota_gate(&settings),
+                    !enhancements && standalone
+                );
+            }
+        }
+    }
+
     async fn read_test_http_request(stream: &mut tokio::net::TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -4239,6 +4665,43 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn isolated_quota_runtime_stops_and_joins_before_restart() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let runtime = IsolatedQuotaGateRuntime::start(listener.local_addr().unwrap().port());
+        let clone = Arc::clone(&runtime);
+        runtime.stop().await;
+        assert!(*runtime.shutdown.borrow());
+        assert!(runtime.task.lock().await.is_none());
+        clone.stop().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_quota_runtime_cancels_only_when_last_owner_is_dropped() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let runtime = IsolatedQuotaGateRuntime::start(listener.local_addr().unwrap().port());
+        let mut receiver = runtime.shutdown.subscribe();
+        let task = runtime.task.lock().await.take().unwrap();
+        let clone = Arc::clone(&runtime);
+        drop(runtime);
+        assert!(!*receiver.borrow());
+        drop(clone);
+        let _ = receiver.wait_for(|stop| *stop).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     // 提权分支依赖 issue #2351 的手动复现步骤验收（勾选兼容性「以管理员身份运行」
@@ -4276,6 +4739,49 @@ mod tests {
     #[test]
     fn owned_launcher_waits_for_its_codex_process_when_cdp_is_unavailable() {
         assert!(owned_launcher_target_alive(true, false));
+    }
+
+    /// macOS 退出等待的回归护栏：一次探测瞬断不能判成「Codex 已退出」。
+    ///
+    /// 这里决定的是 `wait_for_codex_exit` 何时返回，而它一返回就会
+    /// `shutdown_helper`——57321 关闭后，写死在 config.toml 里的 base_url
+    /// 失去对端，页面停在启动壳上。所以「一次失败仍继续等」必须是硬保证。
+    #[test]
+    fn exit_wait_survives_a_single_transient_probe_miss() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        // 探到目标：正常续命。
+        assert!(grace.keep_waiting(Some(true), false, now));
+        // 瞬断一次：仍在等待。
+        assert!(grace.keep_waiting(Some(false), false, now + std::time::Duration::from_secs(2)));
+        // 恢复：计数复位，之后再有瞬断也照样给宽限。
+        assert!(grace.keep_waiting(Some(true), false, now + std::time::Duration::from_secs(4)));
+        assert!(grace.keep_waiting(Some(false), false, now + std::time::Duration::from_secs(6)));
+    }
+
+    /// 与上一条互补：真退出必须被有限次探测判出，不能因为宽限而永久续命。
+    ///
+    /// 宽限条件是「不足 3 次探测失败 **或** 距首次失败不足 10 秒」，两者取宽，
+    /// 所以持续探不到时约 10 秒才结束等待——晚一点，但一定会结束。
+    #[test]
+    fn exit_wait_still_ends_after_sustained_misses() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(Some(false), false, now));
+        assert!(grace.keep_waiting(Some(false), false, now + std::time::Duration::from_secs(2)));
+        // 4 秒：探测次数已超，但仍在 10 秒窗口内，继续等。
+        assert!(grace.keep_waiting(Some(false), false, now + std::time::Duration::from_secs(4)));
+        // 越过 10 秒窗口：结束等待。
+        assert!(!grace.keep_waiting(Some(false), false, now + std::time::Duration::from_secs(12)));
+    }
+
+    /// cdp_available 仍要能独立续命：进程身份没捕获到时靠它兜底。
+    #[test]
+    fn exit_wait_keeps_alive_on_cdp_alone() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(None, true, now));
+        assert!(grace.keep_waiting(None, true, now + std::time::Duration::from_secs(60)));
     }
 
     #[test]
@@ -4357,19 +4863,38 @@ mod tests {
         // discovery 失败，没有真实句柄，activation 已退出后原路径降级为 None。
         let process_alive = Some(false).filter(|alive| *alive);
         for seconds in [0, 2, 4, 6, 8] {
-            assert!(grace.keep_waiting(process_alive, binding.owns(Some("replacement")), now + std::time::Duration::from_secs(seconds)));
+            assert!(grace.keep_waiting(
+                process_alive,
+                binding.owns(Some("replacement")),
+                now + std::time::Duration::from_secs(seconds)
+            ));
         }
-        assert!(!grace.keep_waiting(process_alive, binding.owns(Some("replacement")), now + std::time::Duration::from_secs(10)));
+        assert!(!grace.keep_waiting(
+            process_alive,
+            binding.owns(Some("replacement")),
+            now + std::time::Duration::from_secs(10)
+        ));
     }
 
     #[test]
     fn packaged_browser_fallback_without_initial_identity_is_bounded() {
         let now = std::time::Instant::now();
-        let mut binding = PackagedBrowserBinding { initial_id: None, replaced: false };
+        let mut binding = PackagedBrowserBinding {
+            initial_id: None,
+            replaced: false,
+        };
         let mut grace = PackagedExitGrace::default();
         assert!(grace.keep_waiting(None, binding.owns(Some("unbound")), now));
-        assert!(grace.keep_waiting(None, binding.owns(Some("unbound")), now + std::time::Duration::from_secs(2)));
-        assert!(!grace.keep_waiting(None, binding.owns(Some("unbound")), now + std::time::Duration::from_secs(10)));
+        assert!(grace.keep_waiting(
+            None,
+            binding.owns(Some("unbound")),
+            now + std::time::Duration::from_secs(2)
+        ));
+        assert!(!grace.keep_waiting(
+            None,
+            binding.owns(Some("unbound")),
+            now + std::time::Duration::from_secs(10)
+        ));
     }
 
     #[tokio::test]
@@ -4393,30 +4918,50 @@ mod tests {
                         serde_json::json!([{ "id":"page", "type":"page", "title":"fixture", "url":url,
                             "webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/page/fixture-page") }])
                     }.to_string();
-                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
                     stream.write_all(response.as_bytes()).await.unwrap();
                 }
             });
             let identity = validated_codex_browser_id(port).await;
             server.await.unwrap();
             assert_eq!(identity.as_deref(), accepted.then_some("fixture-browser"));
-            assert_eq!(requests.lock().unwrap().as_slice(), if accepted { &["/json", "/json/version"][..] } else { &["/json"][..] });
+            assert_eq!(
+                requests.lock().unwrap().as_slice(),
+                if accepted {
+                    &["/json", "/json/version"][..]
+                } else {
+                    &["/json"][..]
+                }
+            );
         }
     }
 
     #[test]
     fn packaged_browser_fallback_after_discovery_error_keeps_only_same_initial_browser() {
         let now = std::time::Instant::now();
-        let mut binding = PackagedBrowserBinding { initial_id: Some("original".to_string()), replaced: false };
+        let mut binding = PackagedBrowserBinding {
+            initial_id: Some("original".to_string()),
+            replaced: false,
+        };
         let mut grace = PackagedExitGrace::default();
         let process_alive = Some(false).filter(|alive| *alive);
         for seconds in [0, 10, 60, 3600] {
-            assert!(grace.keep_waiting(process_alive, binding.owns(Some("original")), now + std::time::Duration::from_secs(seconds)));
+            assert!(grace.keep_waiting(
+                process_alive,
+                binding.owns(Some("original")),
+                now + std::time::Duration::from_secs(seconds)
+            ));
         }
         assert!(!binding.owns(None));
         assert!(binding.owns(Some("original")));
         assert!(!binding.owns(Some("replacement")));
-        assert!(!binding.owns(Some("original")), "实例替换后不能重新绑定旧 ID");
+        assert!(
+            !binding.owns(Some("original")),
+            "实例替换后不能重新绑定旧 ID"
+        );
     }
 
     #[test]
@@ -4429,8 +4974,8 @@ mod tests {
         let mut grace = PackagedExitGrace::default();
         for seconds in [0, 10, 30, 60, 3600] {
             let elapsed = std::time::Duration::from_secs(seconds);
-            let activation_alive = Some(false)
-                .filter(|alive| activation_process_is_startup_evidence(*alive, elapsed));
+            let activation_alive =
+                Some(false).filter(|alive| activation_process_is_startup_evidence(*alive, elapsed));
             assert!(grace.keep_waiting(
                 activation_alive,
                 binding.owns(Some("captured-degraded-browser")),
@@ -4443,11 +4988,18 @@ mod tests {
     #[test]
     fn packaged_tracked_process_remains_authoritative_when_browser_probe_fails() {
         let now = std::time::Instant::now();
-        let mut binding = PackagedBrowserBinding { initial_id: Some("original".to_string()), replaced: false };
+        let mut binding = PackagedBrowserBinding {
+            initial_id: Some("original".to_string()),
+            replaced: false,
+        };
         let mut grace = PackagedExitGrace::default();
         assert!(grace.keep_waiting(Some(true), binding.owns(None), now));
         assert!(grace.keep_waiting(Some(true), binding.owns(Some("replacement")), now));
-        assert!(grace.keep_waiting(Some(true), false, now + std::time::Duration::from_secs(3600)));
+        assert!(grace.keep_waiting(
+            Some(true),
+            false,
+            now + std::time::Duration::from_secs(3600)
+        ));
     }
 
     #[test]
@@ -5204,15 +5756,24 @@ mod tests {
                 crate::paths::set_settings_path_for_tests(self.0.take());
             }
         }
-        let _restore = RestoreSettingsPath(crate::paths::set_settings_path_for_tests(Some(settings_path.clone())));
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let _restore = RestoreSettingsPath(crate::paths::set_settings_path_for_tests(Some(
+            settings_path.clone(),
+        )));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
-        std::fs::write(settings_path, serde_json::to_vec(&serde_json::json!({
-            "activeRelayId":"encrypted-agent-test",
-            "relayProfiles":[{"id":"encrypted-agent-test","name":"Encrypted agent test",
-                "baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-api-key",
-                "protocol":"chatCompletions","relayMode":"mixedApi"}]
-        })).unwrap()).unwrap();
+        std::fs::write(
+            settings_path,
+            serde_json::to_vec(&serde_json::json!({
+                "activeRelayId":"encrypted-agent-test",
+                "relayProfiles":[{"id":"encrypted-agent-test","name":"Encrypted agent test",
+                    "baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-api-key",
+                    "protocol":"chatCompletions","relayMode":"mixedApi"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let upstream = tokio::spawn(async move {
             tokio::select! {
@@ -5234,11 +5795,17 @@ mod tests {
         let _ = stop.send(());
         let contacted = upstream.await.unwrap();
         let response = String::from_utf8(response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
         let body = response.split_once("\r\n\r\n").unwrap().1;
         let error: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(error["error"]["type"], "invalid_request_error");
-        assert_eq!(error["error"]["code"], "unsupported_encrypted_agent_content");
+        assert_eq!(
+            error["error"]["code"],
+            "unsupported_encrypted_agent_content"
+        );
         assert!(!response.contains("fixture-private-payload"));
         assert!(!response.contains("fixture-api-key"));
         assert!(!contacted);
@@ -5247,7 +5814,8 @@ mod tests {
         let response = send_raw_helper_request(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{").await;
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 502 Bad Gateway"));
-        let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["status"], "failed");
         assert!(!response.contains("unsupported_encrypted_agent_content"));
     }
@@ -5379,7 +5947,11 @@ mod proxy_stream_tests {
     use crate::protocol_proxy::UpstreamWireApi;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
+    async fn forward_fixture(
+        body: &str,
+        truncated: bool,
+        wire: UpstreamWireApi,
+    ) -> (Option<String>, String) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -5389,20 +5961,37 @@ mod proxy_stream_tests {
             loop {
                 let byte = socket.read_u8().await.unwrap();
                 request.push(byte);
-                if request.ends_with(b"\r\n\r\n") { break; }
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
             }
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
-            socket.write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes()).await.unwrap();
-            if !truncated { socket.write_all(b"0\r\n\r\n").await.unwrap(); }
+            socket
+                .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
+                .await
+                .unwrap();
+            if !truncated {
+                socket.write_all(b"0\r\n\r\n").await.unwrap();
+            }
             socket.shutdown().await.unwrap();
         });
-        let response = reqwest::Client::builder().no_proxy().build().unwrap()
-            .get(format!("http://{address}/stream?key=fixture-secret")).send().await.unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/stream?key=fixture-secret"))
+            .send()
+            .await
+            .unwrap();
         let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap()).await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None).await.unwrap();
+            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None)
+                .await
+                .unwrap();
             writer.shutdown().await.unwrap();
             result
         });
@@ -5417,8 +6006,11 @@ mod proxy_stream_tests {
     async fn transport_errors_are_failures_for_native_and_chat_streams() {
         for wire in [UpstreamWireApi::Responses, UpstreamWireApi::ChatCompletions] {
             let (failure, output) = forward_fixture(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", true, wire,
-            ).await;
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                true,
+                wire,
+            )
+            .await;
             let failure = failure.expect("truncated transfer must not log stream_ok");
             assert!(!failure.contains("fixture-secret"));
             assert!(!output.contains("event: response.completed"));
@@ -5434,7 +6026,8 @@ mod proxy_stream_tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
             "event: error\ndata: {\"error\":{\"message\":\"failed\"}}\n\n",
         ] {
-            let (failure, output) = forward_fixture(body, false, UpstreamWireApi::ChatCompletions).await;
+            let (failure, output) =
+                forward_fixture(body, false, UpstreamWireApi::ChatCompletions).await;
             assert!(failure.is_some());
             assert!(output.contains("event: response.failed"));
             assert!(!output.contains("event: response.completed"));
@@ -5444,9 +6037,18 @@ mod proxy_stream_tests {
     #[tokio::test]
     async fn native_responses_failure_events_are_observed_without_rewriting_or_echoing_payload() {
         for (body, event_type) in [
-            ("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"private-upstream-error\"},\"output\":[{\"encrypted_content\":\"private-payload\"}]}}\n\n", "response.failed"),
-            ("data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"private-upstream-error\"}}}\n\n", "response.incomplete"),
-            ("event: error\ndata: {\"error\":{\"message\":\"private-upstream-error\"}}\r\n\r\n", "error"),
+            (
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"private-upstream-error\"},\"output\":[{\"encrypted_content\":\"private-payload\"}]}}\n\n",
+                "response.failed",
+            ),
+            (
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"private-upstream-error\"}}}\n\n",
+                "response.incomplete",
+            ),
+            (
+                "event: error\ndata: {\"error\":{\"message\":\"private-upstream-error\"}}\r\n\r\n",
+                "error",
+            ),
         ] {
             let (failure, output) = forward_fixture(body, false, UpstreamWireApi::Responses).await;
             let failure = failure.expect("原生失败事件不得记成 stream_ok");
@@ -5461,7 +6063,11 @@ mod proxy_stream_tests {
     async fn native_responses_clean_http_eof_without_completed_is_diagnosed_without_replay() {
         let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: [DONE]\n\n";
         let (failure, output) = forward_fixture(body, false, UpstreamWireApi::Responses).await;
-        assert!(failure.expect("HTTP EOF 和 DONE 均不能代替 response.completed").contains("完成事件"));
+        assert!(
+            failure
+                .expect("HTTP EOF 和 DONE 均不能代替 response.completed")
+                .contains("完成事件")
+        );
         assert_eq!(output, body);
     }
 

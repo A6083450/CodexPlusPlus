@@ -574,24 +574,24 @@ mod tests {
             Arc::clone(&status),
             WeixinCodexPath::new(""),
         ));
-        // 等待真实消息状态，避免固定 sleep 把尚未完成的 HTTP 请求判成业务失败。
-        // 循环退出时会改写状态，必须在停止前取快照。
-        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let message = status.lock().unwrap().message.clone();
-                if message.contains("已忽略来自非白名单发送方的消息") {
-                    return message;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // 轮询等待「已忽略」状态出现：固定 sleep 在并行测试负载下会抖动（CI/本地实测偶发）。
+        // 循环正常退出时会写「微信连接已停止」，所以要在 stop 之前拿到快照。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut message = String::new();
+        while std::time::Instant::now() < deadline {
+            message = status
+                .lock()
+                .map(|current| current.message.clone())
+                .unwrap_or_default();
+            if message.contains("已忽略来自非白名单发送方的消息") {
+                break;
             }
-        })
-        .await
-        .unwrap_or_else(|_| status.lock().unwrap().message.clone());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let requests = server.received_requests().await.unwrap_or_default();
         stop.store(true, Ordering::SeqCst);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 
-        let message = snapshot;
         assert!(
             message.contains("已忽略来自非白名单发送方的消息"),
             "状态栏应提示已忽略，实际：{message}，网关请求数：{}",

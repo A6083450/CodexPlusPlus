@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 type NavigationHandler = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
@@ -60,6 +61,54 @@ struct SessionState {
     options: LaunchOptions,
     requested_at_ms: u64,
     status_started_at_ms: u64,
+}
+
+/// 本进程 launcher 会话的只读快照，供自动接管的判据使用。
+///
+/// 为什么需要它：launcher 被当库链接进管理器进程，`launcher_guard_port()` 的文件锁
+/// 在同一进程内自证无效（`try_lock_exclusive` 必然成功），所以「我这边是不是已经有
+/// 一个在管的会话」只能从内存态读，不能从锁或端口反推。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    /// 本进程当前是否存在已就绪的 launcher 会话。
+    pub owned: bool,
+    /// 会话是否已就绪（注入流程走完）。
+    pub ready: bool,
+    /// `latest-status.json` 里的状态（`running` / `running_degraded` / …）。
+    pub status: Option<String>,
+    pub debug_port: Option<u16>,
+    /// 该会话的状态代际，用来判断是不是同一次启动。
+    pub started_at_ms: Option<u64>,
+}
+
+/// 会话在运行线程里创建，判据在别的线程读；用一个进程级小结构传递即可，
+/// 不必把 `Arc<Mutex<SessionState>>` 暴露出去。
+static SESSION_PROBE: OnceLock<Mutex<Option<SessionProbe>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct SessionProbe {
+    debug_port: u16,
+    started_at_ms: u64,
+}
+
+fn session_probe_slot() -> &'static Mutex<Option<SessionProbe>> {
+    SESSION_PROBE.get_or_init(|| Mutex::new(None))
+}
+
+fn record_session_probe(options: &LaunchOptions, started_at_ms: u64) {
+    let probe = SessionProbe {
+        debug_port: options.debug_port,
+        started_at_ms,
+    };
+    *session_probe_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(probe);
+}
+
+fn clear_session_probe() {
+    *session_probe_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
 type SessionRunner = Arc<
@@ -314,6 +363,35 @@ pub fn shutdown() -> Result<()> {
     shutdown_worker(current)
 }
 
+/// 读会话快照。纯内存读 + 一次状态文件读，无副作用、不会启动任何东西。
+pub fn session_snapshot() -> SessionSnapshot {
+    let probe = session_probe_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let latest = codex_plus_core::status::StatusStore::default()
+        .load_latest()
+        .ok()
+        .flatten();
+    // status 取状态文件：它是「注入是否降级」的唯一来源（running_degraded）。
+    let status = probe
+        .as_ref()
+        .and(latest.as_ref().map(|latest| latest.status.clone()));
+    SessionSnapshot {
+        owned: probe.is_some(),
+        ready: probe.is_some(),
+        status,
+        debug_port: probe
+            .as_ref()
+            .map(|probe| probe.debug_port)
+            .or_else(|| latest.as_ref().and_then(|latest| latest.debug_port)),
+        started_at_ms: probe
+            .as_ref()
+            .map(|probe| probe.started_at_ms)
+            .or_else(|| latest.as_ref().map(|latest| latest.started_at_ms)),
+    }
+}
+
 fn shutdown_worker(current: RuntimeWorker) -> Result<()> {
     let (reply, result) = mpsc::channel();
     let sent = current
@@ -346,6 +424,7 @@ async fn runtime_commands(
                     Some(RuntimeCommand::Start(options, requested_at_ms, attach_only, ready)) => {
                         if session.as_mut().is_some_and(EmbeddedSession::is_finished) {
                             if let Some(previous) = session.take() { let _ = previous.join().await; }
+                            clear_session_probe();
                         }
                         if let Some(current) = &session {
                             let current_options = {
@@ -353,8 +432,10 @@ async fn runtime_commands(
                                 state.ready.then(|| (state.options.clone(), state.status_started_at_ms))
                             };
                             let result = match current_options {
-                                Some(_) if attach_only => Ok(()),
-                                Some((current_options, started_at_ms)) => activate(current_options, started_at_ms).await,
+                                Some((current_options, started_at_ms)) => {
+                                    record_session_probe(&current_options, started_at_ms);
+                                    if attach_only { Ok(()) } else { activate(current_options, started_at_ms).await }
+                                }
                                 None => Err(StartupBusy.into()),
                             };
                             let _ = ready.send(result);
@@ -367,15 +448,18 @@ async fn runtime_commands(
                     }
                     Some(RuntimeCommand::Stop(reply)) => {
                         let result = match session.take() { Some(current) => current.stop().await, None => Ok(()) };
+                        clear_session_probe();
                         let _ = reply.send(result);
                     }
                     Some(RuntimeCommand::Shutdown(reply)) => {
                         let result = match session.take() { Some(current) => current.stop().await, None => Ok(()) };
+                        clear_session_probe();
                         let _ = reply.send(result);
                         break;
                     }
                     None => {
                         if let Some(current) = session.take() { let _ = current.stop().await; }
+                        clear_session_probe();
                         break;
                     }
                 }
@@ -383,7 +467,10 @@ async fn runtime_commands(
             _ = async {
                 if let Some(current) = &mut session { let _ = (&mut current.finished).await; }
                 else { std::future::pending::<()>().await; }
-            } => { if let Some(current) = session.take() { let _ = current.join().await; } }
+            } => {
+                if let Some(current) = session.take() { let _ = current.join().await; }
+                clear_session_probe();
+            }
         }
     }
 }
@@ -397,6 +484,7 @@ struct LauncherHooks {
     runtime: Arc<LauncherRuntimeService>,
     bridge_context: Arc<Mutex<Option<BridgeContext>>>,
     browser_monitor: Arc<Mutex<Option<codex_plus_core::native_browser::BrowserMonitor>>>,
+    index_repair_due: Arc<AtomicBool>,
     session_state: Option<Arc<Mutex<SessionState>>>,
 }
 
@@ -412,12 +500,19 @@ impl Default for LauncherHooks {
             )),
             bridge_context: Arc::new(Mutex::new(None)),
             browser_monitor: Arc::new(Mutex::new(None)),
+            index_repair_due: Arc::new(AtomicBool::new(false)),
             session_state: None,
         }
     }
 }
 
 impl LauncherHooks {
+    fn index_repair_checks_setting(&self) -> bool {
+        // A sync attempted during startup still gets its first repair if settings
+        // change before injection completes. Later checks use the live setting.
+        !self.index_repair_due.swap(false, Ordering::SeqCst)
+    }
+
     fn watchdog_bridge_context(&self) -> anyhow::Result<BridgeContext> {
         self.bridge_context
             .lock()
@@ -504,18 +599,15 @@ async fn run_embedded_session(
     let result = match launcher_session(options.clone(), &hooks, &mut ready, guard.is_some()).await
     {
         Ok(Some(handle)) => {
-            tokio::select! {
-                biased;
-                _ = &mut stop => {
-                    stopped_by_host = true;
-                    Ok(())
-                },
-                result = run_periodic_until_exit(
-                    handle.wait_for_codex_exit(),
-                    std::time::Duration::from_secs(30 * 60),
-                    || repair_session_index_automatically(true),
-                ) => result,
-            }
+            let (host_stop, result) = run_periodic_until_exit(
+                wait_for_session_exit_or_stop(handle.wait_for_codex_exit(), &mut stop),
+                std::time::Duration::from_secs(30 * 60),
+                || repair_session_index_automatically(hooks.index_repair_checks_setting()),
+            )
+            .await;
+            handle.stop_isolated_api_quota_gate().await;
+            stopped_by_host = host_stop;
+            result
         }
         Ok(None) => Ok(()),
         Err(error) => Err(error),
@@ -600,7 +692,12 @@ async fn launcher_session(
         }
         return Ok(None);
     }
+    let started = std::time::Instant::now();
     let handle = launch_and_inject_with_hooks(options, hooks).await?;
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "launcher.startup_phase",
+        json!({"phase": "launch_and_inject", "elapsed_ms": started.elapsed().as_millis()}),
+    );
     if let Some(ready) = ready.take() {
         {
             let mut state = ready
@@ -643,7 +740,18 @@ async fn activate_and_write_running_status(
     })
 }
 
-// 退出时不再安排下一次检查；已开始的数据库事务先完成，避免脱离启动器生命周期。
+async fn wait_for_session_exit_or_stop(
+    exit: impl std::future::Future<Output = Result<()>>,
+    stop: &mut tokio::sync::oneshot::Receiver<()>,
+) -> (bool, Result<()>) {
+    tokio::select! {
+        biased;
+        _ = stop => (true, Ok(())),
+        result = exit => (false, result),
+    }
+}
+
+// App exit and host stop share this lifetime: neither cancels a started repair.
 async fn run_periodic_until_exit<F, T, C, W>(
     exit: F,
     interval: std::time::Duration,
@@ -655,11 +763,17 @@ where
     W: std::future::Future<Output = ()>,
 {
     tokio::pin!(exit);
+    // The initial index check runs only after App launch/injection. Keep all started
+    // transactions inside this lifetime and do not start one after App exit.
+    let mut delay = std::time::Duration::ZERO;
     loop {
         tokio::select! {
             biased;
             result = &mut exit => return result,
-            _ = tokio::time::sleep(interval) => check().await,
+            _ = tokio::time::sleep(delay) => {
+                check().await;
+                delay = interval;
+            },
         }
     }
 }
@@ -673,7 +787,16 @@ async fn repair_session_index_automatically(check_setting: bool) {
         {
             return Ok(());
         }
-        codex_plus_data::repair_session_index(None)?;
+        let report = codex_plus_data::repair_session_index(None)?;
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.session_index_repair.completed",
+            json!({
+                "elapsed_ms": report.elapsed_ms,
+                "scanned_files": report.scanned_files,
+                "cached_files": report.cached_files,
+                "repaired_items": report.repaired_items,
+            }),
+        );
         Ok(())
     })
     .await
@@ -797,11 +920,12 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     // 只有管理工具的「重启」才生效（issue #2080）。失败不阻断激活，只记日志。
     run_activation_provider_sync(&hooks, &settings).await;
     let launch_result = hooks
-        .launch_codex(
+        .launch_codex_for_instance(
             &app_dir,
             options.debug_port,
             &settings,
             &settings.codex_extra_args,
+            &codex_plus_core::launcher::LaunchInstance::from_options(&options),
         )
         .await;
     let process_ids = codex_plus_core::watcher::find_codex_processes();
@@ -883,6 +1007,7 @@ impl LaunchHooks for LauncherHooks {
         &self,
         settings: &codex_plus_core::settings::BackendSettings,
     ) {
+        let started = std::time::Instant::now();
         let monitor = codex_plus_core::native_browser::start_monitor(
             settings.enhancements_enabled
                 && settings.codex_app_native_browser_require_identification,
@@ -892,6 +1017,10 @@ impl LaunchHooks for LauncherHooks {
             .browser_monitor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = monitor;
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.startup_phase",
+            json!({"phase": "native_browser", "elapsed_ms": started.elapsed().as_millis()}),
+        );
     }
 
     async fn stop_native_browser_compatibility(&self) {
@@ -921,10 +1050,20 @@ impl LaunchHooks for LauncherHooks {
         // 为空或被截断）失败时，provider sync 返回 Skipped 并带上底层 serde_json 原文；
         // 以前这里用 `?` 把它变成致命的，用户看到一句无从下手的英文就直接退出了。
         // 口径与 run_activation_provider_sync 一致：失败只记诊断日志，不阻断启动。
+        self.index_repair_due.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
         let outcome =
             tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None)).await;
         match outcome {
             Ok(result) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.startup_phase",
+                    json!({
+                        "phase": "provider_sync",
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "status": format!("{:?}", result.status),
+                    }),
+                );
                 if let Err(error) = require_completed_provider_sync(&result.status, &result.message)
                 {
                     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -938,12 +1077,20 @@ impl LaunchHooks for LauncherHooks {
             }
             Err(error) => {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.startup_phase",
+                    json!({
+                        "phase": "provider_sync",
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "status": "task_failed",
+                    }),
+                );
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "launcher.provider_sync.degraded",
                     json!({ "message": format!("provider sync task failed: {error}") }),
                 );
             }
         }
-        // 全量索引校验交给已有的 30 分钟周期任务，避免启动时哈希所有历史记录。
+        // 同步降级也保留待修复标记；注入后由后台周期任务检查索引。
         Ok(())
     }
 
@@ -1113,6 +1260,24 @@ impl LaunchHooks for LauncherHooks {
         settings: &codex_plus_core::settings::BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<codex_plus_core::launcher::CodexLaunch> {
+        self.launch_codex_for_instance(
+            app_dir,
+            debug_port,
+            settings,
+            extra_args,
+            &codex_plus_core::launcher::LaunchInstance::default(),
+        )
+        .await
+    }
+
+    async fn launch_codex_for_instance(
+        &self,
+        app_dir: &Path,
+        debug_port: u16,
+        settings: &codex_plus_core::settings::BackendSettings,
+        extra_args: &[String],
+        instance: &codex_plus_core::launcher::LaunchInstance,
+    ) -> anyhow::Result<codex_plus_core::launcher::CodexLaunch> {
         if self.attach_only {
             anyhow::ensure!(
                 codex_plus_core::cdp::endpoint_available(debug_port),
@@ -1127,7 +1292,7 @@ impl LaunchHooks for LauncherHooks {
             });
         }
         self.core
-            .launch_codex(app_dir, debug_port, settings, extra_args)
+            .launch_codex_for_instance(app_dir, debug_port, settings, extra_args, instance)
             .await
     }
 
@@ -1295,6 +1460,13 @@ impl BridgeDataService for LauncherDataService {
             .map_err(|error| anyhow::anyhow!("thread usage history task failed: {error}"))
     }
 
+    async fn thread_usage_live(&self, session: SessionRef) -> anyhow::Result<Value> {
+        let adapter = self.storage_adapter();
+        tokio::task::spawn_blocking(move || adapter.codex_thread_usage_live(&session))
+            .await
+            .map_err(|error| anyhow::anyhow!("thread usage live task failed: {error}"))
+    }
+
     async fn whale_session(&self, session: SessionRef) -> anyhow::Result<Value> {
         let adapter = self.storage_adapter();
         tokio::task::spawn_blocking(move || {
@@ -1423,7 +1595,6 @@ impl BridgeDataService for LauncherDataService {
         .await
         .map_err(|error| anyhow::anyhow!("Remote Control session recovery task failed: {error}"))?
     }
-
 }
 
 impl LauncherDataService {
@@ -1451,7 +1622,6 @@ impl LauncherDataService {
         .with_allowed_db_paths(allowed_db_paths)
         .with_codex_home(codex_plus_core::codex_sqlite::default_codex_home_dir())
     }
-
 }
 
 struct LauncherRuntimeService {
@@ -1743,6 +1913,155 @@ fn default_user_scripts_config_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn first_index_repair_preserves_startup_sync_even_if_setting_changes() {
+        let hooks = LauncherHooks::default();
+        assert!(hooks.index_repair_checks_setting());
+        hooks.index_repair_due.store(true, Ordering::SeqCst);
+        assert!(!hooks.clone().index_repair_checks_setting());
+        assert!(hooks.index_repair_checks_setting());
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_host_stop_finishes_started_transaction() {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let mut stop = Some(stop);
+        let finished = std::cell::Cell::new(false);
+        let checks = std::cell::Cell::new(0);
+        let (host_stop, result) = run_periodic_until_exit(
+            wait_for_session_exit_or_stop(std::future::pending(), &mut stopped),
+            std::time::Duration::ZERO,
+            || {
+                checks.set(checks.get() + 1);
+                stop.take().expect("only one repair").send(()).unwrap();
+                let finished = &finished;
+                async move {
+                    // This represents the awaited blocking database transaction.
+                    tokio::task::spawn_blocking(|| std::thread::yield_now())
+                        .await
+                        .unwrap();
+                    finished.set(true);
+                }
+            },
+        )
+        .await;
+        assert!(host_stop);
+        result.unwrap();
+        assert!(finished.get());
+        assert_eq!(checks.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_host_stop_before_first_check_skips_repair() {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        stop.send(()).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let (host_stop, result) = run_periodic_until_exit(
+            wait_for_session_exit_or_stop(std::future::pending(), &mut stopped),
+            std::time::Duration::ZERO,
+            || {
+                checks.set(checks.get() + 1);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert!(host_stop);
+        result.unwrap();
+        assert_eq!(checks.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_preserves_app_exit_errors() {
+        let (_stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let (host_stop, result) = run_periodic_until_exit(
+            wait_for_session_exit_or_stop(
+                async { anyhow::bail!("process monitoring failed") },
+                &mut stopped,
+            ),
+            std::time::Duration::ZERO,
+            || std::future::ready(()),
+        )
+        .await;
+        assert!(!host_stop);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("process monitoring failed")
+        );
+    }
+
+    #[test]
+    fn automatic_index_repair_starts_after_launch_and_injection() {
+        let source = include_str!("main.rs");
+        let start = source.find("async fn run_embedded_session(").unwrap();
+        let end = source[start..]
+            .find("fn save_stopped_service_status_if_current(")
+            .unwrap()
+            + start;
+        let body = &source[start..end];
+        let launched = body.find("launcher_session(options.clone()").unwrap();
+        let checked = body.find("repair_session_index_automatically(").unwrap();
+        assert!(launched < checked);
+        assert_eq!(
+            body.matches("repair_session_index_automatically(").count(),
+            1
+        );
+        assert!(
+            body.contains("wait_for_session_exit_or_stop(handle.wait_for_codex_exit(), &mut stop)")
+        );
+        let quota_stop = body
+            .find("handle.stop_isolated_api_quota_gate().await")
+            .unwrap();
+        let helper_stop = body
+            .find("hooks.shutdown_helper(options.helper_port).await")
+            .unwrap();
+        assert!(quota_stop < helper_stop);
+        let launch_start = source.find("async fn launcher_session(").unwrap();
+        let launch_end = source[launch_start..]
+            .find("async fn activate_and_write_running_status(")
+            .unwrap()
+            + launch_start;
+        let launch_body = &source[launch_start..launch_end];
+        assert!(launch_body.contains("launch_and_inject_with_hooks(options, hooks).await?"));
+        assert!(launch_body.contains("Ok(Some(handle))"));
+        assert!(!launch_body.contains("repair_session_index_automatically("));
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_runs_initial_check_without_waiting_for_interval() {
+        let (done, exit) = tokio::sync::oneshot::channel::<()>();
+        let mut done = Some(done);
+        let checks = std::cell::Cell::new(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_periodic_until_exit(exit, std::time::Duration::from_secs(30 * 60), || {
+                checks.set(checks.get() + 1);
+                done.take().expect("only one check").send(()).unwrap();
+                std::future::ready(())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(checks.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_index_monitor_waits_between_checks() {
+        let checks = std::cell::Cell::new(0);
+        run_periodic_until_exit(
+            tokio::time::sleep(std::time::Duration::from_millis(30)),
+            std::time::Duration::from_secs(30 * 60),
+            || {
+                checks.set(checks.get() + 1);
+                std::future::ready(())
+            },
+        )
+        .await;
+        assert_eq!(checks.get(), 1);
+    }
+
     #[tokio::test]
     async fn session_index_monitor_does_not_start_after_exit() {
         let checks = std::cell::Cell::new(0);
@@ -1816,9 +2135,9 @@ mod tests {
             body.contains("launcher.provider_sync.degraded"),
             "降级要留下诊断日志"
         );
-        // fork 保留启动优化：全量索引修复仍由已有的 30 分钟周期任务执行。
-        assert!(!body.contains("repair_session_index_automatically"));
-        assert!(source.contains("|| repair_session_index_automatically(true)"));
+        // 保留启动优化：同步阶段仅标记，注入后再交给后台周期任务。
+        assert!(body.contains("self.index_repair_due.store(true, Ordering::SeqCst)"));
+        assert!(!body.contains("repair_session_index_automatically("));
         assert!(body.trim_end().ends_with("Ok(())\n    }"));
     }
 
@@ -1920,11 +2239,12 @@ mod tests {
             ..Default::default()
         };
         let error = hooks
-            .launch_codex(
+            .launch_codex_for_instance(
                 Path::new("/missing-codex"),
                 port,
                 &codex_plus_core::settings::BackendSettings::default(),
                 &[],
+                &codex_plus_core::launcher::LaunchInstance::default(),
             )
             .await
             .unwrap_err();
@@ -2178,6 +2498,7 @@ mod tests {
             status_store: codex_plus_core::status::StatusStore::new(
                 temp.path().join("latest.json"),
             ),
+            ..LaunchOptions::default()
         };
         let request = LaunchStatus {
             status: "starting".into(),
@@ -2371,6 +2692,8 @@ mod tests {
         // 同步失败只记日志，不能把用户这次「激活已有窗口」的诉求一起弄失败。
         assert!(!body.contains("hooks.run_provider_sync().await?"));
         assert!(body.contains("launcher.activate_existing_provider_sync.failed"));
+        // 复用主 launcher 的后台周期任务，激活窗口不能重复扫描全部历史记录。
+        assert!(!body.contains("repair_session_index_automatically("));
     }
 
     #[test]
@@ -2457,6 +2780,7 @@ mod tests {
             )),
             bridge_context: Arc::new(Mutex::new(None)),
             browser_monitor: Arc::new(Mutex::new(None)),
+            index_repair_due: Arc::new(AtomicBool::new(false)),
             session_state: None,
         };
 

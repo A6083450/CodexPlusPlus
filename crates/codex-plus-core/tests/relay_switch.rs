@@ -254,12 +254,14 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
             id: "agg".to_string(),
             name: "聚合供应商 1".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
                 weight: 1,
             }],
             routes: Vec::new(),
+            default_relay_id: String::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -594,12 +596,14 @@ fn official_oauth_survives_aggregate_round_trip() {
             id: "agg".to_string(),
             name: "聚合".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "official".to_string(),
                 weight: 1,
             }],
             routes: Vec::new(),
+            default_relay_id: String::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -669,12 +673,14 @@ fn aggregate_target_settings(api: RelayProfile, aggregate: RelayProfile) -> Back
             id: "agg".to_string(),
             name: "聚合供应商".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::Failover,
             members: vec![AggregateRelayMember {
                 relay_id: "api".to_string(),
                 weight: 1,
             }],
             routes: Vec::new(),
+            default_relay_id: String::new(),
         }],
         active_aggregate_relay_id: "agg".to_string(),
         ..BackendSettings::default()
@@ -919,4 +925,76 @@ fn switch_reports_previous_profile_id_when_it_is_missing() {
     // 中止切换后不能覆盖用户的磁盘配置。
     assert_eq!(store.load().unwrap().active_relay_id, "a");
     assert!(!home.join("config.toml").exists());
+}
+
+/// 回归：列表页按分页过滤后提交的子集设置（只带当前分页的聚合、成员供应商全丢）
+/// 不能丢配置，也不能因成员不在请求里而拒绝切换。
+#[test]
+fn switch_restores_profiles_filtered_out_of_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let home = temp.path().join("codex");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let aggregate_profile = RelayProfile {
+        id: "agg".to_string(),
+        name: "聚合".to_string(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    };
+    let original = BackendSettings {
+        active_relay_id: "deepseek".to_string(),
+        relay_profiles: vec![
+            pure_profile("deepseek", "https://deepseek.example/v1", "sk-deepseek"),
+            pure_profile("openai", "https://openai.example/v1", "sk-openai"),
+            aggregate_profile.clone(),
+        ],
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: "agg".to_string(),
+            name: "聚合".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: true,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![
+                AggregateRelayMember {
+                    relay_id: "deepseek".to_string(),
+                    weight: 1,
+                },
+                AggregateRelayMember {
+                    relay_id: "openai".to_string(),
+                    weight: 1,
+                },
+            ],
+            routes: Vec::new(),
+            default_relay_id: "deepseek".to_string(),
+        }],
+        ..BackendSettings::default()
+    };
+    store.save(&original).unwrap();
+
+    let filtered = BackendSettings {
+        active_relay_id: "agg".to_string(),
+        relay_profiles: vec![aggregate_profile],
+        ..BackendSettings::default()
+    };
+    let result = switch_relay_profile_in_home(&store, &home, filtered, "deepseek").unwrap();
+    assert_eq!(result.settings.active_relay_id, "agg");
+
+    let saved = store.load().unwrap();
+    let ids: Vec<String> = saved
+        .relay_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect();
+    assert!(ids.contains(&"deepseek".to_string()), "{ids:?}");
+    assert!(ids.contains(&"openai".to_string()), "{ids:?}");
+    assert_eq!(
+        saved.aggregate_relay_profiles.len(),
+        1,
+        "聚合成员配置不能被过滤请求吞掉"
+    );
+    assert_eq!(
+        saved.aggregate_relay_profiles[0].default_relay_id, "deepseek",
+        "默认供应商配置要跟着聚合一起回填"
+    );
 }

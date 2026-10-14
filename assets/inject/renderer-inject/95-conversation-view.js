@@ -912,7 +912,11 @@
   }
 
   function scan() {
+    if (document.hidden) {
+      window.__codexSessionDeleteScanPending = true;
+      return;
+    }
     void installDictationSupportPatch();
     runScanStep(scanLightweight);
-    requestAnimationFrame(() => runScanStep(scanDeferred));
+    scheduleDeferredScan();
   }

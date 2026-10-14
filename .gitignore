@@ -39,6 +39,7 @@ CLAUDE.md
 .codegraph
 
 # agent 工作区产物：调试脚本 / 计划 / 临时提交信息，一律不入库
+work/
 .zcode/
 .tmp-commit-msg.txt
 .tmp-*.cjs

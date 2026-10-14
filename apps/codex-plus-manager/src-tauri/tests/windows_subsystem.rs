@@ -291,8 +291,8 @@ fn relay_settings_keeps_profile_config_and_auth_files_isolated() {
     assert!(app_tsx.contains("function relayProfileSwitchCommand"));
     assert!(app_tsx.contains("return \"apply_pure_api_injection\""));
     assert!(app_tsx.contains("return \"apply_relay_injection\""));
-    assert!(app_tsx.contains("const createNewAggregateProfile = () =>"));
-    assert!(app_tsx.contains("onClick={createNewAggregateProfile}"));
+    assert!(app_tsx.contains("const createNewAggregateProfile = (mode: AggregateMode)"));
+    assert!(app_tsx.contains("onClick={() => createNewAggregateProfile("));
     assert!(app_tsx.contains("已打开聚合供应商详情"));
     assert!(app_tsx.contains(
         "buildRelayConfigToml(profile, { includeBearerToken: !profile.noAuth, requiresOpenAiAuth: false })"
@@ -316,7 +316,7 @@ fn relay_context_management_is_global_not_supplier_scoped() {
     let styles = std::fs::read_to_string(&styles).expect("read manager styles.css");
 
     assert!(app_tsx.contains("作为全局配置独立管理"));
-    assert!(app_tsx.contains("id: \"context\", label: \"MCP\""));
+    assert!(app_tsx.contains("label: \"MCP\"") || app_tsx.contains("label: t(\"MCP\")"));
     assert!(
         app_tsx.contains("title={t(\"Codex MCP&插件\")}")
             || app_tsx.contains("title=\"Codex MCP&插件\"")
