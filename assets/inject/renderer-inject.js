@@ -9115,6 +9115,8 @@
   }
 
   let codexStateApiPromise = null;
+  const chatsSortRefreshIntervalMs = 1500;
+  const chatsSortDbRefreshIntervalMs = 5000;
   let chatsSortInFlight = false;
   let chatsSortSignature = "";
   let chatsSortLastFetchAt = 0;

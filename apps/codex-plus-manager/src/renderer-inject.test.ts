@@ -1927,6 +1927,48 @@ it("assembles the imagegen runtime into the resolved renderer without syntax dri
   assert.doesNotThrow(() => new Function(`${renderer.replace(slot, runtime)}\n${generatedImages}`));
 });
 
+it("schedules chat sorting without aborting scans and refreshes stale sort keys", async () => {
+  const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const declarations = Array.from(renderer.matchAll(/^  (?:const|let) chatsSort\w+ = .+;$/gm), match => match[0]).join("\n");
+  const start = renderer.indexOf("  async function applyChatsSortCorrection(");
+  const end = renderer.indexOf("  async function setProjectlessThreadIds(", start);
+  assert.ok(start >= 0 && end > start);
+  let enabled = false;
+  let fetches = 0;
+  const delays: number[] = [];
+  const rows = [
+    { id: "a", dataset: { codexProjectMoveSortMs: "3000" } },
+    { id: "b", dataset: { codexProjectMoveSortMs: "2000" } },
+  ];
+  const api = vm.runInNewContext(`${declarations}\n${renderer.slice(start, end)}
+    chatsSortSignature = "a|b";
+    ({ schedule: scheduleChatsSortCorrection, apply: applyChatsSortCorrection });`, {
+    window: {},
+    Date: { now: () => 10000 },
+    codexPlusSettings: () => ({ projectMove: enabled }),
+    setTimeout: (_callback: unknown, delay: number) => { delays.push(delay); return 1; },
+    visibleChatsRows: () => rows,
+    sessionRefFromRow: (row: typeof rows[number]) => ({ session_id: row.id }),
+    projectMoveSessionKey: (id: string) => id,
+    numericTimestamp: Number,
+    rowListItem: (row: typeof rows[number]) => row,
+    chatsSortNeedsCorrection: () => false,
+    postJson: async () => { fetches += 1; return { status: "ok", sort_keys: [] }; },
+    timestampMsFromPayload: () => 0,
+    sortMsForSession: (_id: string, value: string) => Number(value),
+  });
+  assert.doesNotThrow(() => api.schedule(), "disabled sorting must not stop subsequent Fast synchronization");
+  assert.deepEqual(delays, []);
+  enabled = true;
+  api.schedule();
+  api.schedule();
+  assert.deepEqual(delays, [1500], "repeated scans should share one sorting timer");
+  await api.apply();
+  assert.equal(fetches, 1, "stale sort keys must be refreshed even when rows are already ordered");
+  await api.apply();
+  assert.equal(fetches, 1, "fresh sort keys should reuse the previous fetch");
+});
+
 // 新版原生滑杆菜单的横排控件不能插入旧版速度子菜单。
 it("keeps the native power-slider menu free of legacy speed rows", async () => {
   const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");

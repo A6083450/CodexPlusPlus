@@ -276,9 +276,10 @@ pub fn bridge_health_check_script() -> &'static str {
   const lastAttemptAt = Number(health.lastAttemptAt) || 0;
   if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
   if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
-  // 页面忙碌时状态请求会超时，但心跳仍在调用桥接。最近一次尝试也算活着，
-  // 避免看门狗把整份脚本反复注入并触发整页刷新。
-  return lastAttemptAt > 0 && now - lastAttemptAt <= 15000;
+  // 短暂忙碌允许超时；一分钟没有成功响应后不能再靠重试掩盖断连。
+  const lastConfirmedAt = Math.max(lastSuccessAt, lastInjectionAt);
+  return lastAttemptAt > 0 && now - lastAttemptAt <= 15000
+    && lastConfirmedAt > 0 && now - lastConfirmedAt <= 60000;
 })()
 "#
 }
