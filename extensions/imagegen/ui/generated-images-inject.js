@@ -35,6 +35,7 @@
 
   function openPreview(sourceImage) {
     const dialog = document.createElement("dialog");
+    dialog.setAttribute("data-codex-plus-ext", "imagegen");
     dialog.setAttribute("data-codex-generated-image-preview", "true");
     dialog.setAttribute("aria-label", "图片预览");
     dialog.className = "codex-dialog left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2 outline-none fixed pointer-events-none inset-0 !left-0 !top-0 max-w-none !translate-x-0 !translate-y-0 overflow-visible rounded-none bg-transparent p-0 shadow-none ring-0 backdrop-blur-none fixed h-[100dvh] w-screen";
@@ -174,9 +175,13 @@
       );
       const nativeImage = Array.from(document.querySelectorAll("img:not([data-codex-generated-image-id])"))
         .find((element) => element.getAttribute("src")?.includes(image.id));
-      if (nativeImage) {
+      if (nativeImage?.complete && nativeImage.naturalWidth > 0) {
         existing?.parentElement?.remove();
         return;
+      }
+      if (nativeImage && !(state.nativeImageListeners ||= new WeakSet()).has(nativeImage)) {
+        state.nativeImageListeners.add(nativeImage);
+        nativeImage.addEventListener("load", scheduleRefresh, { once: true });
       }
       if (existing && existing.parentElement?.getAttribute("data-codex-generated-image-preview-trigger") !== null) {
         return;
@@ -196,6 +201,7 @@
       let container = markdown.querySelector(":scope > [data-codex-generated-images]");
       if (!container) {
         container = document.createElement("div");
+        container.setAttribute("data-codex-plus-ext", "imagegen");
         container.setAttribute("data-codex-generated-images", "true");
         container.style.cssText = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;max-width:100%;";
         markdown.appendChild(container);
@@ -252,7 +258,12 @@
         return;
       }
       if ((result?.status === "found" || result?.status === "empty") && Array.isArray(result.images)) {
-        state.images = result.images;
+        const returned = new Set(result.images.map(image => image.id));
+        const nativeImages = Array.from(document.querySelectorAll("img:not([data-codex-generated-image-id])"));
+        const pending = state.images.filter(image => !returned.has(image.id)
+          && !nativeImages.some(element => element.getAttribute("src")?.includes(image.id)
+            && element.complete && element.naturalWidth > 0));
+        state.images = [...result.images, ...pending];
         renderImages(state.images, responseTargets());
         const persistKey = `${sessionId}:${state.images.map(image => image.id).join(",")}`;
         if (state.images.length && state.persistKey !== persistKey
@@ -261,8 +272,6 @@
           const persisted = await window.__codexPlusPersistGeneratedImages(sessionRef);
           if (persisted === true) {
             state.requestKey = "";
-            state.images = [];
-            renderImages([], responseTargets());
             state.timer = setTimeout(() => void refresh(), 150);
           } else if (persisted === "busy") {
             state.persistKey = "";

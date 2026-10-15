@@ -165,6 +165,26 @@ fn injection_script_recovers_generated_images_runtime() {
 }
 
 #[test]
+fn image_generation_turn_reloads_existing_threads_into_the_proxy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/imagegen");
+    let output = Command::new("node")
+        .arg(root.join("tests/turn-preparation.cjs"))
+        .arg(root.join("ui/renderer-runtime.js"))
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn generated_image_fallback_survives_failed_native_image_loading() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/imagegen");
+    let output = Command::new("node")
+        .arg(root.join("tests/generated-images-rendering.cjs"))
+        .arg(root.join("ui/generated-images-inject.js"))
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
 fn generated_image_waits_for_its_exact_assistant_message_target() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("generated-images-inject.js");
@@ -3739,7 +3759,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"14\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"15\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
     assert!(script.contains("querySelector?.(`[data-fast-mode-enabled]`)"));
@@ -4136,6 +4156,7 @@ let profile = {{ relayMode: 'pureApi', protocol: 'responses', imageGenerationPro
   modelList: 'gpt-6\ngpt-image-2.5-flare' }};
 const codexRemoteSessionActiveProfile = () => profile;
 const codexPlusBackendSettings = {{}};
+const codexServiceTierCurrentModelName = () => 'gpt-6';
 const defaults = {{ image_generation: true, other_feature: true }};
 const manager = {{ requestClient: {{ hostId: 'local' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
 {}
@@ -7984,7 +8005,7 @@ fn image_persistence_restores_native_thread_even_when_repair_fails() {
     let harness = r#"
 const assert = require('node:assert/strict');
 global.window = {};
-let calls = [], busy = false, fail = false, navigations = 0;
+let calls = [], busy = false, fail = false, navigations = 0, resumedModel = null;
 let streamOwned = true;
 const conversation = { latestModel: "test", resumeState: "resumed",
   turns: [{ items: [{ type: 'agentMessage', id: 'msg-image', text: 'old text' }] }],
@@ -8001,7 +8022,7 @@ const manager = {
   notificationContext: { handleThreadArchived() { navigations++; }, handleThreadUnarchived() { navigations++; } },
   getConversation: () => conversation, getConversationCwd: () => '/tmp',
   updateConversationState(id, update) { update(conversation); },
-  async resumeConversation() { assert.equal(streamOwned, false, 'stale stream ownership would skip native resume'); assert.equal(conversation.resumeState, 'needs_resume'); calls.push('resume'); return { status: 'ready' }; }
+  async resumeConversation(options) { resumedModel = options.model; assert.equal(streamOwned, false, 'stale stream ownership would skip native resume'); assert.equal(conversation.resumeState, 'needs_resume'); calls.push('resume'); return { status: 'ready' }; }
 };
 global.collectCodexReactRuntimeCandidates = () => ({ conversationManagers: [manager] });
 global.postJson = async () => { calls.push('persist'); if (fail) throw Error('disk full'); return 1; };
@@ -8024,6 +8045,9 @@ global.sendCodexPlusDiagnostic = () => {};
   calls = []; busy = true;
   assert.equal(await window.__codexPlusPersistGeneratedImages(session), 'busy');
   assert.deepEqual(calls, ['thread/read']);
+  busy = false;
+  assert.equal(await window.__codexPlusPersistGeneratedImages({ ...session, model: 'gpt-image-2.5-flare' }, true), true);
+  assert.equal(resumedModel, 'gpt-image-2.5-flare');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 "#;
     let output = Command::new("node").arg("-e").arg(format!("{harness_prefix}\n{}\n{harness_suffix}", &source[start..end], harness_prefix = harness.split("(async () =>").next().unwrap(), harness_suffix = format!("(async () =>{}", harness.split_once("(async () =>").unwrap().1))).output().unwrap();

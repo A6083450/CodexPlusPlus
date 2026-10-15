@@ -409,7 +409,7 @@
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "14";
+  const codexAppServerModelRequestPatchVersion = "15";
   const codexNativeServiceTierSelectionSyncVersion = "3";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
@@ -12548,6 +12548,7 @@
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
+      || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
       || codexPlusSettings().serviceTierControls
       || codexPlusSettings().sessionDelete;
     if (!wanted) return false;
@@ -12754,6 +12755,7 @@
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
+        || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
         || codexPlusSettings().serviceTierControls
         || codexPlusSettings().sessionDelete) {
       installAppServerModelRequestPatch();

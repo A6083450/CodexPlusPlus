@@ -18,3 +18,7 @@ crates/codex-plus-core/tests/imagegen_skill.rs	extensions/imagegen/tests/imagege
 crates/codex-plus-data/tests/generated_images.rs	extensions/imagegen/tests/generated_images.rs
 scripts/installer/macos/package-dmg.sh	extensions/imagegen/sync.py
 assets/inject/renderer-inject.js	await prepareCodexImageGenerationTurn(client, requestMethod, params)
+crates/codex-plus-core/src/protocol_proxy.rs	extensions/imagegen/rust/protocol_tools.rs
+crates/codex-plus-core/tests/protocol_proxy.rs	extensions/imagegen/tests/protocol_tools.rs
+crates/codex-plus-core/src/protocol_proxy.rs	let settings = image_generation_settings_for_request(
+crates/codex-plus-core/src/routes.rs	configured_image_generation_proxy(&crate::relay_config::default_codex_home_dir(), &settings)

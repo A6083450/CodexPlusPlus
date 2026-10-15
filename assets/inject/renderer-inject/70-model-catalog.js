@@ -1100,6 +1100,7 @@
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
+      || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
       || codexPlusSettings().serviceTierControls
       || codexPlusSettings().sessionDelete;
     if (!wanted) return false;
@@ -1306,6 +1307,7 @@
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
+        || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
         || codexPlusSettings().serviceTierControls
         || codexPlusSettings().sessionDelete) {
       installAppServerModelRequestPatch();

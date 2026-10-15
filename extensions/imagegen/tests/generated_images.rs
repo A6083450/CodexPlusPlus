@@ -275,6 +275,9 @@ fn native_markdown_delivery_is_not_materialized_again() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("state_5.sqlite");
     let rollout_path = tmp.path().join("rollout.jsonl");
+    let image_path = tmp.path().join("generated_images/thread-markdown/ig-markdown.png");
+    fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+    fs::write(&image_path, b"image").unwrap();
     fs::write(
         &rollout_path,
         concat!(
@@ -284,6 +287,9 @@ fn native_markdown_delivery_is_not_materialized_again() {
         ),
     )
     .unwrap();
+    let text = fs::read_to_string(&rollout_path).unwrap()
+        .replace("/tmp/generated_images/thread-markdown/ig-markdown.png", &image_path.to_string_lossy().replace('\\', "\\\\"));
+    fs::write(&rollout_path, text).unwrap();
     create_thread_db(&db_path, &rollout_path, "thread-markdown");
 
     let result = generated_images_from_paths(
@@ -291,13 +297,53 @@ fn native_markdown_delivery_is_not_materialized_again() {
         &SessionRef::new("thread-markdown", "Image task").unwrap(),
     );
 
-    assert!(!tmp.path().join("generated_images/thread-markdown").exists());
+    assert_eq!(fs::read(&image_path).unwrap(), b"image");
     assert!(result.images.is_empty(), "native Markdown must not also be injected");
     assert!(
         !fs::read_to_string(rollout_path)
             .unwrap()
             .contains("msg_codex_plus_generated_")
     );
+}
+
+#[test]
+fn missing_or_damaged_markdown_image_is_recovered_from_generation() {
+    for damaged in [false, true] {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("state_5.sqlite");
+        let rollout_path = tmp.path().join("rollout.jsonl");
+        let image_path = tmp.path().join("generated_images/recover/ig-recover.png");
+        if damaged {
+            fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+            fs::write(&image_path, b"damaged").unwrap();
+        }
+        let rows = [
+            json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-recover","status":"completed","result":"aW1hZ2U="}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"msg-final","role":"assistant","content":[{"type":"output_text","text":format!("![image](<{}>)", image_path.display())}]}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ];
+        fs::write(&rollout_path, rows.iter().map(|row| format!("{row}\n")).collect::<String>()).unwrap();
+        create_thread_db(&db_path, &rollout_path, "recover");
+        Connection::open(&db_path).unwrap().execute("ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 1", []).unwrap();
+        let session = SessionRef::new("recover", "Image task").unwrap();
+        let result = generated_images_from_paths([db_path.clone()], &session);
+        assert_eq!(result.status, GeneratedImagesStatus::Found, "damaged={damaged}");
+        assert_eq!(result.images.len(), 1);
+        codex_plus_data::generated_images::persist_generated_images_from_paths([db_path.clone()], &session).unwrap();
+        let files = fs::read_dir(image_path.parent().unwrap()).unwrap()
+            .map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        let restored = files.iter().find(|path| fs::read(path).unwrap() == b"image").unwrap();
+        assert!(fs::read_to_string(&rollout_path).unwrap().contains(&restored.to_string_lossy().replace('\\', "\\\\")));
+        if damaged { assert_eq!(fs::read(&image_path).unwrap(), b"damaged"); }
+        assert!(generated_images_from_paths([db_path.clone()], &session).images.is_empty());
+        if damaged {
+            fs::write(restored, b"damaged-again").unwrap();
+            assert_eq!(generated_images_from_paths([db_path.clone()], &session).status, GeneratedImagesStatus::Found);
+            codex_plus_data::generated_images::persist_generated_images_from_paths([db_path.clone()], &session).unwrap();
+            assert_eq!(fs::read(restored).unwrap(), b"damaged-again");
+            assert!(generated_images_from_paths([db_path], &session).images.is_empty());
+        }
+    }
 }
 
 #[test]

@@ -29,7 +29,7 @@
       if (!["idle", "notLoaded"].includes(thread.status?.type)) return "busy";
       const conversation = manager.getConversation(id);
       const cwd = manager.getConversationCwd(id) || thread.cwd;
-      const model = conversation?.latestModel;
+      const model = (refreshOnly && session.model) || conversation?.latestModel;
       let archived = false;
       try {
         // Archive closes the native writer before changing existing references; no events are appended.
@@ -73,18 +73,32 @@
     const threadId = params?.threadId;
     const model = String(params?.collaborationMode?.settings?.model || params?.model
       || client.__codexPlusThreadModels?.get(threadId) || codexServiceTierCurrentModelName());
-    if (!threadId || !model?.toLowerCase().startsWith("gpt-image-")) return;
+    if (!threadId) return;
+    const imageModel = model.toLowerCase().startsWith("gpt-image-");
+    const proxyThreads = client.__codexPlusImageGenerationProxyThreads ||= new Set();
+    if (!imageModel && !proxyThreads.has(threadId)) return;
     await loadBackendSettingsState();
-    if (!codexImageGenerationDisabled()) return;
+    const profile = codexRemoteSessionActiveProfile();
+    const proxied = codexPlusBackendSettings.imageGenerationProxy
+      || (profile?.imageGenerationProxy !== false && profile?.protocol === "responses"
+        && (profile.relayMode !== "official" || profile.officialMixApiKey));
+    const wantsProxy = imageModel && Boolean(proxied);
+    if (!wantsProxy && !proxyThreads.has(threadId) && !codexImageGenerationDisabled()) return;
     const ready = client.__codexPlusImageGenerationReady ||= new Set();
-    if (ready.has(threadId)) return;
+    const readyKey = `hosted-v2:${model}:${profile?.id || ""}:${JSON.stringify(codexPlusBackendSettings.imageGenerationProxy)}:${threadId}`;
+    if (ready.has(readyKey) && wantsProxy === proxyThreads.has(threadId)) return;
     // 已加载会话会忽略 resume 的 config；首次发送前必须真正卸载再恢复。
     const { thread } = await client.sendRequest("thread/read", { threadId, includeTurns: false });
-    if (!thread.path) return; // 新会话尚未创建 rollout，由已安装的 start 拦截负责。
+    if (!thread.path) {
+      if (wantsProxy) proxyThreads.add(threadId);
+      return; // 新会话尚未创建 rollout，由已安装的 start 拦截负责。
+    }
     await window.__codexPlusImagePersistenceJobs.get(threadId);
-    const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId }, true);
+    const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId, model }, true);
     if (restored !== true) throw new Error("生图会话配置未恢复，请稍后重试");
-    ready.add(threadId);
+    ready.add(readyKey);
+    if (wantsProxy) proxyThreads.add(threadId);
+    else proxyThreads.delete(threadId);
   }
 
   function patchCodexImageGenerationManager(manager) {
@@ -112,12 +126,18 @@
   }
 
   function applyCodexImageGenerationRequestOverride(method, params) {
-    if (!["thread/start", "thread/resume", "thread/fork"].includes(method)
-        || !codexImageGenerationDisabled()) return params;
+    if (!["thread/start", "thread/resume", "thread/fork"].includes(method)) return params;
+    const model = String(params?.collaborationMode?.settings?.model || params?.model || codexServiceTierCurrentModelName());
+    const proxy = model.toLowerCase().startsWith("gpt-image-") && codexPlusBackendSettings.imageGenerationProxy;
+    if (!proxy && !codexImageGenerationDisabled()) return params;
     const config = { ...params?.config, "features.image_generation": false };
+    if (proxy) {
+      config[`model_providers.${JSON.stringify(proxy.provider)}.base_url`] = proxy.baseUrl;
+      config[`model_providers.${JSON.stringify(proxy.provider)}.supports_websockets`] = false;
+    }
     if (config.features && typeof config.features === "object" && !Array.isArray(config.features)) {
       config.features = { ...config.features, image_generation: false };
     }
-    return { ...params, config };
+    return { ...params, ...(proxy ? { modelProvider: proxy.provider } : {}), config };
   }
 

@@ -848,8 +848,10 @@ fn settings_payload_value(
         &settings.active_relay_profile(),
     );
     settings.dictation = crate::dictation::effective_settings(&settings);
+    let image_generation_proxy = configured_image_generation_proxy(&crate::relay_config::default_codex_home_dir(), &settings);
     let mut value = serde_json::to_value(settings)?;
     if let Some(object) = value.as_object_mut() {
+        object.insert("imageGenerationProxy".to_string(), image_generation_proxy.unwrap_or(Value::Null));
         object.insert(
             "nativeImageGenerationEnabled".to_string(),
             configured_image_generation(&crate::relay_config::default_codex_home_dir())

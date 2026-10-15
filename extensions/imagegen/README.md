@@ -11,7 +11,12 @@ CodexPlusPlus 的 `extensions/imagegen` 仅是构建快照；**后续修改请�
 - `rust/generated_images.rs`：图片落盘、原生消息修复、历史索引重建。
 - `rust/imagegen_skill.rs`、`skill/`：本地 imagegen 增强版本、覆盖安装和覆盖状态检查。
 - `rust/relay_compatibility.rs`、`rust/config_read.rs`：图片模型配置兼容与有效开关读取。
+- `rust/protocol_tools.rs`：图片模型使用托管生图，清理顶层及 Code Mode `additional_tools` 中冲突的同名函数。
 - `tests/`：图片数据和 skill 安装回归测试，由宿主 cargo test 执行。
+
+图片模型会话优先使用 Responses 托管生图。关闭供应商配置管理时，仅在会话配置中临时接入代理，上游地址、有效 API 凭据与自定义头来自当前 Codex 配置，不改写全局配置或登录文件；切回文字模型时恢复会话配置。官方原生登录、命令认证和带额外查询参数的配置保留原生路径。
+
+图片是否已交付以本地文件内容和原生图片加载结果为准。缺失文件从生成结果恢复，损坏文件保留并另存恢复副本；保存成功后仍保留兜底预览，直到原生图片确实加载成功。
 
 这里是独立版本管理的扩展源码包，不是独立运行的 Codex 插件。Rust 通过宿主薄门面编译，复用宿主的数据类型、数据库定位和原子文件写入；renderer 通过一个固定插槽装配，复用宿主桥接和原生会话管理器。宿主的通用 HTTP/模型选择/协议代理仍由宿主管理，不复制整套应用。
 

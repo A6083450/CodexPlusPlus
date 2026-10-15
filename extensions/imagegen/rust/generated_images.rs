@@ -76,7 +76,8 @@ fn generated_images_from_database(
         )));
     }
 
-    let scan = load_generated_images(&rollout_path)?;
+    let output_dir = db_path.parent().unwrap().join("generated_images").join(&resolved_thread_id);
+    let scan = load_generated_images(&rollout_path, &output_dir, &resolved_thread_id)?;
     materialize_generated_images(db_path, &resolved_thread_id, &scan)?;
     let images: Vec<_> = scan.images.into_iter().filter(|image| {
         !scan.markdown_image_ids.contains(&image.id)
@@ -108,7 +109,7 @@ struct GeneratedImageScan {
     message_ids: HashSet<String>,
 }
 
-fn load_generated_images(path: &Path) -> anyhow::Result<GeneratedImageScan> {
+fn load_generated_images(path: &Path, output_dir: &Path, thread_id: &str) -> anyhow::Result<GeneratedImageScan> {
     let file = File::open(path)?;
     let mut images = Vec::new();
     let mut pending = Vec::new();
@@ -171,7 +172,7 @@ fn load_generated_images(path: &Path) -> anyhow::Result<GeneratedImageScan> {
                 if payload.get("phase").and_then(Value::as_str) == Some("commentary") {
                     continue;
                 }
-                collect_markdown_image_ids(payload, &images, &mut markdown_image_ids);
+                collect_markdown_image_ids(payload, &images, output_dir, thread_id, &mut markdown_image_ids)?;
                 let message_id = payload
                     .get("id")
                     .and_then(Value::as_str)
@@ -203,10 +204,12 @@ fn load_generated_images(path: &Path) -> anyhow::Result<GeneratedImageScan> {
 fn collect_markdown_image_ids(
     payload: &Value,
     images: &[GeneratedImage],
+    output_dir: &Path,
+    thread_id: &str,
     image_ids: &mut HashSet<String>,
-) {
+) -> anyhow::Result<()> {
     let Some(content) = payload.get("content").and_then(Value::as_array) else {
-        return;
+        return Ok(());
     };
     for text in content.iter().filter_map(|item| {
         (item.get("type").and_then(Value::as_str) == Some("output_text"))
@@ -216,13 +219,19 @@ fn collect_markdown_image_ids(
         if !text.contains("![") {
             continue;
         }
-        image_ids.extend(
-            images
-                .iter()
-                .filter(|image| !image.id.is_empty() && text.contains(&image.id))
-                .map(|image| image.id.clone()),
-        );
+        for image in images.iter().filter(|image| !image.id.is_empty() && text.contains(&image.id)) {
+            let path = generated_image_path(output_dir, thread_id, image)?;
+            let reference = path.to_string_lossy().replace('\\', "/");
+            let text = text.replace('\\', "/");
+            if (text.contains(&format!("](<{reference}>)")) || text.contains(&format!("]({reference})")))
+                && std::fs::read(&path).ok().is_some_and(|bytes|
+                    base64::engine::general_purpose::STANDARD.encode(bytes) == image.base64_data)
+            {
+                image_ids.insert(image.id.clone());
+            }
+        }
     }
+    Ok(())
 }
 
 /// Only the native app may unload/archive a thread before this operation.
@@ -239,10 +248,10 @@ pub fn persist_generated_images_from_paths(
         let archived: bool = db.query_row("SELECT archived FROM threads WHERE id = ?1", [&thread_id], |r| r.get(0))?;
         anyhow::ensure!(archived, "图片引用只能在会话卸载后修复");
         let path = record.rollout_path.ok_or_else(|| anyhow::anyhow!("会话缺少日志路径"))?;
-        let scan = load_generated_images(&path)?;
+        let output_dir = db_path.parent().unwrap().join("generated_images").join(&thread_id);
+        let scan = load_generated_images(&path, &output_dir, &thread_id)?;
         materialize_generated_images(&db_path, &thread_id, &scan)?;
         let original = std::fs::read_to_string(&path)?;
-        let output_dir = db_path.parent().unwrap().join("generated_images").join(&thread_id);
         // 模型可能复用历史里的本地图片路径；本轮生成结果才是该回复的图片来源。
         let directory = output_dir.join("");
         // Windows Markdown 可能使用原生反斜杠或浏览器正斜杠，目录范围保持不变。
@@ -265,10 +274,8 @@ pub fn persist_generated_images_from_paths(
                     && !scan.native_image_hashes.contains(&encoded_hash(&image.base64_data)))
                 .map(|(_, image)| image).collect();
             if event_is_assistant_message(payload) && !images.is_empty() {
-                let mut paths = images.iter().map(|image| {
-                    db_path.parent().unwrap().join("generated_images").join(&thread_id)
-                        .join(format!("{}.{}", safe_file_stem(&image.id, &native_message_id(&thread_id, &image.id)), image_extension(&image.media_type)))
-                });
+                let mut paths = images.iter().map(|image| generated_image_path(&output_dir, &thread_id, image))
+                    .collect::<anyhow::Result<Vec<_>>>()?.into_iter();
                 let content = payload.get_mut("content").and_then(Value::as_array_mut)
                     .ok_or_else(|| anyhow::anyhow!("Invalid assistant content"))?;
                 let mut replaced = false;
@@ -414,11 +421,7 @@ fn materialize_generated_images(
             continue;
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(&image.base64_data)?;
-        let image_path = output_dir.join(format!(
-            "{}.{}",
-            safe_file_stem(&image.id, &message_id),
-            image_extension(&image.media_type)
-        ));
+        let image_path = generated_image_path(&output_dir, thread_id, image)?;
         if image_path.exists() {
             anyhow::ensure!(
                 std::fs::read(&image_path)? == bytes,
@@ -431,6 +434,21 @@ fn materialize_generated_images(
     }
 
     Ok(())
+}
+
+fn generated_image_path(output_dir: &Path, thread_id: &str, image: &GeneratedImage) -> anyhow::Result<PathBuf> {
+    let stem = safe_file_stem(&image.id, &native_message_id(thread_id, &image.id));
+    let extension = image_extension(&image.media_type);
+    let mut path = output_dir.join(format!("{stem}.{extension}"));
+    let mut recovery = 0;
+    while let Ok(existing) = std::fs::read(&path) {
+        if existing == base64::engine::general_purpose::STANDARD.decode(&image.base64_data)? { break; }
+        // 恢复副本也可能损坏；逐个避开已有内容，保留所有原文件。
+        let suffix = if recovery == 0 { String::new() } else { format!("-{recovery}") };
+        path = output_dir.join(format!("{stem}-{}{suffix}.{extension}", encoded_hash(&image.base64_data)));
+        recovery += 1;
+    }
+    Ok(path)
 }
 
 fn native_message_id(thread_id: &str, image_id: &str) -> String {
