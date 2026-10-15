@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) static CODEX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn default_codex_home_dir() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -125,7 +128,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::Mutex;
 
     // ---- #2146 递归删除守卫 ----
 
@@ -274,8 +276,6 @@ mod tests {
         assert!(ensure_safe_recursive_removal(temp.path(), &home).is_err());
         assert!(ensure_safe_recursive_removal(&home, &home).is_err());
     }
-
-    static CODEX_HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct CodexHomeEnvGuard {
         previous: Option<OsString>,
