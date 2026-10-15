@@ -1083,6 +1083,7 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
     } catch (_) {
       return false;
     }

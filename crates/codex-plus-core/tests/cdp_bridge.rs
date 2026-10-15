@@ -165,6 +165,40 @@ fn injection_script_recovers_generated_images_runtime() {
 }
 
 #[test]
+fn image_generation_reinjection_does_not_keep_obsolete_client_wrappers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("node")
+        .arg(root.join("extensions/imagegen/tests/client-reinjection.cjs"))
+        .arg(root.join("assets/inject/renderer-inject/70-model-catalog.js"))
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn image_generation_restores_native_requests_after_backend_exit() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/imagegen");
+    let output = Command::new("node")
+        .arg(root.join("tests/lifecycle.cjs"))
+        .arg(root.join("ui/renderer-runtime.js"))
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[tokio::test]
+async fn image_generation_shutdown_waits_for_native_restoration() {
+    let (url, done) = spawn_cdp_server(|mut socket| async move {
+        let request = recv_json(&mut socket).await;
+        assert_eq!(request["method"], "Runtime.evaluate");
+        assert_eq!(request["params"]["awaitPromise"], true);
+        assert!(request["params"]["expression"].as_str().unwrap().contains("__codexPlusRestoreNativeImageGeneration"));
+        send_json(&mut socket, json!({"id":request["id"],"result":{"result":{"type":"object","value":{"restored":1,"pending":0}}}})).await;
+    }).await;
+    let restored = codex_plus_core::imagegen_runtime::restore_native_image_generation(&url).await.unwrap();
+    assert_eq!(restored, json!({"restored":1,"pending":0}));
+    done.await.unwrap();
+}
+
+#[test]
 fn image_generation_turn_reloads_existing_threads_into_the_proxy() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/imagegen");
     let output = Command::new("node")
@@ -3759,7 +3793,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"15\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"16\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
     assert!(script.contains("querySelector?.(`[data-fast-mode-enabled]`)"));
@@ -4152,48 +4186,33 @@ fn desktop_image_feature_defaults_respect_direct_image_profile() {
     let end = script[start..].find("  function patchCodexContextUsageManager(").unwrap() + start;
     let harness = format!(r#"
 const assert = require('node:assert/strict');
-let profile = {{ relayMode: 'pureApi', protocol: 'responses', imageGenerationProxy: false,
-  modelList: 'gpt-6\ngpt-image-2.5-flare' }};
+let profile = {{ relayMode: 'pureApi', protocol: 'responses', imageGenerationProxy: false }};
 const codexRemoteSessionActiveProfile = () => profile;
 const codexPlusBackendSettings = {{}};
 const codexServiceTierCurrentModelName = () => 'gpt-6';
+const window = {{ __codexPlusImageGenerationRuntime: {{ active: true, threads: new Map() }} }};
+const codexImageGenerationRuntimeActive = () => window.__codexPlusImageGenerationRuntime.active;
 const defaults = {{ image_generation: true, other_feature: true }};
 const manager = {{ requestClient: {{ hostId: 'local' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
 {}
 patchCodexImageGenerationManager(manager);
 const reader = manager.settings.readDefaultFeatureOverrides;
-patchCodexImageGenerationManager(manager);
-assert.equal(manager.settings.readDefaultFeatureOverrides, reader);
+assert.equal(reader(), defaults, 'explicit proxy opt-out preserves native defaults');
+codexPlusBackendSettings.imageGenerationProxy = {{ provider: 'custom', baseUrl: 'http://localhost:57321/v1' }};
 assert.deepEqual(reader(), {{ image_generation: false, other_feature: true }});
 assert.equal(defaults.image_generation, true);
-const savedProfile = profile;
-profile = null; // Supplier management disabled: respect the effective config instead.
-codexPlusBackendSettings.nativeImageGenerationEnabled = false;
-assert.equal(reader().image_generation, false);
 const resume = {{ threadId: 'image-thread', config: {{ 'features.image_generation': true,
   'features.other': true, features: {{ image_generation: true, retained: true }} }} }};
-const patchedResume = applyCodexImageGenerationRequestOverride('thread/resume', resume);
-assert.equal(patchedResume.config['features.image_generation'], false);
-assert.equal(patchedResume.config.features.image_generation, false);
-assert.equal(patchedResume.config.features.retained, true);
-assert.equal(patchedResume.config['features.other'], true);
+const patched = applyCodexImageGenerationRequestOverride('thread/resume', resume);
+assert.equal(patched.config['features.image_generation'], false);
+assert.equal(patched.config.features.image_generation, false);
+assert.equal(patched.config.features.retained, true);
+assert.equal(patched.config['features.other'], true);
 assert.equal(resume.config['features.image_generation'], true);
-assert.equal(applyCodexImageGenerationRequestOverride('turn/start', resume), resume);
-assert.equal(applyCodexImageGenerationRequestOverride('thread/start', {{}}).config['features.image_generation'], false);
-
-delete codexPlusBackendSettings.nativeImageGenerationEnabled;
+window.__codexPlusImageGenerationRuntime.active = false;
 assert.equal(reader(), defaults);
-profile = savedProfile;
-profile.imageGenerationProxy = true;
-assert.equal(reader(), defaults);
-profile.imageGenerationProxy = false;
-profile.relayMode = 'official';
-assert.equal(reader(), defaults);
-profile.relayMode = 'pureApi';
-profile.modelList = 'gpt-6';
-assert.equal(reader(), defaults);
+assert.equal(applyCodexImageGenerationRequestOverride('thread/resume', resume), resume);
 const remote = {{ requestClient: {{ hostId: 'remote' }}, settings: {{ readDefaultFeatureOverrides: () => defaults }} }};
-profile.modelList = 'gpt-image-2';
 patchCodexImageGenerationManager(remote);
 assert.equal(remote.settings.readDefaultFeatureOverrides(), defaults);
 "#, &script[start..end]);

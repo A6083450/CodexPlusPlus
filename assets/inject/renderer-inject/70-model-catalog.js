@@ -918,7 +918,13 @@
       return false;
     }
     if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
-    const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
+    const cachedOriginal = Object.hasOwn(client, "__codexPlusModelOriginalSendRequest")
+      ? client.__codexPlusModelOriginalSendRequest : null;
+    const prototypeOriginal = Object.getPrototypeOf(client)?.__codexPlusModelOriginalSendRequest;
+    const staleWrapper = cachedOriginal?.name === "bound codexPlusModelPatchedSendRequest"
+      || (!cachedOriginal && client.sendRequest.name === "codexPlusModelPatchedSendRequest");
+    const originalSendRequest = (staleWrapper && typeof prototypeOriginal === "function"
+      ? prototypeOriginal : cachedOriginal || client.sendRequest).bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
@@ -958,6 +964,7 @@
       );
       const result = await originalSendRequest(method, nextParams, options);
       const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
@@ -1163,6 +1170,7 @@
       );
       const result = await originalSendRequest.call(client, method, nextParams, options);
       const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);

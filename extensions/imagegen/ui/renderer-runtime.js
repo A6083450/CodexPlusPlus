@@ -1,3 +1,46 @@
+  window.__codexPlusImageGenerationRuntime ||= { active: false, threads: new Map() };
+  window.__codexPlusImageGenerationRuntime.stopping = false;
+
+  function codexImageGenerationRuntimeActive() {
+    const runtime = window.__codexPlusImageGenerationRuntime;
+    return runtime?.active === true && !runtime.stopping;
+  }
+
+  function setCodexImageGenerationRuntimeActive(active) {
+    const runtime = window.__codexPlusImageGenerationRuntime ||= { active: false, threads: new Map() };
+    if (active && (runtime.stopping || runtime.restoring)) return;
+    runtime.active = active;
+  }
+
+  function recordCodexImageGenerationThread(client, state, params) {
+    if (client.hostId !== "local" || !codexImageGenerationRuntimeActive() || !state.threadId
+        || params?.config?.["features.image_generation"] !== false) return;
+    window.__codexPlusImageGenerationRuntime.threads.set(state.threadId, {
+      client, model: state.model || codexServiceTierCurrentModelName(),
+    });
+  }
+
+  window.__codexPlusRestoreNativeImageGeneration = (stopping = true) => {
+    const runtime = window.__codexPlusImageGenerationRuntime;
+    runtime.active = false;
+    runtime.stopping ||= stopping;
+    if (runtime.restoring) return runtime.restoring;
+    runtime.restoring = (async () => {
+      let restored = 0;
+      for (const [id, entry] of [...runtime.threads]) {
+        await window.__codexPlusImagePersistenceJobs?.get(id);
+        const result = await window.__codexPlusPersistGeneratedImages({ session_id: id, model: entry.model }, true);
+        if (result !== true) continue;
+        runtime.threads.delete(id);
+        entry.client.__codexPlusImageGenerationProxyThreads?.delete(id);
+        entry.client.__codexPlusImageGenerationReady?.clear();
+        restored++;
+      }
+      return { restored, pending: runtime.threads.size };
+    })().finally(() => { runtime.restoring = null; });
+    return runtime.restoring;
+  };
+
   window.__codexPlusImagePersistenceJobs = window.__codexPlusImagePersistenceJobs || new Map();
   window.__codexPlusPersistGeneratedImages = (session, refreshOnly = false) => {
     const id = session?.session_id;
@@ -74,9 +117,26 @@
     const model = String(params?.collaborationMode?.settings?.model || params?.model
       || client.__codexPlusThreadModels?.get(threadId) || codexServiceTierCurrentModelName());
     if (!threadId) return;
+    const runtime = window.__codexPlusImageGenerationRuntime;
+    if (!runtime) return;
+    if (codexImageGenerationRuntimeActive()) {
+      const status = await postJson("/backend/status", {}).catch(() => null);
+      if (status?.status !== "ok") setCodexImageGenerationRuntimeActive(false);
+    }
+    if (!codexImageGenerationRuntimeActive()) {
+      await runtime.restoring;
+      if (runtime.threads.has(threadId) || client.__codexPlusImageGenerationProxyThreads?.has(threadId)) {
+        await window.__codexPlusImagePersistenceJobs?.get(threadId);
+        const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId, model }, true);
+        if (restored !== true) throw new Error("原生生图配置尚未恢复，请等待当前会话空闲后重试");
+        runtime.threads.delete(threadId);
+        client.__codexPlusImageGenerationProxyThreads?.delete(threadId);
+        client.__codexPlusImageGenerationReady?.clear();
+      }
+      return;
+    }
     const imageModel = model.toLowerCase().startsWith("gpt-image-");
     const proxyThreads = client.__codexPlusImageGenerationProxyThreads ||= new Set();
-    if (!imageModel && !proxyThreads.has(threadId)) return;
     await loadBackendSettingsState();
     const profile = codexRemoteSessionActiveProfile();
     const proxied = codexPlusBackendSettings.imageGenerationProxy
@@ -85,18 +145,20 @@
     const wantsProxy = imageModel && Boolean(proxied);
     if (!wantsProxy && !proxyThreads.has(threadId) && !codexImageGenerationDisabled()) return;
     const ready = client.__codexPlusImageGenerationReady ||= new Set();
-    const readyKey = `hosted-v2:${model}:${profile?.id || ""}:${JSON.stringify(codexPlusBackendSettings.imageGenerationProxy)}:${threadId}`;
+    const readyKey = `hosted-v3:${model}:${profile?.id || ""}:${JSON.stringify(codexPlusBackendSettings.imageGenerationProxy)}:${threadId}`;
     if (ready.has(readyKey) && wantsProxy === proxyThreads.has(threadId)) return;
     // 已加载会话会忽略 resume 的 config；首次发送前必须真正卸载再恢复。
     const { thread } = await client.sendRequest("thread/read", { threadId, includeTurns: false });
     if (!thread.path) {
       if (wantsProxy) proxyThreads.add(threadId);
+      runtime.threads.set(threadId, { client, model });
       return; // 新会话尚未创建 rollout，由已安装的 start 拦截负责。
     }
     await window.__codexPlusImagePersistenceJobs.get(threadId);
     const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId, model }, true);
     if (restored !== true) throw new Error("生图会话配置未恢复，请稍后重试");
     ready.add(readyKey);
+    runtime.threads.set(threadId, { client, model });
     if (wantsProxy) proxyThreads.add(threadId);
     else proxyThreads.delete(threadId);
   }
@@ -104,29 +166,39 @@
   function patchCodexImageGenerationManager(manager) {
     if (manager.requestClient?.hostId !== "local") return;
     const settings = manager.settings;
+    const id = typeof currentSessionRef === "function" && currentSessionRef()?.session_id;
+    const conversation = id && manager.getConversation?.(id);
+    if (conversation && codexImageGenerationRuntimeActive()) window.__codexPlusImageGenerationRuntime.threads.set(id, {
+      client: manager.requestClient, model: conversation.latestModel,
+    });
     if (typeof settings?.readDefaultFeatureOverrides !== "function"
-        || settings.__codexPlusImageGenerationDefaults) return;
-    const original = settings.readDefaultFeatureOverrides.bind(settings);
+        || settings.__codexPlusImageGenerationDefaults === "lifecycle-v1") return;
+    const legacy = settings.__codexPlusImageGenerationDefaults === true;
+    const original = settings.__codexPlusImageGenerationOriginalDefaults
+      || (legacy && typeof Object.getPrototypeOf(settings)?.readDefaultFeatureOverrides === "function"
+        ? Object.getPrototypeOf(settings).readDefaultFeatureOverrides.bind(settings)
+        : settings.readDefaultFeatureOverrides.bind(settings));
+    settings.__codexPlusImageGenerationOriginalDefaults = original;
     settings.readDefaultFeatureOverrides = (...args) => {
       const defaults = original(...args);
       // 默认值及下方请求拦截同时生效，覆盖原生界面的显式实验开关。
-      return codexImageGenerationDisabled()
-        ? { ...defaults, image_generation: false } : defaults;
+      if (codexImageGenerationDisabled()) return { ...defaults, image_generation: false };
+      return legacy && typeof codexPlusBackendSettings.nativeImageGenerationEnabled === "boolean"
+        ? { ...defaults, image_generation: codexPlusBackendSettings.nativeImageGenerationEnabled } : defaults;
     };
-    settings.__codexPlusImageGenerationDefaults = true;
+    settings.__codexPlusImageGenerationDefaults = "lifecycle-v1";
   }
 
   function codexImageGenerationDisabled() {
+    if (!codexImageGenerationRuntimeActive()) return false;
     const profile = codexRemoteSessionActiveProfile();
-    const directImages = profile?.imageGenerationProxy === false && profile.protocol === "responses"
+    return Boolean(codexPlusBackendSettings.imageGenerationProxy || (profile?.imageGenerationProxy !== false && profile?.protocol === "responses"
       && (profile.relayMode !== "official" || profile.officialMixApiKey)
-      && `${profile.model || ""}\n${profile.modelList || ""}`.split("\n")
-        .some((model) => model.trim().toLowerCase().startsWith("gpt-image-"));
-    return directImages || codexPlusBackendSettings.nativeImageGenerationEnabled === false;
+    ));
   }
 
   function applyCodexImageGenerationRequestOverride(method, params) {
-    if (!["thread/start", "thread/resume", "thread/fork"].includes(method)) return params;
+    if (!codexImageGenerationRuntimeActive() || !["thread/start", "thread/resume", "thread/fork"].includes(method)) return params;
     const model = String(params?.collaborationMode?.settings?.model || params?.model || codexServiceTierCurrentModelName());
     const proxy = model.toLowerCase().startsWith("gpt-image-") && codexPlusBackendSettings.imageGenerationProxy;
     if (!proxy && !codexImageGenerationDisabled()) return params;

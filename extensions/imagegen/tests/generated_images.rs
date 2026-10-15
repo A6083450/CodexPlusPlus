@@ -312,7 +312,7 @@ fn missing_or_damaged_markdown_image_is_recovered_from_generation() {
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("state_5.sqlite");
         let rollout_path = tmp.path().join("rollout.jsonl");
-        let image_path = tmp.path().join("generated_images/recover/ig-recover.png");
+        let image_path = tmp.path().join("generated_images").join("recover").join("ig-recover.png");
         if damaged {
             fs::create_dir_all(image_path.parent().unwrap()).unwrap();
             fs::write(&image_path, b"damaged").unwrap();

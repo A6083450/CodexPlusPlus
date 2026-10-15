@@ -7,12 +7,16 @@ const end = source.indexOf('  function patchCodexImageGenerationManager(', start
 let calls = 0, restores = 0, succeed = true, path = '/rollout.jsonl', expectedModel = 'gpt-image-2.5-flare';
 const context = {
   window: { __codexPlusImagePersistenceJobs: new Map(),
+    __codexPlusImageGenerationRuntime: { active: true, threads: new Map() },
     __codexPlusPersistGeneratedImages: async (session, refreshOnly) => {
       assert.equal(session.session_id, 'old'); assert.equal(refreshOnly, true);
       assert.equal(session.model, expectedModel);
       restores++; return succeed;
     } },
   loadBackendSettingsState: async () => {}, codexImageGenerationDisabled: () => false,
+  postJson: async () => ({ status: 'ok' }),
+  codexImageGenerationRuntimeActive: () => context.window.__codexPlusImageGenerationRuntime.active,
+  setCodexImageGenerationRuntimeActive: active => { context.window.__codexPlusImageGenerationRuntime.active = active; },
   codexRemoteSessionActiveProfile: () => ({ id: 'images', protocol: 'responses', relayMode: 'pureApi', imageGenerationProxy: true }),
   codexPlusBackendSettings: { imageGenerationProxy: { provider: 'custom', baseUrl: 'http://127.0.0.1:57321/v1' } },
   codexServiceTierCurrentModelName: () => 'gpt-image-2.5-flare',
@@ -37,7 +41,7 @@ const client = { hostId: 'local', async sendRequest(method) {
   assert.equal(overridden.modelProvider, 'custom');
   assert.equal(overridden.config.retained, true);
   assert.equal(params.config['model_providers."custom".base_url'], undefined);
-  assert.equal(context.applyCodexImageGenerationRequestOverride('thread/start', { model: 'gpt-6' }).config, undefined);
+  assert.equal(context.applyCodexImageGenerationRequestOverride('thread/start', { model: 'gpt-6' }).config['features.image_generation'], false);
   client.hostId = 'local'; path = '/rollout.jsonl'; succeed = true;
   expectedModel = 'gpt-6';
   await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });

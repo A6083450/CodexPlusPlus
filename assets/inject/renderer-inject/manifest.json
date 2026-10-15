@@ -23,12 +23,12 @@
     {
       "name": "30-service-tier.js",
       "description": "服务等级（service tier）读写、线程覆盖与控件同步",
-      "lines": 1093
+      "lines": 1094
     },
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 2129
+      "lines": 2131
     },
     {
       "name": "50-navigation.js",
@@ -53,7 +53,7 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 1387
+      "lines": 1395
     },
     {
       "name": "71-model-picker-groups.js",

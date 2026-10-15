@@ -1133,9 +1133,9 @@ experimental_bearer_token = "sk-test-redacted"
 }
 
 #[test]
-fn direct_image_profiles_disable_native_image_tool_after_common_config_merge() {
+fn image_profiles_preserve_native_image_preference_after_common_config_merge() {
     for (mode, proxy, models, expected) in [
-        (RelayMode::PureApi, false, "gpt-image-2.5-flare", false),
+        (RelayMode::PureApi, false, "gpt-image-2.5-flare", true),
         (RelayMode::PureApi, true, "gpt-image-2.5-flare", true),
         (RelayMode::PureApi, false, "gpt-6", true),
         (RelayMode::Official, false, "gpt-image-2.5-flare", true),

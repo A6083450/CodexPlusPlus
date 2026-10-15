@@ -3653,8 +3653,7 @@ fn apply_relay_responses_compatibility(
     profile: &RelayProfile,
     config_text: &str,
 ) -> anyhow::Result<String> {
-    let config_text = apply_deepseek_responses_compatibility(profile, config_text)?;
-    apply_image_generation_compatibility(profile, &config_text)
+    apply_deepseek_responses_compatibility(profile, config_text)
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/relay_compatibility.rs"));

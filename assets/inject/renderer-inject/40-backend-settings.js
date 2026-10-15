@@ -198,6 +198,7 @@
       if (nextStatus?.status === "ok") {
         codexPlusBackendFailureCount = 0;
         codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+        if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
         if (typeof nextStatus.hideOfficialUsageAlert === "boolean") {
           window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
           syncOfficialUsagePolicy();
@@ -213,6 +214,7 @@
         });
         if (codexPlusBackendFailureCount >= CODEX_PLUS_BACKEND_FAILURE_THRESHOLD) {
           codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+          void window.__codexPlusRestoreNativeImageGeneration?.(false);
         }
       }
       renderBackendStatus();

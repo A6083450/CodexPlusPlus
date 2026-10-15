@@ -409,7 +409,7 @@
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "15";
+  const codexAppServerModelRequestPatchVersion = "16";
   const codexNativeServiceTierSelectionSyncVersion = "3";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
@@ -6541,6 +6541,7 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
     } catch (_) {
       return false;
     }
@@ -6749,6 +6750,7 @@
       if (nextStatus?.status === "ok") {
         codexPlusBackendFailureCount = 0;
         codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+        if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
         if (typeof nextStatus.hideOfficialUsageAlert === "boolean") {
           window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
           syncOfficialUsagePolicy();
@@ -6764,6 +6766,7 @@
         });
         if (codexPlusBackendFailureCount >= CODEX_PLUS_BACKEND_FAILURE_THRESHOLD) {
           codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+          void window.__codexPlusRestoreNativeImageGeneration?.(false);
         }
       }
       renderBackendStatus();
@@ -12366,7 +12369,13 @@
       return false;
     }
     if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
-    const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
+    const cachedOriginal = Object.hasOwn(client, "__codexPlusModelOriginalSendRequest")
+      ? client.__codexPlusModelOriginalSendRequest : null;
+    const prototypeOriginal = Object.getPrototypeOf(client)?.__codexPlusModelOriginalSendRequest;
+    const staleWrapper = cachedOriginal?.name === "bound codexPlusModelPatchedSendRequest"
+      || (!cachedOriginal && client.sendRequest.name === "codexPlusModelPatchedSendRequest");
+    const originalSendRequest = (staleWrapper && typeof prototypeOriginal === "function"
+      ? prototypeOriginal : cachedOriginal || client.sendRequest).bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
@@ -12406,6 +12415,7 @@
       );
       const result = await originalSendRequest(method, nextParams, options);
       const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
@@ -12611,6 +12621,7 @@
       );
       const result = await originalSendRequest.call(client, method, nextParams, options);
       const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);

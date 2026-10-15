@@ -25,6 +25,7 @@ pub mod env_conflicts;
 pub mod grok_config;
 pub mod http_client;
 pub mod imagegen_skill;
+pub mod imagegen_runtime;
 pub mod image_delivery;
 pub mod install;
 pub mod launcher;

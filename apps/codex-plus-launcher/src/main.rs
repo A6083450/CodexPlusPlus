@@ -1367,6 +1367,14 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn shutdown_helper(&self, helper_port: u16) {
+        let websocket_url = self.runtime.websocket_url.lock().ok().and_then(|url| url.clone());
+        if let Some(websocket_url) = websocket_url {
+            if let Err(error) = codex_plus_core::imagegen_runtime::restore_native_image_generation(&websocket_url).await {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "imagegen.native_restore_failed", json!({"message": error.to_string()}),
+                );
+            }
+        }
         self.core.shutdown_helper(helper_port).await;
     }
 
