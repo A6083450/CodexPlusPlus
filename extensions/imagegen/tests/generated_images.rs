@@ -441,3 +441,49 @@ fn text_only_image_reply_keeps_text_and_persists_native_image() {
     assert_eq!(fs::read_to_string(&rollout).unwrap(), text);
     assert!(generated_images_from_paths([db_path], &session).images.is_empty());
 }
+
+#[test]
+fn missing_local_image_reference_is_replaced_instead_of_leaving_a_broken_placeholder() {
+    for already_delivered in [false, true] {
+        for browser_slashes in [false, true] {
+            let tmp = tempdir().unwrap();
+            let db_path = tmp.path().join("state_5.sqlite");
+            let rollout = tmp.path().join("rollout.jsonl");
+            let missing = tmp.path().join("visualizations").join("2026").join("10").join("16")
+                .join("logo-thread").join("原创协作logo.png");
+            let missing_ref = if browser_slashes { missing.to_string_lossy().replace('\\', "/") } else { missing.display().to_string() };
+            let image = tmp.path().join("generated_images").join("logo-thread").join("ig-logo.png");
+            let reference = tmp.path().join("reference.png");
+            fs::write(&reference, b"reference image").unwrap();
+            let mut text = format!("已生成。\n![原创logo]({missing_ref})\n![参考](<{}>)\n![远程](https://example.test/reference.png)", reference.display());
+            if already_delivered {
+                fs::create_dir_all(image.parent().unwrap()).unwrap();
+                fs::write(&image, b"image").unwrap();
+                text.push_str(&format!("\n![生成的图片](<{}>)", image.display()));
+            }
+            let events = [
+                json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-logo","status":"completed","result":"aW1hZ2U="}}),
+                json!({"type":"response_item","payload":{"type":"message","id":"msg-logo","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":text}]}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+            ];
+            fs::write(&rollout, events.iter().map(|event| format!("{event}\n")).collect::<String>()).unwrap();
+            create_thread_db(&db_path, &rollout, "logo-thread");
+            Connection::open(&db_path).unwrap().execute("ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 1", []).unwrap();
+            let session = SessionRef::new("logo-thread", "Logo task").unwrap();
+            let persist = || codex_plus_data::generated_images::persist_generated_images_from_paths([db_path.clone()], &session).unwrap();
+            assert_eq!(persist(), 1, "already_delivered={already_delivered}, browser_slashes={browser_slashes}");
+            let repaired = fs::read_to_string(&rollout).unwrap();
+            let message: Value = serde_json::from_str(repaired.lines().nth(1).unwrap()).unwrap();
+            let content = message["payload"]["content"].as_array().unwrap().iter()
+                .filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
+            assert!(!content.contains("原创协作logo.png"), "missing local reference must not remain as a broken image");
+            assert_eq!(content.matches("ig-logo.png").count(), 1, "the generated image must appear once in its original position");
+            assert!(content.contains(&format!("![原创logo](<{}>)", image.display())));
+            assert!(content.contains(&format!("![参考](<{}>)", reference.display())));
+            assert!(content.contains("![远程](https://example.test/reference.png)"));
+            assert_eq!(fs::read(&reference).unwrap(), b"reference image");
+            assert_eq!(persist(), 0);
+            assert_eq!(fs::read_to_string(&rollout).unwrap(), repaired);
+        }
+    }
+}

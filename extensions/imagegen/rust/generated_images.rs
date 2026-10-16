@@ -253,15 +253,8 @@ pub fn persist_generated_images_from_paths(
         materialize_generated_images(&db_path, &thread_id, &scan)?;
         let original = std::fs::read_to_string(&path)?;
         // 模型可能复用历史里的本地图片路径；本轮生成结果才是该回复的图片来源。
-        let directory = output_dir.join("");
-        // Windows Markdown 可能使用原生反斜杠或浏览器正斜杠，目录范围保持不变。
-        let directory_pattern = if cfg!(windows) {
-            directory.to_string_lossy().split(['/', '\\']).map(regex::escape)
-                .collect::<Vec<_>>().join(r"[\\/]")
-        } else {
-            regex::escape(&directory.to_string_lossy())
-        };
-        let invalid = regex::Regex::new(&format!(r"!\[([^\]]*)\]\((?:<?/mnt/data/[^)]+|attachment://[^)]+|<?{}[^)]+)\)", directory_pattern))?;
+        let directory = output_dir.join("").to_string_lossy().replace('\\', "/");
+        let references = regex::Regex::new(r"!\[([^\]]*)\]\((?:<([^>]+)>|([^)]+))\)")?;
         let mut changed = 0;
         let mut repaired = String::with_capacity(original.len());
         for line in original.split_inclusive('\n') {
@@ -270,29 +263,43 @@ pub fn persist_generated_images_from_paths(
             let id = payload.get("id").and_then(Value::as_str).unwrap_or_default();
             let images: Vec<_> = scan.images.iter().enumerate()
                 .filter(|(i, image)| scan.completed_indices.contains(i) && image.assistant_message_id == id
-                    && !scan.markdown_image_ids.contains(&image.id)
                     && !scan.native_image_hashes.contains(&encoded_hash(&image.base64_data)))
                 .map(|(_, image)| image).collect();
             if event_is_assistant_message(payload) && !images.is_empty() {
-                let mut paths = images.iter().map(|image| generated_image_path(&output_dir, &thread_id, image))
-                    .collect::<anyhow::Result<Vec<_>>>()?.into_iter();
+                let paths = images.iter().map(|image| generated_image_path(&output_dir, &thread_id, image))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let mut used = HashSet::new();
                 let content = payload.get_mut("content").and_then(Value::as_array_mut)
                     .ok_or_else(|| anyhow::anyhow!("Invalid assistant content"))?;
                 let mut replaced = false;
                 for part in content.iter_mut() {
                     if part["type"] != "output_text" { continue; }
                     if let Some(text) = part["text"].as_str() {
-                        let next = invalid.replace_all(text, |caps: &regex::Captures<'_>| {
-                            if let Some(path) = paths.next() {
-                                replaced = true;
-                                format!("![{}](<{}>)", &caps[1], path.display())
-                            } else { caps[0].to_string() }
+                        let next = references.replace_all(text, |caps: &regex::Captures<'_>| {
+                            let reference = caps.get(2).or_else(|| caps.get(3)).unwrap().as_str().trim();
+                            let normalized = reference.replace('\\', "/");
+                            if let Some(path) = paths.iter().find(|path| path.to_string_lossy().replace('\\', "/") == normalized) {
+                                return if used.insert(path.clone()) { caps[0].to_string() } else { String::new() };
+                            }
+                            // 模型可能编造任意本地路径；只替换失效引用，保留已有参考图及远程图片。
+                            let invalid = reference.starts_with("/mnt/data/") || reference.starts_with("attachment://")
+                                || normalized.starts_with(&directory)
+                                || (Path::new(reference).is_absolute() && !Path::new(reference).is_file());
+                            if invalid {
+                                if let Some(path) = paths.iter().find(|path| !used.contains(*path)) {
+                                    used.insert(path.clone());
+                                    return format!("![{}](<{}>)", &caps[1], path.display());
+                                }
+                            }
+                            caps[0].to_string()
                         }).into_owned();
+                        replaced |= next != text;
                         part["text"] = Value::String(next);
                     }
                 }
                 // 即使模型只返回说明文字，也必须把尚未引用的本轮图片写入原生消息。
-                let remaining = paths.map(|p| format!("![生成的图片](<{}>)", p.display())).collect::<Vec<_>>();
+                let remaining = paths.iter().filter(|path| !used.contains(*path))
+                    .map(|path| format!("![生成的图片](<{}>)", path.display())).collect::<Vec<_>>();
                 if !remaining.is_empty() {
                     content.push(serde_json::json!({"type":"output_text","text":remaining.join("\n")}));
                     replaced = true;

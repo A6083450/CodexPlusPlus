@@ -86,6 +86,7 @@
     viewport.setAttribute("data-codex-generated-image-preview-viewport", "true");
     viewport.className = "flex min-h-0 w-full flex-1 touch-none items-start justify-start overflow-auto";
     const previewImage = document.createElement("img");
+    previewImage.setAttribute("data-codex-generated-image-preview-content", "true");
     previewImage.alt = sourceImage.alt;
     previewImage.src = sourceImage.src;
     previewImage.className = "m-auto rounded-lg object-contain block max-w-none";
@@ -174,7 +175,9 @@
         (element) => element.getAttribute("data-codex-generated-image-id") === image.id,
       );
       const nativeImage = Array.from(document.querySelectorAll("img:not([data-codex-generated-image-id])"))
-        .find((element) => element.getAttribute("src")?.includes(image.id));
+        .find((element) => element.getAttribute("data-codex-generated-image-preview-content") !== "true"
+          && (element.getAttribute("src")?.includes(image.id)
+            || element.getAttribute("src") === `data:${image.media_type || "image/png"};base64,${image.base64_data}`));
       if (nativeImage?.complete && nativeImage.naturalWidth > 0) {
         existing?.parentElement?.remove();
         return;
@@ -183,18 +186,15 @@
         state.nativeImageListeners.add(nativeImage);
         nativeImage.addEventListener("load", scheduleRefresh, { once: true });
       }
-      if (existing && existing.parentElement?.getAttribute("data-codex-generated-image-preview-trigger") !== null) {
-        return;
-      }
-      if (existing && existing.parentElement?.getAttribute("data-codex-generated-images") !== null) {
-        existing.parentElement.remove();
-      }
       const target = findResponseTarget(
         image.assistant_message_id,
         image.assistant_response_index,
         targets,
       );
       if (!target) return;
+      if (existing && existing.parentElement?.getAttribute("data-codex-generated-images") !== null) {
+        existing.parentElement.remove();
+      }
       const markdown = Array.from(target.children).find(
         (child) => child.getAttribute?.("data-selected-text-overlay-target") !== null,
       ) || target;
@@ -205,6 +205,11 @@
         container.setAttribute("data-codex-generated-images", "true");
         container.style.cssText = "display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;max-width:100%;";
         markdown.appendChild(container);
+      }
+      if (existing && existing.parentElement?.getAttribute("data-codex-generated-image-preview-trigger") !== null) {
+        // 流式结果先于正文到达时，预览必须跟随最终消息移动。
+        if (existing.parentElement.parentElement !== container) container.appendChild(existing.parentElement);
+        return;
       }
       const trigger = document.createElement("button");
       trigger.type = "button";
@@ -261,7 +266,9 @@
         const returned = new Set(result.images.map(image => image.id));
         const nativeImages = Array.from(document.querySelectorAll("img:not([data-codex-generated-image-id])"));
         const pending = state.images.filter(image => !returned.has(image.id)
-          && !nativeImages.some(element => element.getAttribute("src")?.includes(image.id)
+          && !nativeImages.some(element => element.getAttribute("data-codex-generated-image-preview-content") !== "true"
+            && (element.getAttribute("src")?.includes(image.id)
+            || element.getAttribute("src") === `data:${image.media_type || "image/png"};base64,${image.base64_data}`)
             && element.complete && element.naturalWidth > 0));
         state.images = [...result.images, ...pending];
         renderImages(state.images, responseTargets());

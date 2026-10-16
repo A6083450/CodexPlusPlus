@@ -4,23 +4,29 @@ const vm = require('node:vm');
 const source = fs.readFileSync(process.argv[2], 'utf8');
 const start = source.indexOf('  function renderImages(');
 const end = source.indexOf('\n  async function refresh()', start);
+const findStart = source.indexOf('  function findResponseTarget(');
+const findEnd = source.indexOf('\n  function openPreview(', findStart);
 
 for (const width of [0, 128]) {
-  let created = 0, removed = 0;
-  const fallback = { getAttribute: () => 'ig-broken', parentElement: {
-    getAttribute: () => 'true', remove: () => { removed++; },
-  } };
-  const native = { complete: true, naturalWidth: width,
-    getAttribute: () => '/generated_images/ig-broken.png', addEventListener() {},
-  };
-  const document = { querySelectorAll: selector =>
-    selector === '[data-codex-generated-image-id]' ? [fallback] : [native],
-    createElement: () => { created++; throw new Error('existing fallback must be reused'); },
-  };
-  vm.runInNewContext(source.slice(start, end) + '\nrenderImages([{id:"ig-broken",base64_data:"aW1hZ2U="}], []);',
-    { document, state: {}, scheduleRefresh() {} });
-  assert.equal(removed, width > 0 ? 1 : 0, 'failed native image must preserve the fallback');
-  assert.equal(created, 0);
+  for (const src of ['/generated_images/ig-broken.png', 'data:image/png;base64,aW1hZ2U=']) {
+    for (const preview of [false, true]) {
+      let created = 0, removed = 0;
+      const fallback = { getAttribute: () => 'ig-broken', parentElement: {
+        getAttribute: () => 'true', remove: () => { removed++; },
+      } };
+      const native = { complete: true, naturalWidth: width,
+        getAttribute: name => name === 'src' ? src : preview ? 'true' : null, addEventListener() {},
+      };
+      const document = { querySelectorAll: selector =>
+        selector === '[data-codex-generated-image-id]' ? [fallback] : [native],
+        createElement: () => { created++; throw new Error('existing fallback must be reused'); },
+      };
+      vm.runInNewContext(source.slice(findStart, findEnd) + source.slice(start, end) + '\nrenderImages([{id:"ig-broken",base64_data:"aW1hZ2U="}], []);',
+        { document, state: {}, scheduleRefresh() {} });
+      assert.equal(removed, width > 0 && !preview ? 1 : 0, 'only a loaded native image replaces the fallback; its own preview does not');
+      assert.equal(created, 0);
+    }
+  }
 }
 
 (async () => {
@@ -39,7 +45,7 @@ for (const width of [0, 128]) {
   target.setAttribute('data-response-annotation-target', 'msg-final');
   const descendants = node => node.children.flatMap(child => [child, ...descendants(child)]);
   const fallbacks = () => descendants(target).filter(node => node.getAttribute('data-codex-generated-image-id'));
-  const native = { complete: true, naturalWidth: 0, getAttribute: () => '/missing/ig-broken.png',
+  const native = { complete: true, naturalWidth: 0, getAttribute: () => 'data:image/png;base64,aW1hZ2U=',
     addEventListener(_name, callback) { this.onload = callback; } };
   let reads = 0;
   const context = {
@@ -70,3 +76,38 @@ for (const width of [0, 128]) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(fallbacks().length, 0, 'native load removes duplicate fallback');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+{
+  function element() {
+    return { attributes: new Map(), children: [], style: {},
+      setAttribute(name, value) { this.attributes.set(name, value); },
+      getAttribute(name) { return this.attributes.get(name) ?? null; },
+      appendChild(child) {
+        if (child.parentElement) child.remove();
+        child.parentElement = this; this.children.push(child);
+      },
+      addEventListener() {},
+      querySelector() { return this.children.find(child => child.getAttribute('data-codex-generated-images')) || null; },
+      remove() { this.parentElement.children = this.parentElement.children.filter(child => child !== this); },
+    };
+  }
+  const preface = element(), final = element();
+  preface.setAttribute('data-response-annotation-target', 'msg-preface');
+  final.setAttribute('data-response-annotation-target', 'msg-final');
+  const descendants = node => node.children.flatMap(child => [child, ...descendants(child)]);
+  const previews = node => descendants(node).filter(child => child.getAttribute('data-codex-generated-image-id'));
+  const context = { state: {}, scheduleRefresh() {},
+    document: { createElement: element, querySelectorAll(selector) {
+      return selector === '[data-codex-generated-image-id]' ? [...previews(preface), ...previews(final)] : [];
+    } },
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(findStart, findEnd) + source.slice(start, end), context);
+  const image = { id: 'ig-streamed', base64_data: 'aW1hZ2U=', assistant_message_id: '' };
+  context.renderImages([image], [preface]);
+  const preview = previews(preface)[0];
+  assert(preview, 'completed generation is visible before the final text arrives');
+  context.renderImages([{ ...image, assistant_message_id: 'msg-final' }], [preface, final]);
+  assert.equal(previews(final)[0], preview, 'streamed preview must move to the final reply instead of staying above it');
+  assert.equal(previews(preface).length, 0);
+}
