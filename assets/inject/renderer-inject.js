@@ -405,7 +405,7 @@
   const codexThreadScrollKey = "codexThreadScroll";
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "25";
+  const codexAppServerModelRequestPatchVersion = "26";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -11935,14 +11935,18 @@
     }
   }
 
+  function codexContextUsageTurnActive(manager, threadId) {
+    const status = manager.getConversation(threadId)?.threadRuntimeStatus?.type;
+    return status ? status === "active" : (manager.isConversationStreaming?.(threadId) ?? true);
+  }
+
   function restoreCodexContextWindowUsage(manager, threadId) {
     const context = manager.requestClient?.__codexPlusNativeModelContext;
     const conversation = manager.getConversation(threadId);
     const usage = conversation?.latestTokenUsageInfo;
     if (!context || !usage || conversation.resumeState !== "resumed"
         || conversation.latestModel !== context.model
-        || typeof manager.isConversationStreaming !== "function"
-        || manager.isConversationStreaming(threadId)
+        || codexContextUsageTurnActive(manager, threadId)
         || usage.modelContextWindow === context.contextWindow) return false;
     manager.updateConversationState(threadId, (state) => {
       state.latestTokenUsageInfo = { ...usage, modelContextWindow: context.contextWindow };
@@ -11977,7 +11981,7 @@
       const model = manager.getConversation(threadId)?.latestModel;
       if (threadId === currentSessionRef().session_id && model
           && model !== client.__codexPlusNativeModelContext?.model
-          && !manager.isConversationStreaming?.(threadId)
+          && !codexContextUsageTurnActive(manager, threadId)
           && !manager.__codexPlusContextUsagePending) {
         manager.__codexPlusContextUsagePending = true;
         void refreshCodexNativeModelCache(client,
@@ -12001,7 +12005,7 @@
       manager.__codexPlusContextUsageUnsubscribe = null;
     };
     const onReady = () => {
-      if (currentSessionRef().session_id !== threadId || manager.isConversationStreaming?.(threadId)) {
+      if (currentSessionRef().session_id !== threadId || codexContextUsageTurnActive(manager, threadId)) {
         stop();
         return;
       }

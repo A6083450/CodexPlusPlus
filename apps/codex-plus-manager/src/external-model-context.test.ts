@@ -43,19 +43,21 @@ test("context usage changes after a model switch only when the active turn is fi
   const body = source.match(/^  function restoreCodexContextWindowUsage\([^]*?^  \}/m)?.[0];
   assert.ok(body);
   const runtime = vm.createContext({});
-  vm.runInContext(body, runtime);
-  let streaming = true;
+  const active = source.match(/^  function codexContextUsageTurnActive\([^]*?^  \}/m)?.[0];
+  assert.ok(active);
+  vm.runInContext(`${active}\n${body}`, runtime);
   const conversation = { latestModel: "gpt-6-sol", resumeState: "resumed",
+    threadRuntimeStatus: { type: "active" },
     latestTokenUsageInfo: { modelContextWindow: 1000000, totalTokens: 104000 } };
   const manager = {
     requestClient: { __codexPlusNativeModelContext: { model: "gpt-6-sol", contextWindow: 500000 } },
     getConversation: () => conversation,
-    isConversationStreaming: () => streaming,
+    isConversationStreaming: () => true,
     updateConversationState: (_id: string, update: (state: typeof conversation) => void) => update(conversation),
   };
   assert.equal(runtime.restoreCodexContextWindowUsage(manager, "thread"), false);
   assert.equal(conversation.latestTokenUsageInfo.modelContextWindow, 1000000);
-  streaming = false;
+  conversation.threadRuntimeStatus.type = "idle";
   assert.equal(runtime.restoreCodexContextWindowUsage(manager, "thread"), true);
   assert.equal(conversation.latestTokenUsageInfo.modelContextWindow, 500000);
   assert.equal(conversation.latestTokenUsageInfo.totalTokens, 104000);
