@@ -354,7 +354,22 @@ pub async fn read_codex_model_catalog_from_home(
         "not_configured"
     };
     let responses_api = preferred_responses_api_status(&source_statuses);
-    let model_metadata = model_ui_metadata_map(&models);
+    let mut model_metadata = model_ui_metadata_map(&models);
+    let catalog_path = string_value(effective.get("model_catalog_json"));
+    if !catalog_path.is_empty()
+        && let Ok(contents) = std::fs::read(resolve_config_path(home, &catalog_path))
+        && let Ok(catalog) = serde_json::from_slice::<Value>(&contents)
+        && let Some(entries) = catalog["models"].as_array()
+    {
+        for entry in entries {
+            let Some(slug) = entry["slug"].as_str() else { continue; };
+            let Some(window) = entry["context_window"].as_u64().filter(|value| *value > 0) else { continue; };
+            if !model_metadata[slug].is_object() { model_metadata[slug] = json!({}); }
+            for field in ["contextWindow", "maxContextWindow", "context_window", "max_context_window"] {
+                model_metadata[slug][field] = json!(window);
+            }
+        }
+    }
 
     json!({
         "status": status,

@@ -13,6 +13,19 @@ use codex_plus_core::settings::{
 };
 use serde_json::json;
 
+#[tokio::test]
+async fn external_catalog_context_metadata_precedes_builtin_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("config.toml"), "model=\"gpt-6.1-sol\"\nmodel_catalog_json=\"custom.json\"\n").unwrap();
+    std::fs::write(temp.path().join("custom.json"), json!({"models":[
+        {"slug":"gpt-6.1-sol","context_window":1000000,"max_context_window":1000000},
+        {"slug":"gpt-6-sol","context_window":500000,"max_context_window":500000}
+    ]}).to_string()).unwrap();
+    let catalog = read_codex_model_catalog_from_home(temp.path(), &HashMap::new(), reqwest::Client::new()).await;
+    assert_eq!(catalog["modelMetadata"]["gpt-6.1-sol"]["contextWindow"], 1000000);
+    assert_eq!(catalog["modelMetadata"]["gpt-6-sol"]["contextWindow"], 500000);
+}
+
 #[test]
 fn catalog_entries_apply_manual_windows_case_insensitively() {
     // 上游 /models 返回的 id 与本地保存的 key 常只差大小写；精确查表会让用户

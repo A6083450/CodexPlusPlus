@@ -16,6 +16,7 @@ test("context usage tracking preserves RpcTarget prototype methods and removes l
   });
   class RpcTarget {
     requestClient = { hostId: "local" };
+    getConversation() { return null; }
     listeners = new Set<(id: string) => void>();
     addAnyConversationCallback(callback: (id: string) => void) {
       this.listeners.add(callback); return () => this.listeners.delete(callback);

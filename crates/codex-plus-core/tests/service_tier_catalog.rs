@@ -3,6 +3,61 @@ use codex_plus_core::service_tier_catalog::{
     sync_service_tier_catalog_in_home,
 };
 
+#[test]
+fn cc_switch_projection_uses_saved_windows_and_native_fast_without_mutating_source() {
+    use codex_plus_core::service_tier_catalog::sync_cc_switch_catalog;
+    use codex_plus_core::settings::BackendSettings;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let config = "model=\"gpt-6.1-sol\"\nmodel_provider=\"relay\"\nmodel_context_window=1000000\nmodel_auto_compact_token_limit=950000\nmodel_catalog_json=\"model-catalogs/relay-old.json\"\n[model_providers.relay]\nbase_url=\"https://test.invalid/v1\"\n";
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    let source = serde_json::json!({"models":[
+        {"slug":"gpt-6.1-sol","context_window":272000,"effective_context_window_percent":95,"service_tiers":[],"additional_speed_tiers":[]},
+        {"slug":"gpt-6-sol","context_window":272000,"effective_context_window_percent":95,"service_tiers":[],"additional_speed_tiers":[]}
+    ]});
+    let source_text = serde_json::to_string(&source).unwrap();
+    std::fs::write(home.join("cc-switch-model-catalog.json"), &source_text).unwrap();
+    let db_path = home.join("cc-switch.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("CREATE TABLE providers(app_type TEXT,is_current INTEGER,settings_config TEXT)").unwrap();
+    let saved = serde_json::json!({"config":config,"modelCatalog":{"models":[
+        {"model":"gpt-6.1-sol","contextWindow":1000000},
+        {"model":"gpt-6-sol","contextWindow":500000}
+    ]}});
+    db.execute("INSERT INTO providers VALUES('codex',1,?1)", [saved.to_string()]).unwrap();
+    let mut settings = BackendSettings::default();
+    settings.relay_profiles_enabled = false;
+    settings.enhancements_enabled = true;
+    settings.codex_app_native_fast_unlock = true;
+    assert!(sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    let projected: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("model-catalogs/cc-switch-native.json")).unwrap()).unwrap();
+    for (index, window) in [1000000, 500000].into_iter().enumerate() {
+        let model = &projected["models"][index];
+        assert_eq!(model["context_window"], window);
+        assert_eq!(model["effective_context_window_percent"], 100);
+        assert_eq!(model["auto_compact_token_limit"], window * 95 / 100);
+        assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(model["additional_speed_tiers"][0], "fast");
+    }
+    let live = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!live.contains("model_context_window"));
+    assert!(!live.contains("model_auto_compact_token_limit"));
+    assert_eq!(std::fs::read_to_string(home.join("cc-switch-model-catalog.json")).unwrap(), source_text);
+    assert!(!sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    settings.codex_app_native_fast_unlock = false;
+    assert!(sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    let projected: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("model-catalogs/cc-switch-native.json")).unwrap()).unwrap();
+    assert_eq!(projected["models"][0]["service_tiers"], serde_json::json!([]));
+    settings.relay_profiles_enabled = true;
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    assert!(!sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    settings.relay_profiles_enabled = false;
+    std::fs::write(home.join("config.toml"), config.replace("model-catalogs/relay-old.json", "custom.json")).unwrap();
+    assert!(!sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    std::fs::write(home.join("config.toml"), config.replace("https://test.invalid/v1", "https://other.invalid/v1")).unwrap();
+    assert!(!sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+}
+
 fn native_context_fixture() -> (tempfile::TempDir, &'static str, serde_json::Value) {
     let temp = tempfile::tempdir().unwrap();
     let config = "model = \"gpt-5.4\"\nmodel_context_window = 512000\nmodel_auto_compact_token_limit = 460000\n";

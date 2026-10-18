@@ -405,7 +405,7 @@
   const codexThreadScrollKey = "codexThreadScroll";
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "24";
+  const codexAppServerModelRequestPatchVersion = "25";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -11913,7 +11913,7 @@
       || result?.threadId
       || ""
     ).trim();
-    const model = String(params?.model || result?.thread?.model || "").trim();
+    const model = String(params?.collaborationMode?.settings?.model || params?.model || result?.thread?.model || "").trim();
     return { requestMethod, threadId, model };
   }
 
@@ -11950,6 +11950,13 @@
     return true;
   }
 
+  function applyCodexNativeContextConfig(method, client, params) {
+    const context = client.__codexPlusNativeModelContext;
+    if (client.hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
+        || !context?.config || context.model !== codexThreadModelRequestState(method, params).model) return params;
+    return { ...params, config: { ...context.config, ...params?.config } };
+  }
+
   /* @codex-imagegen:runtime */
 
   function patchCodexContextUsageManager(manager) {
@@ -11965,7 +11972,21 @@
     manager.__codexPlusContextUsageObserver?.();
     manager.__codexPlusContextUsageObserver = manager.addAnyConversationCallback?.((id) => {
       const threadId = typeof id === "string" ? id : currentSessionRef().session_id;
-      if (threadId) restoreCodexContextWindowUsage(manager, threadId);
+      if (!threadId) return;
+      const client = manager.requestClient;
+      const model = manager.getConversation(threadId)?.latestModel;
+      if (threadId === currentSessionRef().session_id && model
+          && model !== client.__codexPlusNativeModelContext?.model
+          && !manager.isConversationStreaming?.(threadId)
+          && !manager.__codexPlusContextUsagePending) {
+        manager.__codexPlusContextUsagePending = true;
+        void refreshCodexNativeModelCache(client,
+          (client.__codexPlusModelOriginalSendRequest || client.sendRequest).bind(client), { threadId, model })
+          .then(() => restoreCodexContextWindowUsage(manager, threadId))
+          .finally(() => { manager.__codexPlusContextUsagePending = false; });
+      } else {
+        restoreCodexContextWindowUsage(manager, threadId);
+      }
     });
     manager.__codexPlusContextUsagePatch = revision;
     bootstrapCodexContextWindowUsage(manager);
@@ -11989,7 +12010,7 @@
       if (!snapshot || conversation.resumeState !== "resumed") return;
       stop();
       const client = manager.requestClient;
-      void refreshCodexNativeModelCache(client, client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client), {
+      void refreshCodexNativeModelCache(client, (client.__codexPlusModelOriginalSendRequest || client.sendRequest).bind(client), {
         threadId, model: conversation.latestModel,
       }).then(() => {
         if (manager.getConversation(threadId)?.latestTokenUsageInfo === snapshot) {
@@ -12009,11 +12030,17 @@
           { ...params, method: nestedMethod, params: nestedParams }, nestedOptions),
         String(params.method), params.params, options);
     }
-    if (String(method || "") !== "turn/start" || !codexPerModelContextEnabled()) return null;
+    if (String(method || "") !== "turn/start") return null;
     const { threadId, model } = codexThreadModelRequestState(method, params);
     if (!threadId || !model) return null;
+    const context = client.hostId === "local" && client.__codexPlusNativeModelContext?.model === model
+      ? client.__codexPlusNativeModelContext : null;
+    const contextConfig = context?.config;
+    if (!contextConfig && !codexPerModelContextEnabled()) return null;
+    const contextKey = contextConfig ? JSON.stringify({ model, config: contextConfig }) : "";
     const previousModel = client.__codexPlusThreadModels?.get(threadId) || "";
-    if (!previousModel || previousModel === model) return null;
+    if (contextConfig ? client.__codexPlusThreadContexts?.get(threadId) === contextKey
+      : !previousModel || previousModel === model) return null;
     if (client.hostId === "local" && codexManagedSessionConnection()
         && window.__codexPlusConnectionRecoveryPending?.has(threadId)) {
       throw new Error("此会话正在检查连接，请稍后重新发送");
@@ -12021,9 +12048,15 @@
     let resumeParams = { threadId, model };
     resumeParams = applyCodexRemoteSessionProviderOverride("thread/resume", resumeParams);
     resumeParams = applyCodexManagedSessionConnection("thread/resume", resumeParams, client.hostId);
+    resumeParams = applyCodexNativeContextConfig("thread/resume", client, resumeParams);
     try {
       await originalSendRequest("thread/resume", resumeParams, options);
+      client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
       client.__codexPlusThreadModels.set(threadId, model);
+      if (contextConfig) {
+        client.__codexPlusThreadContexts = client.__codexPlusThreadContexts || new Map();
+        client.__codexPlusThreadContexts.set(threadId, contextKey);
+      }
       sendCodexPlusDiagnostic("thread_model_context_refreshed", {
         threadId,
         from: previousModel,
@@ -12046,7 +12079,7 @@
     if (client.hostId === "local") {
       nextParams = applyCodexImageGenerationRequestOverride(requestMethod, nextParams);
     }
-    return nextParams;
+    return applyCodexNativeContextConfig(requestMethod, client, nextParams);
   }
 
   function patchAppServerModelRequestClient(client) {
@@ -12107,10 +12140,10 @@
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
       let nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
         providerParams, client.hostId, originalSendRequest);
-      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
       if (["thread/start", "thread/resume", "thread/settings/update", "turn/start"].includes(requestMethod)) {
         await refreshCodexNativeModelCache(client, originalSendRequest, nextParams, options);
       }
+      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
         client,
         originalSendRequest,
@@ -12320,10 +12353,10 @@
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
       let nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
         providerParams, client.hostId, originalSendRequest.bind(client));
-      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
       if (["thread/start", "thread/resume", "thread/settings/update", "turn/start"].includes(requestMethod)) {
         await refreshCodexNativeModelCache(client, originalSendRequest.bind(client), nextParams, options);
       }
+      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
         client,
         originalSendRequest.bind(client),

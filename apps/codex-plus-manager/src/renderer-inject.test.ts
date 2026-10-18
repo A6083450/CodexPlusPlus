@@ -1945,9 +1945,11 @@ it("preserves fork request overrides in both app-server entrypoints", async () =
   const body = source.slice(start, end);
   const apply = new Function(
     "applyCodexImageGenerationRequestOverride",
+    "applyCodexNativeContextConfig",
     `${body}\nreturn applyCodexAppServerRequestOverrides;`,
   )(
     (_method: string, params: object) => ({ ...params, imageGeneration: true }),
+    (_method: string, _client: object, params: object) => params,
   );
   assert.deepEqual(apply("turn/start", { hostId: "local" }, { model: "gpt-image-2" }), {
     model: "gpt-image-2", imageGeneration: true,
@@ -1967,9 +1969,10 @@ it("preserves native service tiers through imagegen and provider adapters", asyn
   const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
   const start = source.indexOf("  function applyCodexAppServerRequestOverrides(");
   const end = source.indexOf("\n  function patchAppServerModelRequestClient(", start);
-  const applyImagegen = new Function("applyCodexImageGenerationRequestOverride",
+  const applyImagegen = new Function("applyCodexImageGenerationRequestOverride", "applyCodexNativeContextConfig",
     `${source.slice(start, end)}\nreturn applyCodexAppServerRequestOverrides;`)(
     (_method: string, params: object) => ({ ...params, imageGeneration: true }),
+    (_method: string, _client: object, params: object) => params,
   );
   const providerStart = source.indexOf("  function applyCodexServiceTierRequestOverride(");
   const providerEnd = source.indexOf("\n  function codexRemoteSessionActiveProfile(", providerStart);

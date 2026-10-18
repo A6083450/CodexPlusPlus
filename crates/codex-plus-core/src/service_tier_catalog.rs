@@ -4,6 +4,102 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 pub const MANAGED_SERVICE_TIER_CATALOG: &str = "model-catalogs/codexplusplus-service-tiers.json";
+const CC_SWITCH_NATIVE_CATALOG: &str = "model-catalogs/cc-switch-native.json";
+
+pub fn sync_cc_switch_catalog(
+    home: &Path,
+    settings: &crate::settings::BackendSettings,
+    db_path: &Path,
+) -> anyhow::Result<bool> {
+    if settings.relay_profiles_enabled || !settings.enhancements_enabled || !db_path.exists() {
+        return Ok(false);
+    }
+    let config_path = home.join("config.toml");
+    let original = std::fs::read_to_string(&config_path)?;
+    let mut config = parse_config(&original)?;
+    let pointer = config.get("model_catalog_json").and_then(Item::as_str).unwrap_or_default();
+    let path = home.join(pointer);
+    if !pointer.is_empty() && path != home.join("cc-switch-model-catalog.json")
+        && path != home.join(CC_SWITCH_NATIVE_CATALOG)
+        && !(path.parent() == Some(home.join("model-catalogs").as_path())
+            && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("relay-")))
+    {
+        return Ok(false);
+    }
+    let source_path = home.join("cc-switch-model-catalog.json");
+    if !source_path.exists() { return Ok(false); }
+    let db = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let saved = db.query_row(
+        "SELECT settings_config FROM providers WHERE app_type='codex' AND is_current=1",
+        [], |row| row.get::<_, String>(0),
+    );
+    let saved = match saved {
+        Ok(saved) => serde_json::from_str::<Value>(&saved)?,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let saved_config = parse_config(saved["config"].as_str().unwrap_or_default())?;
+    let provider = config.get("model_provider").and_then(Item::as_str).unwrap_or_default();
+    if provider.is_empty() || saved_config.get("model_provider").and_then(Item::as_str) != Some(provider) {
+        return Ok(false);
+    }
+    let base_url = |document: &DocumentMut| document.get("model_providers")
+        .and_then(|providers| providers.get(provider)).and_then(|entry| entry.get("base_url"))
+        .and_then(Item::as_str).unwrap_or_default().trim_end_matches('/').to_string();
+    if base_url(&config).is_empty() || base_url(&config) != base_url(&saved_config) { return Ok(false); }
+    let Some(entries) = saved["modelCatalog"]["models"].as_array().filter(|entries| !entries.is_empty()) else {
+        return Ok(false);
+    };
+    let source: Value = serde_json::from_slice(&std::fs::read(source_path)?)?;
+    let templates = source["models"].as_array().context("CC Switch catalog has no models")?;
+    let global_window = positive_config_integer(&saved_config, "model_context_window");
+    let global_compact = positive_config_integer(&saved_config, "model_auto_compact_token_limit");
+    let mut models = Vec::new();
+    for entry in entries {
+        let slug = entry["model"].as_str().context("CC Switch model has no id")?;
+        let mut model = templates.iter().find(|model| model["slug"] == slug)
+            .context("CC Switch generated catalog is missing a saved model")?.clone();
+        if let Some(window) = entry["contextWindow"].as_u64().filter(|value| *value > 0 && *value <= i64::MAX as u64).or(global_window) {
+            model["context_window"] = window.into();
+            model["max_context_window"] = window.into();
+            model["effective_context_window_percent"] = 100.into();
+            let compact = global_window.zip(global_compact)
+                .filter(|(total, limit)| limit <= total)
+                .and_then(|(total, limit)| window.checked_mul(limit).map(|value| value / total))
+                .unwrap_or(window / 100 * 95 + window % 100 * 95 / 100);
+            model["auto_compact_token_limit"] = compact.into();
+        }
+        if settings.codex_app_native_fast_unlock && matches!(slug,
+            "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol")
+        {
+            let mut tiers = model["service_tiers"].as_array().cloned().unwrap_or_default();
+            if !tiers.iter().any(|tier| tier["id"] == "priority") {
+                tiers.push(serde_json::json!({"id":"priority","name":"Fast","description":"Priority processing, increased usage"}));
+            }
+            model["service_tiers"] = tiers.into();
+            let mut speeds = model["additional_speed_tiers"].as_array().cloned().unwrap_or_default();
+            if !speeds.iter().any(|speed| speed == "fast") { speeds.push("fast".into()); }
+            model["additional_speed_tiers"] = speeds.into();
+        }
+        models.push(model);
+    }
+    let target = home.join(CC_SWITCH_NATIVE_CATALOG);
+    let projected = serde_json::to_vec_pretty(&serde_json::json!({"models":models}))?;
+    let mut changed = std::fs::read(&target).ok().as_deref() != Some(projected.as_slice());
+    if changed {
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        crate::settings::atomic_write(&target, &projected)?;
+    }
+    config["model_catalog_json"] = toml_edit::value(target.to_string_lossy().as_ref());
+    config.remove("model_context_window");
+    config.remove("model_auto_compact_token_limit");
+    let updated = config.to_string();
+    if updated != original {
+        crate::settings::atomic_write(&config_path, updated.as_bytes())?;
+        changed = true;
+    }
+    Ok(changed)
+}
 
 pub fn sync_native_model_cache_in_home(
     home: &Path,
@@ -12,7 +108,9 @@ pub fn sync_native_model_cache_in_home(
     sync_service_tier_catalog_in_home(home)?;
     let config =
         parse_config(&std::fs::read_to_string(home.join("config.toml")).unwrap_or_default())?;
-    if uses_external_catalog(&config) {
+    let projection = config.get("model_catalog_json").and_then(Item::as_str)
+        .is_some_and(|path| home.join(path) == home.join(CC_SWITCH_NATIVE_CATALOG));
+    if uses_external_catalog(&config) && !projection {
         return Ok(serde_json::json!({ "status": "unavailable" }));
     }
     let model_name = requested_model
@@ -20,7 +118,7 @@ pub fn sync_native_model_cache_in_home(
         .filter(|model| !model.is_empty())
         .or_else(|| config.get("model").and_then(Item::as_str))
         .unwrap_or_default();
-    let path = home.join("models_cache.json");
+    let path = home.join(if projection { CC_SWITCH_NATIVE_CATALOG } else { "models_cache.json" });
     if !path.exists() {
         return Ok(serde_json::json!({ "status": "unavailable" }));
     }
@@ -36,15 +134,32 @@ pub fn sync_native_model_cache_in_home(
         }
         window.checked_mul(percent).map(|value| value / 100)
     });
-    Ok(match window {
+    let mut result = match window {
         Some(window) => serde_json::json!({
             "status": "ok", "model": model_name, "contextWindow": window
         }),
         None => serde_json::json!({ "status": "unavailable" }),
-    })
+    };
+    if projection && result["status"] == "ok" {
+        result["config"] = serde_json::json!({"model_context_window": window.unwrap()});
+        if let Some(limit) = model.and_then(|model| model["auto_compact_token_limit"].as_u64()) {
+            result["config"]["model_auto_compact_token_limit"] = limit.into();
+        }
+    }
+    Ok(result)
 }
 
 pub fn sync_service_tier_catalog_in_home(home: &Path) -> anyhow::Result<bool> {
+    let mut projected = false;
+    if home.join("config.toml").exists() {
+        let settings_path = crate::paths::default_settings_path();
+        if settings_path.exists() {
+            let settings = crate::settings::SettingsStore::new(settings_path).load()?;
+            let db_path = if settings.ccs_db_path.is_empty() { crate::ccs_import::default_ccs_db_path() }
+                else { settings.ccs_db_path.clone().into() };
+            projected = sync_cc_switch_catalog(home, &settings, &db_path)?;
+        }
+    }
     let config_path = home.join("config.toml");
     let config_text = match std::fs::read_to_string(&config_path) {
         Ok(contents) => contents,
@@ -60,7 +175,7 @@ pub fn sync_service_tier_catalog_in_home(home: &Path) -> anyhow::Result<bool> {
         config.get("model").and_then(Item::as_str),
         Some("gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
     ) && config.get("model_reasoning_effort").and_then(Item::as_str) == Some("none");
-    let mut changed = patch_native_model_cache(home, &config)?;
+    let mut changed = patch_native_model_cache(home, &config)? || projected;
 
     if uses_managed_catalog {
         config.remove("model_catalog_json");
