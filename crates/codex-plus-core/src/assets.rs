@@ -773,7 +773,10 @@ mod tests {
                 assert.deepEqual(window.order,['renderer','images','stepwise']);
             }}
         "#, serde_json::to_string(&script).unwrap());
-        let output = std::process::Command::new("node").arg("-e").arg(harness).output().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let harness_path = temp.path().join("native-fast-dom.cjs");
+        std::fs::write(&harness_path, harness).unwrap();
+        let output = std::process::Command::new("node").arg(&harness_path).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
