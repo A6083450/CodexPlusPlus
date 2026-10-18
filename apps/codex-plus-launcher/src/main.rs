@@ -46,10 +46,9 @@ struct StartupReply {
 impl StartupReply {
     fn send(self, result: Result<()>) -> std::result::Result<(), mpsc::SendError<Result<()>>> {
         if result.is_ok() {
-            self.state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .ready = true;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.ready = true;
+            record_session_probe(&state.options, state.status_started_at_ms);
         }
         self.reply.send(result)
     }
@@ -88,6 +87,8 @@ static SESSION_PROBE: OnceLock<Mutex<Option<SessionProbe>>> = OnceLock::new();
 #[derive(Clone)]
 struct SessionProbe {
     debug_port: u16,
+    helper_port: u16,
+    app_dir: Option<std::path::PathBuf>,
     started_at_ms: u64,
 }
 
@@ -98,6 +99,8 @@ fn session_probe_slot() -> &'static Mutex<Option<SessionProbe>> {
 fn record_session_probe(options: &LaunchOptions, started_at_ms: u64) {
     let probe = SessionProbe {
         debug_port: options.debug_port,
+        helper_port: options.helper_port,
+        app_dir: options.app_dir.clone(),
         started_at_ms,
     };
     *session_probe_slot()
@@ -334,6 +337,29 @@ pub fn start(options: LaunchOptions) -> Result<()> {
         record_launch_failure(&status_options, requested_at_ms, error);
     }
     result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchReceipt {
+    pub debug_port: u16,
+    pub helper_port: u16,
+    pub app_dir: std::path::PathBuf,
+    pub started_at_ms: u64,
+}
+
+/// 与 start 相同，但只从已就绪的本进程会话返回实际端口，不读取旧状态文件猜测。
+pub fn start_with_receipt(options: LaunchOptions) -> Result<LaunchReceipt> {
+    start(options)?;
+    let probe = session_probe_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let probe = probe.as_ref().context("Codex 启动完成后缺少会话回执")?;
+    Ok(LaunchReceipt {
+        debug_port: probe.debug_port,
+        helper_port: probe.helper_port,
+        app_dir: probe.app_dir.clone().context("Codex 会话缺少应用目录")?,
+        started_at_ms: probe.started_at_ms,
+    })
 }
 
 /// 只恢复已有 Codex 的后台服务。调试端点不存在时不启动或重启官方应用。
@@ -928,6 +954,20 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             &codex_plus_core::launcher::LaunchInstance::from_options(&options),
         )
         .await;
+    // 复用后台服务也属于用户主动启动；已有资源补丁由原服务持有，
+    // 这里只执行与完整启动相同的首次应用检查，不能重新创建 helper 或 watchdog。
+    if settings.enhancements_enabled
+        && settings.codex_app_native_fast_unlock
+        && let Ok(launch) = &launch_result
+        && let Err(error) = hooks
+            .apply_native_fast_unlock_on_launch(launch.debug_port().unwrap_or(options.debug_port))
+            .await
+    {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.native_fast_unlock_failed",
+            json!({"message": error.to_string(), "phase": "activate_existing"}),
+        );
+    }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     #[cfg(windows)]
     let activated = process_ids
@@ -1148,6 +1188,9 @@ impl LaunchHooks for LauncherHooks {
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
                             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                            recovery_journal_path: None,
+                            recovery_errors: Vec::new(),
+                            database_outcomes: Vec::new(),
                         },
                         completion_error,
                     ));
@@ -1179,6 +1222,9 @@ impl LaunchHooks for LauncherHooks {
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
                             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                            recovery_journal_path: None,
+                            recovery_errors: Vec::new(),
+                            database_outcomes: Vec::new(),
                         },
                         None,
                     ));
@@ -1325,6 +1371,16 @@ impl LaunchHooks for LauncherHooks {
 
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         self.core.inject(debug_port, helper_port).await
+    }
+
+    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        // 恢复后台服务只补回桥接，不刷新用户正在使用的页面。
+        if self.attach_only {
+            return Ok(());
+        }
+        self.core
+            .apply_native_fast_unlock_on_launch(debug_port)
+            .await
     }
 
     async fn capture_injected_launch_identity(&self, debug_port: u16) {
@@ -1703,6 +1759,16 @@ impl BridgeRuntimeService for LauncherRuntimeService {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
         codex_plus_core::user_scripts::reload_scripts_at(&websocket_url, &self.user_scripts).await
+    }
+
+    async fn cdp_targets(&self) -> anyhow::Result<Value> {
+        let debug_port = *self.debug_port.lock().unwrap();
+        codex_plus_core::cdp::list_extension_cdp_targets(debug_port).await
+    }
+
+    async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
+        let debug_port = *self.debug_port.lock().unwrap();
+        codex_plus_core::routes::evaluate_extension_cdp(debug_port, &payload).await
     }
 
     async fn script_market_list(&self) -> anyhow::Result<Value> {
@@ -2684,6 +2750,33 @@ mod tests {
     }
 
     #[test]
+    fn existing_launcher_path_applies_native_fast_after_successful_activation() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn activate_existing_codex_app")
+            .expect("existing launcher activation function");
+        let end = source[start..]
+            .find("fn should_finalize_pending_remote_control_recovery")
+            .map(|offset| start + offset)
+            .expect("next function after existing launcher activation");
+        let body = &source[start..end];
+        let launch = body.find("let launch_result = hooks").unwrap();
+        let patch = body.find(".apply_native_fast_unlock_on_launch(").unwrap();
+
+        assert!(
+            launch < patch,
+            "Fast must be applied after Codex activation"
+        );
+        let guard = &body[launch..patch];
+        assert!(guard.contains("settings.enhancements_enabled"));
+        assert!(guard.contains("settings.codex_app_native_fast_unlock"));
+        assert!(guard.contains("let Ok(launch) = &launch_result"));
+        assert!(body[patch..].contains("launch.debug_port().unwrap_or(options.debug_port)"));
+        assert!(body[patch..].contains("launcher.native_fast_unlock_failed"));
+        assert!(body[patch..].contains("launch_result.map(|_| ())"));
+    }
+
+    #[test]
     fn activation_provider_sync_respects_the_setting_and_is_non_fatal() {
         let source = include_str!("main.rs");
         let start = source
@@ -2763,6 +2856,27 @@ mod tests {
             compact_source
                 .contains("self.core.ensure_active_protocol_proxy_config(settings).await")
         );
+    }
+
+    #[tokio::test]
+    async fn launcher_hooks_forward_native_fast_instead_of_using_the_default_noop() {
+        let hooks = LauncherHooks::default();
+        // 没有 CDP 端点时核心实现会返回错误；trait 默认的空实现则错误地成功。
+        let result = hooks.apply_native_fast_unlock_on_launch(0).await;
+        assert!(
+            result.is_err(),
+            "native Fast hook must reach the core launcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_recovery_does_not_apply_or_reload_native_fast() {
+        let hooks = LauncherHooks {
+            attach_only: true,
+            ..LauncherHooks::default()
+        };
+        // 后台恢复不访问 CDP，因此相同的不可用端点也应成功跳过。
+        hooks.apply_native_fast_unlock_on_launch(0).await.unwrap();
     }
 
     #[tokio::test]

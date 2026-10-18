@@ -42,82 +42,78 @@ test("Fast editing touches only the selected model and cancellation keeps the sa
   assert.equal(synchronizeModelMetadataFastSupport(JSON.stringify({ models: [{ slug: "grok" }, { slug: "grok" }] }), "grok", "supported"), null);
 });
 
-function policyFixture() {
+test("Fast support declarations stay available for model metadata without enforcing a request policy", () => {
   const metadata: Record<string, unknown> = {};
-  const state = { mode: "global-fast", defaultMode: "inherit", entries: {} };
-  const context = vm.createContext({ metadata, state,
+  const context = vm.createContext({
     codexServiceTierSupportedFastModels: new Set(["gpt-5.4"]),
     codexPlusModelMetadata: (model: string) => metadata[model.toLowerCase()],
-    codexServiceTierUiModelName: () => "grok-custom", codexPlusSettings: () => ({ serviceTierControls: true }),
-    codexServiceTierRequestMethods: () => new Set(["turn/start"]), readThreadServiceTierState: () => state,
-    normalizeCodexServiceTierControlMode: (mode: string) => mode, normalizeCodexThreadServiceTierMode: (mode: string) => mode,
-    codexServiceTierThreadIdForRequest: (_method: string, params: Record<string, string>) => params.threadId,
-    codexServiceTierModelForRequest: (params: Record<string, string>) => params.model,
-    codexServiceTierRememberThreadModel: () => {}, codexFastServiceTierValue: () => "priority", codexServiceTierInheritedValue: () => null,
-    sendCodexPlusDiagnostic: () => {},
+    codexServiceTierUiModelName: () => "grok-custom",
   });
-  const menu = fragment("20-menu.js"), tier = fragment("30-service-tier.js");
-  vm.runInContext([
-    ...["normalizeCodexServiceTierModelName", "codexServiceTierFastSupportedForModel", "codexServiceTierFastAvailability", "isFastServiceTierValue"].map((name) => extract(menu, name)),
-    ...["codexServiceTierOverrideResult", "codexServiceTierOverrideForRequest", "applyCodexServiceTierRequestOnly"].map((name) => extract(tier, name)),
-  ].join("\n"), context);
-  return { metadata, state, ui: (model: string) => context.codexServiceTierFastAvailability(model).supported,
-    request: (model: string, serviceTier: string | null = null) => context.applyCodexServiceTierRequestOnly("turn/start", { threadId: "thread-12345678", model, service_tier: serviceTier }) };
-}
-
-test("Fast UI and request filtering share explicit declarations, including denial of built-in models", () => {
-  const f = policyFixture();
-  assert.equal(f.ui("grok-fast-without-a-declaration"), false);
-  assert.equal(f.request("grok-fast-without-a-declaration").service_tier, null);
-  f.metadata["grok-custom"] = { prioritySupportOverride: true };
-  assert.equal(f.ui("grok-custom"), true); assert.equal(f.request("grok-custom").service_tier, "priority");
-  f.metadata["gpt-5.4"] = { prioritySupportOverride: false, serviceTiers: [{ id: "priority" }] };
-  assert.equal(f.ui("gpt-5.4"), false); assert.equal(f.request("gpt-5.4", "priority").service_tier, null);
-  f.metadata["gpt-5.4"] = { serviceTiers: [] };
-  assert.equal(f.ui("gpt-5.4"), true, "empty built-in metadata must preserve the old default");
-  f.metadata["gpt-5.4"] = { prioritySupportOverride: false, serviceTiers: [{ id: "flex" }] };
-  assert.equal(f.ui("gpt-5.4"), false, "inheriting original flex-only user metadata must remain consistent with its native catalog");
-  f.state.mode = "global-standard";
-  assert.equal(f.request("grok-custom", "priority").service_tier, null);
-  f.state.mode = "inherit";
-  assert.equal(f.request("grok-custom", "priority").service_tier, "priority");
-  assert.equal(f.request("gpt-5.4", "priority").service_tier, null);
+  vm.runInContext(["normalizeCodexServiceTierModelName", "codexServiceTierFastSupportedForModel", "codexServiceTierFastAvailability"]
+    .map((name) => extract(fragment("20-menu.js"), name)).join("\n"), context);
+  const supported = (model: string) => context.codexServiceTierFastAvailability(model).supported;
+  assert.equal(supported("grok-fast-without-a-declaration"), false);
+  metadata["grok-custom"] = { prioritySupportOverride: true };
+  assert.equal(supported("grok-custom"), true);
+  metadata["gpt-5.4"] = { prioritySupportOverride: false, serviceTiers: [{ id: "priority" }] };
+  assert.equal(supported("gpt-5.4"), false);
+  metadata["gpt-5.4"] = { serviceTiers: [] };
+  assert.equal(supported("gpt-5.4"), true);
 });
 
-test("a responsive-only composer footer supplies the Fast badge placement without a provider button", () => {
-  const source = fragment("90-action-groups.js");
-  const footer = { children: [] as unknown[], parentElement: null, textContent: "", matches: (selector: string) => selector.includes("[data-composer-footer-responsive]"), querySelectorAll: () => [], getBoundingClientRect: () => ({ left: 100, top: 600, width: 600, height: 30 }) };
-  const button = { visible: true };
-  const group = { children: [button], textContent: "", firstChild: button };
-  footer.children = [group];
-  const composer = { querySelectorAll: (selector: string) => selector.includes("[data-composer-footer-responsive]") ? [footer] : [], matches: () => false };
-  const context = vm.createContext({ document: { querySelectorAll: () => [footer] },
-    codexServiceTierComposerFooterSelector: ".composer-footer, [data-composer-footer-responsive]",
-    codexServiceTierBadgeVisibleElement: () => true, codexServiceTierKnownProviderNames: () => [],
-    codexServiceTierBadgeAnchor: () => null, codexServiceTierBadgeText: () => "",
+test("retired Fast preferences cannot rewrite the native service tier or enable native unlock", () => {
+  const style = fragment("10-style.js");
+  const map = style.match(/  const codexPlusBackendSettingMap = \{[^]*?^  \};/m)?.[0];
+  assert.ok(map);
+  const stored = { serviceTierControls: true, nativeFastUnlock: false };
+  const context = vm.createContext({
+    conversationViewDefaultWidth: 900, window: {},
+    localStorage: { getItem: () => JSON.stringify(stored) },
+    codexPlusSettingsKey: "settings",
+    codexPlusBackendSettings: { enhancementsEnabled: true, codexAppServiceTierControls: true },
+    applyCodexRemoteSessionProviderOverride: (_method: string, params: unknown) => params,
   });
-  vm.runInContext(["codexServiceTierVisibleComposerFooters", "codexServiceTierComposerScore", "codexServiceTierBestComposerFooter", "codexServiceTierComposerFooter", "codexServiceTierBadgeFooterGroup", "codexServiceTierBadgePlacement"].map((name) => extract(source, name)).join("\n"), context);
-  assert.equal(context.codexServiceTierBadgePlacement(composer).parent, group);
-  const withoutFooter = { ...composer, querySelectorAll: () => [] };
-  assert.equal(context.codexServiceTierBadgePlacement(withoutFooter), null, "another pane's footer is never the fallback");
+  vm.runInContext([map, ...["defaultCodexPlusSettings", "backendCodexPlusSettings", "codexPlusSettings"]
+    .map((name) => extract(style, name)), extract(fragment("30-service-tier.js"), "applyCodexServiceTierRequestOverride")].join("\n"), context);
+  assert.equal(context.codexPlusSettings().serviceTierControls, undefined);
+  assert.equal(context.codexPlusSettings().nativeFastUnlock, false);
+  for (const params of [{ model: "custom", serviceTier: "priority" }, { model: "custom", service_tier: "flex" }, { model: "custom" }]) {
+    assert.equal(context.applyCodexServiceTierRequestOverride("turn/start", params), params);
+  }
 });
 
-test("Fast-only UI metadata leaves an existing native descriptor's name and reasoning default intact", () => {
+test("reinjection removes the retired composer Fast badge", () => {
+  let removed = 0;
+  const context = vm.createContext({ document: { querySelectorAll: (selector: string) => {
+    assert.equal(selector, '[data-codex-service-tier-badge="true"]');
+    return [{ remove: () => { removed += 1; } }];
+  } } });
+  vm.runInContext(extract(fragment("90-action-groups.js"), "removeLegacyCodexServiceTierBadges"), context);
+  context.removeLegacyCodexServiceTierBadges();
+  assert.equal(removed, 1);
+  assert.doesNotMatch(fragment("90-action-groups.js"), /function installCodexServiceTierBadge/);
+});
+
+test("Fast-only metadata preserves native speed policy, display name and reasoning defaults", () => {
   const metadata: Record<string, unknown> = {
     prioritySupportOverride: true,
     serviceTiers: [{ id: "priority", name: "Fast", description: "Provider-declared priority" }],
     supportedReasoningEfforts: [],
+    additionalSpeedTiers: ["fast"],
   };
   const context = vm.createContext({
     codexPlusModelMetadata: () => metadata,
     modelReasoningEfforts: () => { throw new Error("Fast does not configure reasoning choices"); },
   });
-  vm.runInContext(["codexPlusModelServiceTiers", "applyCodexPlusModelServiceTiers", "applyCodexPlusModelMetadata"]
-    .map((name) => extract(fragment("70-model-catalog.js"), name)).join("\n"), context);
+  vm.runInContext(extract(fragment("70-model-catalog.js"), "applyCodexPlusModelMetadata"), context);
   const descriptor = { displayName: "Native Grok", description: "Native details", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] };
   const original = structuredClone(descriptor);
-  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), true);
-  assert.deepEqual(structuredClone(descriptor), { ...original, serviceTiers: metadata.serviceTiers });
+  assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), false);
+  assert.deepEqual(structuredClone(descriptor), original);
+  const native = { ...descriptor, serviceTiers: [{ id: "flex" }], additionalSpeedTiers: ["native-ultrafast"] };
+  const nativeOriginal = structuredClone(native);
+  assert.equal(context.applyCodexPlusModelMetadata(native, "grok-custom"), false);
+  assert.deepEqual(structuredClone(native), nativeOriginal);
   Object.assign(metadata, { displayName: "Explicit name", description: "Explicit details", defaultReasoningEffort: "low" });
   assert.equal(context.applyCodexPlusModelMetadata(descriptor, "grok-custom"), true);
   assert.equal(descriptor.displayName, "Explicit name");

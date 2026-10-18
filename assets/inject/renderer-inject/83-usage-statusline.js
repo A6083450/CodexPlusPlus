@@ -40,6 +40,8 @@
     failures: 0,
     inFlight: false,
     lastFingerprint: "",
+    cache: new Map(),
+    observer: null,
   };
 
   const codexPlusUsageSvgNs = "http://www.w3.org/2000/svg";
@@ -302,6 +304,66 @@
       && codexPlusSettings().usageStatusLine === true;
   }
 
+  /** 挂载与取数分开：切换时先恢复栏位，网络请求只更新数值。 */
+  function codexPlusUsageSyncPlacement() {
+    const card = codexPlusUsageEnabled() ? codexPlusUsageComposerCard() : null;
+    const threadId = codexPlusUsageThreadId(card);
+    if (!card || !threadId) {
+      codexPlusUsageHide();
+      codexPlusUsageState.threadId = "";
+      return null;
+    }
+    const changed = codexPlusUsageState.threadId !== threadId
+      || !codexPlusUsageState.node?.isConnected
+      || codexPlusUsageState.node.previousElementSibling !== card;
+    const node = codexPlusUsageEnsureNode(card);
+    if (!node) return null;
+    if (changed) {
+      codexPlusUsageState.threadId = threadId;
+      codexPlusUsageState.failures = 0;
+      codexPlusUsageState.lastFingerprint = "";
+    }
+    codexPlusUsageShow(node);
+    codexPlusUsageRender(codexPlusUsageSnapshot(codexPlusUsageState.cache.get(threadId)));
+    return { card, threadId, changed };
+  }
+
+  function codexPlusUsageRemember(threadId, events) {
+    if (!events?.length) return;
+    codexPlusUsageState.cache.delete(threadId);
+    codexPlusUsageState.cache.set(threadId, events.slice(-24));
+    if (codexPlusUsageState.cache.size > 32) {
+      codexPlusUsageState.cache.delete(codexPlusUsageState.cache.keys().next().value);
+    }
+  }
+
+  /** 只观察输入框结构和会话标识，忽略状态栏自身的写入，避免自喂循环。 */
+  function codexPlusUsageObserve() {
+    if (!document.body || typeof MutationObserver !== "function") return;
+    const selector = "[data-codex-composer-root], [data-composer-surface-variant], [data-above-composer-conversation-id]";
+    codexPlusUsageState.observer = new MutationObserver((records) => {
+      const relevant = records.some((record) => {
+        if (record.target?.closest?.("[data-codex-plus-ext]")) return false;
+        if (record.type === "attributes") return true;
+        return [...record.addedNodes, ...record.removedNodes].some((node) =>
+          node.nodeType === 1 && !node.matches?.("[data-codex-plus-ext]")
+          && (node.matches?.(selector) || node.querySelector?.(selector)));
+      });
+      if (!relevant) return;
+      const placement = codexPlusUsageSyncPlacement();
+      if (placement?.changed) codexPlusUsageSchedule(0);
+    });
+    codexPlusUsageState.observer.observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: [
+        "data-above-composer-conversation-id", "data-composer-placement",
+        "data-app-action-sidebar-thread-selected", "data-app-action-sidebar-thread-id",
+      ],
+    });
+  }
+
   async function codexPlusUsageRefresh(threadId) {
     if (codexPlusUsageState.inFlight) return null;
     codexPlusUsageState.inFlight = true;
@@ -327,30 +389,21 @@
       codexPlusUsageSchedule(codexPlusUsageIdleIntervalMs);
       return;
     }
-    const card = codexPlusUsageComposerCard();
-    const threadId = codexPlusUsageThreadId(card);
-    if (!card || !threadId) {
-      codexPlusUsageHide();
-      codexPlusUsageState.threadId = "";
+    const placement = codexPlusUsageSyncPlacement();
+    if (!placement) {
       codexPlusUsageSchedule(codexPlusUsageIdleIntervalMs);
       return;
     }
-    codexPlusUsageInstallStyle();
-    const node = codexPlusUsageEnsureNode(card);
-    if (!node) {
-      codexPlusUsageSchedule(codexPlusUsageIdleIntervalMs);
+    const { threadId } = placement;
+    if (codexPlusUsageState.inFlight) {
+      codexPlusUsageSchedule(codexPlusUsageActiveIntervalMs);
       return;
-    }
-    // 换会话时清掉上一个会话的读数，避免把旧数字挂在新会话上。
-    if (codexPlusUsageState.threadId !== threadId && codexPlusUsageState.node === node) {
-      codexPlusUsageState.threadId = threadId;
-      codexPlusUsageState.lastFingerprint = "";
     }
     let events = null;
     try {
       events = await codexPlusUsageRefresh(threadId);
     } catch (error) {
-      codexPlusUsageState.failures += 1;
+      if (codexPlusUsageState.threadId === threadId) codexPlusUsageState.failures += 1;
       if (codexPlusUsageState.failures === codexPlusUsageFailureLimit) {
         sendCodexPlusDiagnostic("usage_statusline_bridge_failed", {
           errorName: error?.name || "",
@@ -359,36 +412,43 @@
       }
     }
     if (codexPlusUsageState.disposed) return;
-    const snapshot = events ? codexPlusUsageSnapshot(events) : null;
+    codexPlusUsageRemember(threadId, events);
+    const current = codexPlusUsageSyncPlacement();
+    if (!current || current.threadId !== threadId) {
+      codexPlusUsageSchedule(current ? 0 : codexPlusUsageIdleIntervalMs);
+      return;
+    }
+    const snapshot = codexPlusUsageSnapshot(codexPlusUsageState.cache.get(threadId));
     if (snapshot) {
-      codexPlusUsageShow(node);
       codexPlusUsageRender(snapshot);
       // 刚有事件说明本轮在跑，加密轮询；本轮已经结束就拉长间隔。
       codexPlusUsageSchedule(snapshot.stale ? codexPlusUsageIdleIntervalMs : codexPlusUsageActiveIntervalMs);
       return;
     }
     if (codexPlusUsageState.failures >= codexPlusUsageFailureLimit) {
-      // 桥接连续失败：整条隐藏，退到慢轮询，等宿主恢复。
-      codexPlusUsageHide();
+      // 桥接连续失败仍保留栏位与最近读数，只降低取数频率。
       codexPlusUsageSchedule(30000);
       return;
     }
     // 会话已经确定、只是还没写出 token 事件（新会话第一轮）：先显示占位符，
     // 用较慢的间隔等第一条数据，避免空转。
-    codexPlusUsageShow(node);
     codexPlusUsageRender(null);
     codexPlusUsageSchedule(codexPlusUsageWarmupIntervalMs);
   }
 
   codexPlusUsageInstallStyle();
+  codexPlusUsageObserve();
+  codexPlusUsageSyncPlacement();
   codexPlusUsageSchedule(600);
   window.__codexPlusUsageStatusLineRuntime = {
-    version: 1,
+    version: 2,
     sync: () => codexPlusUsageSchedule(0),
     dispose() {
       codexPlusUsageState.disposed = true;
       clearTimeout(codexPlusUsageState.timer);
       codexPlusUsageState.timer = 0;
+      codexPlusUsageState.observer?.disconnect();
+      codexPlusUsageState.cache.clear();
       // 卸载时把节点整个摘掉：注入会被重跑，留一个隐藏节点等于每次重注入多挂一个。
       codexPlusUsageState.node?.remove();
       codexPlusUsageState.node = null;

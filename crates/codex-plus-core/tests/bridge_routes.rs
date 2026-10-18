@@ -10,7 +10,7 @@ use codex_plus_core::models::{
 };
 use codex_plus_core::routes::{
     BridgeContext, BridgeDataService, BridgeRuntimeService, BridgeSettingsService,
-    CoreRuntimeService, handle_bridge_request,
+    CoreRuntimeService, evaluate_extension_cdp, handle_bridge_request,
 };
 use codex_plus_core::settings::BackendSettings;
 use codex_plus_core::status::StatusStore;
@@ -43,6 +43,8 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/user-scripts/delete", json!({"key": "user:a.js"})),
         ("/user-scripts/reload", json!({})),
         ("/user-scripts/load", json!({})),
+        ("/cdp/targets", json!({})),
+        ("/cdp/evaluate", json!({"kind":"avatar-overlay","expression":"1"})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
         ("/manager/open-transient", json!({})),
@@ -113,6 +115,29 @@ async fn bridge_routes_cover_all_current_paths() {
             "{path} should be routed"
         );
     }
+}
+
+#[tokio::test]
+async fn cdp_evaluate_rejects_empty_expression_without_touching_cdp() {
+    let error = evaluate_extension_cdp(1, &json!({"kind": "avatar-overlay"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("expression"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn cdp_routes_are_wired_for_extensions() {
+    let result = handle_bridge_request(test_context(), "/cdp/targets", json!({})).await;
+    assert_eq!(result["status"], "failed");
+    assert_ne!(result["message"], "Unknown bridge path");
+    assert!(
+        result["message"].as_str().unwrap_or("").contains("CDP targets"),
+        "{}",
+        result
+    );
 }
 
 #[tokio::test]
@@ -478,14 +503,15 @@ async fn settings_routes_use_settings_service() {
     let updated = handle_bridge_request(
         ctx.clone(),
         "/settings/set",
-        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppServiceTierControls": true, "codexAppPetRealMouseLook": true, "codexAppActivityOverlayRight": true}),
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppNativeFastUnlock": true, "codexAppPetRealMouseLook": true, "codexAppActivityOverlayRight": true}),
     )
     .await;
     let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
 
     assert_eq!(updated["providerSyncEnabled"], true);
     assert_eq!(updated["codexAppSessionDelete"], false);
-    assert_eq!(updated["codexAppServiceTierControls"], true);
+    assert_eq!(updated["codexAppNativeFastUnlock"], true);
+    assert!(updated.get("codexAppServiceTierControls").is_none());
     assert_eq!(updated["codexAppPetRealMouseLook"], true);
     assert_eq!(updated["codexAppActivityOverlayRight"], true);
     assert_eq!(loaded, updated);
@@ -1483,7 +1509,7 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppConversationView",
             "codexAppThreadScrollRestore",
             "codexAppNativeMenuPlacement",
-            "codexAppServiceTierControls",
+            "codexAppNativeFastUnlock",
             "codexAppPetRealMouseLook",
             "codexAppActivityOverlayRight",
             "codexAppWhaleWidgetEnabled",

@@ -92,6 +92,14 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn load_user_scripts(&self) -> anyhow::Result<Value> {
         self.user_script_inventory().await
     }
+    /// 列出拓展可注入的 Codex 页面。默认关闭，具体 runtime 再接 CDP。
+    async fn cdp_targets(&self) -> anyhow::Result<Value> {
+        anyhow::bail!("CDP targets are unavailable")
+    }
+    /// 在指定 Codex 页面执行表达式。默认关闭。
+    async fn cdp_evaluate(&self, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("CDP evaluate is unavailable")
+    }
     /// 拉市场清单，并合并本地已安装状态。
     async fn script_market_list(&self) -> anyhow::Result<Value> {
         anyhow::bail!("script market is unavailable")
@@ -204,6 +212,57 @@ pub trait BridgeDataService: Send + Sync {
     }
 }
 
+/// 拓展脚本在独立 Codex 页面（例如宠物 overlay）执行表达式。
+/// 只走 Runtime.evaluate，且必须指定 kind 或 target_id，避免误打到管理页。
+pub const EXTENSION_CDP_EXPRESSION_MAX_BYTES: usize = 256 * 1024;
+
+fn nonempty_payload_str<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub async fn evaluate_extension_cdp(debug_port: u16, payload: &Value) -> anyhow::Result<Value> {
+    let expression = nonempty_payload_str(payload, "expression")
+        .ok_or_else(|| anyhow::anyhow!("expression 不能为空"))?;
+    if expression.len() > EXTENSION_CDP_EXPRESSION_MAX_BYTES {
+        anyhow::bail!(
+            "expression 超过 {} 字节上限",
+            EXTENSION_CDP_EXPRESSION_MAX_BYTES
+        );
+    }
+    let target_id = nonempty_payload_str(payload, "target_id")
+        .or_else(|| nonempty_payload_str(payload, "targetId"));
+    let kind = nonempty_payload_str(payload, "kind");
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let selected = crate::cdp::select_extension_cdp_targets(&targets, target_id, kind)?;
+    let mut results = Vec::new();
+    for target in selected {
+        let websocket = target
+            .web_socket_debugger_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("CDP 页面没有 WebSocket URL"))?;
+        let result = match crate::bridge::evaluate_script_return_by_value(websocket, expression)
+            .await
+        {
+            Ok(response) => json!({
+                "id": target.id,
+                "ok": true,
+                "value": response.pointer("/result/result/value").cloned().unwrap_or(Value::Null),
+            }),
+            Err(error) => json!({
+                "id": target.id,
+                "ok": false,
+                "error": error.to_string(),
+            }),
+        };
+        results.push(result);
+    }
+    Ok(json!({ "status": "ok", "results": results }))
+}
+
 pub async fn handle_bridge_request(
     ctx: BridgeContext,
     path: &str,
@@ -279,6 +338,8 @@ pub async fn handle_bridge_request(
         }
         "/user-scripts/load" => ctx.runtime.load_user_scripts().await,
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
+        "/cdp/targets" => ctx.runtime.cdp_targets().await,
+        "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager(payload.clone()).await,
@@ -656,6 +717,14 @@ impl BridgeRuntimeService for CoreRuntimeService {
         self.user_script_inventory().await
     }
 
+    async fn cdp_targets(&self) -> anyhow::Result<Value> {
+        crate::cdp::list_extension_cdp_targets(self.debug_port).await
+    }
+
+    async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
+        evaluate_extension_cdp(self.debug_port, &payload).await
+    }
+
     async fn open_devtools(&self) -> anyhow::Result<Value> {
         let target_id = self
             .devtools_target_id
@@ -842,6 +911,7 @@ fn settings_payload_value(
     mut settings: BackendSettings,
     codex_app_version: String,
 ) -> anyhow::Result<Value> {
+    let managed_session_connection = managed_session_connection(&settings);
     let active_relay_session_provider = settings.active_relay_session_provider();
     let active_relay_codex_provider = crate::model_catalog::codex_model_provider_for_relay_profile(
         &crate::relay_config::default_codex_home_dir(),
@@ -850,6 +920,23 @@ fn settings_payload_value(
     settings.dictation = crate::dictation::effective_settings(&settings);
     let image_generation_proxy = configured_image_generation_proxy(&crate::relay_config::default_codex_home_dir(), &settings);
     let mut value = serde_json::to_value(settings)?;
+    fn remove_named_keys(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("apiKeys");
+                for child in object.values_mut() {
+                    remove_named_keys(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    remove_named_keys(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    remove_named_keys(&mut value);
     if let Some(object) = value.as_object_mut() {
         object.insert("imageGenerationProxy".to_string(), image_generation_proxy.unwrap_or(Value::Null));
         object.insert(
@@ -866,6 +953,10 @@ fn settings_payload_value(
             dictation.insert("apiKeyConfigured".to_string(), json!(configured));
         }
         object.insert(
+            "managedSessionConnection".to_string(),
+            managed_session_connection,
+        );
+        object.insert(
             "activeRelaySessionProvider".to_string(),
             Value::String(active_relay_session_provider.as_str().to_string()),
         );
@@ -881,9 +972,81 @@ fn settings_payload_value(
     Ok(value)
 }
 
+fn managed_session_connection(settings: &BackendSettings) -> Value {
+    // 固定所有自定义会话聚合的本地传输，模型聚合与故障转移共用这一入口。
+    // 不要把成员的真实认证信息下发给 renderer。
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return Value::Null;
+    };
+    if !settings.relay_profiles_enabled
+        || aggregate.session_provider != crate::settings::RelaySessionProvider::Custom
+        || aggregate.sync_default_member_login
+    {
+        return Value::Null;
+    }
+    json!({
+        "profileId": settings.active_relay_id,
+        "provider": "codex_plus_managed",
+        "baseUrl": crate::protocol_proxy::local_responses_proxy_base_url(
+            crate::protocol_proxy::protocol_proxy_port()
+        ),
+    })
+}
+
 #[cfg(test)]
 mod dictation_privacy_tests {
     use super::*;
+
+    #[test]
+    fn managed_session_connection_uses_settings_and_local_proxy_only() {
+        use crate::settings::{AggregateRelayProfile, RelayMode, RelayProfile, RelaySessionProvider};
+        let mut settings = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: "aggregate".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            }],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "aggregate".to_string(),
+                name: String::new(),
+                session_provider: RelaySessionProvider::Custom,
+                model_aggregation_enabled: true,
+                strategy: Default::default(),
+                members: Vec::new(),
+                routes: Vec::new(),
+                default_relay_id: String::new(),
+                sync_default_member_login: false,
+            }],
+            ..BackendSettings::default()
+        };
+        let connection = managed_session_connection(&settings);
+        assert_eq!(connection["profileId"], "aggregate");
+        assert_eq!(connection["provider"], "codex_plus_managed");
+        assert_eq!(
+            connection["baseUrl"],
+            crate::protocol_proxy::local_responses_proxy_base_url(
+                crate::protocol_proxy::protocol_proxy_port()
+            )
+        );
+        assert_eq!(connection.as_object().unwrap().len(), 3);
+        // 模型聚合开关、故障转移策略及默认选择不改变本地会话连接地址。
+        settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+        settings.aggregate_relay_profiles[0].strategy =
+            crate::settings::AggregateRelayStrategy::Failover;
+        settings.aggregate_relay_profiles[0].default_relay_id = "new-default".to_string();
+        settings.relay_profiles[0].model = "new-model".to_string();
+        assert_eq!(managed_session_connection(&settings), connection);
+        settings.aggregate_relay_profiles[0].sync_default_member_login = true;
+        assert!(managed_session_connection(&settings).is_null());
+        settings.aggregate_relay_profiles[0].sync_default_member_login = false;
+        settings.aggregate_relay_profiles[0].session_provider = RelaySessionProvider::Openai;
+        assert!(managed_session_connection(&settings).is_null());
+        settings.aggregate_relay_profiles[0].session_provider = RelaySessionProvider::Custom;
+        settings.relay_profiles_enabled = false;
+        assert!(managed_session_connection(&settings).is_null());
+    }
 
     #[test]
     fn settings_bridge_preserves_session_share_choice_for_renderer_master_gating() {
@@ -907,6 +1070,17 @@ mod dictation_privacy_tests {
         assert!(result["dictation"].get("apiKey").is_none());
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(!result.to_string().contains("fake-asr-private-key"));
+    }
+
+    #[test]
+    fn settings_bridge_never_returns_named_key_lists() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles[0].api_keys = vec![crate::settings::RelayApiKey {
+            id: "backup".into(), name: "备用".into(), api_key: "fake-backup-secret".into(),
+        }];
+        let result = settings_payload_value(settings, String::new()).unwrap();
+        assert!(result["relayProfiles"][0].get("apiKeys").is_none());
+        assert!(!result.to_string().contains("fake-backup-secret"));
     }
     #[test]
     fn dictation_settings_bridge_applies_enhancement_switch_without_mutating_settings() {

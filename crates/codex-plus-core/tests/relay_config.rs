@@ -5285,8 +5285,13 @@ fn apply_relay_profile_generates_gpt6_catalog_without_suffix() {
     let expected_max = if slug == "gpt-6-astra" { 872_000 } else { 272_000 };
     assert_eq!(astra["max_context_window"], expected_max);
     assert_eq!(astra["use_responses_lite"], false);
-    assert_eq!(astra["additional_speed_tiers"], serde_json::json!(["fast"]));
-    assert_eq!(astra["service_tiers"][0]["id"], "priority");
+    if slug == "gpt-6-astra" {
+        assert_eq!(astra["additional_speed_tiers"], serde_json::json!(["fast"]));
+        assert_eq!(astra["service_tiers"][0]["id"], "priority");
+    } else {
+        assert_eq!(astra["additional_speed_tiers"], serde_json::json!([]));
+        assert_eq!(astra["service_tiers"], serde_json::json!([]));
+    }
     let efforts: Vec<_> = astra["supported_reasoning_levels"]
         .as_array()
         .unwrap()
@@ -5398,8 +5403,8 @@ base_url = "https://relay.example/v1"
         assert_eq!(model["max_context_window"], 272_000);
         assert_eq!(model["use_responses_lite"], false);
         assert_eq!(model["multi_agent_version"], "v2");
-        assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
-        assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(model["additional_speed_tiers"], serde_json::json!([]));
+        assert_eq!(model["service_tiers"], serde_json::json!([]));
         assert_eq!(
             model["supported_reasoning_levels"]
                 .as_array()
@@ -5714,6 +5719,8 @@ fn apply_third_party_deepseek_responses_preserves_code_mode_and_catalog_tool_mod
             "models": [{
                 "slug": "relay-deepseek",
                 "display_name": "Relay DeepSeek",
+                "base_instructions": "",
+                "supports_parallel_tool_calls": false,
                 "context_window": 262_144,
                 "tool_mode": "code_mode_only",
                 "use_responses_lite": true,
@@ -5910,6 +5917,8 @@ fn apply_relay_profile_copies_external_lite_catalog_for_standard_responses() {
       "slug": "gpt-5.6-sol",
       "context_window": 272000,
       "max_context_window": 272000,
+      "base_instructions": "",
+      "supports_parallel_tool_calls": true,
       "supports_search_tool": true,
       "web_search_tool_type": "text_and_image",
       "use_responses_lite": true

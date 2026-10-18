@@ -183,6 +183,24 @@ pub fn build_wrapper_script(
         anyhow::anyhow!("找不到可用的回环调试端口（请求 {debug_port}，候选 {known_ports:?}）")
     })?;
 
+    build_wrapper_script_for_port(
+        state_dir,
+        executable,
+        codex_home,
+        sqlite_home,
+        user_data_dir,
+        port,
+    )
+}
+
+fn build_wrapper_script_for_port(
+    state_dir: &Path,
+    executable: &Path,
+    codex_home: &Path,
+    sqlite_home: &Path,
+    user_data_dir: &Path,
+    port: u16,
+) -> anyhow::Result<String> {
     let state_dir_literal = batch_path_literal(state_dir)?;
     let executable_literal = batch_path_literal(executable)?;
     let codex_home_literal = batch_path_literal(codex_home)?;
@@ -239,7 +257,7 @@ pub fn prepare_wrapper_script(
     debug_port: u16,
     known_ports: &[u16],
 ) -> anyhow::Result<PathBuf> {
-    let script = build_wrapper_script(
+    Ok(prepare_wrapper_script_with_port(
         state_dir,
         executable,
         codex_home,
@@ -247,8 +265,47 @@ pub fn prepare_wrapper_script(
         user_data_dir,
         debug_port,
         known_ports,
+    )?
+    .path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWrapper {
+    pub path: PathBuf,
+    pub debug_port: u16,
+}
+
+/// 端口只选择一次，并与写入的脚本一起返回；调用方必须传播这个最终端口。
+pub fn prepare_wrapper_script_with_port(
+    state_dir: &Path,
+    executable: &Path,
+    codex_home: &Path,
+    sqlite_home: &Path,
+    user_data_dir: &Path,
+    debug_port: u16,
+    known_ports: &[u16],
+) -> anyhow::Result<PreparedWrapper> {
+    // 新实例不能复用一个已经监听的 CDP；那可能属于另一实例。
+    let debug_port = select_debug_port_with(
+        debug_port,
+        known_ports,
+        crate::ports::can_bind_loopback_port,
+        |_| false,
+        || crate::ports::find_available_loopback_port(),
+    )
+    .context("找不到可用的回环调试端口")?;
+    let script = build_wrapper_script_for_port(
+        state_dir,
+        executable,
+        codex_home,
+        sqlite_home,
+        user_data_dir,
+        debug_port,
     )?;
-    write_wrapper_script(state_dir, &script)
+    Ok(PreparedWrapper {
+        path: write_wrapper_script(state_dir, &script)?,
+        debug_port,
+    })
 }
 
 /// 拼出在包上下文里执行 wrapper 的 PowerShell 脚本（纯函数，可在 macOS 上单测）。
@@ -531,6 +588,31 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
     use std::thread;
+
+    #[test]
+    fn prepared_wrapper_receipt_matches_reselected_script_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let preferred = busy.local_addr().unwrap().port();
+        let wrapper = prepare_wrapper_script_with_port(
+            temp.path(),
+            Path::new("/app/ChatGPT.exe"),
+            &temp.path().join("home"),
+            &temp.path().join("sqlite"),
+            &temp.path().join("user data"),
+            preferred,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(wrapper.debug_port, preferred);
+        let script = std::fs::read_to_string(wrapper.path).unwrap();
+        assert!(script.contains(&format!("--remote-debugging-port={}", wrapper.debug_port)));
+        assert!(script.contains(&format!(
+            "--remote-allow-origins=http://127.0.0.1:{}",
+            wrapper.debug_port
+        )));
+        assert!(!script.contains(&format!("--remote-debugging-port={preferred}")));
+    }
 
     const AUMID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
     /// Windows 形式的路径只在字面量断言里用：macOS 上 `Path::parent()` 按 `/` 切分，

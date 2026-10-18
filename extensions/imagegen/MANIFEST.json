@@ -27,7 +27,7 @@
   "skill/scripts/responses_image_gen.py": "b18b0c8b8a0ebca7e38f43bc016dbf4098643f69285f2c5c968093610564991e",
   "skill/scripts/responses_transport.py": "312c2d174c0d09f6d52f1c434fab294892115bba58c06bf5e6d4571a622b6ea5",
   "sync.py": "053885b2a79df7d7ea698f1fcfd22f3b935a6a7eaa294132229355ac3eb57160",
-  "tests/client-reinjection.cjs": "9bdf9af57c635abd946c151db7d232bf9c862387004f24c9d1c5028aee0d9953",
+  "tests/client-reinjection.cjs": "e5f1386b3940955df4f166f79bf7712017ed755926ed8f2c4a408cf040bf20d9",
   "tests/generated-images-rendering.cjs": "c963ddba0dbed8ed934de585879df7701eee6e83f7526f463c61f6be8bfcaa9a",
   "tests/generated_images.rs": "5c0bbb206195bda1731f64a26fd949ead8736cb40fb0cce7d8202e6d3ad26c3b",
   "tests/imagegen_skill.rs": "c7af2df50af5d12603daf948eca1daf167edbc44cfa18e17118af5af0dd67205",

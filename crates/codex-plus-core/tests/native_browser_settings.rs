@@ -34,6 +34,11 @@ fn save_and_partial_update_preserve_explicit_choice() {
             .unwrap()
             .codex_app_native_browser_require_identification
     );
-    // Saving this option writes settings only, not browser runtime or recovery files.
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    // 只写设置及其并发保护锁，不生成浏览器运行时或恢复文件。
+    let mut files: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["settings.json", "settings.json.lock"]);
 }

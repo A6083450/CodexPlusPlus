@@ -87,12 +87,7 @@ pub fn close_process_tree(process_id: u32, force: bool) -> bool {
         return request_process_close(process_id);
     }
     let output = std::process::Command::new("taskkill")
-        .args([
-            "/PID",
-            process_id.to_string().as_str(),
-            "/T",
-            "/F",
-        ])
+        .args(["/PID", process_id.to_string().as_str(), "/T", "/F"])
         .output();
     matches!(output, Ok(output) if output.status.success())
 }
@@ -499,10 +494,17 @@ pub(crate) fn terminate_verified_multi_worker(
         return Ok(false);
     }
     let Ok(handle) = (unsafe {
-        OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false, process_id)
-    }) else { return Ok(false); };
-    if handle.is_invalid() { return Ok(false); }
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            process_id,
+        )
+    }) else {
+        return Ok(false);
+    };
+    if handle.is_invalid() {
+        return Ok(false);
+    }
     let _guard = HandleGuard(handle);
     let actual_birth = process_birth_id_from_handle(handle);
     if actual_birth != expected_birth { return Ok(false); }
@@ -517,8 +519,15 @@ pub(crate) fn terminate_verified_multi_worker(
     } else { None };
     // CommandLineToArgvW 分配的 argv 必须用 LocalFree 释放。
     unsafe { LocalFree(HLOCAL(argv.cast())) };
-    let Some(arguments) = arguments else { return Ok(false); };
-    if !crate::multi_worker::worker_identity_matches(expected_birth, actual_birth, &arguments, options_path) {
+    let Some(arguments) = arguments else {
+        return Ok(false);
+    };
+    if !crate::multi_worker::worker_identity_matches(
+        expected_birth,
+        actual_birth,
+        &arguments,
+        options_path,
+    ) {
         return Ok(false);
     }
     let Some(image) = process_image_path_from_handle(handle) else { return Ok(false); };
@@ -526,6 +535,86 @@ pub(crate) fn terminate_verified_multi_worker(
         else { return Ok(false); };
     if image.canonicalize().ok().as_ref() != Some(&expected_image) { return Ok(false); }
     unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 worker 失败")?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn command_line_arguments(command_line: &str) -> Option<Vec<String>> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::UI::Shell::CommandLineToArgvW;
+    let wide = wide_null(command_line);
+    let mut count = 0;
+    let argv = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+    if argv.is_null() {
+        return None;
+    }
+    let arguments = if (1..=32768).contains(&count) {
+        unsafe { std::slice::from_raw_parts(argv, count as usize) }
+            .iter()
+            .map(|value| unsafe { value.to_string() }.ok())
+            .collect()
+    } else {
+        None
+    };
+    unsafe { LocalFree(HLOCAL(argv.cast())) };
+    arguments
+}
+
+#[cfg(windows)]
+pub(crate) fn process_arguments(process_id: u32) -> Option<Vec<String>> {
+    command_line_arguments(&process_command_line(process_id)?)
+}
+
+/// 命令行、创建时间、映像与终止共用同一句柄，拒绝按端口或 PID 猜测归属。
+#[cfg(windows)]
+pub(crate) fn terminate_verified_codex_instance(
+    identity: &crate::multi_worker::CodexInstanceIdentity,
+) -> anyhow::Result<bool> {
+    if identity.process_id == std::process::id() || identity.process_birth_id == 0 {
+        return Ok(false);
+    }
+    let Ok(handle) = (unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            identity.process_id,
+        )
+    }) else {
+        return Ok(false);
+    };
+    if handle.is_invalid() {
+        return Ok(false);
+    }
+    let _guard = HandleGuard(handle);
+    if process_birth_id_from_handle(handle) != Some(identity.process_birth_id) {
+        return Ok(false);
+    }
+    let Some(image) = process_image_path_from_handle(handle) else {
+        return Ok(false);
+    };
+    let normalize = |path: &std::path::Path| {
+        path.to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase()
+    };
+    if normalize(&image) != normalize(&identity.executable) {
+        return Ok(false);
+    }
+    let Some(arguments) =
+        process_command_line_from_handle(handle).and_then(|line| command_line_arguments(&line))
+    else {
+        return Ok(false);
+    };
+    if !crate::multi_worker::codex_arguments_match(
+        &arguments,
+        &identity.user_data_dir,
+        identity.debug_port,
+    ) || unique_listener_process_id(&loopback_listener_process_ids(identity.debug_port)?)?
+        != Some(identity.process_id)
+    {
+        return Ok(false);
+    }
+    unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 Codex 实例失败")?;
     Ok(true)
 }
 

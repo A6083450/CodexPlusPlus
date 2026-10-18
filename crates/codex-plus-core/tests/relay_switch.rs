@@ -48,7 +48,7 @@ base_url = "https://a.example/v1"
         ..BackendSettings::default()
     };
 
-    let error = switch_relay_profile_in_home(&store, &temp.path().join("codex"), next, "a")
+    let error = switch_current_relay_profile(&store, &temp.path().join("codex"), next, "a")
         .expect_err("invalid auth should fail switch");
 
     assert!(error.to_string().contains("auth.json"));
@@ -119,7 +119,7 @@ base_url = "https://b.example/v1"
         ..BackendSettings::default()
     };
 
-    let error = switch_relay_profile_in_home(&store, &home, next, "a")
+    let error = switch_current_relay_profile(&store, &home, next, "a")
         .expect_err("missing api key should fail post-write status check");
 
     assert!(
@@ -189,7 +189,7 @@ base_url = "https://edited-a.example/v1"
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+    switch_current_relay_profile(&store, &home, next, "a").unwrap();
 
     let stored = store.load().unwrap();
     let previous = stored
@@ -268,7 +268,7 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
         ..BackendSettings::default()
     };
 
-    let result = switch_relay_profile_in_home(&store, &home, next, "api").unwrap();
+    let result = switch_current_relay_profile(&store, &home, next, "api").unwrap();
     let live = std::fs::read_to_string(home.join("config.toml")).unwrap();
 
     assert!(result.configured);
@@ -327,7 +327,7 @@ goals = true
         ..BackendSettings::default()
     };
 
-    let result = switch_relay_profile_in_home(&store, &home, next, "official").unwrap();
+    let result = switch_current_relay_profile(&store, &home, next, "official").unwrap();
     let returned = result
         .settings
         .relay_profiles
@@ -375,7 +375,7 @@ fn switch_captures_safe_app_state_before_writing_provider_config() {
         ..BackendSettings::default()
     };
 
-    switch_relay_profile_in_home(&store, &home, next, "a").unwrap();
+    switch_current_relay_profile(&store, &home, next, "a").unwrap();
 
     let snapshot: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -421,7 +421,7 @@ fn switch_from_aggregate_backfills_aggregate_auth_state() {
     store.save(&original).unwrap();
 
     // 先切到聚合，让 live auth.json 带上聚合代理凭据
-    switch_relay_profile_in_home(
+    switch_current_relay_profile(
         &store,
         &home,
         aggregate_target_settings(api.clone(), aggregate.clone()),
@@ -430,7 +430,7 @@ fn switch_from_aggregate_backfills_aggregate_auth_state() {
     .unwrap();
 
     // 再从聚合切回普通供应商：这一步会 backfill 聚合 profile
-    switch_relay_profile_in_home(
+    switch_current_relay_profile(
         &store,
         &home,
         BackendSettings {
@@ -613,7 +613,7 @@ fn official_oauth_survives_aggregate_round_trip() {
     store.save(&round_trip_settings("official")).unwrap();
 
     // 官方 → 聚合
-    switch_relay_profile_in_home(&store, &home, round_trip_settings("agg"), "official").unwrap();
+    switch_current_relay_profile(&store, &home, round_trip_settings("agg"), "official").unwrap();
     let after_switch: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
     assert_eq!(
@@ -632,7 +632,7 @@ fn official_oauth_survives_aggregate_round_trip() {
     );
 
     // 聚合 → 官方
-    switch_relay_profile_in_home(&store, &home, round_trip_settings("official"), "agg").unwrap();
+    switch_current_relay_profile(&store, &home, round_trip_settings("official"), "agg").unwrap();
     let final_auth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap()).unwrap();
     assert_eq!(
@@ -707,7 +707,7 @@ fn switch_api_to_aggregate_with(
         ..BackendSettings::default()
     };
     store.save(&original)?;
-    switch_relay_profile_in_home(
+    switch_current_relay_profile(
         &store,
         home,
         aggregate_target_settings(api, aggregate),
@@ -868,7 +868,7 @@ base_url = "https://a.example/v1"
         let previous = settings.active_relay_id.clone();
         settings.active_relay_id = if cycle % 2 == 0 { "b" } else { "a" }.to_string();
         let result =
-            switch_relay_profile_in_home(&store, &home, settings.clone(), &previous).unwrap();
+            switch_current_relay_profile(&store, &home, settings.clone(), &previous).unwrap();
         settings = result.settings;
     }
 
@@ -913,7 +913,7 @@ fn switch_reports_previous_profile_id_when_it_is_missing() {
         ..BackendSettings::default()
     };
 
-    let error = switch_relay_profile_in_home(&store, &home, next, "deleted-id")
+    let error = switch_current_relay_profile(&store, &home, next, "deleted-id")
         .expect_err("上一个供应商不存在时必须中止切换");
     let message = error.to_string();
 
@@ -981,7 +981,7 @@ fn switch_restores_profiles_filtered_out_of_request() {
         relay_profiles: vec![aggregate_profile],
         ..BackendSettings::default()
     };
-    let result = switch_relay_profile_in_home(&store, &home, filtered, "deepseek").unwrap();
+    let result = switch_current_relay_profile(&store, &home, filtered, "deepseek").unwrap();
     assert_eq!(result.settings.active_relay_id, "agg");
 
     let saved = store.load().unwrap();
@@ -1001,4 +1001,15 @@ fn switch_restores_profiles_filtered_out_of_request() {
         saved.aggregate_relay_profiles[0].default_relay_id, "deepseek",
         "默认供应商配置要跟着聚合一起回填"
     );
+}
+
+// 这些测试验证切换、回填和回滚；请求携带当前版本，避免先被并发保护拒绝。
+fn switch_current_relay_profile(
+    store: &SettingsStore,
+    home: &std::path::Path,
+    mut settings: BackendSettings,
+    previous_active_relay_id: &str,
+) -> anyhow::Result<codex_plus_core::relay_switch::RelaySwitchResult> {
+    settings.settings_revision = store.revision()?;
+    switch_relay_profile_in_home(store, home, settings, previous_active_relay_id)
 }

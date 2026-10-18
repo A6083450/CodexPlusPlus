@@ -18,6 +18,108 @@ use tempfile::tempdir;
 
 static CODEX_HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn pending_full_sync_journal_blocks_both_remote_control_writers_without_changes() {
+    let temp=tempdir().unwrap();let home=temp.path().join("home");fs::create_dir_all(&home).unwrap();write_provider_config(&home,"apigather");
+    let db=home.join("state_5.sqlite");create_state_db_with_providers(&db,&[("thread-1","openai",0)]);
+    let rollout=home.join("sessions/rollout-thread-1.jsonl");write_rollout(&rollout,"openai","thread-1","C:/workspace");
+    let before_db=fs::read(&db).unwrap();let before_rollout=fs::read(&rollout).unwrap();
+    let backup=home.join("backups_state/provider-sync/unfinished");fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("metadata.json"),br#"{"version":2,"managedBy":"Codex++ provider sync","namespace":"provider-sync"}"#).unwrap();
+    let journal=backup.join("recovery-journal.json");fs::write(&journal,br#"{"version":1,"state":"prepared","entries":[]}"#).unwrap();
+    let catalog=run_remote_control_session_catalog_recovery_for_thread_with_target(Some(&home),"thread-1","apigather");
+    let finalization=run_remote_control_session_finalization_for_thread_with_target(Some(&home),"thread-1","apigather");
+    for result in [catalog,finalization] {
+        assert_eq!(result.status,ProviderSyncStatus::PartialFailure);assert_eq!(result.recovery_journal_path.as_ref(),Some(&journal));assert_eq!(result.changed_session_files,0);assert_eq!(result.sqlite_rows_updated,0);
+    }
+    assert!(fs::read(&db).unwrap()==before_db);assert!(fs::read(&rollout).unwrap()==before_rollout);
+    assert_eq!(fs::read_dir(home.join("backups_state/provider-sync")).unwrap().count(),1);
+}
+
+#[test]
+fn cross_database_failure_reports_backup_and_complete_or_conditional_partial_recovery() {
+    for concurrent in [false, true] {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        write_provider_config(&home, "target");
+        let rollout = home.join("sessions/rollout-thread-1.jsonl");
+        write_rollout(&rollout, "openai", "thread-1", "C:/workspace");
+        let a = home.join("sqlite/a.db");
+        let b = home.join("sqlite/b.db");
+        create_state_db_with_providers(&a, &[("thread-1", "openai", 0)]);
+        create_state_db_with_providers(&b, &[("thread-1", "openai", 0)]);
+        Connection::open(&b).unwrap().execute_batch("CREATE TRIGGER fixture_abort BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        let result = run_provider_sync_with_target_and_progress(Some(&home), None, |progress| {
+            if concurrent && progress.phase == ProviderSyncProgressPhase::RollingBack {
+                Connection::open(&a)
+                    .unwrap()
+                    .execute("UPDATE threads SET model_provider='concurrent'", [])
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            result.status,
+            if concurrent {
+                ProviderSyncStatus::PartialFailure
+            } else {
+                ProviderSyncStatus::Failed
+            },
+            "{result:?}"
+        );
+        assert!(result.backup_dir.as_ref().unwrap().is_dir());
+        assert!(result.recovery_journal_path.as_ref().unwrap().is_file());
+        assert_eq!(
+            Connection::open(&a)
+                .unwrap()
+                .query_row("SELECT model_provider FROM threads LIMIT 1", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            if concurrent { "concurrent" } else { "openai" }
+        );
+        assert!(fs::read_to_string(&rollout).unwrap().contains("openai"));
+        if concurrent {
+            assert!(result.sqlite_rows_updated > 0);
+            assert!(!result.recovery_errors.is_empty());
+            let blocked = run_provider_sync(Some(&home));
+            assert_eq!(blocked.status, ProviderSyncStatus::PartialFailure);
+            assert_eq!(blocked.recovery_journal_path, result.recovery_journal_path);
+            let first = codex_plus_data::recover_provider_sync_from_backup(
+                &home,
+                result.backup_dir.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(!first.completed);
+            Connection::open(&a)
+                .unwrap()
+                .execute("UPDATE threads SET model_provider='target'", [])
+                .unwrap();
+            let recovered = codex_plus_data::recover_provider_sync_from_backup(
+                &home,
+                result.backup_dir.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(recovered.completed, "{recovered:?}");
+            assert!(codex_plus_data::pending_recovery_journal(&home).is_none());
+            let journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(recovered.recovery_journal_path).unwrap())
+                    .unwrap();
+            assert_eq!(journal["state"], "rolled_back");
+        } else {
+            assert_eq!(result.sqlite_rows_updated, 0);
+            assert!(result.recovery_errors.is_empty());
+            let recovered = codex_plus_data::recover_provider_sync_from_backup(
+                &home,
+                result.backup_dir.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(recovered.completed);
+        }
+    }
+}
+
 struct CodexHomeEnvGuard {
     previous: Option<OsString>,
 }
@@ -833,7 +935,7 @@ fn provider_sync_reports_rollback_when_rewrite_write_fails() {
         progress.push(event);
     });
 
-    assert_eq!(result.status, ProviderSyncStatus::Skipped);
+    assert_eq!(result.status, ProviderSyncStatus::Failed);
     assert_eq!(fs::read(&first_rollout).unwrap(), original_first_rollout);
     assert!(progress
         .iter()
@@ -886,7 +988,7 @@ fn provider_sync_continues_rollback_after_a_conflicted_rollout() {
     });
 
     assert!(conflicted);
-    assert_eq!(result.status, ProviderSyncStatus::Skipped);
+    assert_eq!(result.status, ProviderSyncStatus::PartialFailure);
     assert_eq!(fs::read(&first_rollout).unwrap(), original_first_rollout);
     assert_eq!(fs::read(&conflicted_rollout).unwrap(), external_contents);
     assert!(progress
@@ -1231,10 +1333,13 @@ fn provider_sync_writes_empty_session_meta_manifest_for_index_only_updates() {
 
     assert_eq!(result.status, ProviderSyncStatus::Synced);
     assert_eq!(result.changed_session_files, 0);
-    let backup_dir = result.backup_dir.expect("index-only sync still needs a backup");
-    let manifest: Vec<serde_json::Value> =
-        serde_json::from_str(&fs::read_to_string(backup_dir.join("session-meta-backup.json")).unwrap())
-            .unwrap();
+    let backup_dir = result
+        .backup_dir
+        .expect("index-only sync still needs a backup");
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(backup_dir.join("session-meta-backup.json")).unwrap(),
+    )
+    .unwrap();
     assert!(manifest.is_empty());
     let metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
@@ -1462,7 +1567,7 @@ fn provider_sync_audits_catalog_only_sessions_without_claiming_recovery() {
 }
 
 #[test]
-fn provider_sync_continues_when_repair_audit_backup_root_is_not_directory() {
+fn provider_sync_blocks_when_recovery_namespace_is_not_directory() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     let sqlite_dir = home.join("sqlite");
@@ -1482,10 +1587,12 @@ fn provider_sync_continues_when_repair_audit_backup_root_is_not_directory() {
 
     assert_eq!(
         result.status,
-        ProviderSyncStatus::Synced,
+        ProviderSyncStatus::PartialFailure,
         "{}",
         result.message
     );
+    assert_eq!(result.recovery_journal_path, Some(backup_root));
+    assert_eq!(result.changed_session_files,0);
     assert_eq!(result.sqlite_rows_updated, 0);
     assert_eq!(result.repair_audit.catalog_only_sessions, 0);
 }
@@ -2863,7 +2970,7 @@ fn provider_sync_backup_metadata_contains_reference_fields_and_managed_marker() 
     let metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
             .unwrap();
-    assert_eq!(metadata["version"], 1);
+    assert_eq!(metadata["version"], 2);
     assert_eq!(metadata["namespace"], "provider-sync");
     assert_eq!(metadata["codexHome"], home.to_string_lossy().to_string());
     assert_eq!(metadata["targetProvider"], "apigather");
@@ -3097,8 +3204,8 @@ fn provider_sync_restores_rollout_first_line_when_later_step_fails() {
 
     let result = run_provider_sync(Some(&home));
 
-    assert_eq!(result.status, ProviderSyncStatus::Skipped);
-    assert!(result.message.contains("Provider sync skipped"));
+    assert_eq!(result.status, ProviderSyncStatus::Failed);
+    assert!(result.message.contains("Provider sync failed"));
     assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
 }
 
@@ -3134,7 +3241,7 @@ fn provider_sync_rolls_back_sqlite_provider_update_when_later_update_fails() {
 
     let result = run_provider_sync(Some(&home));
 
-    assert_eq!(result.status, ProviderSyncStatus::Skipped);
+    assert_eq!(result.status, ProviderSyncStatus::Failed);
     let db = Connection::open(home.join("state_5.sqlite")).unwrap();
     let row = db
         .query_row(

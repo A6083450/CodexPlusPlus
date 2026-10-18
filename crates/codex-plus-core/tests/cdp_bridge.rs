@@ -15,7 +15,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -3201,24 +3201,6 @@ fn injection_script_loads_backend_settings_before_initial_scan() {
     assert!(script.contains("if (attempt < 60)"));
 }
 
-#[test]
-fn injection_script_loads_service_tier_after_startup_settings() {
-    // Given: service-tier controls are enabled before the renderer starts.
-    let script = assets::injection_script(57321);
-    let startup = script
-        .find("function loadBackendSettingsForStartup")
-        .expect("script should define the startup settings loader");
-    let startup_body = &script[startup
-        ..script[startup..]
-            .find("async function setBackendSetting")
-            .map(|offset| startup + offset)
-            .expect("startup settings loader should end before the settings writer")];
-
-    // When: backend settings finish loading successfully.
-    // Then: the service-tier state is loaded without requiring the menu to open.
-    assert!(startup_body.contains("codexPlusSettings().serviceTierControls"));
-    assert!(startup_body.contains("void loadCodexServiceTierState();"));
-}
 
 #[test]
 fn conversation_view_scope_regressions() {
@@ -3793,10 +3775,9 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"16\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"24\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
-    assert!(script.contains("querySelector?.(`[data-fast-mode-enabled]`)"));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3912,105 +3893,23 @@ if (existingContainerDefault.model !== hostModel) process.exit(10);
 }
 
 #[test]
-fn injection_script_exposes_fast_service_tier_control() {
+fn injection_script_retires_legacy_fast_controls_and_preserves_native_unlock() {
     let script = assets::injection_script(57321);
-
-    assert!(script.contains("default-service-tier"));
-    assert!(script.contains("setting-storage-"));
-    assert!(script.contains("codexAppAssetUrl"));
-    assert!(script.contains("codexThreadServiceTierOverrides"));
-    assert!(script.contains("setCodexThreadServiceTierMode"));
-    assert!(script.contains("codexServiceTierRequestOverride"));
-    assert!(script.contains("codexServiceTierSupportedFastModels"));
-    assert!(script.contains("\"gpt-5.4\""));
-    assert!(script.contains("\"gpt-5.5\""));
-    assert!(script.contains("\"gpt-5.6-sol\""));
-    assert!(script.contains("\"gpt-5.6-terra\""));
-    assert!(script.contains("\"gpt-5.6-luna\""));
-    assert!(script.contains("codexServiceTierFastSupportedForModel"));
-    assert!(script.contains("codexServiceTierModelForRequest"));
-    assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
-    assert!(script.contains("fastBlocked"));
-    assert!(script.contains("data-tier=\"unsupported\""));
-    assert!(script.contains("nextParams.service_tier = override.serviceTier"));
-    assert!(script.contains("serviceTierControls: false"));
-    assert!(script.contains("data-codex-plus-setting=\"serviceTierControls\""));
-    assert!(script.contains("data-codex-service-tier-controls"));
-    assert!(script.contains("removeCodexServiceTierBadges"));
-    assert!(script.contains("installCodexServiceTierDispatcherPatch"));
-    assert!(script.contains("codexServiceTierDispatcherPatchable"));
-    assert!(script.contains("dispatcher is a non-writable RPC stub"));
-    assert!(script.contains("Object.isExtensible(dispatcher)"));
-    assert!(script.contains("applyCodexServiceTierRequestOnly"));
-    assert!(script.contains("codexPlusServiceTierPrewarmThreadStart"));
-    assert!(script.contains("Object.isExtensible(client)"));
+    for retired in [
+        "data-codex-plus-setting=\"serviceTierControls\"",
+        "data-codex-service-tier-global-fast",
+        "toggleCodexServiceTierFromBadge",
+        "setCodexThreadServiceTierMode",
+        "applyCodexServiceTierRequestOnly",
+    ] {
+        assert!(!script.contains(retired), "retired legacy Fast behavior: {retired}");
+    }
+    assert!(script.contains("data-codex-plus-setting=\"nativeFastUnlock\""));
+    assert!(script.contains("__codexPlusNativeFastUnlock"));
+    assert!(script.contains("codexAppNativeFastUnlock"));
+    assert!(script.contains("serviceTiers"));
     assert!(script.contains("locateCodexAppServerClientBreakpoint"));
-    assert!(script.contains("installCodexAppServerClientCapture"));
-    assert!(script.contains("__codexPlusAppServerClientCapture"));
     assert!(script.contains("installCodexAppServerClientPrototypePatch"));
-    assert!(script.contains("__codexPlusAppServerClientClass"));
-    assert!(script.contains("app_server_client_prototype_patch_installed"));
-    assert!(script.contains("服务模式"));
-    assert!(script.contains("data-codex-service-tier-status"));
-    assert!(script.contains("data-codex-service-tier-inherit"));
-    assert!(script.contains("data-codex-service-tier-standard"));
-    assert!(script.contains("data-codex-service-tier-fast"));
-    assert!(script.contains("data-codex-service-tier-custom"));
-    assert!(script.contains("data-codex-service-tier-thread-inherit"));
-    assert!(script.contains("data-codex-service-tier-thread-standard"));
-    assert!(script.contains("data-codex-service-tier-thread-fast"));
-    assert!(script.contains("global-standard"));
-    assert!(script.contains("global-fast"));
-    assert!(script.contains("defaultMode"));
-    assert!(script.contains("codexServiceTierEffectiveThreadMode"));
-    assert!(script.contains("codexServiceTierDefaultModeForControlMode"));
-    assert!(script.contains("normalizeCodexServiceTierControlMode(state.mode) !== \"custom\""));
-    assert!(script.contains("state.draft = null"));
-    assert!(script.contains("后端未连接，无法切换服务模式"));
-    assert!(script.contains("未连接"));
-    assert!(script.contains("thread/start"));
-    assert!(script.contains("thread/resume"));
-    assert!(script.contains("turn/start"));
-    assert!(script.contains("send-cli-request-for-host"));
-    assert!(script.contains("start-conversation"));
-    assert!(script.contains("applyCodexServiceTierRequestOverride(\"thread/start\", message)"));
-    assert!(script.contains("codex-service-tier-badge"));
-    assert!(script.contains("installCodexServiceTierBadge"));
-    assert!(script.contains("toggleCodexServiceTierFromBadge"));
-    assert!(script.contains("wireCodexServiceTierBadge"));
-    assert!(script.contains("codexServiceTierBadgePlacement"));
-    assert!(script.contains("codexServiceTierBadgeFooterGroup"));
-    assert!(script.contains("codexServiceTierFindComposerEl"));
-    assert!(script.contains("codexServiceTierVisibleComposerFooters"));
-    assert!(script.contains("codexServiceTierBestComposerFooter"));
-    assert!(script.contains("codexServiceTierComposerCandidates"));
-    assert!(script.contains("codexServiceTierComposerScore"));
-    assert!(script.contains("data-codex-service-tier-badge"));
-    assert!(script.contains("codexServiceTierBadgeWired"));
-    assert!(script.contains("setAttribute(\"role\", \"button\")"));
-    assert!(script.contains("setAttribute(\"tabindex\", \"0\")"));
-    assert!(script.contains("继承 Codex 默认设置"));
-    assert!(script.contains("继承 config.toml"));
-    assert!(script.contains("serviceTierInheritSourceLabel"));
-    assert!(script.contains("resolveInheritedServiceTier"));
-    assert!(script.contains("getConfigTomlServiceTier"));
-    assert!(script.contains("catalog.service_tier"));
-    assert!(script.contains("service_tier=\\\"priority\\\""));
-    assert!(script.contains("Fast 仅支持"));
-    assert!(script.contains("当前 thread"));
-    assert!(script.contains("standard"));
-    assert!(script.contains("fast"));
-    assert!(script.contains("[\"setting-storage-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"setting-storage-\", \"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("codexSettingStorageFromModule"));
-    assert!(script.contains("codexStateApiFromModule"));
-    assert!(script.contains("message.type === \"fetch\""));
-    assert!(script.contains("vscode://codex/"));
-    assert!(script.contains("./(?:assets/)?"));
-    assert!(script.contains("dispatcher export unavailable"));
-    assert!(!script.contains("data-codex-max-reasoning-control"));
-    assert!(!script.contains("codexAppMaxReasoningOverride"));
 }
 
 #[test]
@@ -4060,122 +3959,8 @@ fn injection_script_discovers_dispatcher_by_runtime_shape_when_named_assets_are_
     assert!(script.contains("runtime-scan:"));
 }
 
-#[test]
-fn injection_script_supports_css_module_composer_footer() {
-    // Given: a Codex App build whose composer footer uses a CSS-module class.
-    let script = assets::injection_script(57321);
 
-    // When: Codex++ builds its service-tier badge locator.
-    // Then: it can find a visible footer through the live contenteditable composer.
-    assert!(script.contains("[class*='_footer_']"));
-    assert!(script.contains("[contenteditable='true']"));
-}
 
-#[test]
-fn injection_script_uses_native_fast_indicator_beside_model_name() {
-    let script = assets::injection_script(57321);
-    let scan = script
-        .find("function scanDeferred")
-        .expect("script should define the deferred scan");
-    let scan_body = &script[scan..script[scan..]
-        .find("function runScanStep")
-        .map(|offset| scan + offset)
-        .expect("deferred scan should end before its wrapper")];
-
-    assert!(scan_body.contains("removeCodexServiceTierBadges();"));
-    assert!(!scan_body.contains("installCodexServiceTierBadge();"));
-    assert!(scan_body.contains("syncCodexNativeServiceTierPicker();"));
-    assert!(script.contains("function syncCodexNativeServiceTierPicker"));
-    assert!(script.contains("updateQueue?.memoCache?.data"));
-    assert!(script.contains("isServiceTierAllowed"));
-    assert!(script.contains("selectedServiceTier"));
-    assert!(script.contains("serviceTierForRequest"));
-    assert!(script.contains("codexServiceTierForceNativePickerRefresh"));
-    assert!(script.contains("installCodexNativeServiceTierSelectionSync"));
-    assert!(script.contains("codexNativeServiceTierModeFromMenuItem"));
-    assert!(script.contains("label === candidate || label.startsWith(candidate)"));
-    assert!(script.contains("syncCodexNativeSolidFastIcon"));
-    assert!(script.contains("data-codex-service-tier-icon=\"solid\""));
-
-    let icon_sync = script
-        .find("function syncCodexNativeSolidFastIcon")
-        .expect("script should define the native Fast icon synchronizer");
-    let icon_sync_body = &script[icon_sync
-        ..script[icon_sync..]
-            .find("function codexNativeServiceTierMemoValues")
-            .map(|offset| icon_sync + offset)
-            .expect("icon synchronizer should end before the native memo helper")];
-    assert!(icon_sync_body.contains("patchCodexNativeSolidFastIcon"));
-    assert!(!icon_sync_body.contains("codexServiceTierState.effectiveMode"));
-}
-
-#[test]
-fn injection_script_places_service_tier_control_in_native_model_menu() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("installCodexServiceTierMenu"));
-    assert!(script.contains("data-codex-service-tier-menu-trigger"));
-    assert!(script.contains("data-codex-service-tier-menu-content"));
-    assert!(script.contains("data-model-picker-model-row"));
-    assert!(script.contains("速度"));
-    assert!(script.contains("默认速度"));
-    assert!(script.contains("1.5 倍速度，用量更多"));
-    assert!(
-        script
-            .contains("setCodexServiceTierModeFromMenu(mode, selectionContext, selectionRevision)")
-    );
-    assert!(script.contains("menuitemradio"));
-    assert!(script.contains("aria-checked"));
-    assert!(script.contains("aria-activedescendant"));
-    assert!(script.contains("__codexServiceTierMenuKeyboardVersion"));
-    assert!(script.contains("event.stopImmediatePropagation()"));
-    assert!(script.contains("codexServiceTierMenuFocusOption"));
-    assert!(script.contains("ArrowDown"));
-    assert!(script.contains("ArrowUp"));
-    assert!(script.contains("event.key === \"Home\""));
-    assert!(script.contains("event.key === \"End\""));
-    assert!(script.contains("cursor-not-allowed opacity-50"));
-    assert!(script.contains("ensureCodexServiceTierMenuBackendReady"));
-    assert!(script.contains("codexServiceTierMenuContext"));
-    assert!(script.contains("selectionRevision !== codexServiceTierMenuSelectionRevision"));
-    assert!(script.contains("++codexServiceTierMenuSelectionRevision"));
-    assert!(script.contains("任务已切换，请在当前任务重新选择服务模式"));
-    assert!(script.contains("content.contains(activeOption) ? activeOption : fallbackOption"));
-    assert!(script.contains("watchCodexServiceTierMenuLifecycle"));
-    assert!(script.contains("parentMenu.isConnected"));
-
-    let relevance = script
-        .find("function scanRelevantSelector")
-        .expect("script should define scan relevance");
-    let relevance_body = &script[relevance
-        ..script[relevance..]
-            .find("function nodeSelfOrAncestorMatchesScanRelevance")
-            .map(|offset| relevance + offset)
-            .expect("scan relevance should end before the node matcher")];
-    assert!(relevance_body.contains("[data-model-picker-model-row]"));
-
-    let backend_check = script
-        .find("async function ensureCodexServiceTierMenuBackendReady")
-        .expect("script should define the live backend check");
-    let backend_check_body = &script[backend_check
-        ..script[backend_check..]
-            .find("function codexServiceTierMenuContext")
-            .map(|offset| backend_check + offset)
-            .expect("backend check should end before the menu context helper")];
-    assert!(backend_check_body.contains("postJson(\"/backend/status\", {})"));
-    assert!(!backend_check_body.contains("status === \"ok\") return true"));
-
-    let scan = script
-        .find("function scanDeferred")
-        .expect("script should define the deferred scan");
-    let scan_body = &script[scan..script[scan..]
-        .find("function runScanStep")
-        .map(|offset| scan + offset)
-        .expect("deferred scan should end before its wrapper")];
-    assert!(scan_body.contains("installCodexServiceTierMenu();"));
-    assert!(scan_body.contains("removeCodexServiceTierBadges();"));
-    assert!(scan_body.contains("syncCodexNativeServiceTierPicker();"));
-}
 
 #[test]
 fn desktop_image_feature_defaults_respect_direct_image_profile() {
@@ -4220,49 +4005,6 @@ assert.equal(remote.settings.readDefaultFeatureOverrides(), defaults);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
-#[test]
-fn injection_script_excludes_chat_reasoning_only_speed_menu() {
-    let script = assets::injection_script(57321);
-    let start = script
-        .find("  function codexServiceTierMenuModelCandidates()")
-        .unwrap();
-    let end = script[start..]
-        .find("  function codexServiceTierNativeSpeedRow(")
-        .unwrap()
-        + start;
-    let harness = format!(
-        r#"
-const assert = require('node:assert/strict');
-let effortOnly = true;
-const chatRow = {{
-  textContent: '即时',
-  getAttribute: () => null,
-  querySelector: (selector) => selector === '[data-effort-only="true"]' && effortOnly ? {{}} : null,
-}};
-const workRow = {{ textContent: 'GPT-6 Ultra', getAttribute: () => null, querySelector: () => null }};
-const imageRow = {{ textContent: 'GPT-Image-2 高', getAttribute: () => null, querySelector: () => null }};
-const document = {{ querySelectorAll: () => [chatRow, workRow, imageRow] }};
-const codexServiceTierSemanticModelMenuRowSelector = () => '[data-model-picker-view-toggle="true"]';
-{}
-assert.deepEqual(codexServiceTierMenuModelCandidates(), [workRow]);
-chatRow.textContent = 'Instant';
-assert.deepEqual(codexServiceTierMenuModelCandidates(), [workRow]);
-effortOnly = false;
-chatRow.textContent = 'DeepSeek';
-assert.deepEqual(codexServiceTierMenuModelCandidates(), [chatRow, workRow]);
-"#,
-        &script[start..end]
-    );
-    let output = std::process::Command::new("node")
-        .args(["-e", &harness])
-        .output()
-        .expect("node should run the renderer regression check");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 #[test]
 fn injection_script_anchors_floating_menu_before_open_location_button() {
@@ -4273,82 +4015,14 @@ fn injection_script_anchors_floating_menu_before_open_location_button() {
     assert!(script.contains("if (isCodexHeaderOpenLocationButton(button)) return true;"));
 }
 
-#[test]
-fn injection_script_falls_back_when_legacy_service_tier_state_api_is_absent() {
-    // Given: a Codex App build without the legacy setting-storage and vscode-api assets.
-    let script = assets::injection_script(57321);
 
-    // When: Codex++ reads the inherited service tier.
-    // Then: missing legacy assets resolve to the declared default instead of a failed control.
-    assert!(script.contains("message.includes(`未找到 Codex App asset:`)"));
-    assert!(script.contains("return codexDefaultServiceTierSetting.default;"));
-}
 
-#[test]
-fn injection_script_bounds_service_tier_state_read_time() {
-    let script = assets::injection_script(57321);
-    let loader = script
-        .find("async function loadCodexServiceTierState")
-        .expect("script should define the service-tier state loader");
-    let loader_body = &script[loader
-        ..script[loader..]
-            .find("function setCodexThreadServiceTierMode")
-            .map(|offset| loader + offset)
-            .expect("state loader should end before the thread-mode setter")];
 
-    assert!(script.contains("codexServiceTierReadTimeoutMs"));
-    assert!(loader_body.contains("Promise.race"));
-    assert!(loader_body.contains("codexDefaultServiceTierSetting.default"));
-}
 
-#[test]
-fn native_service_tier_selection_does_not_reload_inherited_default() {
-    let script = assets::injection_script(57321);
-    let sync = script
-        .find("function syncCodexServiceTierFromNativeSelection")
-        .expect("script should synchronize native service-tier selections");
-    let sync_body = &script[sync..script[sync..]
-        .find("function installCodexNativeServiceTierSelectionSync")
-        .map(|offset| sync + offset)
-        .expect("native selection synchronization should end before its listener")];
-
-    assert!(sync_body.contains("writeThreadServiceTierState(state)"));
-    assert!(
-        !sync_body.contains("loadCodexServiceTierState"),
-        "a native Standard selection must not be overwritten by the inherited Fast default"
-    );
-}
-
-#[test]
-fn native_fast_toggle_survives_settings_update_and_turn_start() {
-    let cases = run_service_tier_contract_harness();
-    assert_eq!(cases["nativeCheckboxEnable"], "fast");
-    assert_eq!(cases["nativeCheckboxDisable"], "standard");
-    assert_eq!(cases["nativeFastSettings"]["serviceTier"], "priority");
-    assert_eq!(cases["nativeFastTurn"]["serviceTierForTurn"], "priority");
-    assert_eq!(cases["nativeStandardTurn"]["serviceTierForTurn"], "default");
-    assert_eq!(cases["nativeCapturedSelection"]["mode"], "global-fast");
-    assert_eq!(cases["nativeKeyboardSelection"]["mode"], "global-standard");
-    let script = assets::injection_script(57321);
-    let listener = script.split("function installCodexNativeServiceTierSelectionSync").nth(1).unwrap();
-    assert!(listener.split("const codexServiceTierMenuVersion").next().unwrap().contains("[role=\"menuitemcheckbox\"]"));
-}
-
-#[test]
-fn custom_service_tier_does_not_carry_a_hidden_global_fast_default() {
-    let cases = run_service_tier_contract_harness();
-    assert_eq!(cases["customLegacyDefaultMode"], "inherit");
-    for request in cases["customUnselectedRequests"].as_array().unwrap() {
-        assert!(request["serviceTier"].is_null());
-        assert_eq!(request["serviceTierForTurn"], "default");
-    }
-    assert_eq!(cases["customExplicitFast"]["serviceTier"], "priority");
-    assert!(cases["customExplicitStandard"]["serviceTier"].is_null());
-}
 
 #[test]
 fn native_context_reload_precedes_requests_and_restores_only_idle_usage() {
-    let cases = run_service_tier_contract_harness();
+    let cases = run_native_tier_and_provider_contract_harness();
     assert_eq!(cases["nativeContextCalls"], json!(["cache/sync", "model/list", "turn/start", "cache/sync", "model/list", "thread/settings/update"]));
     assert_eq!(cases["restoredContextWindow"], 1_000_000);
     assert_eq!(cases["restoredUsedTokens"], 226_307);
@@ -4393,66 +4067,17 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
 }
 
 #[test]
-fn injection_script_applies_fast_service_tier_contract() {
-    let cases = run_service_tier_contract_harness();
+fn injection_script_preserves_native_tiers_and_shared_provider_contracts() {
+    let cases = run_native_tier_and_provider_contract_harness();
 
-    assert_eq!(cases["supportedFast"]["serviceTier"], "priority");
-    assert_eq!(cases["supportedFast"]["service_tier"], "priority");
-
-    assert_eq!(
-        cases["unsupportedModel"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["unsupportedModel"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["turnWithoutModel"]["serviceTier"], "priority");
-    assert_eq!(cases["turnWithoutModelDiagnosticModel"], "gpt-5.4");
-
-    assert_eq!(
-        cases["customInheritUnsupported"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["customInheritUnsupported"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["inheritUnsetStatus"], "继承 Codex 默认设置：默认");
-    assert_eq!(cases["inheritFastStatus"], "继承 Codex 默认设置：fast");
-    assert_eq!(
-        cases["inheritStandardStatus"],
-        "继承 Codex 默认设置：standard"
-    );
-    assert_eq!(
-        cases["inheritConfigTomlFastStatus"],
-        "继承 config.toml：fast"
-    );
-    assert_eq!(cases["resolvedConfigTomlTier"]["configServiceTier"], "fast");
-    assert_eq!(
-        cases["resolvedConfigTomlTier"]["serviceTierSource"],
-        "config-toml"
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["configServiceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["serviceTierSource"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+    // 旧浏览器开关和线程模式残留不能再注入或剥离原生 service tier。
+    assert_eq!(cases["withoutNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["withoutNativeTier"]["service_tier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["service_tier"], "priority");
+    assert_eq!(cases["threadOnlyRequest"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeSnakeTier"]["service_tier"], "priority");
+    assert_eq!(cases["startConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["explicitProjectStartConversation"]["workspaceKind"],
         "project"
@@ -4472,55 +4097,16 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert!(cases["projectlessStartConversation"]
         .get("projectAssignment")
         .is_none());
-    assert_eq!(cases["fetchStartConversation"]["serviceTier"], "priority");
+    assert_eq!(cases["fetchStartConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["serviceTier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["service_tier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(cases["solFastAvailability"]["supported"], true);
-    assert_eq!(
-        cases["solFastDescriptor"]["additionalSpeedTiers"],
-        json!(["fast"])
-    );
-    assert_eq!(
-        cases["solFastDescriptor"]["serviceTiers"][0]["id"],
-        "priority"
-    );
-    assert_eq!(
-        cases["existingSolDescriptor"]["serviceTiers"][0]["id"],
-        "priority"
-    );
-    assert_eq!(
-        cases["modelListResult"]["data"][0]["serviceTiers"][0]["id"],
-        "priority"
-    );
-    for model in [
-        "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
-    ] {
-        assert_eq!(
-            cases["missingNativeTiers"][model]["created"][0]["id"], "priority", "{model}"
-        );
-        assert_eq!(
-            cases["missingNativeTiers"][model]["patched"][0]["id"], "priority", "{model}"
-        );
-        assert_eq!(cases["missingNativeTiers"][model]["changedAgain"], false, "{model}");
-    }
-    assert_eq!(cases["preservedNativeTiers"][1]["id"], "ultrafast");
-    assert_eq!(cases["preservedNativeTiers"][0]["description"], "Native priority");
-    assert_eq!(cases["unknownModelTiers"], serde_json::json!([]));
-    assert_eq!(cases["nativeMultiSpeedRowDetected"], true);
-    for model in ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6.1-sol"] {
-        assert_eq!(cases["nativeModelsOutsideCatalog"][model][0]["id"], "priority", "{model}");
-        assert_eq!(cases["nativeQueryOutsideCatalog"][model][0]["id"], "priority", "{model}");
-    }
-    assert_eq!(cases["nativeModelsOutsideCatalog"]["unknown-model"], serde_json::json!([]));
-    assert_eq!(cases["outsideCatalogMetadataPreserved"], true);
-    assert_eq!(cases["speedControlsDisabledTiers"], serde_json::json!([]));
-
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
     assert_eq!(
         cases["solDescriptor"]["supportedReasoningEfforts"][4]["reasoningEffort"],
@@ -4532,7 +4118,6 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
     for slug in ["gpt-6-sol", "gpt-6-luna"] {
         let case = &cases["gpt6NewModels"][slug];
-        assert_eq!(case["fast"]["supported"], true, "{slug}");
         assert_eq!(case["changedAgain"], false, "{slug}");
         assert_eq!(case["descriptor"]["defaultReasoningEffort"], "medium", "{slug}");
         assert_eq!(case["descriptor"]["multiAgentVersion"], "v2");
@@ -4543,7 +4128,6 @@ fn injection_script_applies_fast_service_tier_contract() {
             vec!["low", "medium", "high", "xhigh", "max", "ultra"]);
         assert_eq!(levels[5]["description"], "Native automatic delegation");
     }
-    assert_eq!(cases["astraFastAvailability"]["supported"], true);
     assert_eq!(cases["astraDescriptor"]["defaultReasoningEffort"], "medium");
     assert_eq!(
         cases["astraDescriptor"]["supportedReasoningEfforts"]
@@ -4553,10 +4137,6 @@ fn injection_script_applies_fast_service_tier_contract() {
             .map(|entry| entry["reasoningEffort"].as_str().unwrap())
             .collect::<Vec<_>>(),
         ["low", "medium", "high", "xhigh", "max", "ultra"]
-    );
-    assert_eq!(
-        cases["astraDescriptor"]["serviceTiers"][0]["id"],
-        "priority"
     );
     assert_eq!(
         cases["astraDescriptor"]["inputModalities"],
@@ -4580,55 +4160,17 @@ fn injection_script_applies_fast_service_tier_contract() {
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(
-        cases["astraQueryDescriptor"]["serviceTiers"][0]["id"],
-        "priority"
-    );
-    assert_eq!(
         cases["astraQueryDescriptor"]["inputModalities"],
         json!(["text", "image"])
     );
     assert_eq!(cases["reactRuntimeQueryClientFound"], true);
     assert_eq!(cases["reactRuntimeRequestClientFound"], true);
-    assert_eq!(cases["nativeFastRowDetected"], true);
-    assert_eq!(cases["dispatcherFromSingleton"], true);
-    assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
-    assert_eq!(cases["dispatcherFromClass"], true);
-    assert_eq!(cases["nativeAuthRefresh"]["selectedAuthDispatch"], true);
-    assert_eq!(cases["nativeAuthRefresh"]["unrelatedDispatchCalls"], 0);
-    assert_eq!(cases["nativeAuthRefresh"]["authMethod"], "apikey");
-    assert_eq!(cases["nativeAuthRefresh"]["sameReference"], false);
-    assert_eq!(
-        cases["reactFiberKeys"],
-        json!(["__reactFiber$test", "__reactProps$test"])
-    );
-    assert_eq!(cases["semanticModelMenuRowFound"], true);
-    assert_eq!(cases["currentModelMenuRowFound"], true);
-    assert_eq!(cases["solidFastIcon"]["patched"], true);
-    assert_eq!(cases["solidFastIcon"]["viewBox"], "0 0 24 24");
-    assert_eq!(cases["solidFastIcon"]["marker"], "solid");
-    assert_eq!(cases["solidFastIcon"]["fill"], "currentColor");
-    assert_eq!(cases["solidFastIcon"]["solidPath"], true);
-    assert_eq!(cases["unrelatedFastIconPatched"], false);
-    assert_eq!(cases["nativeSelectionStandard"]["mode"], "global-standard");
-    assert_eq!(cases["nativeSelectionStandard"]["defaultMode"], "standard");
-    assert_eq!(cases["nativeSelectionStandardGuard"]["mode"], "standard");
-    assert_eq!(cases["nativeSelectionStandardGuard"]["active"], true);
-    assert_eq!(cases["nativeSelectionFast"]["mode"], "global-fast");
-    assert_eq!(cases["nativeSelectionFast"]["defaultMode"], "fast");
-    assert_eq!(cases["nestedNativeMenuStandard"], "standard");
-    assert_eq!(cases["nestedNativeMenuFast"], "fast");
-    assert_eq!(cases["legacySettingStorage"], true);
-    assert_eq!(cases["currentSettingStorage"], true);
-    assert_eq!(cases["capabilitySettingStorage"], true);
-    assert_eq!(cases["legacyStateApi"], true);
-    assert_eq!(cases["currentStateApi"], true);
     assert_eq!(cases["currentHeaderFound"], true);
     assert_eq!(cases["panelHeaderRejected"], true);
     assert_eq!(cases["textOnlyOpenLocationRecognized"], true);
     assert_eq!(cases["floatingMenuRightBoundary"], 1568.0);
     assert_eq!(cases["nativeMenuInsertionWithExternalStatus"], true);
     assert_eq!(cases["currentHeaderMountSchedulesScan"], true);
-    assert_eq!(cases["composerFastIconReplacementSchedulesScan"], true);
     assert_eq!(cases["delayedNativeMenuRetryAvailable"], true);
     assert_eq!(cases["delayedNativeMenuRetryScheduled"], true);
     assert_eq!(cases["delayedNativeMenuHiddenWhileWaiting"], true);
@@ -4641,12 +4183,21 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["conversationViewInitialFrameBudget"], 2);
     assert_eq!(cases["conversationViewResizeFrameBudget"], 1);
     assert_eq!(cases["conversationViewPollFrameBudget"], 1);
+    assert_eq!(cases["dispatcherFromSingleton"], true);
+    assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
+    assert_eq!(cases["dispatcherFromClass"], true);
+    assert_eq!(cases["legacySettingStorage"], true);
+    assert_eq!(cases["currentSettingStorage"], true);
+    assert_eq!(cases["capabilitySettingStorage"], true);
+    assert_eq!(cases["legacyStateApi"], true);
+    assert_eq!(cases["currentStateApi"], true);
     assert_eq!(cases["appServerParamsUnchanged"], true);
     assert_eq!(cases["appServerProjectlessParamsUnchanged"], true);
     assert_eq!(cases["appServerSentCount"], 7);
     assert_eq!(cases["serviceTierClientPatched"], true);
     assert_eq!(cases["serviceTierClientSendTier"], "priority");
     assert_eq!(cases["serviceTierClientPrewarmTier"], "priority");
+    assert_eq!(cases["retiredClientPatchReplaced"], true);
     assert_eq!(cases["frozenClientPatchSkipped"], true);
     assert_eq!(cases["captureLine"], 1);
     assert_eq!(cases["captureColumn"], 24);
@@ -4663,7 +4214,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["providerFromOtherUnchanged"], true);
     assert_eq!(cases["nonThreadProviderUnchanged"], true);
     assert_eq!(
-        cases["providerWithServiceTierControlsDisabled"]["modelProvider"],
+        cases["providerWithLegacyControlsIgnored"]["modelProvider"],
         "vendor_alpha"
     );
     assert_eq!(cases["appServerProviderOverride"], "vendor_alpha");
@@ -4770,37 +4321,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["globalStatsigWithoutHostPreserved"], true);
 }
 
-#[test]
-fn injection_script_handles_irrelevant_mutations_without_runtime_errors() {
-    let cases = run_service_tier_contract_harness();
-
-    assert_eq!(cases["irrelevantMutationScanSucceeded"], true);
-}
-
-#[test]
-fn injected_service_tier_submenu_uses_an_opaque_background() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("px-1 py-1 bg-token-dropdown-background text-token-foreground"));
-    assert!(!script.contains("px-1 py-1 bg-token-dropdown-background/90 text-token-foreground"));
-    assert!(!script.contains("shadow-xl-spread backdrop-blur-sm w-[233px]"));
-}
-
-#[test]
-fn injection_script_places_menu_in_home_header_action_slot() {
-    let cases = run_service_tier_contract_harness();
-
-    assert_eq!(cases["homeHeaderInsertionUsesActionSlot"], true);
-}
-
-#[test]
-fn injection_script_normalizes_logical_direction_group_classes() {
-    let cases = run_service_tier_contract_harness();
-
-    assert_eq!(cases["logicalDirectionGroupClassesNormalized"], true);
-}
-
-fn run_service_tier_contract_harness() -> serde_json::Value {
+fn run_native_tier_and_provider_contract_harness() -> serde_json::Value {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("renderer-inject.js");
     let harness_path = temp.path().join("service-tier-harness.cjs");
@@ -4812,10 +4333,8 @@ fn run_service_tier_contract_harness() -> serde_json::Value {
         r#"
 const scriptPath = {script_path};
 const store = new Map();
-store.set("codexPlusSettings", JSON.stringify({{
-  serviceTierControls: true,
-  nativeMenuPlacement: true,
-}}));
+store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true, nativeMenuPlacement: true }}));
+store.set("codexThreadServiceTierOverrides", JSON.stringify({{ version: "1", mode: "global-fast", defaultMode: "fast", entries: {{}} }}));
 function node() {{
   return {{
     appendChild() {{}},
@@ -4876,132 +4395,31 @@ const logicalDirectionGroupClassesNormalized =
     .some((name) => normalizedLogicalDirectionClasses.has(name))
   && ["native", "gap-1", "rounded-full", "border-l", "px-2"]
     .every((name) => normalizedLogicalDirectionClasses.has(name));
-const reactFiberKeys = api.reactFiberKeys({{
-  "__reactFiber$test": {{}},
-  "__reactProps$test": {{}},
-  ordinary: {{}},
-}});
-const semanticModelMenuRow = {{ ariaLabel: "模型 5.6 Sol" }};
-document.querySelectorAll = (selector) => selector.includes('[aria-label^="模型 "]')
-  ? [semanticModelMenuRow]
-  : [];
-const semanticModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(semanticModelMenuRow);
-const currentModelMenuRow = {{ current: true }};
-document.querySelectorAll = (selector) => selector.includes('[data-model-picker-view-toggle="true"]')
-  ? [currentModelMenuRow]
-  : [];
-const currentModelMenuRowFound = api.serviceTierMenuModelCandidates().includes(currentModelMenuRow);
-document.querySelectorAll = () => [];
-const svgNode = (pathData) => {{
-  const attributes = new Map([["viewBox", "0 0 20 20"]]);
-  const pathAttributes = new Map([["d", pathData], ["fill", "currentColor"]]);
-  const path = {{
-    getAttribute: (name) => pathAttributes.get(name) ?? null,
-    setAttribute: (name, value) => pathAttributes.set(name, String(value)),
-  }};
-  return {{
-    dataset: {{}},
-    getAttribute: (name) => attributes.get(name) ?? null,
-    setAttribute: (name, value) => attributes.set(name, String(value)),
-    querySelector: (selector) => selector === "path" ? path : null,
-    snapshot: () => ({{
-      viewBox: attributes.get("viewBox"),
-      marker: attributes.get("data-codex-service-tier-icon"),
-      fill: pathAttributes.get("fill"),
-      path: pathAttributes.get("d"),
-    }}),
-  }};
-}};
-const outlineFastSvg = svgNode("M9.80999 17.8302 outline-fast-icon");
-const solidFastIconPatched = typeof api.patchNativeFastIcon === "function"
-  ? api.patchNativeFastIcon(outlineFastSvg)
-  : false;
-const solidFastIconSnapshot = outlineFastSvg.snapshot();
-const solidFastIcon = {{
-  patched: solidFastIconPatched,
-  viewBox: solidFastIconSnapshot.viewBox,
-  marker: solidFastIconSnapshot.marker,
-  fill: solidFastIconSnapshot.fill,
-  solidPath: solidFastIconSnapshot.path?.startsWith("M11.9125 21.4125") || false,
-}};
-const unrelatedFastIconPatched = typeof api.patchNativeFastIcon === "function"
-  ? api.patchNativeFastIcon(svgNode("M0 0 unrelated-icon"))
-  : false;
-api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
-api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
-const inheritUnsetStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: null,
-}});
-const inheritFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "priority",
-}});
-const inheritStandardStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: "standard",
-}});
-const inheritConfigTomlFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "fast",
-  serviceTierSource: "config-toml",
-}});
-
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
-const supportedFast = api.applyServiceTierOverride("turn/start", {{
+const withoutNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-5.4",
   service_tier: null,
 }}, "conv-should-not-be-model");
 
-const unsupportedModel = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-4.1",
   service_tier: "priority",
 }}, "conv-should-not-be-model");
 
-const turnWithoutModel = api.applyServiceTierOverride("turn/start", {{
+const threadOnlyRequest = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: null,
 }}, "conversation-should-not-be-model");
-const turnWithoutModelDiagnosticModel = api.diagnostics().at(-1)?.detail?.model;
-
-api.setThreadState({{ mode: "custom", defaultMode: "fast", entries: {{
-  "thread-explicit-fast": {{ mode: "fast", at: Date.now() }},
-  "thread-explicit-standard": {{ mode: "standard", at: Date.now() }},
-}} }});
-const customLegacyDefaultMode = api.threadState().defaultMode;
-const customUnselectedRequests = ["thread/start", "thread/resume", "turn/start"].map(method =>
-  api.applyServiceTierOverride(method, {{
-    threadId: "thread-unselected", model: "gpt-5.4", serviceTier: null, serviceTierForTurn: "default",
-  }})
-);
-const customExplicitFast = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-explicit-fast", model: "gpt-5.4", serviceTier: null }});
-const customExplicitStandard = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-explicit-standard", model: "gpt-5.4", serviceTier: "priority" }});
 
 api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "custom", defaultMode: "inherit", entries: {{}}, draft: {{ mode: "inherit", at: Date.now() }} }});
-api.setServiceTierState({{ serviceTier: "priority" }});
-const customInheritUnsupported = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeSnakeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: "priority",
 }}, "");
 
 api.setModelCatalog({{ status: "ok", model: "gpt-5.5", default_model: "gpt-5.5", models: ["gpt-5.5"] }});
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 const startConversation = api.requestOverride({{
   type: "start-conversation",
   threadId: "thread-12345678",
@@ -5067,12 +4485,6 @@ api.setModelCatalog({{
   }},
 }});
 const solFastAvailability = api.fastAvailability("gpt-5.6-sol");
-const solFastDescriptor = api.modelDescriptor("gpt-5.6-sol");
-const existingSolDescriptor = {{ model: "gpt-5.6-sol", serviceTiers: [] }};
-api.applyModelMetadata(existingSolDescriptor, "gpt-5.6-sol");
-const modelListResult = api.patchAppServerResult("model/list", {{
-  data: [{{ model: "gpt-5.6-sol", serviceTiers: [] }}],
-}});
 api.setModelCatalog({{
   status: "ok",
   model: "gpt-5.6-sol",
@@ -5088,66 +4500,6 @@ api.setModelCatalog({{
   }},
 }});
 const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
-const missingNativeTiers = {{}};
-for (const model of ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {{
-  const descriptor = {{ model, serviceTiers: [], additionalSpeedTiers: [] }};
-  api.applyModelMetadata(descriptor, model);
-  missingNativeTiers[model] = {{
-    created: api.modelDescriptor(model).serviceTiers,
-    patched: descriptor.serviceTiers,
-    changedAgain: api.applyModelMetadata(descriptor, model),
-  }};
-}}
-api.setModelCatalog({{
-  modelMetadata: {{ "gpt-5.6-sol": {{ serviceTiers: [{{ id: "priority", name: "Fallback Fast" }}] }} }},
-}});
-const nativeSpeedDescriptor = {{ model: "gpt-5.6-sol", serviceTiers: [
-  {{ id: "priority", name: "Fast", description: "Native priority" }},
-  {{ id: "ultrafast", name: "Ultrafast" }},
-] }};
-api.applyModelMetadata(nativeSpeedDescriptor, "gpt-5.6-sol");
-const preservedNativeTiers = nativeSpeedDescriptor.serviceTiers;
-const unknownModelTiers = api.modelDescriptor("unknown-model").serviceTiers;
-const nativeMultiSpeedRowDetected = !!api.nativeSpeedRow({{
-  querySelector: (selector) => selector === '[data-fast-mode-enabled]' ? {{ tagName: "SPAN" }} : null,
-}}, []);
-
-api.setModelCatalog({{
-  status: "ok",
-  model: "gpt-6-astra",
-  default_model: "gpt-6-astra",
-  models: ["gpt-6-astra"],
-  modelMetadata: {{
-    "gpt-6-astra": {{
-      displayName: "GPT-6-Astra",
-      description: "Frontier coding model.",
-      defaultReasoningEffort: "medium",
-      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map((reasoningEffort) => ({{ reasoningEffort }})),
-      inputModalities: ["text", "image"],
-      supportsImageDetailOriginal: true,
-      additionalSpeedTiers: [],
-      serviceTiers: [{{ id: "priority", name: "Fast" }}],
-    }},
-  }},
-}});
-// 启动目录仅含 GPT-6，原生 model/list 还包含 GPT-5.5/5.6；必须走真实列表补丁。
-const nativeRowsOutsideCatalog = ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6.1-sol", "unknown-model"]
-  .map(model => ({{ model, serviceTiers: [], hidden: true, defaultReasoningEffort: "high" }}));
-const nativeListOutsideCatalog = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
-api.patchAppServerResult("model/list", nativeListOutsideCatalog);
-const nativeModelsOutsideCatalog = Object.fromEntries(nativeListOutsideCatalog.data.map(m => [m.model, m.serviceTiers]));
-const outsideCatalogMetadataPreserved = nativeListOutsideCatalog.data.filter(m => m.model !== "gpt-6-astra")
-  .every(m => m.hidden === true && m.defaultReasoningEffort === "high");
-let nativeQueryResult = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
-api.patchModelQueryClient({{ setQueriesData(filters, update) {{
-  if (filters.predicate({{ queryKey: ["models", "list", "local"] }})) nativeQueryResult = update(nativeQueryResult);
-}} }});
-const nativeQueryOutsideCatalog = Object.fromEntries(nativeQueryResult.data.map(m => [m.model, m.serviceTiers]));
-api.setBackendSettings({{ codexAppServiceTierControls: false }});
-const disabledNativeList = {{ data: structuredClone(nativeRowsOutsideCatalog) }};
-api.patchAppServerResult("model/list", disabledNativeList);
-const speedControlsDisabledTiers = disabledNativeList.data[0].serviceTiers;
-api.setBackendSettings({{ codexAppServiceTierControls: true }});
 const gpt6NewModels = {{}};
 const gpt6Metadata = {gpt6_metadata};
 for (const slug of ["gpt-6-sol", "gpt-6-luna"]) {{
@@ -5158,12 +4510,11 @@ for (const slug of ["gpt-6-sol", "gpt-6-luna"]) {{
     additionalSpeedTiers: ["fast", "ultrafast"],
   }}] }};
   api.patchAppServerResult("model/list", result);
-  gpt6NewModels[slug] = {{ descriptor: result.data[0], fast: api.fastAvailability(slug),
+  gpt6NewModels[slug] = {{ descriptor: result.data[0],
     changedAgain: api.applyModelMetadata(result.data[0], slug) }};
 }}
 api.setModelCatalog({{ model: "gpt-6-astra", models: ["gpt-6-astra"],
   modelMetadata: {{ "gpt-6-astra": gpt6Metadata["gpt-6-astra"] }} }});
-const astraFastAvailability = api.fastAvailability("gpt-6-astra");
 const astraDescriptor = api.modelDescriptor("gpt-6-astra");
 const nativeAstraDescriptor = {{
   model: "gpt-6-astra", multiAgentVersion: "v2",
@@ -5211,12 +4562,6 @@ const reactRuntimeCandidates = api.reactRuntimeCandidates([{{
   child: null,
   sibling: null,
 }}]);
-const nativeFastRow = {{ native: true }};
-const nativeFastRowDetected = api.nativeSpeedRow({{
-  querySelector: (selector) => ['[role="menuitemcheckbox"][data-fast-mode-enabled]', '[data-fast-mode-enabled]'].includes(selector)
-    ? nativeFastRow
-    : null,
-}}, []) === nativeFastRow;
 const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
 const dispatcherFromSingleton = api.dispatcherFromModule({{ current: singletonDispatcher }}) === singletonDispatcher;
 const currentSingletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
@@ -5230,83 +4575,6 @@ class DispatcherClass {{
   dispatchMessage() {{}}
 }}
 const dispatcherFromClass = api.dispatcherFromModule({{ current: DispatcherClass }}) === DispatcherClass.instance;
-let unrelatedDispatchCalls = 0;
-const authState = {{ openAIAuth: "apikey", authMethod: "apikey", requiresAuth: false }};
-let refreshedAuthState = authState;
-const unrelatedDispatch = () => {{ unrelatedDispatchCalls += 1; }};
-const authDispatch = (action) => {{
-  refreshedAuthState = typeof action === "function" ? action(authState) : action;
-}};
-const nativeAuthRefreshDispatch = api.nativeAuthRefreshDispatch({{
-  memoizedState: {{
-    memoizedState: null,
-    baseState: null,
-    queue: {{ dispatch: unrelatedDispatch }},
-    next: {{
-      memoizedState: authState,
-      baseState: authState,
-      queue: {{ dispatch: authDispatch }},
-      next: null,
-    }},
-  }},
-  alternate: null,
-}});
-nativeAuthRefreshDispatch?.(api.nativeAuthRefreshAction);
-const nativeAuthRefresh = {{
-  selectedAuthDispatch: nativeAuthRefreshDispatch === authDispatch,
-  unrelatedDispatchCalls,
-  authMethod: refreshedAuthState.authMethod,
-  sameReference: refreshedAuthState === authState,
-}};
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.syncNativeSelection("standard");
-const nativeSelectionStandard = api.threadState();
-const nativeSelectionStandardGuard = api.nativeSelectionGuard();
-api.syncNativeSelection("fast");
-const nativeSelectionFast = api.threadState();
-const speedHeader = {{
-  textContent: "速度",
-  closest: () => null,
-}};
-const speedWrapper = {{
-  textContent: "速度标准默认速度快速1.5 倍速度，用量更多",
-  closest: () => null,
-}};
-const speedMenu = {{
-  children: [speedWrapper],
-  querySelectorAll: () => [speedWrapper, speedHeader],
-}};
-const nativeMenuItem = (label) => ({{
-  textContent: label,
-  getAttribute: (name) => name === "aria-label" ? label : "",
-  querySelectorAll: () => [],
-  closest: (selector) => selector === '[role="menu"]' ? speedMenu : null,
-}});
-const nestedNativeMenuStandard = api.nativeModeFromMenuItem(nativeMenuItem("标准默认速度"));
-const nestedNativeMenuFast = api.nativeModeFromMenuItem(nativeMenuItem("快速1.5 倍速度，用量更多"));
-const nativeCheckbox = (enabled) => ({{
-  closest: () => null,
-  getAttribute: (name) => ({{ role: "menuitemcheckbox", "data-fast-mode-enabled": String(enabled), "aria-checked": String(enabled) }})[name] ?? null,
-}});
-const nativeCheckboxEnable = api.nativeModeFromMenuItem(nativeCheckbox(false));
-const nativeCheckboxDisable = api.nativeModeFromMenuItem(nativeCheckbox(true));
-const nativeFastSettings = api.applyServiceTierOverride("thread/settings/update", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTier: null }});
-const nativeFastTurn = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTier: null, serviceTierForTurn: "default" }});
-api.syncNativeSelection("standard");
-const nativeStandardTurn = api.applyServiceTierOverride("turn/start", {{ threadId: "thread-12345678", model: "gpt-6-astra", serviceTierForTurn: "priority" }});
-api.syncNativeSelection("fast");
-api.installNativeSelectionSync();
-const nativeCaptureTarget = nativeCheckbox(false);
-const nativeCaptureEvent = {{ type: "click", target: {{ closest: () => nativeCaptureTarget }} }};
-api.syncNativeSelection("standard");
-window.__codexNativeServiceTierSelectionSyncHandler(nativeCaptureEvent);
-const nativeCapturedSelection = api.threadState();
-const nativeKeyboardTarget = nativeCheckbox(true);
-window.__codexNativeServiceTierSelectionSyncHandler({{ type: "keydown", key: "Enter", target: {{ closest: () => nativeKeyboardTarget }} }});
-nativeKeyboardTarget.getAttribute = nativeCheckbox(false).getAttribute;
-window.__codexNativeServiceTierSelectionSyncHandler({{ type: "click", target: {{ closest: () => nativeKeyboardTarget }} }});
-const nativeKeyboardSelection = api.threadState();
-api.syncNativeSelection("fast");
 const legacyGetSetting = async () => "legacy-get";
 const legacySetSetting = async () => "legacy-set";
 const legacySettingStorageValue = api.settingStorageFromModule({{
@@ -5462,19 +4730,6 @@ const currentHeaderMountSchedulesScan = api.shouldScheduleScan([{{
   addedNodes: [mountedCurrentHeader],
   removedNodes: [],
 }}]);
-const composerReasoningTrigger = {{
-  nodeType: 1,
-  closest: (selector) => selector.split(", ").includes('[data-codex-intelligence-trigger="true"]')
-    ? composerReasoningTrigger
-    : null,
-  matches: () => false,
-  querySelector: () => null,
-}};
-const composerFastIconReplacementSchedulesScan = api.shouldScheduleScan([{{
-  target: composerReasoningTrigger,
-  addedNodes: [],
-  removedNodes: [],
-}}]);
 api.scheduleScan([]);
 const irrelevantMutationScanSucceeded = true;
 const delayedNativeMenuRetryAvailable = typeof api.scheduleNativeMenuPlacementRetry === "function"
@@ -5607,7 +4862,6 @@ await appServerClient.sendRequest(
   nativeProjectlessAppServerParams,
   {{ signal: "native-projectless" }}
 );
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 api.setBackendSettings({{ codexAppServiceTierControls: true }});
 localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
 const serviceTierClientCalls = [];
@@ -5616,10 +4870,23 @@ const serviceTierClient = {{
   async prewarmThreadStart(params) {{ serviceTierClientCalls.push({{ method: "prewarm", params }}); return {{ ok: true }}; }},
 }};
 const serviceTierClientPatched = api.patchAppServerClient(serviceTierClient);
-await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4" }});
-await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4" }});
+await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
+await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
 const serviceTierClientSendTier = serviceTierClientCalls[0]?.params?.serviceTier;
 const serviceTierClientPrewarmTier = serviceTierClientCalls[1]?.params?.serviceTier;
+// 运行中升级必须替换旧闭包，不能因为旧版本标记而保留旧 Fast 请求覆盖。
+const retiredCalls = [];
+const retiredOriginal = async (method, params) => {{ retiredCalls.push(params); return params; }};
+const retiredClient = {{
+  __codexPlusModelRequestPatch: "23",
+  __codexPlusModelOriginalSendRequest: retiredOriginal,
+  sendRequest: async (method, params) => retiredOriginal(method, {{ ...params, serviceTier: "legacy-forced-fast" }}),
+}};
+const retiredNativeParams = {{ threadId: "thread-retired-fast", model: "gpt-5.4", serviceTier: "default", service_tier: "priority" }};
+api.patchAppServerClient(retiredClient);
+await retiredClient.sendRequest("turn/start", retiredNativeParams);
+const retiredClientPatchReplaced = retiredCalls[0] === retiredNativeParams
+  && retiredCalls[0].serviceTier === "default" && retiredCalls[0].service_tier === "priority";
 const frozenClient = Object.preventExtensions({{ async sendRequest() {{ return {{ ok: true }}; }} }});
 const frozenClientPatchSkipped = api.patchAppServerClient(frozenClient) === false;
 const captureSample = "x" + String.fromCharCode(10) + "async sendRequest(e,t,n){{if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);}}";
@@ -5633,25 +4900,11 @@ window.__codexPlusAppServerClientClass = class CodexPlusTestClient {{
 }};
 const prototypePatched = api.installAppServerClientPrototypePatch();
 const protoClient = new window.__codexPlusAppServerClientClass();
-const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4" }});
-const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4" }});
+const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
+const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
 const prototypeSendTier = protoTurn && protoTurn.params ? protoTurn.params.serviceTier : null;
 const prototypePrewarmTier = protoPrewarm && protoPrewarm.prewarm ? protoPrewarm.prewarm.serviceTier : null;
 const prototypeState = api.appServerClientPrototypeState();
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setBackendSettings({{ codexAppServiceTierControls: false }});
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
-const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
-const resolvedUnsetTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setServiceTierState({{ status: "ok", serviceTier: null, configServiceTier: "fast", serviceTierSource: "config-toml" }});
-const inheritedConfigFastBlocked = api.applyServiceTierOverride("turn/start", {{
-  threadId: "thread-12345678",
-  model: "gpt-4.1",
-  service_tier: null,
-}}, "");
 const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerParams
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
@@ -5683,7 +4936,7 @@ const explicitOtherProvider = {{ cwd: "C:/mobile", modelProvider: "other" }};
 const providerFromOther = api.applyProviderOverride("thread/start", explicitOtherProvider);
 const nonThreadParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const nonThreadProviderUnchanged = api.applyProviderOverride("turn/start", nonThreadParams) === nonThreadParams;
-const providerWithServiceTierControlsDisabled = api.requestOverride({{
+const providerWithLegacyControlsIgnored = api.requestOverride({{
   type: "start-conversation",
   cwd: "C:/mobile",
   modelProvider: "openai",
@@ -6033,6 +5286,7 @@ await failedModelSwitchClient.sendRequest("turn/start", {{
 }});
 const failedModelSwitchResumeAttempts = failedModelSwitchCalls.filter((call) => call.method === "thread/resume").length;
 const failedModelSwitchTurnAttempts = failedModelSwitchCalls.filter((call) => call.method === "turn/start").length;
+
 api.setBackendSettings({{ relayProfilesEnabled: false }});
 const nativeContextCalls = [];
 window.__codexSessionDeleteBridge = async (route) => {{
@@ -6295,107 +5549,47 @@ await deleteOnlyClient.sendRequest("ping", {{}});
 const sessionDeleteOnlyRegistersNativeClient = deleteOnlyInstalled
   && window.__codexPlusNativeHostClients.get("ssh:delete-only")?.ref?.deref() === deleteOnlyClient;
 process.stdout.write(JSON.stringify({{
-  supportedFast,
-  unsupportedModel,
-  turnWithoutModel,
-  turnWithoutModelDiagnosticModel,
-  customInheritUnsupported,
-  inheritUnsetStatus,
-  inheritFastStatus,
-  inheritStandardStatus,
-  inheritConfigTomlFastStatus,
-  resolvedConfigTomlTier,
-  resolvedUnsetTier,
-  inheritedConfigFastBlocked,
+  withoutNativeTier,
+  customModelNativeTier,
+  threadOnlyRequest,
+  customModelNativeSnakeTier,
   startConversation,
   explicitProjectStartConversation,
   projectlessStartConversation,
   fetchStartConversation,
   fetchSendCliRequest,
   solFastAvailability,
-  solFastDescriptor,
-  existingSolDescriptor,
-  modelListResult,
-  solDescriptor,
-  missingNativeTiers, preservedNativeTiers, unknownModelTiers, nativeMultiSpeedRowDetected,
-  nativeModelsOutsideCatalog, nativeQueryOutsideCatalog, outsideCatalogMetadataPreserved, speedControlsDisabledTiers,
-  gpt6NewModels,
-  astraFastAvailability,
-  astraDescriptor,
-  nativeAstraDescriptor,
-  astraQueryPatchCount,
-  astraQueryDescriptor,
+  logicalDirectionGroupClassesNormalized,
+  gpt6NewModels, astraDescriptor, nativeAstraDescriptor, astraQueryPatchCount, astraQueryDescriptor,
   reactRuntimeQueryClientFound: reactRuntimeCandidates.queryClients.includes(modelQueryClient),
   reactRuntimeRequestClientFound: reactRuntimeCandidates.requestClients.includes(appServerRuntimeClient),
-  nativeFastRowDetected,
+  nativeContextCalls: nativeContextCallOrder,
+  restoredContextWindow, restoredUsedTokens, streamingContextWindow, resumedContextWindow,
+  bootContextWindow, bootListenerRemoved, remoteContextCalls, otherModelContext, otherModelContextCalls,
+  currentHeaderFound, panelHeaderRejected, textOnlyOpenLocationRecognized, floatingMenuRightBoundary,
+  nativeMenuInsertionWithExternalStatus, homeHeaderInsertionUsesActionSlot, currentHeaderMountSchedulesScan,
+  irrelevantMutationScanSucceeded,
+  delayedNativeMenuRetryAvailable, delayedNativeMenuRetryScheduled, delayedNativeMenuHiddenWhileWaiting,
+  delayedNativeMenuRetryUsesLowFrequencyDelay, delayedNativeMenuRetryPersists, delayedNativeMenuRetryMigrated,
+  delayedNativeMenuRetryStopped,
+  conversationViewFirstOffset, conversationViewRepeatedOffset,
+  conversationViewInitialFrameBudget, conversationViewResizeFrameBudget, conversationViewPollFrameBudget,
+  solDescriptor,
   dispatcherFromSingleton,
   dispatcherFromCurrentSingleton,
   dispatcherFromClass,
-  nativeAuthRefresh,
-  reactFiberKeys,
-  semanticModelMenuRowFound,
-  currentModelMenuRowFound,
-  solidFastIcon,
-  unrelatedFastIconPatched,
-  nativeSelectionStandard,
-  nativeSelectionStandardGuard,
-  nativeSelectionFast,
-  nestedNativeMenuStandard,
-  nestedNativeMenuFast,
-  nativeCheckboxEnable,
-  customLegacyDefaultMode,
-  customUnselectedRequests,
-  customExplicitFast,
-  customExplicitStandard,
-  nativeCheckboxDisable,
-  nativeFastSettings,
-  nativeFastTurn,
-  nativeStandardTurn,
-  nativeCapturedSelection,
-  nativeKeyboardSelection,
-  nativeContextCalls: nativeContextCallOrder,
-  restoredContextWindow,
-  restoredUsedTokens,
-  streamingContextWindow,
-  resumedContextWindow,
-  bootContextWindow,
-  bootListenerRemoved,
-  remoteContextCalls,
-  otherModelContext,
-  otherModelContextCalls,
   legacySettingStorage,
   currentSettingStorage,
   capabilitySettingStorage,
   legacyStateApi,
   currentStateApi,
-  currentHeaderFound,
-  panelHeaderRejected,
-  textOnlyOpenLocationRecognized,
-  floatingMenuRightBoundary,
-  nativeMenuInsertionWithExternalStatus,
-  homeHeaderInsertionUsesActionSlot,
-  logicalDirectionGroupClassesNormalized,
-  currentHeaderMountSchedulesScan,
-  composerFastIconReplacementSchedulesScan,
-  irrelevantMutationScanSucceeded,
-  delayedNativeMenuRetryAvailable,
-  delayedNativeMenuRetryScheduled,
-  delayedNativeMenuHiddenWhileWaiting,
-  delayedNativeMenuRetryUsesLowFrequencyDelay,
-  delayedNativeMenuRetryPersists,
-  delayedNativeMenuRetryMigrated,
-  delayedNativeMenuRetryStopped,
-  conversationViewFirstOffset,
-  conversationViewRepeatedOffset,
-  conversationViewInitialFrameBudget,
-  conversationViewResizeFrameBudget,
-  conversationViewPollFrameBudget,
   appServerParamsUnchanged,
   appServerProjectlessParamsUnchanged,
   appServerSentCount: appServerCalls.length,
   serviceTierClientPatched,
   serviceTierClientSendTier,
   serviceTierClientPrewarmTier,
+  retiredClientPatchReplaced,
   frozenClientPatchSkipped,
   captureLine,
   captureColumn,
@@ -6409,7 +5603,7 @@ process.stdout.write(JSON.stringify({{
   providerFromOpenAi,
   providerFromOtherUnchanged: providerFromOther === explicitOtherProvider,
   nonThreadProviderUnchanged,
-  providerWithServiceTierControlsDisabled,
+  providerWithLegacyControlsIgnored,
   appServerProviderOverride,
   directThreadStartedId,
   nestedThreadStartedId,
@@ -6504,6 +5698,29 @@ process.stdout.write(JSON.stringify({{
 }
 
 #[test]
+fn injection_script_handles_irrelevant_mutations_without_runtime_errors() {
+    let cases = run_native_tier_and_provider_contract_harness();
+
+    assert_eq!(cases["irrelevantMutationScanSucceeded"], true);
+}
+
+
+#[test]
+fn injection_script_places_menu_in_home_header_action_slot() {
+    let cases = run_native_tier_and_provider_contract_harness();
+
+    assert_eq!(cases["homeHeaderInsertionUsesActionSlot"], true);
+}
+
+#[test]
+fn injection_script_normalizes_logical_direction_group_classes() {
+    let cases = run_native_tier_and_provider_contract_harness();
+
+    assert_eq!(cases["logicalDirectionGroupClassesNormalized"], true);
+}
+
+
+#[test]
 fn injection_script_leaves_new_threads_to_the_codex_app() {
     let script = assets::injection_script(57321);
 
@@ -6582,6 +5799,15 @@ fn runtime_evaluate_params_sets_expected_flags() {
     let params = bridge::runtime_evaluate_params("1 + 1");
 
     assert_eq!(params["expression"], "1 + 1");
+    assert_eq!(params["awaitPromise"], false);
+    assert_eq!(params["allowUnsafeEvalBlockedByCSP"], true);
+}
+
+#[test]
+fn runtime_evaluate_params_return_by_value_sets_flag() {
+    let params = bridge::runtime_evaluate_params_return_by_value("({hello:\"world\"})");
+
+    assert_eq!(params["returnByValue"], true);
     assert_eq!(params["awaitPromise"], false);
     assert_eq!(params["allowUnsafeEvalBlockedByCSP"], true);
 }
@@ -7164,7 +6390,7 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while processing interleaved binding call")
@@ -7220,7 +6446,7 @@ async fn install_bridge_immediately_evaluates_new_document_scripts() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             noop_handler(),
@@ -7302,7 +6528,7 @@ async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() 
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             handler,
@@ -7339,7 +6565,7 @@ async fn install_bridge_command_error_mentions_method_and_id() {
     let handler = noop_handler();
     let error = tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang on CDP error response")
@@ -7421,7 +6647,7 @@ async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparsea
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
     )
     .await
     .expect("bridge should not hang after bad payload")
@@ -7482,7 +6708,7 @@ async fn install_bridge_queues_consecutive_bindings_without_recursive_dispatch()
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while draining queued binding calls")
@@ -7552,7 +6778,7 @@ async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should not wait for resolve ack")
@@ -7638,7 +6864,7 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should return while generate is pending")
@@ -7652,10 +6878,10 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 async fn superseded_bridge_session_stops_answering_binding_calls() {
     let (url, stale_rx, fresh_rx) = spawn_two_session_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -7751,10 +6977,10 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
         let _ = fresh_alive_tx.send(fresh_resolved);
     });
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -7776,10 +7002,10 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
 async fn failed_bridge_reinstall_keeps_existing_session_current() {
     let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    let error = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    let error = install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect_err("second bridge install should fail");
     assert!(error.to_string().contains("Runtime.addBinding"));
@@ -7947,6 +7173,86 @@ async fn recv_text_message(socket: &mut TestSocket) -> Option<String> {
     }
 }
 
+#[tokio::test]
+async fn extension_cdp_evaluate_returns_objects_and_arrays_by_value() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("cdp listener should bind");
+    let port = listener.local_addr().expect("listener address").port();
+    let websocket = format!("ws://127.0.0.1:{port}/devtools/page/overlay");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let websocket = websocket.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut peeked = [0_u8; 2048];
+                let peeked_len = stream.peek(&mut peeked).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&peeked[..peeked_len]);
+                if head.contains("GET /json") {
+                    let mut buf = vec![0_u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = json!([{
+                        "id": "overlay",
+                        "type": "page",
+                        "title": "overlay",
+                        "url": "app://-/index.html?initialRoute=%2Favatar-overlay",
+                        "webSocketDebuggerUrl": websocket,
+                    }])
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let mut socket = accept_async(stream)
+                    .await
+                    .expect("websocket should upgrade");
+                let command = recv_json(&mut socket).await;
+                assert_eq!(command["method"], "Runtime.evaluate");
+                let by_value = command["params"]["returnByValue"] == true;
+                let expression = command["params"]["expression"].as_str().unwrap_or("");
+                // 不带 returnByValue 时，V8 对对象只回 objectId，value 为空。
+                let remote = if !by_value {
+                    json!({ "type": "object", "objectId": "obj-1" })
+                } else if expression.contains('[') {
+                    json!({ "type": "object", "value": [1, "two"] })
+                } else {
+                    json!({ "type": "object", "value": { "hello": "world" } })
+                };
+                send_json(
+                    &mut socket,
+                    json!({ "id": command["id"], "result": { "result": remote } }),
+                )
+                .await;
+                close_socket(&mut socket).await;
+            });
+        }
+    });
+
+    let object = codex_plus_core::routes::evaluate_extension_cdp(
+        port,
+        &json!({ "kind": "avatar-overlay", "expression": "({hello:\"world\"})" }),
+    )
+    .await
+    .expect("object evaluation should succeed");
+    assert_eq!(object["results"][0]["ok"], true);
+    assert_eq!(object["results"][0]["value"]["hello"], "world");
+
+    let array = codex_plus_core::routes::evaluate_extension_cdp(
+        port,
+        &json!({ "kind": "avatar-overlay", "expression": "[1, \"two\"]" }),
+    )
+    .await
+    .expect("array evaluation should succeed");
+    assert_eq!(array["results"][0]["ok"], true);
+    assert_eq!(array["results"][0]["value"], json!([1, "two"]));
+}
+
 async fn spawn_cdp_server<F, Fut>(handler: F) -> (String, oneshot::Receiver<()>)
 where
     F: FnOnce(TestSocket) -> Fut + Send + 'static,
@@ -8007,6 +7313,23 @@ fn assert_expression_contains_request(command: &serde_json::Value, request_id: &
 async fn close_socket(socket: &mut TestSocket) {
     socket.close(None).await.expect("websocket should close");
     let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+}
+
+async fn install_test_bridge(
+    websocket_url: &str,
+    binding_name: &str,
+    handler: bridge::BridgeHandler,
+    new_document_scripts: &[String],
+) -> anyhow::Result<()> {
+    // 桥接模拟协议使用缺省开关，不能受本机用户已开启的 Fast 等设置影响。
+    // 目录保留到进程结束，供安装后启动的后台任务继续读取。
+    static SETTINGS_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    SETTINGS_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        codex_plus_core::paths::set_settings_path_for_tests(Some(dir.path().join("settings.json")));
+        dir
+    });
+    bridge::install_bridge(websocket_url, binding_name, handler, new_document_scripts).await
 }
 
 fn noop_handler() -> bridge::BridgeHandler {

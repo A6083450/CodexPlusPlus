@@ -55,7 +55,7 @@ fn copied_external_catalog_pointers_are_absolute_without_changing_source() {
     for from_live in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let external = temp.path().join("user-catalog.json");
-        let original = r#"{"models":[{"slug":"path-test-model","use_responses_lite":true}]}"#;
+        let original = r#"{"models":[{"slug":"path-test-model","base_instructions":"You are a coding assistant.","supports_parallel_tool_calls":true,"use_responses_lite":true}]}"#;
         std::fs::write(&external, original).unwrap();
         let mut config = toml_edit::DocumentMut::new();
         config["model_catalog_json"] = toml_edit::value(external.to_string_lossy().as_ref());

@@ -206,11 +206,11 @@ fn source_app(deadline: Instant) -> Result<PathBuf> {
     let program = std::env::var_os("ProgramFiles").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
     let query = probe_output(Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", "(Get-AppxPackage -Name Claude).InstallLocation"]), deadline);
+        .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; @(Get-AppxPackage -Name Claude; Get-AppxPackage -Name AnthropicPBC.Claude) | Select-Object Name,InstallLocation | ConvertTo-Json -Compress"]), deadline);
     if let Ok(output) = &query {
         if output.status.success() {
-            for install in String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|s| !s.is_empty()) {
-                let packaged = PathBuf::from(install).join(r"app\claude.exe");
+            for install in claude_package_locations(&output.stdout)? {
+                let packaged = PathBuf::from(install).join(r"app\Claude.exe");
                 if packaged.is_file() { return Ok(packaged); }
             }
         }
@@ -230,10 +230,70 @@ fn source_app(deadline: Instant) -> Result<PathBuf> {
     Ok(local.join(r"Programs\Claude\Claude.exe"))
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn claude_package_locations(bytes: &[u8]) -> Result<Vec<String>> {
+    // PowerShell 对零、一、多条记录分别输出空白、对象、数组。
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("Claude 应用包查询返回了无效 JSON")?;
+    let records = match &value {
+        serde_json::Value::Array(records) => records.as_slice(),
+        serde_json::Value::Null => &[],
+        _ => std::slice::from_ref(&value),
+    };
+    Ok(records
+        .iter()
+        .filter_map(|record| {
+            let name = record.get("Name")?.as_str()?;
+            if !["Claude", "AnthropicPBC.Claude"]
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+            {
+                return None;
+            }
+            let path = record.get("InstallLocation")?.as_str()?.trim();
+            (!path.is_empty()).then(|| path.to_string())
+        })
+        .collect())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_claude_msix_path(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let parts = text
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(index) = parts
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case("WindowsApps"))
+    else {
+        return false;
+    };
+    let tail = &parts[index + 1..];
+    if tail.len() == 1 && tail[0].eq_ignore_ascii_case("claude-desktop.exe") {
+        return true; // 已注册的 App Execution Alias。
+    }
+    let Some(package) = tail.first() else {
+        return false;
+    };
+    let known = ["Claude_", "AnthropicPBC.Claude_"].iter().any(|prefix| {
+        package
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+    });
+    known
+        && ((tail.len() == 3
+            && tail[1].eq_ignore_ascii_case("app")
+            && tail[2].eq_ignore_ascii_case("Claude.exe"))
+            || (tail.len() == 2 && tail[1].eq_ignore_ascii_case("claude-desktop.exe")))
+}
+
 #[cfg(target_os = "windows")]
 fn windows_msix_source(path: &Path) -> bool {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
-    lower.ends_with("\\claude-desktop.exe") && lower.contains("\\windowsapps\\")
+    is_claude_msix_path(path)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -755,6 +815,43 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_msix_namespace_discovery_and_classification_agree() {
+        let packages = br#"[{"Name":"AnthropicPBC.Claude","InstallLocation":"C:\\Program Files\\WindowsApps\\AnthropicPBC.Claude_2.42304.0.0_x64__fnn82j28hfe8t"},{"Name":"ClaudeFork","InstallLocation":"C:\\Other"}]"#;
+        let locations = claude_package_locations(packages).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert!(is_claude_msix_path(Path::new(&format!(
+            "{}\\app\\Claude.exe",
+            locations[0]
+        ))));
+        assert_eq!(
+            claude_package_locations(br#"{"Name":"Claude","InstallLocation":"C:\\legacy"}"#)
+                .unwrap(),
+            vec![r"C:\legacy"]
+        );
+        assert!(claude_package_locations(b"").unwrap().is_empty());
+        assert!(claude_package_locations(b"not JSON").is_err());
+    }
+
+    #[test]
+    fn claude_msix_classification_preserves_alias_and_rejects_lookalikes() {
+        for path in [
+            r"C:\Users\test\AppData\Local\Microsoft\WindowsApps\claude-desktop.exe",
+            r"C:\Program Files\WindowsApps\Claude_1.0_x64__publisher\app\Claude.exe",
+        ] {
+            assert!(is_claude_msix_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            r"C:\Programs\Claude\Claude.exe",
+            r"C:\WindowsApps-other\AnthropicPBC.Claude_1_x64__publisher\app\Claude.exe",
+            r"C:\WindowsApps\ClaudeFork_1_x64__publisher\app\Claude.exe",
+            r"C:\WindowsApps\AnthropicPBC.Claude_1_x64__publisher\other\Claude.exe",
+        ] {
+            assert!(!is_claude_msix_path(Path::new(path)), "{path}");
+        }
+    }
+
 
     #[test]
     fn catalog_entries_come_from_the_chinese_catalog() {

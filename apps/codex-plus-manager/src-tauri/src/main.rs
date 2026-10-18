@@ -2,6 +2,14 @@
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    // MCP 是独立 stdio 进程，必须在 GUI、单实例锁和启动日志之前处理。
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-agent-mcp") {
+        if let Err(error) = codex_plus_manager_lib::run_agent_collaboration_mcp(&args[2..]) {
+            eprintln!("Agent 协作 MCP 启动失败：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(options_path) = args
         .windows(2)
         .find(|window| window[0] == "--codex-plus-multi-worker")

@@ -255,6 +255,7 @@ async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider(
         store.save(&settings).unwrap();
         let result = read_codex_model_catalog().await;
 
+        settings = store.load().unwrap();
         settings.relay_profiles[0].relay_mode = RelayMode::Official;
         settings.relay_profiles[0].official_mix_api_key = false;
         settings.relay_profiles[0].config_contents = "model = \"qwen3-coder\"\n".to_string();

@@ -1,5 +1,7 @@
-use fs2::FileExt;
 use crate::storage::{has_table, json_to_sql_value, select_dicts};
+pub use crate::sync_journal::ProviderSyncDatabaseOutcome;
+use crate::sync_journal::{Snapshot as SqliteSnapshot, SyncJournal};
+use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -230,6 +232,8 @@ pub enum ProviderSyncStatus {
     Disabled,
     Skipped,
     Synced,
+    Failed,
+    PartialFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +255,49 @@ pub struct ProviderSyncResult {
     pub encrypted_content_warning: Option<String>,
     #[serde(default)]
     pub repair_audit: ProviderSyncAudit,
+    #[serde(default)]
+    pub recovery_journal_path: Option<PathBuf>,
+    #[serde(default)]
+    pub recovery_errors: Vec<String>,
+    #[serde(default)]
+    pub database_outcomes: Vec<ProviderSyncDatabaseOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSyncRecoveryReport {
+    pub completed: bool,
+    pub recovery_journal_path: PathBuf,
+    pub remaining_rollout_files: usize,
+    pub recovery_errors: Vec<String>,
+    pub database_outcomes: Vec<ProviderSyncDatabaseOutcome>,
+}
+
+/// 仅显式恢复未完成作业。逐行条件补偿，不从备份整库覆盖原库，也不自动恢复成功作业。
+pub fn recover_provider_sync_from_backup(
+    home: &Path,
+    backup_dir: &Path,
+) -> anyhow::Result<ProviderSyncRecoveryReport> {
+    let _guard = try_acquire_provider_sync_lifecycle_guard(Some(home))?;
+    let root = fs::canonicalize(home.join("backups_state/provider-sync"))?;
+    let backup = fs::canonicalize(backup_dir)?;
+    if backup.parent() != Some(root.as_path()) {
+        anyhow::bail!("recovery backup is outside managed backup root");
+    }
+    let metadata: Value = serde_json::from_slice(&fs::read(backup.join("metadata.json"))?)?;
+    if metadata["managedBy"] != "Codex++ provider sync" || metadata["namespace"] != "provider-sync"
+    {
+        anyhow::bail!("unmanaged provider sync backup");
+    }
+    let path = backup.join("recovery-journal.json");
+    let mut journal = SyncJournal::load_for_recovery(&path, home, &provider_sync_db_paths(home))?;
+    let errors = journal.rollback();
+    Ok(ProviderSyncRecoveryReport {
+        completed: errors.is_empty(),
+        recovery_journal_path: path,
+        remaining_rollout_files: journal.remaining_rollouts(),
+        recovery_errors: errors,
+        database_outcomes: journal.outcomes(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,18 +625,19 @@ pub struct ProviderSyncDryRunPreview {
     pub backup_root: PathBuf,
 }
 
-pub fn preview_provider_sync(codex_home: Option<&Path>) -> anyhow::Result<ProviderSyncDryRunPreview> {
+pub fn preview_provider_sync(
+    codex_home: Option<&Path>,
+) -> anyhow::Result<ProviderSyncDryRunPreview> {
     let home = codex_home
         .map(Path::to_path_buf)
         .unwrap_or_else(default_codex_home_dir);
     let config_path = home.join("config.toml");
-    let target_provider =
-        match resolve_provider_sync_target_snapshot(&config_path, None) {
-            Ok(snapshot) => snapshot.target_provider,
-            // 预览不该因为目标解析失败就报错——那会让用户在真正执行前拿不到审计信息。
-            // 退回默认 provider，只影响展示。
-            Err(_) => DEFAULT_PROVIDER.to_string(),
-        };
+    let target_provider = match resolve_provider_sync_target_snapshot(&config_path, None) {
+        Ok(snapshot) => snapshot.target_provider,
+        // 预览不该因为目标解析失败就报错——那会让用户在真正执行前拿不到审计信息。
+        // 退回默认 provider，只影响展示。
+        Err(_) => DEFAULT_PROVIDER.to_string(),
+    };
     let sqlite_paths = provider_sync_db_paths(&home);
     let audit = match audit_provider_sync_state(&home, &sqlite_paths) {
         Ok(audit) => audit,
@@ -703,6 +751,9 @@ pub fn run_remote_control_session_catalog_recovery_for_thread_with_target(
             );
         }
     };
+    if let Some(blocked) = pending_recovery_result(&home, target_provider) {
+        return blocked;
+    }
     let thread_ids = HashSet::from([thread_id.to_string()]);
     let recovery = run_remote_control_catalog_recovery_for_threads(
         &home,
@@ -760,6 +811,9 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             );
         }
     };
+    if let Some(blocked) = pending_recovery_result(&home, target_provider) {
+        return blocked;
+    }
     let recovery = (|| -> anyhow::Result<ProviderSyncResult> {
         let sqlite_paths = provider_sync_db_paths(&home);
         let rollout_path = match remote_control_rollout_for_thread(
@@ -1007,6 +1061,10 @@ where
             );
         }
     };
+    if let Some(blocked) = pending_recovery_result(&home, &target_provider) {
+        return blocked;
+    }
+    let mut failure_result: Option<ProviderSyncResult> = None;
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
         let sqlite_paths = provider_sync_db_paths(&home);
         let thread_kinds = sqlite_provider_sync_thread_kinds(&sqlite_paths)?;
@@ -1034,7 +1092,7 @@ where
         )?;
         let BulkSessionScan {
             rewrite_plans,
-            skipped_locked_rollout_files: scanned_skipped_rollout_files,
+            skipped_locked_rollout_files: mut scanned_skipped_rollout_files,
             encrypted_content_counts,
             subagent_thread_ids: scanned_subagent_thread_ids,
             thread_ids_with_user_events,
@@ -1131,13 +1189,69 @@ where
             scanned_skipped_rollout_files.len(),
         );
         let backup_dir = create_bulk_backup(&home, &target_provider, &rewrite_plans)?;
-        let applied = apply_bulk_session_rewrite_plans(
-            &rewrite_plans,
+        failure_result = Some(result(
+            ProviderSyncStatus::Failed,
+            "Provider sync failed after backup",
+            &target_provider,
+            Some(backup_dir.clone()),
+            0,
+            0,
+        ));
+        let mut journal = SyncJournal::new(&backup_dir)?;
+        failure_result.as_mut().unwrap().recovery_journal_path = Some(journal.path().to_path_buf());
+        let mut rollout_journal = Vec::new();
+        let mut eligible_rewrite_plans = Vec::new();
+        for plan in &rewrite_plans {
+            let mut writer = HashingWriter::new(std::io::sink());
+            let before = stream_rewrite_rollout_session_meta_providers(
+                &plan.path,
+                &target_provider,
+                &mut writer,
+            )?;
+            if before == plan.original_sha256 {
+                rollout_journal.push(crate::sync_journal::JournalRollout {
+                    path: plan.path.clone(),
+                    before_sha256: before,
+                    after_sha256: writer.sha256_hex(),
+                    original_meta_lines: plan.original_session_meta_lines.clone(),
+                    original_mtime: plan.original_mtime,
+                    applied: None,
+                    restored: false,
+                });
+                eligible_rewrite_plans.push(plan.clone());
+            } else {
+                scanned_skipped_rollout_files.push(plan.path.clone());
+            }
+        }
+        journal.prepare_rollouts(rollout_journal)?;
+        let applied = match apply_bulk_session_rewrite_plans(
+            &eligible_rewrite_plans,
             &target_provider,
             total_rollout_files,
             scanned_skipped_rollout_files.len(),
             &mut report_progress,
-        )?;
+        ) {
+            Ok(applied) => applied,
+            Err(error) => {
+                let recovery_errors = journal.rollback();
+                let mut failed = result(
+                    if recovery_errors.is_empty() {
+                        ProviderSyncStatus::Failed
+                    } else {
+                        ProviderSyncStatus::PartialFailure
+                    },
+                    format!("Provider sync rollout rewrite failed: {error:#}"),
+                    &target_provider,
+                    Some(backup_dir.clone()),
+                    journal.remaining_rollouts(),
+                    0,
+                );
+                failed.recovery_journal_path = Some(journal.path().to_path_buf());
+                failed.recovery_errors = recovery_errors;
+                failure_result = Some(failed);
+                return Err(error);
+            }
+        };
         report_provider_sync_progress(
             &mut report_progress,
             ProviderSyncProgressPhase::UpdatingIndexes,
@@ -1148,16 +1262,28 @@ where
             scanned_skipped_rollout_files.len() + applied.skipped_locked_rollout_files.len(),
         );
         let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
+            journal.mark_rollouts_applied(
+                &applied
+                    .changes
+                    .iter()
+                    .map(|change| change.plan.path.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             let sqlite_updates = apply_sqlite_update_for_paths(
                 &sqlite_paths,
                 &target_provider,
                 &thread_ids_with_user_events,
                 &cwd_by_thread_id,
                 &subagent_thread_ids,
+                Some(&mut journal),
             )?;
             let mut sqlite_updates = sqlite_updates;
-            let catalog_repairs =
-                repair_missing_local_thread_catalog_rows(&home, &sqlite_paths, &target_provider)?;
+            let catalog_repairs = repair_missing_local_thread_catalog_rows(
+                &home,
+                &sqlite_paths,
+                &target_provider,
+                Some(&mut journal),
+            )?;
             sqlite_updates.catalog_insert_rows = catalog_repairs.inserted_rows;
             sqlite_updates.catalog_remove_rows = catalog_repairs.removed_rows;
             // issue #240：canonical `threads` 行缺失时补建。
@@ -1165,11 +1291,15 @@ where
             // 只 INSERT，不 UPDATE、不 DELETE。用户报「修复后会话从列表消失」，
             // 而列表读的是 canonical `threads`；这里补上「rollout 还在、但
             // threads 行没了」的会话，属纯增量加固。
-            sqlite_updates.thread_rows_rebuilt =
-                rebuild_missing_canonical_thread_rows(&home, &sqlite_paths, &target_provider)?;
+            sqlite_updates.thread_rows_rebuilt = rebuild_missing_canonical_thread_rows(
+                &home,
+                &sqlite_paths,
+                &target_provider,
+                Some(&mut journal),
+            )?;
             let updated_workspace_roots =
-                apply_global_state_update(&home.join(".codex-global-state.json"))?;
-            prune_backups(&home)?;
+                apply_global_state_update(&home.join(".codex-global-state.json"), &mut journal)?;
+            journal.complete()?;
             Ok((sqlite_updates, updated_workspace_roots))
         })();
         let (sqlite_updates, updated_workspace_roots) = match apply_result {
@@ -1185,11 +1315,30 @@ where
                     scanned_skipped_rollout_files.len()
                         + applied.skipped_locked_rollout_files.len(),
                 );
-                if let Err(restore_error) = restore_bulk_session_rewrites(&applied.changes) {
-                    return Err(anyhow::anyhow!(
-                        "{err}; rollout rollback failed: {restore_error}"
-                    ));
-                }
+                let recovery_errors = journal.rollback();
+                let remaining_rollouts = journal.remaining_rollouts();
+                let outcomes = journal.outcomes();
+                let remaining_rows = outcomes.iter().map(|out| out.remaining_rows).sum();
+                let mut failed = result(
+                    if recovery_errors.is_empty() {
+                        ProviderSyncStatus::Failed
+                    } else {
+                        ProviderSyncStatus::PartialFailure
+                    },
+                    format!("Provider sync failed: {err}"),
+                    &target_provider,
+                    Some(backup_dir.clone()),
+                    remaining_rollouts,
+                    remaining_rows,
+                );
+                failed.recovery_journal_path = Some(journal.path().to_path_buf());
+                failed.recovery_errors = recovery_errors;
+                failed.database_outcomes = outcomes;
+                failed.skipped_locked_rollout_files = scanned_skipped_rollout_files.clone();
+                failed
+                    .skipped_locked_rollout_files
+                    .extend(applied.skipped_locked_rollout_files.clone());
+                failure_result = Some(failed);
                 return Err(err);
             }
         };
@@ -1197,7 +1346,7 @@ where
             ProviderSyncStatus::Synced,
             "Provider sync complete",
             &target_provider,
-            Some(backup_dir),
+            Some(backup_dir.clone()),
             applied.changes.len(),
             sqlite_updates.total(),
         );
@@ -1215,6 +1364,14 @@ where
         synced.updated_workspace_roots = updated_workspace_roots;
         synced.encrypted_content_warning = encrypted_content_warning;
         synced.repair_audit = repair_audit;
+        synced.recovery_journal_path = Some(journal.path().to_path_buf());
+        synced.database_outcomes = journal.outcomes();
+        // 清理旧备份不是同步事务；失败不能触发已完成数据的回滚。
+        if let Err(error) = prune_backups(&home) {
+            synced
+                .recovery_errors
+                .push(format!("backup retention warning: {error:#}"));
+        }
         synced.message = provider_sync_message_with_audit(&synced.message, &synced.repair_audit);
         report_provider_sync_progress(
             &mut report_progress,
@@ -1228,6 +1385,12 @@ where
         Ok(synced)
     })();
     sync_result.unwrap_or_else(|err| {
+        if let Some(mut failed) = failure_result {
+            if failed.message == "Provider sync failed after backup" {
+                failed.message = format!("Provider sync failed: {err}");
+            }
+            return failed;
+        }
         result(
             ProviderSyncStatus::Skipped,
             format!("Provider sync skipped: {err}"),
@@ -1272,6 +1435,7 @@ fn rebuild_missing_canonical_thread_rows(
     home: &Path,
     sqlite_paths: &[PathBuf],
     target_provider: &str,
+    mut journal: Option<&mut SyncJournal>,
 ) -> anyhow::Result<usize> {
     let mut rebuilt = 0usize;
     for thread in collect_rebuildable_canonical_threads(home, sqlite_paths, target_provider)? {
@@ -1305,9 +1469,17 @@ fn rebuild_missing_canonical_thread_rows(
             let Ok(tx) = db.transaction() else {
                 continue;
             };
+            let before = if journal.is_some() {
+                Some(SqliteSnapshot::capture(&tx)?)
+            } else {
+                None
+            };
             match tx.execute(&sql, params_from_iter(values)) {
                 Ok(affected) => {
-                    if tx.commit().is_ok() {
+                    if let Some(journal) = journal.as_deref_mut() {
+                        journal.commit(tx, before.unwrap(), path)?;
+                        rebuilt += affected;
+                    } else if tx.commit().is_ok() {
                         rebuilt += affected;
                     }
                 }
@@ -1460,10 +1632,7 @@ fn canonical_thread_insert_columns(columns: &HashSet<String>) -> Vec<&'static st
     .collect()
 }
 
-fn canonical_thread_insert_values(
-    columns: &[&str],
-    thread: &CatalogRepairThread,
-) -> Vec<SqlValue> {
+fn canonical_thread_insert_values(columns: &[&str], thread: &CatalogRepairThread) -> Vec<SqlValue> {
     columns
         .iter()
         .map(|column| match *column {
@@ -1517,6 +1686,9 @@ fn result(
         updated_workspace_roots: 0,
         encrypted_content_warning: None,
         repair_audit: ProviderSyncAudit::default(),
+        recovery_journal_path: None,
+        recovery_errors: Vec::new(),
+        database_outcomes: Vec::new(),
     }
 }
 
@@ -1629,7 +1801,6 @@ fn audit_provider_sync_state(
         .count();
     Ok(audit)
 }
-
 
 fn backup_database_thread_ids(home: &Path) -> anyhow::Result<HashSet<String>> {
     let root = home.join("backups_state/provider-sync");
@@ -2212,8 +2383,11 @@ fn parse_session_meta_record(line: &str) -> Option<Value> {
     let envelope = match serde_json::from_str::<BulkRolloutEnvelope<'_>>(line) {
         Ok(envelope) => envelope,
         // Derived structs reject duplicate fields, whereas Value keeps the last.
-        Err(_) => return serde_json::from_str::<Value>(line).ok()
-            .filter(|record| record["type"].as_str() == Some("session_meta")),
+        Err(_) => {
+            return serde_json::from_str::<Value>(line)
+                .ok()
+                .filter(|record| record["type"].as_str() == Some("session_meta"));
+        }
     };
     let kind = envelope.kind?.get().trim();
     let metadata = kind == "\"session_meta\""
@@ -2256,8 +2430,10 @@ fn scan_bulk_rollout(
             hasher.update(line.as_bytes());
         }
         facts.has_user_event = facts.has_user_event
-            || line.contains("\"user_message\"") || line.contains("\"user_input\"");
-        facts.has_encrypted_content = facts.has_encrypted_content || line.contains("encrypted_content");
+            || line.contains("\"user_message\"")
+            || line.contains("\"user_input\"");
+        facts.has_encrypted_content =
+            facts.has_encrypted_content || line.contains("encrypted_content");
         let (record_line, _) = split_line_ending(&line);
         if record_line.trim().is_empty() {
             continue;
@@ -2272,22 +2448,38 @@ fn scan_bulk_rollout(
             continue;
         };
         facts.session_meta_count += 1;
-        facts.original_session_meta_lines.push(record_line.to_string());
+        facts
+            .original_session_meta_lines
+            .push(record_line.to_string());
         if facts.thread_id.is_none() {
-            facts.thread_id = payload.get("id").and_then(Value::as_str).map(ToString::to_string);
+            facts.thread_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
         }
         if facts.cwd.is_none() {
-            facts.cwd = payload.get("cwd").and_then(Value::as_str).and_then(to_desktop_workspace_path);
+            facts.cwd = payload
+                .get("cwd")
+                .and_then(Value::as_str)
+                .and_then(to_desktop_workspace_path);
         }
         facts.providers.push(
-            payload.get("model_provider").and_then(Value::as_str).unwrap_or("(missing)").to_string(),
+            payload
+                .get("model_provider")
+                .and_then(Value::as_str)
+                .unwrap_or("(missing)")
+                .to_string(),
         );
         facts.rewrite_needed |=
             payload.get("model_provider").and_then(Value::as_str) != Some(target_provider);
-        facts.rollout_marks_non_root_agent |=
-            payload.get("source").is_some_and(source_value_marks_non_root_agent);
+        facts.rollout_marks_non_root_agent |= payload
+            .get("source")
+            .is_some_and(source_value_marks_non_root_agent);
     }
-    Ok((facts, hasher.map(|hasher| format!("{:x}", hasher.finalize()))))
+    Ok((
+        facts,
+        hasher.map(|hasher| format!("{:x}", hasher.finalize())),
+    ))
 }
 
 fn hash_bulk_rollout_plan(
@@ -2300,7 +2492,10 @@ fn hash_bulk_rollout_plan(
     // revalidate all scan facts while hashing, including metadata late in a file.
     reader.seek(SeekFrom::Start(0))?;
     let (actual, digest) = scan_bulk_rollout(reader, target_provider, parse_record, true)?;
-    anyhow::ensure!(actual == *expected, "Rollout changed while planning provider sync");
+    anyhow::ensure!(
+        actual == *expected,
+        "Rollout changed while planning provider sync"
+    );
     digest.ok_or_else(|| anyhow::anyhow!("Missing rollout source hash"))
 }
 
@@ -2345,23 +2540,40 @@ fn scan_bulk_session_rewrites_with_parser(
         };
 
         let mut reader = BufReader::with_capacity(64 * 1024, file);
-        let (facts, mut original_sha256) =
-            scan_bulk_rollout(&mut reader, target_provider, &parse_record, hash_all_sources)?;
-        let is_explicit_user = facts.thread_id
+        let (facts, mut original_sha256) = scan_bulk_rollout(
+            &mut reader,
+            target_provider,
+            &parse_record,
+            hash_all_sources,
+        )?;
+        let is_explicit_user = facts
+            .thread_id
             .as_ref()
             .is_some_and(|id| explicit_user_thread_ids.contains(id));
         let excluded = facts.rollout_marks_non_root_agent
-            || (!is_explicit_user && facts.thread_id
-                .as_ref()
-                .is_some_and(|id| excluded_thread_ids.contains(id)));
+            || (!is_explicit_user
+                && facts
+                    .thread_id
+                    .as_ref()
+                    .is_some_and(|id| excluded_thread_ids.contains(id)));
         if facts.rewrite_needed && !excluded && original_sha256.is_none() {
             original_sha256 = Some(hash_bulk_rollout_plan(
-                &mut reader, target_provider, &parse_record, &facts,
+                &mut reader,
+                target_provider,
+                &parse_record,
+                &facts,
             )?);
         }
         let BulkRolloutFacts {
-            session_meta_count, thread_id, cwd, providers, original_session_meta_lines,
-            rewrite_needed, rollout_marks_non_root_agent, has_user_event, has_encrypted_content,
+            session_meta_count,
+            thread_id,
+            cwd,
+            providers,
+            original_session_meta_lines,
+            rewrite_needed,
+            rollout_marks_non_root_agent,
+            has_user_event,
+            has_encrypted_content,
         } = facts;
 
         if session_meta_count > 0 {
@@ -2554,9 +2766,12 @@ fn resolve_active_rollout_path(home: &Path, value: &str) -> Option<PathBuf> {
 fn rollout_path_candidates(home: &Path, raw: &str) -> Vec<PathBuf> {
     let raw = raw.trim();
     let mut candidates = Vec::new();
-    for view in [Some(raw.to_string()), crate::storage::wsl_path_alternative(raw)]
-        .into_iter()
-        .flatten()
+    for view in [
+        Some(raw.to_string()),
+        crate::storage::wsl_path_alternative(raw),
+    ]
+    .into_iter()
+    .flatten()
     {
         let path = PathBuf::from(&view);
         let path = if rollout_view_is_absolute(&view) {
@@ -2580,10 +2795,8 @@ fn rollout_path_candidates(home: &Path, raw: &str) -> Vec<PathBuf> {
 fn rollout_view_is_absolute(view: &str) -> bool {
     let normalized = view.replace('\\', "/");
     let bytes = normalized.as_bytes();
-    let drive_prefixed = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'/';
+    let drive_prefixed =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
     drive_prefixed || normalized.starts_with("/") || Path::new(view).is_absolute()
 }
 
@@ -3179,16 +3392,16 @@ pub fn restore_thread_sidebar_references(
     if !thread_id.is_empty() {
         clear_thread_tombstones(
             codex_home,
-            &HashSet::from([thread_id.strip_prefix("local:").unwrap_or(thread_id).to_string()]),
+            &HashSet::from([thread_id
+                .strip_prefix("local:")
+                .unwrap_or(thread_id)
+                .to_string()]),
         );
     }
     Ok(restored)
 }
 
-pub fn validate_thread_sidebar_snapshot(
-    codex_home: &Path,
-    snapshot: &Value,
-) -> anyhow::Result<()> {
+pub fn validate_thread_sidebar_snapshot(codex_home: &Path, snapshot: &Value) -> anyhow::Result<()> {
     let thread_id = snapshot
         .get("thread_id")
         .and_then(Value::as_str)
@@ -3240,10 +3453,7 @@ const SIDEBAR_CATALOG_TABLES: [&str; 3] = [
     "local_thread_catalog_scan_entries",
 ];
 
-fn snapshot_thread_from_global_state(
-    codex_home: &Path,
-    thread_id: &str,
-) -> anyhow::Result<Value> {
+fn snapshot_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow::Result<Value> {
     let path = codex_home.join(".codex-global-state.json");
     if !path.exists() {
         return Ok(json!({}));
@@ -3299,10 +3509,7 @@ fn snapshot_thread_from_global_state(
     Ok(Value::Object(snapshot))
 }
 
-fn snapshot_thread_from_catalog_dbs(
-    codex_home: &Path,
-    thread_id: &str,
-) -> anyhow::Result<Value> {
+fn snapshot_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow::Result<Value> {
     let mut entries = Vec::new();
     for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
     {
@@ -3405,7 +3612,10 @@ fn restore_thread_to_global_state(
     if path.exists() && fs::read(&path)? != original_bytes {
         anyhow::bail!(".codex-global-state.json changed while restoring sidebar state");
     }
-    codex_plus_core::settings::atomic_write(&path, serde_json::to_string_pretty(&state)?.as_bytes())?;
+    codex_plus_core::settings::atomic_write(
+        &path,
+        serde_json::to_string_pretty(&state)?.as_bytes(),
+    )?;
     Ok(restored)
 }
 
@@ -3472,7 +3682,11 @@ fn restore_thread_to_catalog_dbs(
     Ok(restored_total)
 }
 
-fn insert_row_ignore(db: &Connection, table: &str, row: &Map<String, Value>) -> anyhow::Result<usize> {
+fn insert_row_ignore(
+    db: &Connection,
+    table: &str,
+    row: &Map<String, Value>,
+) -> anyhow::Result<usize> {
     let columns: Vec<&String> = row.keys().collect();
     if columns.is_empty() {
         return Ok(0);
@@ -3501,10 +3715,12 @@ fn insert_row_ignore(db: &Connection, table: &str, row: &Map<String, Value>) -> 
 }
 
 fn sidebar_catalog_db_paths(codex_home: &Path) -> anyhow::Result<HashSet<PathBuf>> {
-    Ok(codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
-        .into_iter()
-        .filter_map(|path| fs::canonicalize(path).ok())
-        .collect())
+    Ok(
+        codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
+            .into_iter()
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .collect(),
+    )
 }
 
 fn thread_value_matches(value: &Value, thread_id: &str) -> bool {
@@ -3688,13 +3904,17 @@ fn remove_thread_from_global_state(codex_home: &Path, thread_id: &str) -> anyhow
     if fs::read(&path)? != original_bytes {
         anyhow::bail!(".codex-global-state.json changed while deleting thread {thread_id}");
     }
-    codex_plus_core::settings::atomic_write(&path, serde_json::to_string_pretty(&state)?.as_bytes())?;
+    codex_plus_core::settings::atomic_write(
+        &path,
+        serde_json::to_string_pretty(&state)?.as_bytes(),
+    )?;
     Ok(removed)
 }
 
 fn remove_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow::Result<usize> {
     let mut removed_total = 0usize;
-    for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home) {
+    for path in codex_plus_core::codex_sqlite::codex_thread_reference_db_paths_from_home(codex_home)
+    {
         if !path.exists() {
             continue;
         }
@@ -3746,19 +3966,60 @@ fn remove_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow:
 
 /// Append previously removed `session_index.jsonl` lines back (undo flow).
 /// Lines whose `id` already exists are skipped. Returns the number of
-/// appended lines. Best-effort: returns `Ok(0)` without writing when the
-/// file changed since it was read.
+/// appended lines. A changed file is reported as a conflict.
 pub fn restore_session_index_entries(codex_home: &Path, lines: &[String]) -> anyhow::Result<usize> {
-    if lines.is_empty() {
+    let Some(plan) = plan_session_index_restore(codex_home, lines)? else {
         return Ok(0);
+    };
+    let staged = stage_session_index_restore(&plan)?;
+    let result = publish_session_index_restore(&plan, &staged);
+    let _ = fs::remove_file(&staged);
+    result?;
+    clear_thread_tombstones(codex_home, &plan.restored_ids);
+    Ok(plan.appended)
+}
+
+/// 在恢复数据库前检查索引是否可读、可解析，以及同目录是否能持久化恢复内容。
+pub(crate) fn preflight_restore_session_index_entries(
+    codex_home: &Path,
+    lines: &[String],
+) -> anyhow::Result<()> {
+    if let Some(plan) = plan_session_index_restore(codex_home, lines)? {
+        let staged = stage_session_index_restore(&plan)?;
+        fs::remove_file(staged)?;
+    }
+    Ok(())
+}
+
+struct SessionIndexRestorePlan {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    next: Vec<u8>,
+    appended: usize,
+    restored_ids: HashSet<String>,
+}
+
+fn read_session_index_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("session_index.jsonl is not a regular file")
+        }
+        Ok(_) => Ok(Some(fs::read(path)?)),
+    }
+}
+
+fn plan_session_index_restore(
+    codex_home: &Path,
+    lines: &[String],
+) -> anyhow::Result<Option<SessionIndexRestorePlan>> {
+    if lines.is_empty() {
+        return Ok(None);
     }
     let path = codex_home.join("session_index.jsonl");
-    let original_bytes = if path.exists() {
-        fs::read(&path)?
-    } else {
-        Vec::new()
-    };
-    let original_text = String::from_utf8(original_bytes.clone())?;
+    let original = read_session_index_snapshot(&path)?;
+    let original_text = String::from_utf8(original.clone().unwrap_or_default())?;
     let mut existing_ids = HashSet::new();
     for segment in original_text.split_inclusive('\n') {
         let (line, _) = split_line_ending(segment);
@@ -3787,14 +4048,87 @@ pub fn restore_session_index_entries(codex_home: &Path, lines: &[String]) -> any
         appended += 1;
     }
     if appended == 0 {
-        return Ok(0);
+        return Ok(None);
     }
-    if fs::read(&path)? != original_bytes {
-        return Ok(0);
+    Ok(Some(SessionIndexRestorePlan {
+        path,
+        original,
+        next: next_text.into_bytes(),
+        appended,
+        restored_ids,
+    }))
+}
+
+fn stage_session_index_restore(plan: &SessionIndexRestorePlan) -> anyhow::Result<PathBuf> {
+    let parent = plan
+        .path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session index has no parent"))?;
+    let staged = parent.join(format!(
+        ".session-index-restore-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let mut output = crate::backup::new_private_file(&staged)?;
+        output.write_all(&plan.next)?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
     }
-    codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
-    clear_thread_tombstones(codex_home, &restored_ids);
-    Ok(appended)
+    Ok(staged)
+}
+
+fn publish_session_index_restore(
+    plan: &SessionIndexRestorePlan,
+    staged: &Path,
+) -> anyhow::Result<()> {
+    if read_session_index_snapshot(&plan.path)? != plan.original {
+        anyhow::bail!("session_index.jsonl changed while restoring deleted entries");
+    }
+    if plan.original.is_none() {
+        // 不存在时只能条件创建；不能覆盖预检后并发新建的索引。
+        fs::hard_link(staged, &plan.path)?;
+    } else {
+        fs::rename(staged, &plan.path)?;
+    }
+    crate::backup::sync_directory(plan.path.parent().unwrap())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_index_restore_safety_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_index_creation_is_preserved_and_reported_as_a_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let lines = vec![r#"{"id":"restored","thread_name":"fixture"}"#.to_string()];
+        let plan = plan_session_index_restore(temp.path(), &lines)
+            .unwrap()
+            .unwrap();
+        let staged = stage_session_index_restore(&plan).unwrap();
+        fs::write(&plan.path, b"concurrent index\n").unwrap();
+        assert!(publish_session_index_restore(&plan, &staged).is_err());
+        assert_eq!(fs::read(&plan.path).unwrap(), b"concurrent index\n");
+    }
+
+    #[test]
+    fn concurrent_existing_index_update_is_preserved_and_reported_as_a_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_index.jsonl");
+        fs::write(&path, b"original index\n").unwrap();
+        let lines = vec![r#"{"id":"restored","thread_name":"fixture"}"#.to_string()];
+        let plan = plan_session_index_restore(temp.path(), &lines)
+            .unwrap()
+            .unwrap();
+        let staged = stage_session_index_restore(&plan).unwrap();
+        fs::write(&path, b"new index\n").unwrap();
+        assert!(publish_session_index_restore(&plan, &staged).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"new index\n");
+    }
 }
 
 fn ensure_codex_app_stopped(
@@ -3979,7 +4313,9 @@ fn create_backup_with_session_meta_lines<'a>(
         suffix += 1;
         backup_dir = backup_root.join(format!("{}-{suffix}", timestamp_name()));
     }
-    fs::create_dir_all(&backup_dir)?;
+    // 最后一层必须独占创建；不能复用被并发创建或符号链接替换的备份目录。
+    crate::backup::private_directory(&backup_root, false)?;
+    crate::backup::private_directory(&backup_dir, true)?;
     for name in [
         "config.toml",
         ".codex-global-state.json",
@@ -3987,47 +4323,143 @@ fn create_backup_with_session_meta_lines<'a>(
     ] {
         let source = home.join(name);
         if source.exists() {
-            fs::copy(&source, backup_dir.join(name))?;
+            let mut output = crate::backup::new_private_file(&backup_dir.join(name))?;
+            std::io::copy(&mut File::open(&source)?, &mut output)?;
+            output.sync_all()?;
         }
     }
     let db_dir = backup_dir.join("db");
     let mut db_files = Vec::new();
+    let mut db_sources = Vec::new();
     for db_path in provider_sync_db_paths(home) {
-        for source in codex_plus_core::codex_sqlite::codex_sqlite_sidecar_paths(&db_path) {
-            if !source.exists() {
-                continue;
-            }
-            let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &source);
-            let target = db_dir.join(&relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source, &target)?;
-            db_files.push(relative.to_string_lossy().replace('\\', "/"));
+        if !db_path.exists() {
+            continue;
         }
+        let relative = sqlite_backup_relative_path(home, &db_path)?;
+        let target = db_dir.join(&relative);
+        backup_sqlite_database(&db_path, &db_dir, &relative)?;
+        db_files.push(relative.to_string_lossy().replace('\\', "/"));
+        db_sources.push(json!({
+            "sourcePath": db_path,
+            "backupPath": relative,
+            "method": "sqlite_online_backup",
+            "bytes": fs::metadata(&target)?.len(),
+            "sha256": sha256_file(&target)?,
+        }));
     }
     write_session_meta_backup(&backup_dir.join("session-meta-backup.json"), entries)?;
-    fs::write(
-        backup_dir.join("metadata.json"),
+    crate::backup::private_atomic_write(
+        &backup_dir.join("metadata.json"),
         serde_json::to_string_pretty(&json!({
-            "version": 1,
+            "version": 2,
             "namespace": "provider-sync",
             "codexHome": home.to_string_lossy(),
             "targetProvider": target_provider,
             "createdAt": chrono::Utc::now().to_rfc3339(),
             "dbFiles": db_files,
+            "dbSources": db_sources,
             "changedSessionFiles": changed_session_files,
             "managedBy": "Codex++ provider sync"
-        }))?,
+        }))?
+        .as_bytes(),
     )?;
     Ok(backup_dir)
+}
+
+/// 外置库永远映射到备份根内，绝对源路径只进入 manifest，不作为 join 的参数。
+fn sqlite_backup_relative_path(home: &Path, source: &Path) -> anyhow::Result<PathBuf> {
+    let source = fs::canonicalize(source)?;
+    let home = fs::canonicalize(home)?;
+    if let Ok(relative) = source.strip_prefix(&home) {
+        if relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Ok(relative.to_path_buf());
+        }
+    }
+    let name = source
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("SQLite source has no file name"))?;
+    let identity = format!("{:x}", Sha256::digest(source.to_string_lossy().as_bytes()));
+    Ok(PathBuf::from("external").join(identity).join(name))
+}
+
+fn backup_sqlite_database(source: &Path, root: &Path, relative: &Path) -> anyhow::Result<()> {
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        anyhow::bail!("unsafe SQLite backup path: {}", relative.display());
+    }
+    crate::backup::private_directory(root, false)?;
+    let root = fs::canonicalize(root)?;
+    let target = root.join(relative);
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("backup target has no parent"))?;
+    // 逐层检查再创建，不能先 create_dir_all 后才发现中间符号链接已把 mkdir 带出根目录。
+    let mut checked = root.clone();
+    for component in relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .components()
+    {
+        checked.push(component.as_os_str());
+        match fs::symlink_metadata(&checked) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                anyhow::bail!("unsafe SQLite backup parent")
+            }
+            Ok(_) => crate::backup::private_directory(&checked, false)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::backup::private_directory(&checked, true)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !fs::canonicalize(parent)?.starts_with(&root) {
+        anyhow::bail!("SQLite backup target escapes backup directory");
+    }
+    let source_path = fs::canonicalize(source)?;
+    if target == source_path {
+        anyhow::bail!("SQLite backup source and target are the same file");
+    }
+    // 已有目标（包括硬链接/符号链接）一律拒绝，绝不截断。新文件仅由本次备份拥有。
+    let target_file = crate::backup::new_private_file(&target)?;
+    drop(target_file);
+    let source_db =
+        Connection::open_with_flags(&source_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut target_db =
+        Connection::open_with_flags(&target, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source_db, &mut target_db)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match backup.step(128)? {
+                rusqlite::backup::StepResult::Done => break,
+                _ if std::time::Instant::now() >= deadline => {
+                    anyhow::bail!("SQLite backup timed out")
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    }
+    let integrity: String = target_db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        anyhow::bail!("SQLite backup integrity check failed: {integrity}");
+    }
+    drop(target_db);
+    File::open(&target)?.sync_all()?;
+    crate::backup::sync_directory(parent)?;
+    Ok(())
 }
 
 fn write_session_meta_backup<'a>(
     path: &Path,
     entries: impl IntoIterator<Item = (&'a Path, &'a [String])>,
 ) -> anyhow::Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
+    let mut writer = BufWriter::new(crate::backup::new_private_file(path)?);
     writer.write_all(b"[\n")?;
     let mut first = true;
     for (entry_path, original_session_meta_lines) in entries {
@@ -4048,6 +4480,7 @@ fn write_session_meta_backup<'a>(
     }
     writer.write_all(b"]\n")?;
     writer.flush()?;
+    writer.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -4124,8 +4557,7 @@ fn apply_bulk_session_rewrite_plans(
                         total_rollout_files,
                         rewrite_plans.len(),
                         applied.changes.len(),
-                        scanned_skipped_rollout_files
-                            + applied.skipped_locked_rollout_files.len(),
+                        scanned_skipped_rollout_files + applied.skipped_locked_rollout_files.len(),
                     );
                 }
                 if let Err(restore_error) = restore_bulk_session_rewrites(&applied.changes) {
@@ -4282,6 +4714,23 @@ fn restore_bulk_session_rewrite(change: &AppliedBulkSessionRewrite) -> anyhow::R
     })?;
     restore_file_mtime(&change.plan.path, change.plan.original_mtime);
     Ok(())
+}
+
+pub(crate) fn restore_recovery_rollout(
+    change: &crate::sync_journal::JournalRollout,
+) -> anyhow::Result<()> {
+    if sha256_file(&change.path)? == change.before_sha256 {
+        return Ok(());
+    }
+    restore_bulk_session_rewrite(&AppliedBulkSessionRewrite {
+        plan: BulkSessionRewritePlan {
+            path: change.path.clone(),
+            original_sha256: change.before_sha256.clone(),
+            original_mtime: change.original_mtime,
+            original_session_meta_lines: change.original_meta_lines.clone(),
+        },
+        rewritten_sha256: change.after_sha256.clone(),
+    })
 }
 
 fn stream_restore_rollout_session_meta_lines<W: Write>(
@@ -4878,6 +5327,7 @@ fn apply_sqlite_update(
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
     excluded_thread_ids: &HashSet<String>,
+    journal: Option<&mut SyncJournal>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     if !path.exists() {
         return Ok(SqliteUpdateCounts::default());
@@ -4888,7 +5338,12 @@ fn apply_sqlite_update(
     if !columns.contains("model_provider") && !catalog_columns.contains("model_provider") {
         return Ok(SqliteUpdateCounts::default());
     }
-    let tx = db.transaction()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let before = if journal.is_some() {
+        Some(SqliteSnapshot::capture(&tx)?)
+    } else {
+        None
+    };
     let mut counts = SqliteUpdateCounts::default();
     if columns.contains("id") && columns.contains("model_provider") {
         for thread_id in
@@ -4936,7 +5391,11 @@ fn apply_sqlite_update(
             )?;
         }
     }
-    tx.commit()?;
+    if let Some(journal) = journal {
+        journal.commit(tx, before.unwrap(), path)?;
+    } else {
+        tx.commit()?;
+    }
     Ok(counts)
 }
 
@@ -4946,6 +5405,7 @@ fn apply_sqlite_update_for_paths(
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
     excluded_thread_ids: &HashSet<String>,
+    mut journal: Option<&mut SyncJournal>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     let mut total = SqliteUpdateCounts::default();
     for path in paths {
@@ -4955,6 +5415,7 @@ fn apply_sqlite_update_for_paths(
             user_event_thread_ids,
             cwd_by_thread_id,
             excluded_thread_ids,
+            journal.as_deref_mut(),
         )?);
     }
     Ok(total)
@@ -5115,8 +5576,16 @@ fn repair_missing_local_thread_catalog_rows(
     home: &Path,
     paths: &[PathBuf],
     target_provider: &str,
+    journal: Option<&mut SyncJournal>,
 ) -> anyhow::Result<CatalogRepairCounts> {
-    repair_missing_local_thread_catalog_rows_filtered(home, paths, target_provider, None, true)
+    repair_missing_local_thread_catalog_rows_filtered(
+        home,
+        paths,
+        target_provider,
+        None,
+        true,
+        journal,
+    )
 }
 
 fn repair_missing_local_thread_catalog_rows_for_threads(
@@ -5131,6 +5600,7 @@ fn repair_missing_local_thread_catalog_rows_for_threads(
         target_provider,
         Some(thread_ids),
         false,
+        None,
     )
 }
 
@@ -5140,6 +5610,7 @@ fn repair_missing_local_thread_catalog_rows_filtered(
     target_provider: &str,
     thread_ids: Option<&HashSet<String>>,
     update_full_sync_state: bool,
+    mut journal: Option<&mut SyncJournal>,
 ) -> anyhow::Result<CatalogRepairCounts> {
     let plan = collect_catalog_repair_plan(home, paths, target_provider, thread_ids)?;
     if plan.threads.is_empty() && (!update_full_sync_state || !plan.has_cleanup_candidates()) {
@@ -5170,7 +5641,12 @@ fn repair_missing_local_thread_catalog_rows_filtered(
             insert_columns.join(", "),
             placeholders
         );
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before = if journal.is_some() {
+            Some(SqliteSnapshot::capture(&tx)?)
+        } else {
+            None
+        };
         let mut removed = 0;
         if update_full_sync_state {
             let cleanup_thread_ids = plan.cleanup_thread_ids_for_path(path);
@@ -5216,7 +5692,11 @@ fn repair_missing_local_thread_catalog_rows_filtered(
                 )?;
             }
         }
-        tx.commit()?;
+        if let Some(journal) = journal.as_deref_mut() {
+            journal.commit(tx, before.unwrap(), path)?;
+        } else {
+            tx.commit()?;
+        }
         total.add(CatalogRepairCounts {
             inserted_rows: inserted,
             removed_rows: removed,
@@ -5923,7 +6403,7 @@ fn count_global_state_updates(path: &Path) -> anyhow::Result<usize> {
         .count())
 }
 
-fn apply_global_state_update(path: &Path) -> anyhow::Result<usize> {
+fn apply_global_state_update(path: &Path, journal: &mut SyncJournal) -> anyhow::Result<usize> {
     let (original_bytes, mut state) = global_state_snapshot(path)?;
     let next = normalized_global_state(&state);
     let count = next
@@ -5933,6 +6413,17 @@ fn apply_global_state_update(path: &Path) -> anyhow::Result<usize> {
     if count > 0 {
         for (key, value) in next {
             state.insert(key, value);
+        }
+        let after = serde_json::to_string_pretty(&state)?;
+        journal.prepare_file(path, Some(&original_bytes), after.as_bytes())?;
+        if let Some(parent) = path.parent() {
+            let backup_path = parent.join(".codex-global-state.json.bak");
+            let backup_before = match fs::read(&backup_path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            journal.prepare_file(&backup_path, backup_before.as_deref(), after.as_bytes())?;
         }
         write_global_state_if_unchanged(path, &original_bytes, &state)?;
     }
@@ -5995,6 +6486,87 @@ fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
     result
 }
 
+fn pending_recovery_result(home: &Path, target_provider: &str) -> Option<ProviderSyncResult> {
+    let path = pending_recovery_journal(home)?;
+    let mut blocked = result(
+        ProviderSyncStatus::PartialFailure,
+        format!(
+            "Provider sync blocked: recovery journal or namespace is unresolved or unreadable: {}",
+            path.display()
+        ),
+        target_provider,
+        path.parent().map(Path::to_path_buf),
+        0,
+        0,
+    );
+    blocked.recovery_journal_path = Some(path);
+    blocked.recovery_errors.push(
+        "Previous operation may contain committed changes; counts require journal inspection"
+            .into(),
+    );
+    Some(blocked)
+}
+
+/// 返回未完成/无法确认安全的恢复位置；namespace 本身不可读时返回该目录供诊断。
+/// 只有 namespace 不存在，或全部受管 journal 明确完成，才返回 None。
+pub fn pending_recovery_journal(home: &Path) -> Option<PathBuf> {
+    let root = home.join("backups_state/provider-sync");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(root),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return Some(root),
+        };
+        let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(_) => return Some(path),
+        };
+        // 不是本程序建立的普通目录，不跟随历史备份中的旁路符号链接。
+        if !kind.is_dir() {
+            continue;
+        }
+        let journal = path.join("recovery-journal.json");
+        match fs::symlink_metadata(&journal) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Some(journal),
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Some(journal);
+            }
+            Ok(_) => {}
+        }
+        // journal 已存在意味着可能已有业务写入，metadata 读错/损坏不能当作“无作业”。
+        let metadata = match fs::read(path.join("metadata.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        {
+            Some(metadata) => metadata,
+            None => return Some(journal),
+        };
+        if metadata.get("managedBy").and_then(Value::as_str) != Some("Codex++ provider sync") {
+            return Some(journal);
+        }
+        let finished = fs::read(&journal)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| {
+                value.get("version").and_then(Value::as_u64) == Some(1)
+                    && matches!(
+                        value.get("state").and_then(Value::as_str),
+                        Some("complete" | "rolled_back")
+                    )
+            });
+        if !finished {
+            return Some(journal);
+        }
+    }
+    None
+}
+
 fn prune_backups(home: &Path) -> anyhow::Result<()> {
     let root = home.join("backups_state/provider-sync");
     if !root.exists() {
@@ -6013,6 +6585,22 @@ fn prune_backups(home: &Path) -> anyhow::Result<()> {
             continue;
         };
         if value.get("managedBy").and_then(Value::as_str) == Some("Codex++ provider sync") {
+            let journal = path.join("recovery-journal.json");
+            if journal.exists() {
+                let completed = fs::read(&journal)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| {
+                        value
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .map(|state| matches!(state, "complete" | "rolled_back"))
+                    })
+                    .unwrap_or(false);
+                if !completed {
+                    continue;
+                }
+            }
             managed.push(path);
         }
     }
@@ -6039,6 +6627,184 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod safe_database_backup_tests {
+    use super::*;
+    #[test]
+    fn unreadable_or_corrupt_recovery_metadata_does_not_hide_a_pending_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let backup = home.join("backups_state/provider-sync/job");
+        fs::create_dir_all(&backup).unwrap();
+        let journal = backup.join("recovery-journal.json");
+        fs::write(&journal, br#"{"version":1,"state":"prepared"}"#).unwrap();
+        assert_eq!(pending_recovery_journal(&home), Some(journal.clone()));
+        fs::write(backup.join("metadata.json"), b"broken JSON").unwrap();
+        assert_eq!(pending_recovery_journal(&home), Some(journal.clone()));
+        fs::write(
+            backup.join("metadata.json"),
+            br#"{"managedBy":"Codex++ provider sync"}"#,
+        )
+        .unwrap();
+        fs::write(&journal, b"broken journal").unwrap();
+        assert_eq!(pending_recovery_journal(&home), Some(journal.clone()));
+        fs::write(&journal, br#"{"version":1,"state":"complete"}"#).unwrap();
+        assert!(pending_recovery_journal(&home).is_none());
+        fs::write(&journal, br#"{"version":99,"state":"complete"}"#).unwrap();
+        assert_eq!(pending_recovery_journal(&home), Some(journal));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_namespace_read_errors_are_not_reported_as_healthy() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join("backups_state/provider-sync");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0)).unwrap();
+        let denied = fs::read_dir(&root).is_err();
+        let pending = pending_recovery_journal(&home);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        if denied {
+            assert_eq!(pending, Some(root));
+        }
+        // 非目录同样是实际 IO 故障，不能由 read_dir().ok() 变成 None。
+        let other = temp.path().join("other");
+        fs::create_dir_all(other.join("backups_state")).unwrap();
+        fs::write(other.join("backups_state/provider-sync"), b"not directory").unwrap();
+        assert_eq!(
+            pending_recovery_journal(&other),
+            Some(other.join("backups_state/provider-sync"))
+        );
+    }
+    #[test]
+    fn external_database_wal_snapshot_is_independent_and_source_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let source = external.join("state_5.sqlite");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES('t','old');").unwrap();
+        let relative = sqlite_backup_relative_path(&home, &source).unwrap();
+        assert!(relative.starts_with("external"));
+        assert!(!relative.is_absolute());
+        let root = home.join("backups_state/provider-sync/fixture/db");
+        backup_sqlite_database(&source, &root, &relative).unwrap();
+        assert_ne!(
+            fs::canonicalize(&source).unwrap(),
+            fs::canonicalize(root.join(&relative)).unwrap()
+        );
+        assert!(fs::metadata(&source).unwrap().len() > 0);
+        assert!(
+            backup_database_thread_ids(&home).unwrap().contains("t"),
+            "外置映射的物理备份必须被既有递归恢复检索发现"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(root.join(&relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        for conn in [&db, &Connection::open(root.join(relative)).unwrap()] {
+            assert_eq!(
+                conn.query_row("SELECT model_provider FROM threads WHERE id='t'", [], |r| r
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "old"
+            );
+        }
+    }
+    #[test]
+    fn existing_hard_link_target_and_parent_escape_are_rejected_without_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("state.db");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT); INSERT INTO threads VALUES('keep');")
+            .unwrap();
+        let root = temp.path().join("backup");
+        fs::create_dir(&root).unwrap();
+        fs::hard_link(&source, root.join("copy.db")).unwrap();
+        assert!(backup_sqlite_database(&source, &root, Path::new("copy.db")).is_err());
+        assert!(backup_sqlite_database(&source, &root, Path::new("../state.db")).is_err());
+        assert_eq!(
+            db.query_row("SELECT id FROM threads", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+    }
+    #[test]
+    fn second_database_failure_rolls_back_first_database_conditionally() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a.db");
+        let b = temp.path().join("b.db");
+        for path in [&a, &b] {
+            Connection::open(path).unwrap().execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES('t','old');").unwrap();
+        }
+        Connection::open(&b).unwrap().execute_batch("CREATE TRIGGER abort_update BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        let mut journal = SyncJournal::new(temp.path()).unwrap();
+        assert!(
+            apply_sqlite_update_for_paths(
+                &[a.clone(), b.clone()],
+                "new",
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                Some(&mut journal)
+            )
+            .is_err()
+        );
+        assert!(journal.rollback().is_empty());
+        for path in [a, b] {
+            assert_eq!(
+                Connection::open(path)
+                    .unwrap()
+                    .query_row("SELECT model_provider FROM threads", [], |r| r
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "old"
+            );
+        }
+        assert_eq!(journal.outcomes()[0].remaining_rows, 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_backup_rejects_symlink_parent_without_touching_external_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        Connection::open(&source)
+            .unwrap()
+            .execute_batch("CREATE TABLE threads(id TEXT)")
+            .unwrap();
+        let root = temp.path().join("backup");
+        fs::create_dir(&root).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        assert!(backup_sqlite_database(&source, &root, Path::new("escape/copy.db")).is_err());
+        assert!(!outside.join("copy.db").exists());
+        assert!(backup_sqlite_database(&source, &root, Path::new("escape/new/copy.db")).is_err());
+        assert!(!outside.join("new").exists());
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6076,13 +6842,34 @@ mod startup_scan_tests {
         let sessions = temp.path().join("sessions");
         fs::create_dir(&sessions).unwrap();
         for (name, meta) in [
-            ("user", r#"{"type":"session_meta","payload":{"id":"user","cwd":"C:/workspace","model_provider":"old"}}"#),
-            ("child", r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"depth":1}},"model_provider":"old"}}"#),
-            ("excluded", r#"{"type":"session_meta","payload":{"id":"excluded","model_provider":"old"}}"#),
-            ("explicit", r#"{"type":"session_meta","payload":{"id":"explicit","model_provider":"old"}}"#),
-            ("missing", r#"{"type":"session_meta","payload":{"id":"missing"}}"#),
-            ("escaped", r#"{"payload":{"id":"escaped","model_provider":"old"},"ty\u0070e":"session\u005fmeta"}"#),
-            ("same", r#"{"type":"session_meta","payload":{"id":"same","model_provider":"new"}}"#),
+            (
+                "user",
+                r#"{"type":"session_meta","payload":{"id":"user","cwd":"C:/workspace","model_provider":"old"}}"#,
+            ),
+            (
+                "child",
+                r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"depth":1}},"model_provider":"old"}}"#,
+            ),
+            (
+                "excluded",
+                r#"{"type":"session_meta","payload":{"id":"excluded","model_provider":"old"}}"#,
+            ),
+            (
+                "explicit",
+                r#"{"type":"session_meta","payload":{"id":"explicit","model_provider":"old"}}"#,
+            ),
+            (
+                "missing",
+                r#"{"type":"session_meta","payload":{"id":"missing"}}"#,
+            ),
+            (
+                "escaped",
+                r#"{"payload":{"id":"escaped","model_provider":"old"},"ty\u0070e":"session\u005fmeta"}"#,
+            ),
+            (
+                "same",
+                r#"{"type":"session_meta","payload":{"id":"same","model_provider":"new"}}"#,
+            ),
         ] {
             let body = format!(
                 "{meta}\r\n{}\n{}\n{meta}\nmalformed\n",
@@ -6095,15 +6882,26 @@ mod startup_scan_tests {
         let explicit = HashSet::from(["explicit".into()]);
         let mut legacy_progress = Vec::new();
         let legacy = scan_bulk_session_rewrites_with_parser(
-            temp.path(), "new", &excluded, &explicit, &mut |p| legacy_progress.push(p),
-            |line| serde_json::from_str::<Value>(line).ok(), true,
-        ).unwrap();
+            temp.path(),
+            "new",
+            &excluded,
+            &explicit,
+            &mut |p| legacy_progress.push(p),
+            |line| serde_json::from_str::<Value>(line).ok(),
+            true,
+        )
+        .unwrap();
         let mut progress = Vec::new();
-        let optimized = scan_bulk_session_rewrites(
-            temp.path(), "new", &excluded, &explicit, &mut |p| progress.push(p),
-        ).unwrap();
+        let optimized =
+            scan_bulk_session_rewrites(temp.path(), "new", &excluded, &explicit, &mut |p| {
+                progress.push(p)
+            })
+            .unwrap();
         assert_eq!(optimized, legacy);
-        assert_eq!(serde_json::to_value(progress).unwrap(), serde_json::to_value(legacy_progress).unwrap());
+        assert_eq!(
+            serde_json::to_value(progress).unwrap(),
+            serde_json::to_value(legacy_progress).unwrap()
+        );
         assert_eq!(optimized.rewrite_plans.len(), 4);
         assert!(optimized.thread_ids_with_user_events.contains("explicit"));
         assert!(!optimized.thread_ids_with_user_events.contains("excluded"));
@@ -6114,33 +6912,42 @@ mod startup_scan_tests {
     fn unchanged_scan_has_no_digest_but_late_metadata_rewrite_hashes_exact_bytes() {
         let current = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"new\"}}\r\n";
         let mut reader = std::io::Cursor::new(current.to_vec());
-        let (facts, digest) = scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
+        let (facts, digest) =
+            scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
         assert!(!facts.rewrite_needed);
         assert!(digest.is_none());
         let mut bytes = current.to_vec();
         bytes.extend_from_slice(b"{\"type\":\"response_item\",\"payload\":{\"text\":\"body\"}}\n");
-        bytes.extend_from_slice(b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n");
+        bytes.extend_from_slice(
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n",
+        );
         let mut reader = std::io::Cursor::new(bytes.clone());
-        let (facts, digest) = scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
+        let (facts, digest) =
+            scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
         assert!(facts.rewrite_needed);
         assert_eq!(facts.session_meta_count, 2);
         assert!(digest.is_none());
-        let digest = hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts).unwrap();
+        let digest =
+            hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts).unwrap();
         assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));
     }
 
     #[test]
     fn write_plan_hash_pass_refuses_changed_metadata_or_summary_facts() {
-        let original = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n";
+        let original =
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n";
         let mut reader = std::io::Cursor::new(original.to_vec());
-        let (facts, _) = scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
+        let (facts, _) =
+            scan_bulk_rollout(&mut reader, "new", &parse_session_meta_record, false).unwrap();
         for changed in [
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"model_provider\":\"old\"}}\n",
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"new\"}}\n",
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n",
         ] {
             let mut reader = std::io::Cursor::new(changed.as_bytes());
-            let error = hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts).unwrap_err();
+            let error =
+                hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts)
+                    .unwrap_err();
             assert!(error.to_string().contains("Rollout changed while planning"));
         }
     }
@@ -6151,29 +6958,52 @@ mod startup_scan_tests {
         let home = PathBuf::from(std::env::var_os("CPP_PROVIDER_SCAN_HOME").unwrap());
         let kinds = sqlite_provider_sync_thread_kinds(&provider_sync_db_paths(&home)).unwrap();
         let target = resolve_provider_sync_target_snapshot(&home.join("config.toml"), None)
-            .unwrap().target_provider;
+            .unwrap()
+            .target_provider;
         let start = std::time::Instant::now();
         let legacy = scan_bulk_session_rewrites_with_parser(
-            &home, &target, &kinds.subagent_thread_ids, &kinds.explicit_user_thread_ids,
-            &mut |_| {}, |line| serde_json::from_str::<Value>(line).ok(), true,
-        ).unwrap();
+            &home,
+            &target,
+            &kinds.subagent_thread_ids,
+            &kinds.explicit_user_thread_ids,
+            &mut |_| {},
+            |line| serde_json::from_str::<Value>(line).ok(),
+            true,
+        )
+        .unwrap();
         let legacy_ms = start.elapsed().as_millis();
         let start = std::time::Instant::now();
         let optimized = scan_bulk_session_rewrites(
-            &home, &target, &kinds.subagent_thread_ids, &kinds.explicit_user_thread_ids,
+            &home,
+            &target,
+            &kinds.subagent_thread_ids,
+            &kinds.explicit_user_thread_ids,
             &mut |_| {},
-        ).unwrap();
+        )
+        .unwrap();
         eprintln!(
             "READ_ONLY_SCAN legacy_ms={legacy_ms} optimized_ms={} legacy_files={} optimized_files={} legacy_plans={} optimized_plans={}",
-            start.elapsed().as_millis(), legacy.total_rollout_files, optimized.total_rollout_files,
-            legacy.rewrite_plans.len(), optimized.rewrite_plans.len(),
+            start.elapsed().as_millis(),
+            legacy.total_rollout_files,
+            optimized.total_rollout_files,
+            legacy.rewrite_plans.len(),
+            optimized.rewrite_plans.len(),
         );
         let start = std::time::Instant::now();
         scan_bulk_session_rewrites_with_parser(
-            &home, &target, &kinds.subagent_thread_ids, &kinds.explicit_user_thread_ids,
-            &mut |_| {}, |_| None, false,
-        ).unwrap();
-        eprintln!("READ_ONLY_SCAN parse_free_read_and_flags_ms={}", start.elapsed().as_millis());
+            &home,
+            &target,
+            &kinds.subagent_thread_ids,
+            &kinds.explicit_user_thread_ids,
+            &mut |_| {},
+            |_| None,
+            false,
+        )
+        .unwrap();
+        eprintln!(
+            "READ_ONLY_SCAN parse_free_read_and_flags_ms={}",
+            start.elapsed().as_millis()
+        );
     }
 }
 
@@ -6271,8 +7101,14 @@ mod provider_sync_preview_tests {
         let preview = preview_provider_sync(Some(&home)).unwrap();
 
         assert_eq!(preview.target_provider, "relay-alpha");
-        assert_eq!(preview.backup_root, home.join("backups_state/provider-sync"));
-        assert!(!home.join("tmp/provider-sync.lock").exists(), "预览不该建锁");
+        assert_eq!(
+            preview.backup_root,
+            home.join("backups_state/provider-sync")
+        );
+        assert!(
+            !home.join("tmp/provider-sync.lock").exists(),
+            "预览不该建锁"
+        );
         assert!(!preview.backup_root.exists(), "预览不该建备份目录");
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
     }
@@ -6379,9 +7215,11 @@ mod rollback_tests {
 
         let error = restore_bulk_session_rewrite(&change).unwrap_err();
 
-        assert!(error
-            .chain()
-            .any(|cause| cause.to_string().contains("rollout rollback hash mismatch")));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("rollout rollback hash mismatch"))
+        );
         assert_eq!(fs::read(&rollout).unwrap(), rewritten.into_bytes());
     }
 }
@@ -6404,10 +7242,14 @@ mod global_state_tests {
         });
         fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
 
-        assert_eq!(apply_global_state_update(&path).unwrap(), 1);
+        let mut journal = SyncJournal::new(temp.path()).unwrap();
+        assert_eq!(apply_global_state_update(&path, &mut journal).unwrap(), 1);
 
         let updated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(updated["projectless-thread-ids"], original["projectless-thread-ids"]);
+        assert_eq!(
+            updated["projectless-thread-ids"],
+            original["projectless-thread-ids"]
+        );
         assert_eq!(
             updated["thread-workspace-root-hints"],
             original["thread-workspace-root-hints"]
@@ -6444,7 +7286,11 @@ mod global_state_tests {
 
         let error = write_global_state_if_unchanged(&path, &original_bytes, &state).unwrap_err();
 
-        assert!(error.to_string().contains(GLOBAL_STATE_SOURCE_CHANGED_ERROR));
+        assert!(
+            error
+                .to_string()
+                .contains(GLOBAL_STATE_SOURCE_CHANGED_ERROR)
+        );
         assert_eq!(fs::read(&path).unwrap(), newer_sidebar_bytes);
     }
 }
@@ -6984,8 +7830,11 @@ mod canonical_thread_rebuild_tests {
             [],
         )
         .unwrap();
-        db.execute("INSERT INTO local_thread_catalog_metadata VALUES (1, 0)", [])
-            .unwrap();
+        db.execute(
+            "INSERT INTO local_thread_catalog_metadata VALUES (1, 0)",
+            [],
+        )
+        .unwrap();
         for (index, (thread_id, provider)) in rows.iter().enumerate() {
             db.execute(
                 "INSERT INTO local_thread_catalog
@@ -7059,7 +7908,10 @@ mod canonical_thread_rebuild_tests {
             result.message
         );
         let after = thread_ids(&state_db);
-        assert!(after.contains(&thread_id.to_string()), "缺失的 canonical 行应被补建：{after:?}");
+        assert!(
+            after.contains(&thread_id.to_string()),
+            "缺失的 canonical 行应被补建：{after:?}"
+        );
         for id in before {
             assert!(after.contains(&id), "原有行不允许丢失：{id}");
         }
@@ -7194,11 +8046,7 @@ mod sync_diagnostics_tests {
 
         assert_eq!(result.repair_audit.scanned_rollout_files, 0);
         assert!(result.repair_audit.scanned_session_dirs.is_empty());
-        assert!(
-            result.message.contains("均不存在"),
-            "{}",
-            result.message
-        );
+        assert!(result.message.contains("均不存在"), "{}", result.message);
         assert!(
             result.message.contains("rollout 文件 0 个"),
             "{}",
@@ -7283,7 +8131,10 @@ mod sync_diagnostics_tests {
         fs::create_dir_all(&home).unwrap();
         write_config(&home, "relay-alpha");
         let global_state = home.join(".codex-global-state.json");
-        assert_eq!(global_state.file_name().unwrap(), ".codex-global-state.json");
+        assert_eq!(
+            global_state.file_name().unwrap(),
+            ".codex-global-state.json"
+        );
         // 空文件 / 被截断的文件：解析报 `expected value at line 1 column 1`。
         fs::write(&global_state, "{\"projectless-thread-ids\": [").unwrap();
 
@@ -7324,7 +8175,10 @@ mod sync_diagnostics_tests {
         let preview = preview_provider_sync(Some(&home)).unwrap();
 
         assert_eq!(preview.audit.scanned_rollout_files, 1);
-        assert_eq!(preview.audit.scanned_session_dirs, vec!["sessions".to_string()]);
+        assert_eq!(
+            preview.audit.scanned_session_dirs,
+            vec!["sessions".to_string()]
+        );
         assert!(!home.join("tmp/provider-sync.lock").exists());
         assert!(!preview.backup_root.exists());
     }

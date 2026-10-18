@@ -45,18 +45,6 @@
       dispatchMessage: (dispatcher, type, payload) => dispatchCodexPlusMessage(dispatcher, type, payload),
       requestOverride: (message) => codexServiceTierRequestOverride(message),
       diagnostics: () => [...(window.__codexPlusServiceTierTestDiagnostics || [])],
-      statusSummary: (state = {}) => {
-        const summaryState = { ...codexServiceTierState, ...state };
-        return serviceTierStatusMessage(
-          summaryState.controlMode,
-          summaryState.threadMode,
-          summaryState.effectiveMode,
-          summaryState.defaultMode,
-          summaryState.effectiveServiceTier,
-          summaryState.serviceTierSource
-        );
-      },
-      resolveInheritedServiceTier: () => resolveInheritedServiceTier(),
       currentModelName: () => codexServiceTierCurrentModelName(),
       fastAvailability: (modelName = codexServiceTierCurrentModelName()) => codexServiceTierFastAvailability(modelName),
       modelDescriptor: (modelName) => codexPlusModelDescriptor(modelName),
@@ -64,11 +52,6 @@
       patchAppServerResult: (method, result) => patchAppServerModelResult(method, result),
       patchModelQueryClient: (queryClient) => patchCodexModelQueryClient(queryClient),
       reactRuntimeCandidates: (rootFibers) => collectCodexReactRuntimeCandidates(rootFibers),
-      nativeSpeedRow: (container, rows = []) => codexServiceTierNativeSpeedRow(container, rows, codexServiceTierMenuStrings()),
-      nativeAuthRefreshDispatch: (fiber) => codexServiceTierNativeAuthRefreshDispatch(fiber),
-      nativeAuthRefreshAction: codexServiceTierNativeAuthRefreshAction,
-      reactFiberKeys,
-      serviceTierMenuModelCandidates: codexServiceTierMenuModelCandidates,
       setModelCatalog: (catalog = {}) => {
         codexModelCatalog = {
           status: "ok",
@@ -98,26 +81,6 @@
       },
       providerPatchEnabled: () => codexRemoteSessionProviderPatchEnabled(),
       providerNormalizationEnabled: () => codexRemoteSessionProviderNormalizationEnabled(),
-      setServiceTierState: (state = {}) => {
-        codexServiceTierState = { ...codexServiceTierState, ...state };
-      },
-      setThreadState: (state = {}) => {
-        localStorage.setItem(codexThreadServiceTierKey, JSON.stringify({
-          version: codexThreadServiceTierVersion,
-          mode: "inherit",
-          defaultMode: "inherit",
-          entries: {},
-          ...state,
-        }));
-      },
-      threadState: () => readThreadServiceTierState(),
-      syncNativeSelection: (mode) => syncCodexServiceTierFromNativeSelection(mode),
-      nativeSelectionGuard: () => ({
-        mode: codexNativeServiceTierSelectionGuard.mode,
-        active: codexNativeServiceTierSelectionGuardActive(),
-      }),
-      nativeModeFromMenuItem: (item) => codexNativeServiceTierModeFromMenuItem(item),
-      installNativeSelectionSync: installCodexNativeServiceTierSelectionSync,
       restoreContextUsage: restoreCodexContextWindowUsage,
       patchContextUsageManager: patchCodexContextUsageManager,
       findAppHeader: (root) => findCodexAppHeader(root),
@@ -135,7 +98,6 @@
       stateApiFromModule: codexStateApiFromModule,
       dispatcherFromModule: codexServiceTierDispatcherFromModule,
       patchAppServerClient: patchAppServerModelRequestClient,
-      patchNativeFastIcon: patchCodexNativeSolidFastIcon,
       locateAppServerClientBreakpoint: locateCodexAppServerClientBreakpoint,
       installAppServerClientPrototypePatch: installCodexAppServerClientPrototypePatch,
       appServerClientPrototypeState: () => ({
@@ -228,30 +190,11 @@
     return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
 
-  function codexPlusModelServiceTiers(modelName, nativeTiers) {
-    // 原生目录优先，保留 Ultrafast 等新档位；旧后端缺字段时仅补已确认支持 Fast 的模型。
-    const metadataTiers = codexPlusModelMetadata(modelName)?.serviceTiers;
-    const tiers = Array.isArray(nativeTiers) && nativeTiers.length ? nativeTiers : metadataTiers;
-    if (Array.isArray(tiers) && tiers.length) {
-      return tiers.map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
-    }
-    return codexServiceTierSupportedFastModels.has(normalizeCodexServiceTierModelName(modelName))
-      ? [{ id: "priority", name: "Fast", description: "1.5x speed, increased usage" }]
-      : [];
-  }
-
-  function applyCodexPlusModelServiceTiers(descriptor, modelName) {
-    const serviceTiers = codexPlusModelServiceTiers(modelName, descriptor.serviceTiers);
-    if (JSON.stringify(descriptor.serviceTiers || []) === JSON.stringify(serviceTiers)) return false;
-    descriptor.serviceTiers = serviceTiers;
-    return true;
-  }
-
   function applyCodexPlusModelMetadata(descriptor, modelName) {
     if (!descriptor) return false;
-    let changed = applyCodexPlusModelServiceTiers(descriptor, modelName);
     const metadata = codexPlusModelMetadata(modelName);
-    if (!metadata) return changed;
+    if (!metadata) return false;
+    let changed = false;
     for (const key of ["displayName", "description", "defaultReasoningEffort", "contextWindow", "maxContextWindow", "context_window", "max_context_window"]) {
       const valid = typeof metadata[key] === "string" ? !!metadata[key] : Number.isFinite(metadata[key]) && metadata[key] > 0;
       if (valid && descriptor[key] !== metadata[key]) {
@@ -274,15 +217,10 @@
         changed = true;
       }
     }
-    for (const key of ["inputModalities", "additionalSpeedTiers"]) {
-      if (!Array.isArray(metadata[key])) continue;
-      // 与 serviceTiers 一致：兼容目录只补缺失的速度能力，不覆盖原生新增档位。
-      if (key === "additionalSpeedTiers" && Array.isArray(descriptor[key]) && descriptor[key].length) continue;
-      const nextValues = metadata[key].map((entry) => entry && typeof entry === "object" ? { ...entry } : entry);
-      if (JSON.stringify(descriptor[key] || []) !== JSON.stringify(nextValues)) {
-        descriptor[key] = nextValues;
-        changed = true;
-      }
+    if (Array.isArray(metadata.inputModalities)
+        && JSON.stringify(descriptor.inputModalities || []) !== JSON.stringify(metadata.inputModalities)) {
+      descriptor.inputModalities = [...metadata.inputModalities];
+      changed = true;
     }
     if (typeof metadata.supportsImageDetailOriginal === "boolean"
         && descriptor.supportsImageDetailOriginal !== metadata.supportsImageDetailOriginal) {
@@ -307,8 +245,6 @@
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
       inputModalities: Array.isArray(metadata?.inputModalities) ? [...metadata.inputModalities] : ["text"],
       supportsImageDetailOriginal: metadata?.supportsImageDetailOriginal === true,
-      additionalSpeedTiers: Array.isArray(metadata?.additionalSpeedTiers) ? [...metadata.additionalSpeedTiers] : [],
-      serviceTiers: codexPlusModelServiceTiers(modelName),
     };
   }
 
@@ -462,9 +398,6 @@
           changed = true;
         }
         if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
-      } else if (codexPlusSettings().serviceTierControls) {
-        // 原生列表中的模型不一定出现在当前供应商目录，速度补丁不能受目录成员限制。
-        if (applyCodexPlusModelServiceTiers(item, item.model)) changed = true;
       }
     });
     customModels.forEach((modelName) => {
@@ -764,6 +697,9 @@
   }
 
   function codexThreadModelRequestState(method, params, result) {
+    if (method === "send-cli-request-for-host" && params?.method) {
+      return codexThreadModelRequestState(String(params.method), params.params, result);
+    }
     const requestMethod = String(method || "");
     const threadId = String(
       params?.threadId
@@ -861,13 +797,25 @@
   }
 
   async function refreshCodexThreadModelBeforeTurn(client, originalSendRequest, method, params, options) {
+    if (method === "send-cli-request-for-host" && params?.method) {
+      if ([params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) return null;
+      return refreshCodexThreadModelBeforeTurn(client,
+        (nestedMethod, nestedParams, nestedOptions) => originalSendRequest(method,
+          { ...params, method: nestedMethod, params: nestedParams }, nestedOptions),
+        String(params.method), params.params, options);
+    }
     if (String(method || "") !== "turn/start" || !codexPerModelContextEnabled()) return null;
     const { threadId, model } = codexThreadModelRequestState(method, params);
     if (!threadId || !model) return null;
     const previousModel = client.__codexPlusThreadModels?.get(threadId) || "";
     if (!previousModel || previousModel === model) return null;
+    if (client.hostId === "local" && codexManagedSessionConnection()
+        && window.__codexPlusConnectionRecoveryPending?.has(threadId)) {
+      throw new Error("此会话正在检查连接，请稍后重新发送");
+    }
     let resumeParams = { threadId, model };
     resumeParams = applyCodexRemoteSessionProviderOverride("thread/resume", resumeParams);
+    resumeParams = applyCodexManagedSessionConnection("thread/resume", resumeParams, client.hostId);
     try {
       await originalSendRequest("thread/resume", resumeParams, options);
       client.__codexPlusThreadModels.set(threadId, model);
@@ -893,9 +841,7 @@
     if (client.hostId === "local") {
       nextParams = applyCodexImageGenerationRequestOverride(requestMethod, nextParams);
     }
-    return ["turn/start", "thread/settings/update"].includes(requestMethod)
-      ? applyCodexServiceTierRequestOnly(requestMethod, nextParams)
-      : nextParams;
+    return nextParams;
   }
 
   function patchAppServerModelRequestClient(client) {
@@ -934,10 +880,13 @@
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       await prepareCodexImageGenerationTurn(client, requestMethod, params);
       let providerRefreshFailed = false;
+      const managedAggregateTurn = requestMethod === "turn/start"
+        && client.hostId === "local" && !!codexManagedSessionConnection();
       if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && (codexRemoteSessionProviderPatchEnabled()
             || ["thread/start", "thread/resume", "thread/fork"].includes(requestMethod))
-          && window.__codexSessionDeleteBridge) {
+          && window.__codexSessionDeleteBridge
+          && !managedAggregateTurn) {
         const settingsLoaded = await loadBackendSettingsState(codexAppServerPreparationTimeoutMs);
         providerRefreshFailed = !settingsLoaded;
         if (providerRefreshFailed) {
@@ -951,8 +900,10 @@
       const providerParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
-      const nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, providerParams);
-      if (codexServiceTierRequestMethods().has(requestMethod)) {
+      let nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
+        providerParams, client.hostId, originalSendRequest);
+      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
+      if (["thread/start", "thread/resume", "thread/settings/update", "turn/start"].includes(requestMethod)) {
         await refreshCodexNativeModelCache(client, originalSendRequest, nextParams, options);
       }
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
@@ -962,8 +913,12 @@
         nextParams,
         options
       );
+      const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest,
+        String(method || ""), nextParams, options, modelContextRefresh);
+      if (managedTurn) return managedTurn.result;
       const result = await originalSendRequest(method, nextParams, options);
-      const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
+      const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
@@ -973,13 +928,12 @@
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
-    if (typeof client.prewarmThreadStart === "function"
-        && !client.__codexPlusServiceTierOriginalPrewarmThreadStart) {
-      const originalPrewarmThreadStart = client.prewarmThreadStart.bind(client);
+    if (typeof client.prewarmThreadStart === "function") {
+      const originalPrewarmThreadStart = (client.__codexPlusServiceTierOriginalPrewarmThreadStart
+        || client.prewarmThreadStart).bind(client);
       client.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       client.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        const nextParams = applyCodexServiceTierRequestOnly("thread/start", params);
-        return originalPrewarmThreadStart(nextParams, options);
+        return await prewarmCodexManagedSession(client, originalPrewarmThreadStart, params, options);
       };
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -1108,7 +1062,6 @@
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
-      || codexPlusSettings().serviceTierControls
       || codexPlusSettings().sessionDelete;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
@@ -1141,9 +1094,12 @@
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       await prepareCodexImageGenerationTurn(client, requestMethod, params);
       let providerRefreshFailed = false;
+      const managedAggregateTurn = requestMethod === "turn/start"
+        && client.hostId === "local" && !!codexManagedSessionConnection();
       if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderPatchEnabled()
-          && window.__codexSessionDeleteBridge) {
+          && window.__codexSessionDeleteBridge
+          && !managedAggregateTurn) {
         const settingsLoaded = await loadBackendSettingsState(codexAppServerPreparationTimeoutMs);
         providerRefreshFailed = !settingsLoaded;
         if (providerRefreshFailed) {
@@ -1157,8 +1113,10 @@
       const providerParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
-      const nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, providerParams);
-      if (codexServiceTierRequestMethods().has(requestMethod)) {
+      let nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
+        providerParams, client.hostId, originalSendRequest.bind(client));
+      nextParams = applyCodexAppServerRequestOverrides(requestMethod, client, nextParams);
+      if (["thread/start", "thread/resume", "thread/settings/update", "turn/start"].includes(requestMethod)) {
         await refreshCodexNativeModelCache(client, originalSendRequest.bind(client), nextParams, options);
       }
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
@@ -1168,8 +1126,12 @@
         nextParams,
         options
       );
+      const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest.bind(client),
+        String(method || ""), nextParams, options, modelContextRefresh);
+      if (managedTurn) return managedTurn.result;
       const result = await originalSendRequest.call(client, method, nextParams, options);
-      const threadState = codexThreadModelRequestState(requestMethod, nextParams, result);
+      noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
+      const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
@@ -1179,13 +1141,12 @@
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
-    if (typeof proto.prewarmThreadStart === "function"
-        && !proto.__codexPlusServiceTierOriginalPrewarmThreadStart) {
-      const originalPrewarmThreadStart = proto.prewarmThreadStart;
+    if (typeof proto.prewarmThreadStart === "function") {
+      const originalPrewarmThreadStart = proto.__codexPlusServiceTierOriginalPrewarmThreadStart
+        || proto.prewarmThreadStart;
       proto.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       proto.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        const nextParams = applyCodexServiceTierRequestOnly("thread/start", params);
-        return originalPrewarmThreadStart.call(this, nextParams, options);
+        return await prewarmCodexManagedSession(this, originalPrewarmThreadStart.bind(this), params, options);
       };
     }
     proto.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -1316,8 +1277,7 @@
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
-        || codexPlusSettings().serviceTierControls
-        || codexPlusSettings().sessionDelete) {
+          || codexPlusSettings().sessionDelete) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
       collectCodexReactRuntimeCandidates().conversationManagers.forEach((manager) => {

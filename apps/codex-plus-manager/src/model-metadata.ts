@@ -851,6 +851,12 @@ function positiveIntegerString(value: unknown): string | null {
 }
 
 export function validateModelCapabilities(metadata: ModelMetadata): string | null {
+  if (Object.hasOwn(metadata, "base_instructions") && typeof metadata.base_instructions !== "string") {
+    return "base_instructions 必须是字符串（允许空字符串）。";
+  }
+  if (Object.hasOwn(metadata, "supports_parallel_tool_calls") && typeof metadata.supports_parallel_tool_calls !== "boolean") {
+    return "supports_parallel_tool_calls 必须是 true 或 false。";
+  }
   if (Object.hasOwn(metadata, "supported_reasoning_levels")) {
     if (!Array.isArray(metadata.supported_reasoning_levels)) {
       return "supported_reasoning_levels 必须是数组。";

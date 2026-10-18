@@ -468,32 +468,21 @@ body::after {
 .fcard p { font-size: 13.5px; color: var(--txt-2); line-height: 1.85; }
 .fcard p .mono { font-size: 0.85em; color: var(--amber); }
 
-/* ============ 横向实拍 ============ */
+/* ============ 点选实拍：无 JS 时完整展示，初始化后单图预览 ============ */
 
-.showcase { position: relative; background: var(--bg-0); }
-.showcase-pin {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  padding: 90px 0 70px;
-  overflow: hidden;
+.showcase {
+  position: relative;
+  padding: clamp(70px, 8vw, 110px) 24px;
+  background: var(--bg-0);
 }
-.showcase .section-head { margin-bottom: 48px; }
-
+.showcase-inner { max-width: 1180px; margin: 0 auto; }
+.showcase .section-head { margin-bottom: 36px; }
 .showcase-track {
-  display: flex;
-  gap: 26px;
-  padding: 0 max(24px, calc((100vw - 1280px) / 2 + 24px));
-  will-change: transform;
-  width: max-content;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 32px 24px;
 }
-.shot {
-  width: min(66vw, 880px);
-  flex-shrink: 0;
-}
-.shot-wide { width: min(78vw, 1080px); }
-.shot-narrow { width: min(34vw, 470px); }
+.shot { min-width: 0; }
 .shot-frame {
   border-radius: 12px;
   border: 1px solid var(--line);
@@ -501,9 +490,10 @@ body::after {
   background: var(--bg-2);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
   transition: box-shadow 0.5s var(--ease-out), border-color 0.4s;
-  transform-style: preserve-3d;
 }
 .shot-frame img { width: 100%; height: auto; }
+.shot-preview { display: block; cursor: zoom-in; }
+.shot-preview:focus-visible { outline: 2px solid var(--cyan); outline-offset: 5px; }
 .shot-dark { background: #0c0e14; }
 .shot:hover .shot-frame {
   border-color: rgba(148, 163, 255, 0.4);
@@ -511,28 +501,49 @@ body::after {
 }
 .shot figcaption {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 14px;
+  row-gap: 4px;
   margin-top: 16px;
   padding: 0 4px;
 }
-.shot figcaption b { font-size: 16px; white-space: nowrap; }
+.shot figcaption b { font-size: 16px; }
 .shot figcaption span { color: var(--txt-2); font-size: 13px; }
-
-/* 最后一卡与右缘对齐，滚动到头正好停住 */
-.shot-end {
-  width: 60px;
-  flex-shrink: 0;
+.showcase.is-gallery .showcase-track { display: block; }
+.showcase.is-gallery .shot[hidden] { display: none; }
+.showcase.is-gallery .shot-frame {
+  height: clamp(280px, 34vw, 440px);
+  background: #080b12;
+}
+.showcase.is-gallery .shot-frame img { width: 100%; height: 100%; object-fit: contain; }
+.showcase.is-gallery .shot figcaption { min-height: 80px; display: block; }
+.showcase.is-gallery .shot figcaption b { display: block; margin-bottom: 4px; }
+.showcase-thumbs { display: none; }
+.showcase.is-gallery .showcase-thumbs {
   display: grid;
-  place-items: center;
-  align-self: stretch;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
 }
-.shot-end .mono {
-  writing-mode: vertical-rl;
-  letter-spacing: 0.5em;
-  font-size: 12px;
-  color: #4d5570;
+.showcase-thumb {
+  appearance: none;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-1);
+  color: var(--txt-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, color 0.2s;
 }
+.showcase-thumb img { width: 100%; height: 58px; object-fit: contain; border-radius: 4px; background: #080b12; }
+.showcase-thumb span { display: block; margin: 7px 2px 1px; font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.showcase-thumb:hover { border-color: var(--indigo); color: var(--txt-0); }
+.showcase-thumb[aria-pressed="true"] { border-color: var(--cyan); background: rgba(110, 231, 242, 0.06); color: var(--txt-0); }
+.showcase-thumb:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
 
 /* ============ 供应商接入方式 ============ */
 
@@ -1194,7 +1205,11 @@ body.no-anim .bar-fill { transition: none; }
   .hero-inner { padding-top: 104px; }
   .hero-stats { gap: 22px 34px; }
   .feature-grid { grid-template-columns: 1fr; }
-  .shot, .shot-wide, .shot-narrow { width: 86vw; }
+  .showcase { padding-right: 20px; padding-left: 20px; }
+  .showcase-track { grid-template-columns: 1fr; }
+  .showcase.is-gallery .shot-frame { height: clamp(210px, 65vw, 320px); }
+  .showcase.is-gallery .shot figcaption { min-height: 104px; }
+  .showcase.is-gallery .showcase-thumbs { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .dl-cards { grid-template-columns: 1fr; }
   .bar-row { grid-template-columns: 118px 1fr 50px; }
   .bar-label { font-size: 11.5px; }

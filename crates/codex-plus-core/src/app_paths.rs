@@ -485,7 +485,12 @@ pub fn find_standalone_codex_app_dir() -> Option<PathBuf> {
 /// Finds the CLI shipped by the standalone Codex installer.
 pub fn find_standalone_codex_cli() -> Option<PathBuf> {
     let local_appdata = std::env::var_os("LOCALAPPDATA")?;
-    find_standalone_codex_cli_in(&PathBuf::from(local_appdata).join("OpenAI").join("Codex").join("bin"))
+    find_standalone_codex_cli_in(
+        &PathBuf::from(local_appdata)
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin"),
+    )
 }
 
 fn find_standalone_codex_cli_in(bin_dir: &Path) -> Option<PathBuf> {
@@ -498,7 +503,11 @@ fn find_standalone_codex_cli_in(bin_dir: &Path) -> Option<PathBuf> {
             }
         }
     }
-    candidates.sort_by_key(|path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok());
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
     candidates.pop()
 }
 
@@ -613,8 +622,18 @@ mod standalone_cli_tests {
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(old.join("codex.exe"), "old").unwrap();
         std::fs::write(new.join("codex.exe"), "new").unwrap();
-        std::fs::File::options().write(true).open(old.join("codex.exe")).unwrap().set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))).unwrap();
-        assert_eq!(find_standalone_codex_cli_in(temp.path()), Some(new.join("codex.exe")));
+        std::fs::File::options()
+            .write(true)
+            .open(old.join("codex.exe"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+            ))
+            .unwrap();
+        assert_eq!(
+            find_standalone_codex_cli_in(temp.path()),
+            Some(new.join("codex.exe"))
+        );
     }
 
     #[test]
@@ -682,13 +701,13 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return normalize_codex_app_path(parent);
     }
 
-    if executable_in_dir(path).is_some() {
+    if is_desktop_host_directory(path) {
         return Some(path.to_path_buf());
     }
 
     let nested_app = path.join("app");
     if nested_app.is_dir() {
-        if executable_in_dir(&nested_app).is_some() {
+        if is_desktop_host_directory(&nested_app) {
             return Some(nested_app);
         }
         // WindowsApps 常因 ACL 无法枚举 exe；只要包名像 OpenAI.Codex_* 仍接受 app\
@@ -703,6 +722,21 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// 桌面宿主必须有包身份或 Electron 资源；只有 codex.exe 的 CLI 安装不算宿主。
+fn is_desktop_host_directory(path: &Path) -> bool {
+    if executable_in_dir(path).is_none() {
+        return false;
+    }
+    // MSIX 的清单解析已经校验过包名与入口边界，保留 Store ACL 受限的兼容路径。
+    if packaged_manifest_application(path).is_some() || is_codex_store_package_dir(path) {
+        return true;
+    }
+    ["resources", "Resources"].iter().any(|name| {
+        let resources = path.join(name);
+        resources.join("app.asar").is_file() || resources.join("app/package.json").is_file()
+    })
 }
 
 /// Codex++ 管理控制台/安装根，绝不能当作 OpenAI Codex 桌面应用。
@@ -862,7 +896,9 @@ pub fn find_desktop_managed_codex_cli() -> Option<PathBuf> {
     )
 }
 
-fn find_desktop_managed_codex_cli_from_var(local_appdata: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_desktop_managed_codex_cli_from_var(
+    local_appdata: Option<&Path>,
+) -> Option<PathBuf> {
     let bin = local_appdata?.join("OpenAI").join("Codex").join("bin");
     let mut candidates = vec![bin.join("codex.exe")];
     if let Ok(entries) = std::fs::read_dir(&bin) {
@@ -1534,9 +1570,24 @@ mod beta_executable_tests {
         std::fs::create_dir(&app).unwrap();
         let beta = app.join("ChatGPT (Beta).exe");
         std::fs::write(&beta, "beta").unwrap();
+        std::fs::create_dir(app.join("resources")).unwrap();
+        std::fs::write(app.join("resources/app.asar"), "electron").unwrap();
         assert_eq!(normalize_codex_app_path(&app), Some(app.clone()));
         assert_eq!(build_codex_executable(&app), beta);
         assert!(is_supported_app_executable_name("ChatGPT (Beta).exe"));
+    }
+
+    #[test]
+    fn standalone_cli_is_not_a_desktop_host() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, name) in ["codex.exe", "Codex.exe"].into_iter().enumerate() {
+            let directory = temp.path().join(format!("{index}-{}", name.replace('.', "-")));
+            std::fs::create_dir(&directory).unwrap();
+            let executable = directory.join(name);
+            std::fs::write(&executable, "cli").unwrap();
+            assert_eq!(normalize_codex_app_path(&directory), None);
+            assert_eq!(normalize_codex_app_path(&executable), None);
+        }
     }
 
     #[test]

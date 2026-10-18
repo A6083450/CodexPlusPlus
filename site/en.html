@@ -4,12 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Codex++ — Make Codex nicer to use</title>
-<meta name="description" content="Codex++ is a unified manager for the Codex desktop app: providers and models, per-model context windows, session management, interface enhancements, extensions and desktop pets.">
+<meta name="description" content="Codex++ is a unified manager for the Codex desktop app: providers and models, per-model context windows, sub-agent collaboration, session management, interface enhancements, extensions and desktop pets.">
 <link rel="icon" type="image/png" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;0,800;1,400&family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=20261017-gallery-2">
 </head>
 <body>
 
@@ -155,6 +155,16 @@
       <h3>WeChat connect</h3>
       <p>Scan a QR code to reach your local Codex. Each contact maps to an isolated session, with an allow-list of WeChat users. Hand off work from anywhere.</p>
     </article>
+    <article class="fcard tilt" id="agent-feature">
+      <span class="fcard-no mono">10</span>
+      <h3>Delegate in a sentence</h3>
+      <p>Ask your current Codex chat to delegate to DeepSeek Harness (dsh), Claude Code or another Codex. The selected CLI runs the task and returns results to the same chat. Configure the default agent, CLI paths and models; naming an agent selects that target.</p>
+    </article>
+    <article class="fcard tilt" id="native-fast-feature">
+      <span class="fcard-no mono">11</span>
+      <h3>Native Fast with an API key</h3>
+      <p>Restore the native Fast switch in API-only mode and use Codex's own Standard / ⚡ Fast controls. Off by default; the model must declare Fast (priority) support. Availability and billing depend on your provider.</p>
+    </article>
   </div>
 </section>
 
@@ -192,42 +202,47 @@
 </section>
 
 <section class="showcase" id="showcase">
-  <div class="showcase-pin" id="showcasePin">
+  <div class="showcase-inner">
     <div class="section-head">
       <p class="eyebrow">SHOWCASE · REAL UI</p>
       <h2>What you see <em>is what ships</em></h2>
-      <p class="section-sub">All screenshots below are the real Codex++ interface. Scroll sideways, take your time.</p>
+      <p class="section-sub">Real Codex++ screenshots. Select a thumbnail to preview; click the large image to view it full size.</p>
     </div>
     <div class="showcase-track" id="showcaseTrack">
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/manager-enhancements.png" alt="Codex++ Manager: models, sessions, input behavior and widget settings in one place"></div>
+      <figure class="shot shot-agent" id="agent-collaboration">
+        <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="Open the full-size sub-agent collaboration screenshot">
+          <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="A Codex chat asks DeepSeek what 1+1 is, uses Codex Plus Collaboration, then shows DeepSeek's answer: 1+1 equals 2">
+        </a>
+        <figcaption><b>Sub-agents, in action</b><span>Codex delegates to DeepSeek via dsh and returns the result in the same chat. Click to view full size.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-enhancements.png" target="_blank" rel="noopener"><img src="assets/manager-enhancements.png" alt="Codex++ Manager: models, sessions, input behavior and widget settings in one place" loading="lazy"></a>
         <figcaption><b>Enhancements hub</b><span>Plugins &amp; models, dialogs &amp; input, widgets &amp; pets — one page of switches.</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/codex-multi-launch.png" alt="Codex multi-launch: running DeepSeek and Zhipu GLM instances"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/codex-multi-launch.png" target="_blank" rel="noopener"><img src="assets/codex-multi-launch.png" alt="Codex multi-launch: running DeepSeek and Zhipu GLM instances" loading="lazy"></a>
         <figcaption><b>Multi-launch</b><span>One isolated instance per provider identity, no cross-talk.</span></figcaption>
       </figure>
-      <figure class="shot shot-narrow tilt">
-        <div class="shot-frame"><img src="assets/model-picker-groups.png" alt="Model picker folded by provider: Provider 4 group (Default, 7 models) and DeepSeek group (2 models)"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/model-picker-groups.png" target="_blank" rel="noopener"><img src="assets/model-picker-groups.png" alt="Model picker folded by provider: Provider 4 group (Default, 7 models) and DeepSeek group (2 models)" loading="lazy"></a>
         <figcaption><b>Grouped model picker</b><span>Folded by provider, with counts and a Default badge.</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/extension-market.png" alt="Codex++ extension marketplace: community scripts and workflow tools"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/extension-market.png" target="_blank" rel="noopener"><img src="assets/extension-market.png" alt="Codex++ extension marketplace: community scripts and workflow tools" loading="lazy"></a>
         <figcaption><b>Extension market</b><span>Install community scripts in one click: usage panels, model matrix, prompt tools.</span></figcaption>
       </figure>
-      <figure class="shot shot-wide tilt">
-        <div class="shot-frame"><img src="assets/usage-statusline.png" alt="Usage status line: 51 tok/s, 99.9% cache hits, 19% context"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/usage-statusline.png" target="_blank" rel="noopener"><img src="assets/usage-statusline.png" alt="Usage status line: 51 tok/s, 99.9% cache hits, 19% context" loading="lazy"></a>
         <figcaption><b>Usage status line</b><span>51 tok/s · 99.9% cache hits · 19% context, right under the composer.</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame shot-dark"><img src="assets/usage-widget.png" alt="Desktop pet usage widget with token stats bubble"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview shot-dark" href="assets/usage-widget.png" target="_blank" rel="noopener"><img src="assets/usage-widget.png" alt="Desktop pet usage widget with token stats bubble" loading="lazy"></a>
         <figcaption><b>Pet widget</b><span>Today's usage, task status and budget alerts — swap in your own character.</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/typing-effects.png" alt="Rainbow particle typing effects in the Codex composer"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/typing-effects.png" target="_blank" rel="noopener"><img src="assets/typing-effects.png" alt="Rainbow particle typing effects in the Codex composer" loading="lazy"></a>
         <figcaption><b>Typing effects</b><span>Rainbow particles, fireworks and starlight; pause automatically with Reduce Motion.</span></figcaption>
       </figure>
-      <div class="shot-end" aria-hidden="true"><span class="mono">FIN · MORE IN APP</span></div>
     </div>
   </div>
 </section>
@@ -326,6 +341,10 @@ your-model<span class="t-hl">[128000]</span>
     <details class="faq-item">
       <summary>Why do requests fail after switching providers?<span class="faq-x" aria-hidden="true"></span></summary>
       <div class="faq-a"><p>Run a model test or Provider Doctor in the provider details first: verify protocol, Base URL, key and model. API-only and official+API modes store credentials differently — don't hand-copy <span class="mono">auth.json</span> between them.</p></div>
+    </details>
+    <details class="faq-item" id="faq-native-fast">
+      <summary>Why is the native Fast switch still missing?<span class="faq-x" aria-hidden="true"></span></summary>
+      <div class="faq-a"><p>Confirm that you saved and restarted Codex through Codex++. In your provider's model settings, set “Fast (priority) support”, then save both the model and provider before restarting. Only declare support that your provider actually offers; unlocking the client control does not change service limits or billing.</p></div>
     </details>
     <details class="faq-item">
       <summary>Can enhancements be disabled? Will they survive official app updates?<span class="faq-x" aria-hidden="true"></span></summary>
@@ -428,6 +447,6 @@ your-model<span class="t-hl">[128000]</span>
 <script src="assets/gsap.min.js"></script>
 <script src="assets/ScrollTrigger.min.js"></script>
 <script src="js/nebula.js"></script>
-<script src="js/main.js"></script>
+<script src="js/main.js?v=20261017-gallery-3"></script>
 </body>
 </html>

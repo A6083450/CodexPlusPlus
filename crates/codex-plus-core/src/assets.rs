@@ -119,6 +119,8 @@ const DREAM_SKIN_DEFAULT_IMAGE: &[u8] =
     include_bytes!("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png");
 const PET_REAL_MOUSE_SCRIPT: &str = include_str!("../../../assets/inject/pet-real-mouse-inject.js");
 const API_QUOTA_GATE_SCRIPT: &str = include_str!("../../../assets/inject/api-quota-gate.js");
+const NATIVE_FAST_UNLOCK_SCRIPT: &str =
+    include_str!("../../../assets/inject/native-fast-unlock.js");
 const STEPWISE_SCRIPT: &str = concat!(
     "(() => {\n",
     include_str!("../../../assets/inject/floating-panel/runtime/state.js"),
@@ -144,7 +146,7 @@ const STEPWISE_SCRIPT: &str = concat!(
     "\n})();\n",
 );
 pub const DIAGNOSTIC_BUILD_ID: &str = "fixed6-20260814";
-const DREAM_SKIN_RENDERER_REVISION: &str = "25-community-shell-material";
+const DREAM_SKIN_RENDERER_REVISION: &str = "26-dream-skin-1.5.20";
 
 pub fn renderer_script() -> &'static str {
     static COMPOSED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -219,7 +221,9 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
 
     let (engine, renderer, base_css) = dream_skin_target_assets(settings);
     let managed_css = managed_dream_skin_css(settings);
-    let css = format!("{base_css}\n{managed_css}");
+    // 原生 shell 兼容属于基础主题：内置图片和没有 Safe CSS 的图片也必须可达。
+    let native_shell_css = include_str!("../../../assets/inject/dream-skin-native-shell-compat.css");
+    let css = format!("{base_css}\n{native_shell_css}\n{managed_css}");
     let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
         .expect("dream skin target theme should serialize");
     let style_revision = dream_skin_content_signature(css.as_bytes());
@@ -258,7 +262,8 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
         )
         .replace(
             "__DREAM_SKIN_VERSION_JSON__",
-            &serde_json::to_string("1.2.0").unwrap(),
+            &serde_json::to_string(crate::dream_skin_package::DREAM_SKIN_PACKAGE_CLIENT_VERSION)
+                .unwrap(),
         )
         .replace(
             "__DREAM_SKIN_STYLE_REVISION_JSON__",
@@ -409,6 +414,10 @@ pub fn api_quota_gate_script() -> &'static str {
     API_QUOTA_GATE_SCRIPT
 }
 
+pub fn native_fast_unlock_script() -> &'static str {
+    NATIVE_FAST_UNLOCK_SCRIPT
+}
+
 const PET_V2_SPRITE_DETECTION_SCRIPT: &str = r#"
   const isV2Sprite = async (mascot) => {
     if (!mascot) return false;
@@ -531,6 +540,12 @@ pub fn force_chinese_locale_config(settings: &BackendSettings) -> Value {
     json!({ "enabled": settings.codex_app_force_chinese_locale, "locale": "zh-CN" })
 }
 
+fn renderer_after_document_ready(script: &str) -> String {
+    format!(
+        "(()=>{{const start=()=>{{{script}\n}};if(document.body)start();else document.addEventListener('DOMContentLoaded',start,{{once:true}});}})();"
+    )
+}
+
 pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettings) -> String {
     let helper_url = format!("http://127.0.0.1:{helper_port}");
     let instance_label = std::env::var("CODEX_PLUS_INSTANCE_LABEL")
@@ -560,8 +575,18 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         } else {
             ""
         };
+    let renderer_runtime = format!(
+        "{}\n{}\n{}\n{}",
+        renderer_script(), GENERATED_IMAGES_SCRIPT, stepwise_runtime, dream_skin_target_runtime,
+    );
+    // Fast 在新文档早期注入，生图等 DOM 扩展也必须一起等待根节点就绪。
+    let renderer_runtime = if settings.enhancements_enabled && settings.codex_app_native_fast_unlock {
+        renderer_after_document_ready(&renderer_runtime)
+    } else {
+        renderer_runtime
+    };
     format!(
-        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_IMAGE_OVERLAY__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}\n{}\n{}\n{}",
+        "{}window.__CODEX_SESSION_DELETE_HELPER__ = {};\nwindow.__CODEX_PLUS_VERSION__ = {};\nwindow.__CODEX_PLUS_BUILD__ = {};\nwindow.__CODEX_PLUS_IMAGE_OVERLAY__ = {};\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_PASTE_FIX__ = {};\nwindow.__CODEX_PLUS_FORCE_CHINESE_LOCALE__ = {};\nwindow.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = {};\n{}",
         instance_identity,
         serde_json::to_string(&helper_url).expect("helper URL should serialize"),
         serde_json::to_string(crate::version::VERSION).expect("version should serialize"),
@@ -580,16 +605,21 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
         format!(
-            "window.__CODEX_PLUS_WHALE_IMAGE__ = {};\n{}\n{}\n{}",
+            "window.__CODEX_PLUS_WHALE_IMAGE__ = {};\n{}\n{}\n{}\n{}",
             serde_json::to_string(&image_data_uri("image/png", WHALE_DEFAULT_IMAGE))
                 .expect("whale image should serialize"),
             whale_runtime_script(),
             include_str!("../../../assets/inject/composer-readiness.js"),
-            renderer_script()
+            format!(
+                "{}\nwindow.__codexPlusNativeFastUnlock.runtime.update({});",
+                native_fast_unlock_script(),
+                json!({
+                    "enhancementsEnabled": settings.enhancements_enabled,
+                    "codexAppNativeFastUnlock": settings.codex_app_native_fast_unlock,
+                }),
+            ),
+            renderer_runtime
         ),
-        GENERATED_IMAGES_SCRIPT,
-        stepwise_runtime,
-        dream_skin_target_runtime,
     )
 }
 
@@ -696,6 +726,70 @@ mod tests {
     #[test]
     fn diagnostic_build_id_matches_fixed6_version() {
         assert_eq!(DIAGNOSTIC_BUILD_ID, "fixed6-20260814");
+    }
+
+    #[test]
+    fn native_fast_renderer_waits_for_dom_and_reinjection_runs_immediately() {
+        let wrapped = renderer_after_document_ready("window.started=(window.started||0)+1;");
+        let test = format!(r#"
+          const vm=require('node:vm'),assert=require('node:assert/strict');
+          for(const ready of [false,true]){{
+            let listener;
+            const window={{}},document={{body:ready?{{}}:null,addEventListener:(name,callback,options)=>{{
+              assert.equal(name,'DOMContentLoaded');assert.equal(options.once,true);listener=callback;
+            }}}};
+            vm.runInNewContext({},{{window,document}});
+            assert.equal(window.started,ready?1:undefined);
+            if(!ready){{document.body={{}};listener();assert.equal(window.started,1);}}
+          }}
+        "#, serde_json::to_string(&wrapped).unwrap());
+        let output = std::process::Command::new("node").arg("-e").arg(test).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn native_fast_defers_generated_images_and_following_dom_extensions() {
+        let settings = BackendSettings {
+            enhancements_enabled: true,
+            codex_app_native_fast_unlock: true,
+            codex_app_stepwise_enabled: true,
+            ..Default::default()
+        };
+        let script = injection_script_with_settings(57321, &settings)
+            .replace(&whale_runtime_script(), "")
+            .replace(include_str!("../../../assets/inject/composer-readiness.js"), "")
+            .replace(native_fast_unlock_script(), "window.__codexPlusNativeFastUnlock={runtime:{update(){}}};")
+            .replace(renderer_script(), "window.order.push('renderer');")
+            .replace(stepwise_script(), "window.order.push('stepwise');");
+        let harness = format!(r#"
+            const vm=require('node:vm'),assert=require('node:assert/strict');
+            for (const ready of [false,true]) {{
+                let listener;
+                const window={{order:[]}}, document={{body:ready?{{}}:null,documentElement:null,
+                    addEventListener:(_name,callback)=>{{listener=callback;}}}};
+                class MutationObserver {{ observe(node) {{ assert.ok(node);window.order.push('images'); }} }}
+                vm.runInNewContext({},{{window,document,MutationObserver,setTimeout:()=>0,clearTimeout(){{}}}});
+                if(!ready){{assert.deepEqual(window.order,[]);document.body={{}};listener();}}
+                assert.deepEqual(window.order,['renderer','images','stepwise']);
+            }}
+        "#, serde_json::to_string(&script).unwrap());
+        let output = std::process::Command::new("node").arg("-e").arg(harness).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn native_shell_compatibility_is_present_without_managed_safe_css() {
+        let temp = tempfile::tempdir().unwrap();
+        for image in [String::new(), temp.path().join("selected.png").to_string_lossy().into_owned()] {
+            let mut settings = BackendSettings::default();
+            settings.codex_app_dream_skin_enabled = true;
+            settings.codex_app_dream_skin_image_path = image;
+            assert!(managed_dream_skin_css(&settings).is_empty());
+            let script = dream_skin_target_runtime_script(&settings, false);
+            assert!(script.contains("全尺寸 shell"));
+            settings.codex_app_dream_skin_paused = true;
+            assert!(dream_skin_target_runtime_script(&settings, false).is_empty());
+        }
     }
 
     #[test]

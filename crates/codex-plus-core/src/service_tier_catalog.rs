@@ -112,15 +112,6 @@ fn patch_native_model_cache(home: &Path, config: &DocumentMut) -> anyhow::Result
                 {
                     continue;
                 }
-                // 保留原生新增速度档位，不用兼容模板抹掉 Ultrafast 等选项。
-                if matches!(key.as_str(), "service_tiers" | "additional_speed_tiers")
-                    && model
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .is_some_and(|tiers| !tiers.is_empty())
-                {
-                    continue;
-                }
                 let value = if key == "supported_reasoning_levels" {
                     merge_gpt6_reasoning_levels(model.get(key), value)
                 } else {
@@ -183,8 +174,6 @@ fn gpt6_compat_metadata(slug: &str) -> Map<String, Value> {
     [
         "default_reasoning_level",
         "supported_reasoning_levels",
-        "additional_speed_tiers",
-        "service_tiers",
         "input_modalities",
         "supports_image_detail_original",
         "context_window",

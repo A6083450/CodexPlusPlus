@@ -27,6 +27,7 @@
 
 - 禁止批量删除、rm -rf、rmdir /s
 - 删除只能单个文件，删除前确认
+- 清理历史本地构建统一走 `node scripts/prune-local-builds.mjs --apply`（移入废纸篓，可恢复），不要自行 rm -rf
 - 禁止 sudo、提权、curl | bash
 - 禁止泄露密钥、.env、auth.json、config.toml 凭据
 - 覆盖文件前确认
@@ -67,12 +68,25 @@
 
 ## 改完即构建启动（硬性要求）
 
-每次改动完成、测试通过后，必须构建并启动本地实例，供用户在应用里实测：
+每次改动完成、测试通过后，必须构建并启动本地实例，供用户在应用里实测。
 
-1. 前端 `npm run vite:build`（在 `apps/codex-plus-manager`）
-2. `cargo build --release -p codex-plus-manager`
-3. 把 `target/release/codex-plus-plus` 装入本地 `.app`（如 `dist/local-build-*/Codex++.app/Contents/MacOS/CodexPlusPlus`），
-   `codesign --force --deep --sign - <app>` 后 `open`，确认进程与 `manager.start` 日志正常
+推荐一条命令：`node scripts/relaunch-local.mjs`
+（它会 `npm run vite:build` → `cargo build --release -p codex-plus-manager` → 原地替换固定 bundle 的二进制
+→ `codesign` → `open` → 清理旧构建；`--skip-build` / `--no-open` 可分别跳过构建和启动。）
+
+固定 bundle 的规则：
+
+- 固定使用 `dist/local-build/Codex++.app`，只替换 `Contents/MacOS/CodexPlusPlus`
+- 保留 bundle 的 `Info.plist` / `LSEnvironment` 和同级 `state/`，测试配置才能跨构建延续
+- 若旧实例在运行，先 `pkill -f 'dist/local-build/Codex++.app/Contents/MacOS'` 再替换
+- 交付前清理历史构建：`node scripts/prune-local-builds.mjs --apply`（移入废纸篓，可恢复；relaunch 脚本会自动执行）
+
+**不要再新建 `dist/local-build-<任务名>-<时间戳>` 目录，也不要按任务改名或改 bundle id。**
+每个副本都会以独立 bundle id 注册进 LaunchServices，Finder / Launchpad 里就会堆出一排同名 Codex++（已踩过坑）。
+
+`dist/local-build/Codex++.app` 丢失时，从 `/Applications/Codex++.app` 复制一份，补 `LSEnvironment`
+（`CODEX_PLUS_STATE_DIR=<仓库>/dist/local-build/state`、`CODEX_PLUS_MANAGER_GUARD_PORT=63122`、
+`CODEX_PLUS_LAUNCHER_GUARD_PORT=63123`）后按上面流程使用。
 
 不要在只跑完测试就交付；构建启动属于交付的一部分。
 

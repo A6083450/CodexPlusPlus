@@ -129,7 +129,8 @@ fn sync_service_tier_catalog_patches_gpt6_in_default_model_cache() {
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(gpt6["default_reasoning_level"], "medium");
-    assert_eq!(gpt6["service_tiers"][0]["id"], "priority");
+    assert_eq!(gpt6["service_tiers"], serde_json::json!([]));
+    assert_eq!(gpt6["additional_speed_tiers"], serde_json::json!([]));
     assert_eq!(
         gpt6["input_modalities"],
         serde_json::json!(["text", "image"])
@@ -183,6 +184,39 @@ fn sync_service_tier_catalog_replaces_invalid_gpt6_none_reasoning() {
             patched["models"][0]["input_modalities"],
             serde_json::json!(["text", "image"])
         );
+    }
+}
+
+#[test]
+fn gpt6_cache_metadata_never_injects_or_replaces_native_speed_tiers() {
+    for slug in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+        for tiers in [
+            serde_json::json!({}),
+            serde_json::json!({"service_tiers": [], "additional_speed_tiers": []}),
+            serde_json::json!({
+                "service_tiers": [{"id": "priority", "name": "Native Fast"}, {"id": "ultrafast"}],
+                "additional_speed_tiers": ["fast", "ultrafast"]
+            }),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut model = tiers.clone();
+            model["slug"] = slug.into();
+            std::fs::write(
+                temp.path().join("models_cache.json"),
+                serde_json::to_vec(&serde_json::json!({"models": [model]})).unwrap(),
+            )
+            .unwrap();
+            assert!(sync_service_tier_catalog_in_home(temp.path()).unwrap());
+            let patched: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(temp.path().join("models_cache.json")).unwrap(),
+            )
+            .unwrap();
+            for key in ["service_tiers", "additional_speed_tiers"] {
+                assert_eq!(patched["models"][0].get(key), tiers.get(key), "{slug}: {key}");
+            }
+            assert_eq!(patched["models"][0]["default_reasoning_level"], "medium");
+            assert!(!sync_service_tier_catalog_in_home(temp.path()).unwrap());
+        }
     }
 }
 

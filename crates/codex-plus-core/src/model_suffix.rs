@@ -720,6 +720,10 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                 .or(fallback_window)
                 .unwrap_or_else(|| metadata_max_window.unwrap_or(context_window));
             model["slug"] = json!(entry.slug);
+            // 借用模板不能证明自定义模型支持并行工具调用；精确元数据才有此权威。
+            if !has_model_metadata || !model.get("supports_parallel_tool_calls").is_some_and(Value::is_boolean) {
+                model["supports_parallel_tool_calls"] = json!(false);
+            }
             if !has_model_metadata {
                 model["display_name"] = json!(entry.display_name);
                 model["description"] = json!(entry.display_name);

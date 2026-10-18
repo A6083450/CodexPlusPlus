@@ -44,8 +44,8 @@ pub fn switch_relay_profile_in_home(
     }
     crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
 
-    store
-        .save(&selected_settings)
+    let committed_revision = store
+        .save_versioned(&selected_settings)
         .context("保存供应商设置失败")?;
     let selected_settings = store.load().context("读取供应商设置失败")?;
 
@@ -67,7 +67,7 @@ pub fn switch_relay_profile_in_home(
         Err(error) => {
             // 内部回滚恢复已验证原始字节，保留unknown字段并避免2→default1保护误拦。
             let settings_restore_error = store
-                .restore_raw_snapshot(original_settings_bytes.as_deref())
+                .restore_raw_snapshot(original_settings_bytes.as_deref(), &committed_revision)
                 .err();
             let live_restore_error = live_snapshot.restore(home).err();
             if settings_restore_error.is_some() || live_restore_error.is_some() {
@@ -211,13 +211,11 @@ fn apply_selected_relay_profile(
     let relay = settings.active_relay_profile();
     let common_config = relay_combined_common_config(settings);
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
-        crate::relay_config::apply_official_profile_to_home(home, &relay, &common_config)?
+        crate::relay_config::apply_relay_profile_with_preservation(home, &relay, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings)?
     } else {
         validate_switch_profile_files(&relay)?;
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            home,
-            &relay,
-            &common_config,
+        crate::relay_config::apply_relay_profile_with_preservation(
+            home, &relay, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
         )?
     };
     let status = relay_config_status_from_home(home);

@@ -147,6 +147,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
       用量挂件、可更换的桌宠角色、任务状态和预算提醒，搭配皮肤与自定义图片，让界面更有自己的风格。
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <h3>⚡ 纯 API Key 也能选择原生 Fast</h3>
+      按需解锁 Codex 原生 Standard / Fast 控件。默认关闭；为模型配置 Fast（priority）支持后，使用供应商提供的优先服务等级，实际支持与计费以供应商为准。
+    </td>
+  </tr>
 </table>
 
 另外，微信连接支持扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。
@@ -161,10 +167,20 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的外部启动器与管理
   <summary><strong>展开查看 Codex 内的增强设置</strong></summary>
 
 <p align="center">
-  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置：后端状态、模型列表、Fast 按钮与会话操作" width="100%">
+  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置示例：后端状态、模型列表与会话操作" width="100%">
 </p>
 
 </details>
+
+### 纯 API Key，也能使用原生 Fast 控件
+
+「原生 Fast 强制解锁」让纯 API Key 模式可以在支持的模型上使用 Codex 原生 **Standard / ⚡ Fast** 控件，沿用原生的模型与推理强度菜单。
+
+1. 打开管理器「Codex 增强 → 常用增强」，开启增强总开关与「原生 Fast 强制解锁」（默认关闭）。
+2. 确认模型已声明 Fast 服务等级；需要手动配置时，在「供应商配置」中打开对应模型的配置，设置「Fast（priority）支持」，保存模型与供应商。
+3. 保存增强设置，从 Codex++ 重新启动 Codex，再打开模型或推理强度菜单，选择 **⚡ Fast**；需要恢复时选择 **Standard**。
+
+实际可用性、提速效果与计费由供应商决定，开启此功能不会让所有模型自动提速。关闭选项并重启 Codex 即可恢复原生身份判断。
 
 ### 让拓展适应你的工作流
 

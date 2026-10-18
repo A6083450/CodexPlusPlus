@@ -116,6 +116,22 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
     </td>
     <td><a href="https://s.qiniu.com/7zUJri"><strong>七牛云</strong></a><br>感谢七牛云 AI 赞助本项目！七牛云 AI 是七牛云（02567.HK）旗下企业级大模型 MaaS 平台，可一站式调用全球 150 多个主流模型，兼容全球主流模型厂商协议，覆盖文本、图像、音频、视频、文件处理等全模态能力，服务超过 169 万企业及开发者用户。企业用户可免费领取 1200 万 Token，邀请好友最高可获得百亿 Token。</td>
   </tr>
+  <tr>
+    <td align="center">
+      <a href="https://agent.tokenmy.ai">
+        <img src="docs/images/sponsor-tokenmy.png" alt="TokenMy" width="96">
+      </a>
+    </td>
+    <td><a href="https://agent.tokenmy.ai"><strong>TokenMy</strong></a><br>感谢 TokenMy 赞助本项目！TokenMy 是面向开发者与团队的统一 AI 模型 API 网关，汇聚 OpenAI、Anthropic、Google、DeepSeek、字节跳动、Suno 等厂商的模型，覆盖 GPT、Claude、Gemini 等对话模型，GPT Image 生图模型，Seedance、Veo 视频模型及 Suno 音乐生成模型。一个 API Key 即可接入多类 AI 能力，配合按量计费、用量监控与账单查询，满足智能体开发、多模态应用与影音内容创作需求。欢迎<a href="https://agent.tokenmy.ai">注册使用</a>，也可申请成为 TokenMy 代理或推广大使，携手拓展 AI 应用市场，享受推广佣金与合作激励。</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://apinebula.ai/ref/IiCBg1nu">
+        <img src="docs/images/sponsor-apinebula.png" alt="APINEBULA" width="96">
+      </a>
+    </td>
+    <td><a href="https://apinebula.ai/ref/IiCBg1nu"><strong>APINEBULA</strong></a><br>感谢 APINEBULA 赞助本项目！APINEBULA 是银河录像局旗下的企业级 AI 聚合平台，背靠大平台资源，面向开发者、团队与企业用户提供稳定、高性价比的大模型 API 接入服务。平台聚合 Claude、GPT、Gemini 等主流满血模型，一个接口接入全球顶尖 AI 大模型，各大模型价格低至 1 折起，支持企业级高并发、正式合同、对公打款与开票服务，适合 AI 编程、Agent 开发、业务系统集成等多种场景！<a href="https://apinebula.ai/ref/IiCBg1nu">使用此链接注册</a>并在充值时填写「PLUSPLUS」优惠码可享九折优惠！</td>
+  </tr>
 </table>
 
 想支持项目或展示品牌？[联系维护者](mailto:1727532@qq.com)。
@@ -155,6 +171,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
   </tr>
   <tr>
     <td colspan="2" valign="top">
+      <h3>⚡ 纯 API Key 也能选择原生 Fast</h3>
+      按需解锁 Codex 原生 Standard / Fast 控件。默认关闭；为模型配置 Fast（priority）支持后，使用供应商提供的优先服务等级，实际支持与计费以供应商为准。
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <h3>📊 用量状态栏</h3>
       在输入框下方实时显示生成速度、缓存命中率和上下文占用；数据取自本机 Codex 会话记录，上下文占比按 Codex 识别到的每模型窗口计算。默认开启，可在「Codex 增强 → 常用增强 → 用量状态栏」关闭。
     </td>
@@ -163,6 +185,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
     <td colspan="2" valign="top">
       <h3>🧵 Codex 多开</h3>
       为每个供应商身份启动相互隔离的 Codex 实例：独立配置、会话和用户数据目录，可与其他单一供应商同时运行；运行中的实例集中列出，可单独重启或结束。
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <h3>🤝 子 Agent 协作</h3>
+      在 Codex 对话中用自然语言委派 Codex CLI、DeepSeek Harness（dsh）或 Claude Code，执行结果回到当前对话。可配置默认 Agent、模型路由，并按需复用 DSH 已保存的登录与密钥。
     </td>
   </tr>
 </table>
@@ -179,10 +207,20 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
   <summary><strong>展开查看 Codex 内的增强设置</strong></summary>
 
 <p align="center">
-  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置：后端状态、模型列表、Fast 按钮与会话操作" width="100%">
+  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置示例：后端状态、模型列表与会话操作" width="100%">
 </p>
 
 </details>
+
+### 纯 API Key，也能使用原生 Fast 控件
+
+「原生 Fast 强制解锁」让纯 API Key 模式可以在支持的模型上使用 Codex 原生 **Standard / ⚡ Fast** 控件，沿用原生的模型与推理强度菜单。
+
+1. 打开管理器「Codex 增强 → 常用增强」，开启增强总开关与「原生 Fast 强制解锁」（默认关闭）。
+2. 确认模型已声明 Fast 服务等级；需要手动配置时，在「供应商配置」中打开对应模型的配置，设置「Fast（priority）支持」，保存模型与供应商。
+3. 保存增强设置，从 Codex++ 重新启动 Codex，再打开模型或推理强度菜单，选择 **⚡ Fast**；需要恢复时选择 **Standard**。
+
+实际可用性、提速效果与计费由供应商决定，开启此功能不会让所有模型自动提速。关闭选项并重启 Codex 即可恢复原生身份判断。
 
 ### 输入框下方，用量一目了然
 
@@ -199,6 +237,22 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例，可单独重启或结束" width="100%">
 </p>
+
+### 在 Codex 对话里，直接请其他 Agent 帮忙
+
+对 Codex 说「让 DeepSeek 实现这个功能」或「让 Claude Code 审核改动」，Codex++ 会通过 MCP 启动对应的原生 CLI，执行结果回到当前对话。支持 Codex CLI、DeepSeek Harness（`dsh`）与 Claude Code；明确点名时使用对应 Agent，未点名时使用配置的默认 Agent。
+
+管理器中可设置默认 Agent、CLI 路径、模型与 DeepSeek 的 `provider/model` 路由。DeepSeek 可选开启「复用 DSH 已保存的登录与密钥」，由 dsh 使用原生认证，无需在 Codex++ 中另存凭据。
+
+1. 打开「Agent 协作」，启用协作及要使用的 Agent，选择默认 Agent 并保存。
+2. 点击「一键接入并刷新」，将协作工具接入 Codex。
+3. 回到 Codex 对话，直接点名分派任务，等待结果返回。
+
+<p align="center">
+  <img src="docs/images/agent-collaboration.png" alt="实测：问问 DeepSeek 1+1 是多少，通过 Codex Plus Collaboration 协作集成返回 2" width="100%">
+</p>
+
+实测示例：「问问 DeepSeek 1+1 是多少」→ 通过协作集成取得 DeepSeek 回答「1+1 等于 2」。更多模型路由、认证与任务配置见 [子 Agent 协作指南](docs/agent-collaboration.md)。
 
 ### 让拓展适应你的工作流
 

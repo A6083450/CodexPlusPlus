@@ -4,7 +4,16 @@ pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
     } else {
         user_agent.trim().to_string()
     };
-    Ok(reqwest::Client::builder().user_agent(ua).build()?)
+    let mut builder = reqwest::Client::builder().user_agent(ua);
+    if let Some(proxy) = crate::proxy::detect_system_proxy()
+        .or_else(|| std::env::var("HTTPS_PROXY").ok())
+        .or_else(|| std::env::var("https_proxy").ok())
+        .or_else(|| std::env::var("ALL_PROXY").ok())
+        .or_else(|| std::env::var("all_proxy").ok())
+    {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    Ok(builder.build()?)
 }
 
 /// VLM 专用 HTTP client（带超时）。

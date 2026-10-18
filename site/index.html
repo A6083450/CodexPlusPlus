@@ -4,12 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Codex++ — 让 Codex 更顺手</title>
-<meta name="description" content="Codex++ 是面向 Codex 桌面应用的统一管理工具：供应商与模型、上下文窗口、会话管理、界面增强、拓展与桌宠。给 Codex 桌面应用加一点「++」。">
+<meta name="description" content="Codex++ 是面向 Codex 桌面应用的统一管理工具：供应商与模型、上下文窗口、子 Agent 协作、会话管理、界面增强、拓展与桌宠。给 Codex 桌面应用加一点「++」。">
 <link rel="icon" type="image/png" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;0,800;1,400&family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=20261017-gallery-2">
 </head>
 <body>
 
@@ -159,6 +159,16 @@
       <h3>微信连接</h3>
       <p>扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。出门在外，也能远程派活。</p>
     </article>
+    <article class="fcard tilt" id="agent-feature">
+      <span class="fcard-no mono">10</span>
+      <h3>一句话，派给子 Agent</h3>
+      <p>在当前 Codex 对话中委派 DeepSeek Harness（dsh）、Claude Code 或另一个 Codex，由对应 CLI 执行，再把结果带回原对话。管理器可配置默认 Agent、CLI 路径和模型；点名时交给指定对象。</p>
+    </article>
+    <article class="fcard tilt" id="native-fast-feature">
+      <span class="fcard-no mono">11</span>
+      <h3>API Key 也能用原生 Fast</h3>
+      <p>纯 API Key 模式恢复 Codex 的原生 Fast 开关，沿用 Standard / ⚡ Fast 控件。默认关闭，模型需声明 Fast（priority）支持；实际可用性与计费由供应商决定。</p>
+    </article>
   </div>
 </section>
 
@@ -196,44 +206,49 @@
   </div>
 </section>
 
-<!-- ========== 横向实拍 ========== -->
+<!-- ========== 点选实拍 ========== -->
 <section class="showcase" id="showcase">
-  <div class="showcase-pin" id="showcasePin">
+  <div class="showcase-inner">
     <div class="section-head">
       <p class="eyebrow">SHOWCASE · 真实截图</p>
       <h2>所见，<em>即所得</em></h2>
-      <p class="section-sub">以下全部是 Codex++ 的真实界面。横向滚动，慢慢看。</p>
+      <p class="section-sub">以下全部是 Codex++ 的真实界面。点选缩略图切换预览，点击大图查看原图。</p>
     </div>
     <div class="showcase-track" id="showcaseTrack">
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/manager-enhancements.png" alt="Codex++ 管理工具：集中管理模型、会话、输入体验和挂件设置"></div>
+      <figure class="shot shot-agent" id="agent-collaboration">
+        <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="打开子 Agent 协作实测截图原图">
+          <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="Codex 对话中请求问问 DeepSeek 1+1 是多少，调用 Codex Plus Collaboration 后，DeepSeek 回答 1+1 等于 2">
+        </a>
+        <figcaption><b>子 Agent 协作实测</b><span>Codex 通过 dsh 委派 DeepSeek，结果回到同一对话。点击截图查看原图。</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-enhancements.png" target="_blank" rel="noopener"><img src="assets/manager-enhancements.png" alt="Codex++ 管理工具：集中管理模型、会话、输入体验和挂件设置" loading="lazy"></a>
         <figcaption><b>增强集中管理</b><span>插件与模型、对话与输入、挂件与桌宠，一页开关。</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/codex-multi-launch.png" target="_blank" rel="noopener"><img src="assets/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例" loading="lazy"></a>
         <figcaption><b>Codex 多开</b><span>每个供应商身份一个隔离实例，互不打扰。</span></figcaption>
       </figure>
-      <figure class="shot shot-narrow tilt">
-        <div class="shot-frame"><img src="assets/model-picker-groups.png" alt="模型选择器按供应商分组折叠：供应商 4 组（默认，7 个模型）与 DeepSeek 组（2 个模型）"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/model-picker-groups.png" target="_blank" rel="noopener"><img src="assets/model-picker-groups.png" alt="模型选择器按供应商分组折叠：供应商 4 组（默认，7 个模型）与 DeepSeek 组（2 个模型）" loading="lazy"></a>
         <figcaption><b>模型选择器分组</b><span>聚合模型按供应商折叠，表头带数量与「默认」标志。</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/extension-market.png" alt="Codex++ 拓展市场：浏览社区脚本和工作流工具"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/extension-market.png" target="_blank" rel="noopener"><img src="assets/extension-market.png" alt="Codex++ 拓展市场：浏览社区脚本和工作流工具" loading="lazy"></a>
         <figcaption><b>拓展市场</b><span>社区脚本即装即用：用量面板、模型矩阵、提示词优化。</span></figcaption>
       </figure>
-      <figure class="shot shot-wide tilt">
-        <div class="shot-frame"><img src="assets/usage-statusline.png" alt="输入框下方的用量状态栏：51 tok/s、缓存命中 99.9%、上下文占用 19%"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/usage-statusline.png" target="_blank" rel="noopener"><img src="assets/usage-statusline.png" alt="输入框下方的用量状态栏：51 tok/s、缓存命中 99.9%、上下文占用 19%" loading="lazy"></a>
         <figcaption><b>用量状态栏</b><span>51 tok/s · 缓存命中 99.9% · 上下文 19%，就在输入框下方。</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame shot-dark"><img src="assets/usage-widget.png" alt="角色用量挂件：气泡显示 Token 统计和运行状态"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview shot-dark" href="assets/usage-widget.png" target="_blank" rel="noopener"><img src="assets/usage-widget.png" alt="角色用量挂件：气泡显示 Token 统计和运行状态" loading="lazy"></a>
         <figcaption><b>桌宠用量挂件</b><span>今日用量、任务状态、预算提醒，换张图就是你的角色。</span></figcaption>
       </figure>
-      <figure class="shot tilt">
-        <div class="shot-frame"><img src="assets/typing-effects.png" alt="Codex 输入框中的彩虹粒子打字特效"></div>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/typing-effects.png" target="_blank" rel="noopener"><img src="assets/typing-effects.png" alt="Codex 输入框中的彩虹粒子打字特效" loading="lazy"></a>
         <figcaption><b>打字特效</b><span>彩虹粒子、烟花与星光，可随系统「减少动态效果」自动暂停。</span></figcaption>
       </figure>
-      <div class="shot-end" aria-hidden="true"><span class="mono">FIN · 更多在应用里</span></div>
     </div>
   </div>
 </section>
@@ -336,6 +351,10 @@ your-model<span class="t-hl">[128000]</span>
     <details class="faq-item">
       <summary>切换供应商后，请求为什么失败？<span class="faq-x" aria-hidden="true"></span></summary>
       <div class="faq-a"><p>先在供应商详情中运行模型测试或 Provider Doctor，确认协议、Base URL、Key 与模型匹配。纯 API 和官方登录 + API 使用不同的认证位置，不要手工复制两种模式的 <span class="mono">auth.json</span>。</p></div>
+    </details>
+    <details class="faq-item" id="faq-native-fast">
+      <summary>开启原生 Fast 后，为什么仍然看不到开关？<span class="faq-x" aria-hidden="true"></span></summary>
+      <div class="faq-a"><p>先确认已经保存，并通过 Codex++ 重启 Codex。当前模型还需要声明 Fast 服务等级：在「供应商配置」中打开该模型的配置，设置「Fast（priority）支持」，保存模型与供应商后重启。请按供应商实际能力声明；此功能只恢复客户端入口，服务限制与计费仍以供应商为准。</p></div>
     </details>
     <details class="faq-item">
       <summary>增强功能可以关闭吗？官方应用更新后还能用吗？<span class="faq-x" aria-hidden="true"></span></summary>
@@ -442,6 +461,6 @@ your-model<span class="t-hl">[128000]</span>
 <script src="assets/gsap.min.js"></script>
 <script src="assets/ScrollTrigger.min.js"></script>
 <script src="js/nebula.js"></script>
-<script src="js/main.js"></script>
+<script src="js/main.js?v=20261017-gallery-3"></script>
 </body>
 </html>

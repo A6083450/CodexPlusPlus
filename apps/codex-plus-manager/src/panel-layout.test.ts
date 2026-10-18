@@ -57,6 +57,9 @@ function layoutHarness(zoom = 1) {
     const codexPlusPageClass = "codex-plus-page-overlay";
     const codexPlusRailSelector = "nav[data-app-navigation-rail]";
     function setCodexPlusSidebarNavActive() {}
+    // 返回按钮行为由 page-back-navigation.test.ts 验证，此处只隔离布局生命周期。
+    function syncCodexPlusPageBackButton() {}
+    function restoreCodexPlusPageBackButton() {}
     ${functionSource("positionCodexPlusPage")}
     ${functionSource("observeCodexPlusPageLayout")}
     ${functionSource("closeCodexPlusPage")}

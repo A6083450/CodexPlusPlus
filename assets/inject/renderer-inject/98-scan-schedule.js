@@ -33,7 +33,6 @@
       '[data-testid="conversation-turn"]',
       '[data-model-picker-model-row]',
       '[data-codex-intelligence-trigger="true"]',
-      codexServiceTierSemanticModelMenuRowSelector(),
       '[class*="user-message"]',
       '[class*="UserMessage"]',
       ".composer-footer",

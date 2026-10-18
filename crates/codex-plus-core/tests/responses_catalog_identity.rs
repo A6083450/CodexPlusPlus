@@ -129,6 +129,8 @@ fn managed_responses_copy_external_catalogs_for_both_identities() {
     let original = json!({
         "models": [{
             "slug": "gpt-5.6-sol",
+            "base_instructions": "You are a coding assistant.",
+            "supports_parallel_tool_calls": true,
             "context_window": 272000,
             "supports_search_tool": true,
             "web_search_tool_type": "text_and_image",

@@ -289,7 +289,8 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /function installCodexPlusPageNavigationCloseHandler\(\)/);
     assert.match(renderer, /target\?\.closest\(selectors\.sidebarThread\)/);
     assert.match(renderer, /closeCodexPlusPageAfterNativeNavigation\(\)/);
-    assert.match(renderer, /setTimeout\(\(\) => \{\s*window\.__codexPlusPageNavigationCloseTimer = null;\s*closeCodexPlusPage\(\);/);
+    assert.match(renderer, /const timer = setTimeout\(\(\) => \{\s*if \(window\.__codexPlusPageNavigationCloseTimer !== timer\) return;/);
+    assert.match(renderer, /if \(document\.querySelector\(`\.\$\{codexPlusPageClass\}`\) === page\) closeCodexPlusPage\(\);/);
     assert.match(renderer, /installCodexPlusNavigationEntries\(\);/);
     assert.match(renderer, /document\.querySelectorAll\(`#\$\{codexPlusMenuId\}/);
   });
@@ -645,7 +646,7 @@ describe("renderer injection header compatibility", () => {
     const renderEnd = renderer.indexOf("\n  let codexPlusBackendSettings =", renderStart);
     assert.ok(renderStart >= 0 && renderEnd > renderStart);
     const settings: Record<string, boolean> = { pluginMarketplaceUnlock: true, threadScrollRestore: true, modelWhitelistUnlock: true };
-    const render = new Function("document", "codexPlusSettings", "codexPlusBackendMappedSettings", "refreshConversationViewControls", "refreshCodexServiceTierControls",
+    const render = new Function("document", "codexPlusSettings", "codexPlusBackendMappedSettings", "refreshConversationViewControls",
       `let codexPlusBackendSettingsLoaded = false; const codexPlusBackendSettings = {};
 ${renderer.slice(renderStart, renderEnd)}
 return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMenu(); };`,
@@ -1944,24 +1945,79 @@ it("preserves fork request overrides in both app-server entrypoints", async () =
   const body = source.slice(start, end);
   const apply = new Function(
     "applyCodexImageGenerationRequestOverride",
-    "applyCodexServiceTierRequestOnly",
     `${body}\nreturn applyCodexAppServerRequestOverrides;`,
   )(
     (_method: string, params: object) => ({ ...params, imageGeneration: true }),
-    (_method: string, params: object) => ({ ...params, serviceTier: "priority" }),
   );
   assert.deepEqual(apply("turn/start", { hostId: "local" }, { model: "gpt-image-2" }), {
-    model: "gpt-image-2", imageGeneration: true, serviceTier: "priority",
+    model: "gpt-image-2", imageGeneration: true,
   });
   assert.deepEqual(apply("turn/start", { hostId: "remote" }, { model: "gpt-6-sol" }), {
-    model: "gpt-6-sol", serviceTier: "priority",
+    model: "gpt-6-sol",
   });
   const nativeThreadParams = { model: "gpt-6-sol" };
   assert.equal(apply("thread/start", { hostId: "remote" }, nativeThreadParams), nativeThreadParams);
-  assert.equal((source.match(/applyCodexAppServerRequestOverrides\(requestMethod, client, providerParams\)/g) || []).length, 2);
+  assert.equal((source.match(/nextParams = applyCodexAppServerRequestOverrides\(requestMethod, client, nextParams\)/g) || []).length, 2);
   const prototype = source.slice(source.indexOf("  function installCodexAppServerClientPrototypePatch("), source.indexOf("  const appServerModelRequestPatchMaxMisses = "));
   assert.ok(prototype.includes("await prepareCodexImageGenerationTurn(client, requestMethod, params)"));
   assert.ok(prototype.includes("refreshCodexNativeModelCache"));
+});
+
+it("preserves native service tiers through imagegen and provider adapters", async () => {
+  const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const start = source.indexOf("  function applyCodexAppServerRequestOverrides(");
+  const end = source.indexOf("\n  function patchAppServerModelRequestClient(", start);
+  const applyImagegen = new Function("applyCodexImageGenerationRequestOverride",
+    `${source.slice(start, end)}\nreturn applyCodexAppServerRequestOverrides;`)(
+    (_method: string, params: object) => ({ ...params, imageGeneration: true }),
+  );
+  const providerStart = source.indexOf("  function applyCodexServiceTierRequestOverride(");
+  const providerEnd = source.indexOf("\n  function codexRemoteSessionActiveProfile(", providerStart);
+  const applyProvider = new Function("applyCodexRemoteSessionProviderOverride",
+    `${source.slice(providerStart, providerEnd)}\nreturn applyCodexServiceTierRequestOverride;`)(
+    (_method: string, params: object) => ({ ...params, modelProvider: "custom" }),
+  );
+  for (const fields of [{}, { serviceTier: null }, { serviceTier: "priority" },
+    { serviceTier: "flex", service_tier: "flex", serviceTierForTurn: "flex" }]) {
+    const params = { model: "gpt-6-sol", ...fields };
+    for (const method of ["thread/start", "thread/resume", "turn/start", "thread/settings/update"]) {
+      assert.deepEqual(applyImagegen(method, { hostId: "local" }, params), { ...params, imageGeneration: true });
+      assert.equal(applyImagegen(method, { hostId: "remote" }, params), params);
+      assert.deepEqual(applyProvider(method, params), { ...params, modelProvider: "custom" });
+    }
+  }
+  assert.doesNotMatch(source, /function (?:applyCodexServiceTierRequestOnly|codexPlusModelServiceTiers|applyCodexPlusModelServiceTiers|installCodexServiceTierMenu|syncCodexNativeServiceTierPicker|patchCodexNativeSolidFastIcon)\(/);
+});
+
+it("keeps context and image metadata without fabricating native speed capabilities", async () => {
+  const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const start = renderer.indexOf("  function codexPlusModelMetadata(");
+  const end = renderer.indexOf("  function modelArrayLooksPatchable(", start);
+  assert.ok(start >= 0 && end > start);
+  const api = vm.runInNewContext(`${renderer.slice(start, end)}\n({ apply: applyCodexPlusModelMetadata, descriptor: codexPlusModelDescriptor })`, {
+    codexModelCatalog: { modelMetadata: { "gpt-6-sol": {
+      contextWindow: 950000, inputModalities: ["text", "image"], supportsImageDetailOriginal: true,
+      serviceTiers: [{ id: "priority" }], additionalSpeedTiers: ["fast"],
+    } } },
+    codexServiceTierModelFromValue: (model: string) => model,
+    normalizeCodexServiceTierModelName: (model: string) => model.toLowerCase(),
+  });
+  const tiers = [{ id: "native-ultrafast" }];
+  const speedTiers = ["native-speed"];
+  const native = { model: "gpt-6-sol", serviceTiers: tiers, additionalSpeedTiers: speedTiers };
+  assert.equal(api.apply(native, native.model), true);
+  assert.equal(native.serviceTiers, tiers);
+  assert.equal(native.additionalSpeedTiers, speedTiers);
+  const custom = api.descriptor("gpt-6-sol");
+  assert.equal(Object.hasOwn(custom, "serviceTiers"), false);
+  assert.equal(Object.hasOwn(custom, "additionalSpeedTiers"), false);
+  const contextOnly: Record<string, unknown> = { model: "gpt-6-sol" };
+  api.apply(contextOnly, "gpt-6-sol");
+  assert.equal(contextOnly.contextWindow, 950000);
+  assert.equal(contextOnly.supportsImageDetailOriginal, true);
+  assert.equal(JSON.stringify(contextOnly.inputModalities), '["text","image"]');
+  assert.equal(Object.hasOwn(contextOnly, "serviceTiers"), false);
+  assert.equal(Object.hasOwn(contextOnly, "additionalSpeedTiers"), false);
 });
 
 it("assembles the imagegen runtime into the resolved renderer without syntax drift", async () => {
@@ -2003,7 +2059,7 @@ it("schedules chat sorting without aborting scans and refreshes stale sort keys"
     timestampMsFromPayload: () => 0,
     sortMsForSession: (_id: string, value: string) => Number(value),
   });
-  assert.doesNotThrow(() => api.schedule(), "disabled sorting must not stop subsequent Fast synchronization");
+  assert.doesNotThrow(() => api.schedule(), "disabled sorting must not stop subsequent scan steps");
   assert.deepEqual(delays, []);
   enabled = true;
   api.schedule();
@@ -2013,42 +2069,6 @@ it("schedules chat sorting without aborting scans and refreshes stale sort keys"
   assert.equal(fetches, 1, "stale sort keys must be refreshed even when rows are already ordered");
   await api.apply();
   assert.equal(fetches, 1, "fresh sort keys should reuse the previous fetch");
-});
-
-// 新版原生滑杆菜单的横排控件不能插入旧版速度子菜单。
-it("keeps the native power-slider menu free of legacy speed rows", async () => {
-  const source = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-  const start = source.indexOf("  function codexServiceTierNativeSpeedRow(");
-  const end = source.indexOf("\n  function installCodexServiceTierMenu(", start);
-  assert.ok(start >= 0 && end > start);
-  const detect = vm.runInNewContext(`(${source.slice(start, end).trim()})`);
-  const slider = { tagName: "DIV" };
-  const menu = { querySelector: (selector: string) => selector === "[data-model-picker-power-slider]" ? slider : null };
-  const container = { querySelector: () => null, closest: (selector: string) => selector === '[role="menu"]' ? menu : null };
-  assert.equal(detect(container, [], { speed: "速度" }), slider);
-  assert.equal(detect({ querySelector: () => null }, [], { speed: "速度" }), undefined);
-  const nativeFast = { tagName: "SPAN" };
-  assert.equal(detect({ querySelector: () => nativeFast }, [], { speed: "速度" }), nativeFast);
-});
-
-// Fast 的界面、原生列表与请求共用同一能力判定，不能遗漏新模型或元数据。
-it("recognizes GPT-6.1 Sol and metadata-declared Fast without enabling unknown models", async () => {
-  const source = await readFile(new URL("../../../assets/inject/renderer-inject/20-menu.js", import.meta.url), "utf8");
-  const set = source.match(/  const codexServiceTierSupportedFastModels = .+;/)![0];
-  const additions = source.match(/^  \["gpt-5\.6-sol".*forEach.*$/m)![0];
-  const extract = (name: string, next: string) => {
-    const start = source.indexOf(`  function ${name}(`);
-    const end = source.indexOf(`  function ${next}(`, start);
-    assert.ok(start >= 0 && end > start);
-    return source.slice(start, end);
-  };
-  const api = vm.runInNewContext(`${set}\n${additions}\n${extract("codexServiceTierFastSupportedForModel", "codexServiceTierFastUnsupportedMessage")}\n${extract("codexServiceTierFastAvailability", "codexServiceTierInheritedValue")}\n({ fast: codexServiceTierFastAvailability })`, {
-    normalizeCodexServiceTierModelName: (model: string) => model.toLowerCase(),
-    codexPlusModelMetadata: (model: string) => model === "relay-priority" ? { serviceTiers: [{ id: "priority" }] } : null,
-  });
-  assert.equal(api.fast("gpt-6.1-sol").supported, true);
-  assert.equal(api.fast("relay-priority").supported, true);
-  assert.equal(api.fast("unknown-model").supported, false);
 });
 
 it("preserves upstream marketplace display names after moving the patch to its own fragment", async () => {
@@ -2243,7 +2263,7 @@ describe("拓展接口层", () => {
     return Array.from(body.matchAll(/"([^"]+)"/g), ([, route]) => route);
   }
 
-  it("路由白名单只放只读能力，不含设置写入与远端控制", async () => {
+  it("路由白名单不含设置写入与远端控制，CDP 注入需显式开放", async () => {
     const routes = await readRouteWhitelist();
     assert.ok(routes.length > 0, "白名单不能为空");
     // 这些路由一旦开放，第三方脚本就能改用户配置或操作远端，必须显式决策后才能加。
@@ -2251,6 +2271,8 @@ describe("拓展接口层", () => {
       assert.ok(!routes.includes(forbidden), `${forbidden} 不应默认开放给拓展`);
     }
     assert.ok(routes.includes("/diagnostics/log"), "诊断上报应保持开放");
+    assert.ok(routes.includes("/cdp/targets"), "CDP 页面列表应开放给拓展");
+    assert.ok(routes.includes("/cdp/evaluate"), "CDP evaluate 应开放给拓展");
   });
 
   it("接口对象在 IIFE 收尾前挂载", async () => {
@@ -2343,7 +2365,7 @@ describe("拓展菜单项", () => {
  */
 function conversationViewRuntime(renderer: string) {
   const start = renderer.indexOf("  // 旧版（26.9xx 之前）内容容器类名清单");
-  const end = renderer.indexOf("  const codexNativeServiceTierPickerVersion = ", start);
+  const end = renderer.indexOf("  function removeLegacyCodexServiceTierBadges(", start);
   assert.ok(start >= 0 && end > start, "conversation view target finder block not found");
   const finderSource = renderer.slice(start, end);
   // 宽度计算与目标查找在文件里不相邻，单独切一段。

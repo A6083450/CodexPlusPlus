@@ -864,16 +864,18 @@ fn collect_entries_prefers_inline_suffix_over_model_windows_map() {
     assert_eq!(entries[0].suffix_window, Some(1_000_000));
 }
 
-// fork 的 Astra 兼容层优先于上游 Sol/Luna 回退：保留已有档位、Fast 和窗口，
+// fork 的 Astra 兼容层保留推理与窗口，速度能力继承原生缓存，
 // 同时验证生成 catalog 与 UI 元数据完全一致。
 #[test]
-fn gpt6_sol_luna_metadata_preserves_fork_efforts_fast_and_default_window() {
+fn gpt6_sol_luna_metadata_preserves_fork_efforts_and_default_window() {
     use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
 
     // catalog 生成链会读 CODEX_HOME/models_cache.json，与其他临时改写
     // CODEX_HOME 的测试互斥。
     let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
 
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = CodexHomeEnvGuard::set(temp.path());
     let entries = collect_catalog_entries(
         "gpt-6-sol\ngpt-6-luna",
         &HashMap::new(),
@@ -909,9 +911,9 @@ fn gpt6_sol_luna_metadata_preserves_fork_efforts_fast_and_default_window() {
         assert_eq!(ui["defaultReasoningEffort"], "medium");
         assert_eq!(model["context_window"], 272_000);
         assert_eq!(model["max_context_window"], 272_000);
-        assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+        assert_eq!(model["additional_speed_tiers"], serde_json::json!([]));
         assert_eq!(ui["additionalSpeedTiers"], model["additional_speed_tiers"]);
-        assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(model["service_tiers"], serde_json::json!([]));
         assert_eq!(ui["serviceTiers"], model["service_tiers"]);
         assert_eq!(model["supports_search_tool"], true);
         assert_eq!(model["use_responses_lite"], false);
@@ -924,6 +926,37 @@ fn gpt6_sol_luna_metadata_preserves_fork_efforts_fast_and_default_window() {
     for model in overridden["models"].as_array().unwrap() {
         assert_eq!(model["context_window"], 200_000);
         assert_eq!(model["max_context_window"], 200_000);
+    }
+}
+
+#[test]
+fn fork_gpt6_metadata_inherits_native_tiers_and_keeps_explicit_overrides() {
+    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    for slug in ["gpt-6-sol", "gpt-6-luna"] {
+        for tiers in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":"priority","name":"Native Fast"},{"id":"ultrafast"}]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = CodexHomeEnvGuard::set(temp.path());
+            let native = serde_json::json!({"models":[{
+                "slug":slug, "service_tiers":tiers, "additional_speed_tiers":["native-speed"]
+            }]});
+            let bytes = serde_json::to_vec(&native).unwrap();
+            std::fs::write(temp.path().join("models_cache.json"), &bytes).unwrap();
+            let entries = collect_catalog_entries(slug, &HashMap::new(), &HashMap::new(), slug);
+            let catalog: serde_json::Value =
+                serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+            let ui = model_ui_metadata(slug).unwrap();
+            assert_eq!(catalog["models"][0]["service_tiers"], tiers);
+            assert_eq!(ui["serviceTiers"], tiers);
+            assert_eq!(ui["additionalSpeedTiers"], serde_json::json!(["native-speed"]));
+            assert_eq!(catalog["models"][0]["context_window"], 272_000);
+            let explicit = serde_json::json!({"service_tiers":[{"id":"flex"}]});
+            let ui = model_ui_metadata_with_override(slug, Some(&explicit)).unwrap();
+            assert_eq!(ui["serviceTiers"], explicit["service_tiers"]);
+            assert_eq!(std::fs::read(temp.path().join("models_cache.json")).unwrap(), bytes);
+        }
     }
 }
 

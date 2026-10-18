@@ -1,6 +1,7 @@
 /* ============================================================
    Codex++ 官网 · 交互主脚本
-   - GSAP 入场与滚动编排（横向实拍、数字滚动、进度条）
+   - GSAP 入场与滚动编排（数字滚动、进度条）
+   - 实拍大图预览与缩略图切换
    - 打字粒子特效（彩虹 / 烟花 / 星光）
    - 终端打字机、卡片 3D 倾斜、磁吸按钮
    所有效果遵循 prefers-reduced-motion，库缺失时自动降级。
@@ -88,35 +89,54 @@
     });
   }
 
-  /* ---------------- 横向实拍 ---------------- */
+  /* ---------------- 点选实拍 ---------------- */
 
-  var track = document.getElementById("showcaseTrack");
-  var pinWrap = document.getElementById("showcasePin");
-  if (track && pinWrap) {
-    if (HAS_ST && !REDUCED) {
-      var getDist = function () {
-        return Math.max(0, track.scrollWidth - window.innerWidth + 48);
-      };
-      window.gsap.to(track, {
-        x: function () { return -getDist(); },
-        ease: "none",
-        scrollTrigger: {
-          trigger: ".showcase",
-          start: "top top",
-          end: function () { return "+=" + (getDist() + window.innerHeight * 0.35); },
-          pin: true,
-          scrub: 0.6,
-          invalidateOnRefresh: true,
-          anticipatePin: 1
-        }
+  (function screenshotGallery() {
+    var showcase = document.getElementById("showcase");
+    var track = document.getElementById("showcaseTrack");
+    if (!showcase || !track) return;
+    var shots = Array.from(track.querySelectorAll(".shot"));
+    if (shots.length < 2 || shots.some(function (shot) {
+      return !shot.querySelector("img") || !shot.querySelector("figcaption b");
+    })) return;
+
+    var controls = document.createElement("div");
+    controls.className = "showcase-thumbs";
+    controls.setAttribute("role", "group");
+    controls.setAttribute("aria-label", document.documentElement.lang === "en" ? "Choose a screenshot" : "选择实拍截图");
+    var buttons = shots.map(function (shot, index) {
+      if (!shot.id) shot.id = "showcase-shot-" + (index + 1);
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "showcase-thumb";
+      button.setAttribute("aria-controls", shot.id);
+      button.setAttribute("aria-pressed", "false");
+      var image = document.createElement("img");
+      image.src = shot.querySelector("img").getAttribute("src");
+      image.alt = "";
+      image.loading = "lazy";
+      var label = document.createElement("span");
+      label.textContent = shot.querySelector("figcaption b").textContent;
+      button.appendChild(image);
+      button.appendChild(label);
+      button.addEventListener("click", function () { selectShot(index); });
+      controls.appendChild(button);
+      return button;
+    });
+
+    function selectShot(index) {
+      shots.forEach(function (shot, i) {
+        shot.hidden = i !== index;
+        buttons[i].setAttribute("aria-pressed", i === index ? "true" : "false");
       });
-    } else {
-      // 降级：允许手动横向滚动
-      var scroller = track.parentElement;
-      scroller.style.overflowX = "auto";
-      track.style.width = "max-content";
+      shots[index].querySelector("img").loading = "eager";
     }
-  }
+
+    // 控件完整创建并绑定后再收起其余截图，脚本不可用时仍可阅读全部图片。
+    track.parentNode.insertBefore(controls, track.nextSibling);
+    showcase.classList.add("is-gallery");
+    selectShot(0);
+  })();
 
   /* ---------------- 终端打字机 ---------------- */
 

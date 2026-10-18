@@ -145,11 +145,16 @@
   /* 焦点圈 */
   --focus-ring: 0 0 0 3px hsl(var(--brand-accent) / 0.28);
 
-  font-family:
-    Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    "Microsoft YaHei", system-ui, sans-serif;
+  /* 界面字体：对齐 DSH（纯系统字体栈，不打包 Web 字体） */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial,
+    sans-serif;
+  /* 等宽字体：对齐 DSH 的代码字体栈（SF Mono 优先，回退打包的 JetBrains Mono） */
+  --font-mono: "SF Mono", "JetBrains Mono", "Fira Code", Consolas,
+    "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei";
+
+  font-family: var(--font-sans);
   font-size: 13.5px;
-  font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01";
   font-variant-numeric: tabular-nums;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -602,7 +607,7 @@ body {
   min-height: 48px;
   overflow-wrap: anywhere;
   color: hsl(var(--muted-foreground));
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.35;
   padding: 0 14px 14px;
@@ -632,7 +637,7 @@ body {
   min-width: 0;
   overflow-wrap: anywhere;
   color: hsl(var(--muted-foreground));
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -840,14 +845,14 @@ body {
   border-radius: 999px;
   background: hsl(var(--background) / 0.6);
   color: hsl(var(--foreground));
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   padding: 4px 8px;
 }
 
 .env-conflict-tags small {
   color: hsl(var(--muted-foreground));
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-family: var(--font-sans);
 }
 
 .relay-master-switch {
@@ -1472,6 +1477,14 @@ body {
   align-items: start;
 }
 
+/* 左侧端点与协议独立排列，不随右侧 Key 列表的高度拉开间距。 */
+.relay-api-connection-fields {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+}
+
 /* 已在 .relay-advanced-block 里，不再需要跨列。左右内边距由自己负责：
    外层盒子的 padding 已经移到 trigger 上，好让收起态整块可点 */
 .relay-advanced-fields {
@@ -1877,6 +1890,94 @@ body {
   grid-column: auto;
 }
 
+.relay-field-key {
+  grid-column: 1 / -1;
+}
+
+.relay-api-key-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  container-type: inline-size;
+  container-name: relay-api-keys;
+}
+
+.relay-api-key-row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 0.55fr) minmax(0, 1.45fr) 36px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: var(--radius-md);
+  background: hsl(var(--surface-raised) / 0.35);
+}
+
+.relay-api-key-row > input {
+  min-width: 0;
+}
+
+/* Key 区可能只占表单半列，按它自身的宽度换行，避免宽窗口内仍挤出边框。 */
+@container relay-api-keys (max-width: 440px) {
+  .relay-api-key-row {
+    grid-template-columns: 36px minmax(0, 1fr) 36px;
+  }
+
+  .relay-api-key-select {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input:not([type="password"]) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input[type="password"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .relay-api-key-row > button:last-child {
+    grid-column: 3;
+    grid-row: 1;
+  }
+}
+
+.relay-api-key-row.active {
+  border-color: hsl(var(--brand-accent) / 0.55);
+  background: hsl(var(--brand-accent) / 0.07);
+}
+
+.relay-api-key-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+}
+
+.relay-api-key-select:hover,
+.relay-api-key-select:focus-visible {
+  background: hsl(var(--surface-raised));
+  color: hsl(var(--foreground));
+  outline: none;
+}
+
+.relay-api-key-row.active .relay-api-key-select {
+  color: hsl(var(--brand-accent));
+}
+
+.relay-api-key-add {
+  justify-self: start;
+}
+
 /* 折叠式高级区：整块描边，标题行自带箭头，收起时用一行提示说明里面有什么 */
 .relay-advanced-block {
   grid-column: 1 / -1;
@@ -2101,8 +2202,7 @@ details.relay-fold[open] > .relay-fold-body {
   min-width: 0;
 }
 
-.relay-options-grid > .relay-field-config-model,
-.relay-connection-section .relay-api-fields > .relay-field-protocol {
+.relay-options-grid > .relay-field-config-model {
   grid-column: 1 / -1;
 }
 
@@ -2603,7 +2703,7 @@ details.relay-fold[open] > .relay-fold-body {
 
 .context-editor-textarea {
   min-height: 160px;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -2685,7 +2785,7 @@ details.relay-fold[open] > .relay-fold-body {
   overflow: auto;
   border-width: 1px;
   border-style: solid;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
   tab-size: 2;
@@ -3620,6 +3720,20 @@ details.relay-fold[open] > .relay-fold-body {
   border-radius: inherit;
   background: hsl(var(--brand-accent));
   transition: width 220ms var(--motion-ease);
+}
+
+.provider-sync-progress-bar[data-indeterminate="true"] .provider-sync-progress-fill {
+  width: 32%;
+  animation: task-progress-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes task-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
 }
 
 .task-progress {
@@ -4575,7 +4689,7 @@ input[type="range"]:disabled {
 .log-view {
   min-height: 180px;
   margin-top: 10px;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
   white-space: pre;
@@ -4583,7 +4697,7 @@ input[type="range"]:disabled {
 
 .launch-args-input {
   min-height: 112px;
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -4600,7 +4714,7 @@ input[type="range"]:disabled {
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
   background: hsl(var(--background));
-  font-family: Consolas, "SFMono-Regular", monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -5612,7 +5726,7 @@ input[type="range"]:disabled {
 
 .relay-model-row input {
   min-width: 0;
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 /* 模型行内的下拉收紧内边距与图标间距，把宽度让给文字：
@@ -5769,7 +5883,7 @@ input[type="range"]:disabled {
 
 .relay-model-import-workbench textarea {
   min-height: 150px;
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .relay-model-metadata-import-error,
@@ -5877,7 +5991,7 @@ input[type="range"]:disabled {
 
 .relay-model-route-row input {
   min-width: 0;
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -6561,7 +6675,7 @@ select {
 .log-view,
 .launch-args-input,
 .log-lines {
-  font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 /* ── 列表行 ─────────────────────────────────────────────────── */
@@ -8451,7 +8565,7 @@ select {
 
 .dream-skin-verification-meta code {
   margin-top: 3px;
-  font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
@@ -8583,7 +8697,7 @@ select {
   min-width: 0;
   overflow: hidden;
   color: hsl(var(--foreground));
-  font-family: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.4;
   text-overflow: ellipsis;
@@ -8733,14 +8847,6 @@ select {
   justify-content: space-between;
   gap: 20px;
   padding: 14px 18px;
-}
-
-.enhance-primary-switches {
-  display: grid;
-  gap: 14px;
-  flex: 1;
-  min-width: 0;
-  max-width: 480px;
 }
 
 .enhance-master-switch.switch-row {

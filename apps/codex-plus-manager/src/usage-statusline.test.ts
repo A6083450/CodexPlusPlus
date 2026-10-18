@@ -189,3 +189,88 @@ test("会话 id 只认 composer 上的实时标识，新会话草稿视为无会
   assert.equal(codexPlusUsageThreadId(card("short")), "");
   assert.equal(codexPlusUsageThreadId(undefined), "");
 });
+
+function lifecycle() {
+  const node = { isConnected: true, previousElementSibling: null as unknown, dataset: {} as Record<string, string> };
+  let current = { id: "thread-a-123", card: {} };
+  const renders: any[] = [];
+  let resolveRequest: (value: unknown) => void = () => {};
+  let rejectRequest: (error: Error) => void = () => {};
+  const source = [
+    ...["codexPlusUsageState", "codexPlusUsageStaleMs", "codexPlusUsageIdleIntervalMs",
+      "codexPlusUsageActiveIntervalMs", "codexPlusUsageWarmupIntervalMs", "codexPlusUsageFailureLimit",
+      "codexPlusUsagePercent", "codexPlusUsageRate", "codexPlusUsageSnapshot",
+      "codexPlusUsageHide", "codexPlusUsageShow", "codexPlusUsageSyncPlacement",
+      "codexPlusUsageRemember", "codexPlusUsageRefresh", "codexPlusUsageTick"].map(declaration),
+    "return { state: codexPlusUsageState, sync: codexPlusUsageSyncPlacement, tick: codexPlusUsageTick, remember: codexPlusUsageRemember };",
+  ].join("\n");
+  const runtime = new Function("document", "codexPlusUsageEnabled", "codexPlusUsageComposerCard",
+    "codexPlusUsageThreadId", "codexPlusUsageEnsureNode", "codexPlusUsageRender",
+    "codexPlusUsageSchedule", "postJson", "sendCodexPlusDiagnostic", source)(
+    { hidden: false }, () => true, () => current.card, () => current.id,
+    (card: unknown) => { node.previousElementSibling = card; return node; },
+    (value: unknown) => renders.push(value), () => {},
+    () => new Promise((resolve, reject) => { resolveRequest = resolve; rejectRequest = reject; }), () => {},
+  );
+  runtime.state.node = node;
+  return {
+    ...runtime, node, renders,
+    switchTo(id: string) { current = { id, card: {} }; },
+    respond(events: unknown[]) { resolveRequest({ status: "ok", events }); },
+    fail() { rejectRequest(new Error("bridge unavailable")); },
+  };
+}
+
+test("数据请求完成前就显示栏位，切换会话立即恢复各自缓存", async () => {
+  const ui = lifecycle();
+  const pending = ui.tick();
+  assert.notEqual(ui.node.dataset.hidden, "true");
+  assert.equal(ui.renders.at(-1), null);
+  ui.respond([event(0, 100, { total_tokens: 27000 })]);
+  await pending;
+  assert.equal(ui.renders.at(-1).context, 27);
+  const original = ui.state.node;
+  ui.switchTo("thread-b-123");
+  ui.sync();
+  assert.equal(ui.renders.at(-1), null, "不能沿用其他会话的数字");
+  ui.switchTo("thread-a-123");
+  ui.sync();
+  assert.equal(ui.renders.at(-1).context, 27);
+  assert.equal(ui.state.node, original, "会话切换复用同一栏位");
+});
+
+test("旧请求返回不能覆盖当前会话，也不能在新建或设置页面重新显示", async () => {
+  const ui = lifecycle();
+  const pending = ui.tick();
+  ui.switchTo("thread-b-123");
+  ui.sync();
+  ui.respond([event(0, 100, { total_tokens: 27000 })]);
+  await pending;
+  assert.equal(ui.renders.at(-1), null);
+  assert.equal(ui.state.threadId, "thread-b-123");
+  const other = ui.tick();
+  ui.switchTo("");
+  ui.sync();
+  ui.respond([event(0, 100)]);
+  await other;
+  assert.equal(ui.node.dataset.hidden, "true");
+  assert.equal(ui.state.threadId, "");
+});
+
+test("空数据及连续失败仍保留已有会话栏位，缓存有界", async () => {
+  const ui = lifecycle();
+  const pending = ui.tick();
+  ui.respond([]);
+  await pending;
+  assert.notEqual(ui.node.dataset.hidden, "true");
+  for (let i = 0; i < 5; i++) {
+    const failed = ui.tick();
+    ui.fail();
+    await failed;
+  }
+  assert.equal(ui.state.failures, 5);
+  assert.notEqual(ui.node.dataset.hidden, "true", "桥接不可用仍保留栏位");
+  for (let i = 0; i < 40; i++) ui.remember(`thread-${i}`, [event(0, i)]);
+  assert.equal(ui.state.cache.size, 32);
+  assert.equal(ui.state.cache.has("thread-0"), false);
+});

@@ -390,7 +390,7 @@ pause_auto_takeover_for_instance() -> CommandResult<AutoTakeoverPayload>
 
 **第 6 步：文档 + 构建启动（硬性要求）**
 - `README.md:123-164`、`README_EN.md:42-53`/`:88-99`、`CHANGELOG.md:3-25`、`docs/release/v<下一版本>-notes.md`。
-- `npm run vite:build` → `cargo build --release -p codex-plus-manager` → 装入 `dist/local-build-*/Codex++.app` → `codesign --force --deep --sign -` → `open`，确认进程与 `manager.start` 日志正常。
+- `npm run vite:build` → `cargo build --release -p codex-plus-manager` → 原地替换固定 `dist/local-build/Codex++.app`（不要按任务新建 `dist/local-build-*`）→ `codesign --force --deep --sign -` → `open`，确认进程与 `manager.start` 日志正常；收尾跑 `node scripts/prune-local-builds.mjs --apply`。
 - 端到端实测（需用户在场）：关掉 Codex++ → 双击官方 App → 观察全流程与耗时；再验「本次不接管」与失败路径。
 
 ---

@@ -1,6 +1,8 @@
 pub mod ads;
 pub mod aggregate_catalog;
 pub mod agent_cache;
+pub mod agent_collaboration;
+pub mod anthropic_bridge;
 pub mod app_paths;
 pub mod assets;
 pub mod auto_takeover;
