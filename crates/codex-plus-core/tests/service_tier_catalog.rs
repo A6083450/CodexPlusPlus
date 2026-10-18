@@ -34,7 +34,7 @@ fn cc_switch_projection_uses_saved_windows_and_native_fast_without_mutating_sour
     for (index, window) in [1000000, 500000].into_iter().enumerate() {
         let model = &projected["models"][index];
         assert_eq!(model["context_window"], window);
-        assert_eq!(model["effective_context_window_percent"], 100);
+        assert_eq!(model["effective_context_window_percent"], 95);
         assert_eq!(model["auto_compact_token_limit"], window * 95 / 100);
         assert_eq!(model["service_tiers"][0]["id"], "priority");
         assert_eq!(model["additional_speed_tiers"][0], "fast");
@@ -44,6 +44,10 @@ fn cc_switch_projection_uses_saved_windows_and_native_fast_without_mutating_sour
     assert!(!live.contains("model_auto_compact_token_limit"));
     assert_eq!(std::fs::read_to_string(home.join("cc-switch-model-catalog.json")).unwrap(), source_text);
     assert!(!sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
+    let context = sync_native_model_cache_in_home(home, Some("gpt-6.1-sol")).unwrap();
+    assert_eq!(context["contextWindow"], 950000);
+    assert_eq!(context["config"]["model_context_window"], 1000000);
+    assert_eq!(context["config"]["model_auto_compact_token_limit"], 950000);
     settings.codex_app_native_fast_unlock = false;
     assert!(sync_cc_switch_catalog(home, &settings, &db_path).unwrap());
     let projected: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("model-catalogs/cc-switch-native.json")).unwrap()).unwrap();

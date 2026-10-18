@@ -62,7 +62,8 @@ pub fn sync_cc_switch_catalog(
         if let Some(window) = entry["contextWindow"].as_u64().filter(|value| *value > 0 && *value <= i64::MAX as u64).or(global_window) {
             model["context_window"] = window.into();
             model["max_context_window"] = window.into();
-            model["effective_context_window_percent"] = 100.into();
+            model["effective_context_window_percent"] = model["effective_context_window_percent"]
+                .as_u64().filter(|percent| (1..=100).contains(percent)).unwrap_or(95).into();
             let compact = global_window.zip(global_compact)
                 .filter(|(total, limit)| limit <= total)
                 .and_then(|(total, limit)| window.checked_mul(limit).map(|value| value / total))
@@ -141,7 +142,7 @@ pub fn sync_native_model_cache_in_home(
         None => serde_json::json!({ "status": "unavailable" }),
     };
     if projection && result["status"] == "ok" {
-        result["config"] = serde_json::json!({"model_context_window": window.unwrap()});
+        result["config"] = serde_json::json!({"model_context_window": model.unwrap()["context_window"]});
         if let Some(limit) = model.and_then(|model| model["auto_compact_token_limit"].as_u64()) {
             result["config"]["model_auto_compact_token_limit"] = limit.into();
         }
