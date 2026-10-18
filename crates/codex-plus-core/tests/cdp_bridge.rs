@@ -3842,6 +3842,7 @@ const codexPlusModelUnlockEnabled = () => true;
 const codexPlusBackendSettingsLoaded = true;
 const codexPlusModelCollectionSnapshots = new WeakMap();
 const codexPlusModelDefaultSnapshots = new WeakMap();
+const codexPlusNativeFastModelSnapshots = new Map();
 {function_source}
 
 const missingDefault = {{ value: {{ available_models: ["native-model"] }} }};

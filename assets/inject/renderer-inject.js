@@ -11200,6 +11200,8 @@
     || (window.__codexPlusModelCollectionSnapshots = new WeakMap());
   const codexPlusModelDefaultSnapshots = window.__codexPlusModelDefaultSnapshots
     || (window.__codexPlusModelDefaultSnapshots = new WeakMap());
+  const codexPlusNativeFastModelSnapshots = window.__codexPlusNativeFastModelSnapshots instanceof Map
+    ? window.__codexPlusNativeFastModelSnapshots : (window.__codexPlusNativeFastModelSnapshots = new Map());
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -11416,6 +11418,35 @@
     };
   }
 
+  function applyCodexNativeFastModelCapability(descriptor, modelName, hostId) {
+    if (hostId !== "local" || !/^(?:gpt-5\.6-(?:luna|sol|terra)|gpt-6-(?:astra|sol|luna)|gpt-6\.1-sol)$/.test(modelName)) return false;
+    const previous = codexPlusNativeFastModelSnapshots.get(modelName);
+    const current = { serviceTiers: descriptor.serviceTiers, additionalSpeedTiers: descriptor.additionalSpeedTiers };
+    // QueryClient 会克隆描述对象，按模型和补入值识别，避免关闭时覆盖上游的新元数据。
+    const wasPatched = previous && JSON.stringify(current) === JSON.stringify(previous.patched);
+    if (!codexPlusSettings().nativeFastUnlock) {
+      if (!wasPatched) return false;
+      for (const key of ["serviceTiers", "additionalSpeedTiers"]) {
+        if (previous.original[key] === undefined) delete descriptor[key];
+        else descriptor[key] = previous.original[key];
+      }
+      return true;
+    }
+    const tiers = Array.isArray(descriptor.serviceTiers) ? descriptor.serviceTiers : [];
+    const speeds = Array.isArray(descriptor.additionalSpeedTiers) ? descriptor.additionalSpeedTiers : [];
+    const hasPriority = tiers.some((tier) => tier?.id === "priority");
+    const hasFast = speeds.includes("fast");
+    if (hasPriority && hasFast) return false;
+    // 只补原生控件的能力声明，不选择默认档位，也不覆盖原生 requirements。
+    if (!hasPriority) descriptor.serviceTiers = [...tiers, { id: "priority", name: "Fast", description: "Priority processing, increased usage" }];
+    if (!hasFast) descriptor.additionalSpeedTiers = [...speeds, "fast"];
+    codexPlusNativeFastModelSnapshots.set(modelName, {
+      original: wasPatched ? previous.original : current,
+      patched: { serviceTiers: descriptor.serviceTiers, additionalSpeedTiers: descriptor.additionalSpeedTiers },
+    });
+    return true;
+  }
+
   function modelArrayLooksPatchable(value, allowEmpty = false) {
     return Array.isArray(value)
       && (allowEmpty || value.length > 0)
@@ -11566,11 +11597,14 @@
           changed = true;
         }
         if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
+        if (applyCodexNativeFastModelCapability(item, item.model, hostId)) changed = true;
       }
     });
     customModels.forEach((modelName) => {
       if (!existing.has(modelName)) {
-        models.push(codexPlusModelDescriptor(modelName));
+        const descriptor = codexPlusModelDescriptor(modelName);
+        applyCodexNativeFastModelCapability(descriptor, modelName, hostId);
+        models.push(descriptor);
         changed = true;
       }
     });
@@ -11643,18 +11677,21 @@
     if (!queryClient || typeof queryClient.setQueriesData !== "function") return 0;
     let changed = 0;
     try {
-      queryClient.setQueriesData({
-        predicate: (query) => {
-          const key = query?.queryKey || query?.options?.queryKey;
-          return Array.isArray(key) && key[0] === "models" && key[1] === "list";
-        },
-      }, (current) => {
-        if (!current || typeof current !== "object" || typeof structuredClone !== "function") return current;
-        const next = structuredClone(current);
-        if (!patchModelContainer(next)) return current;
-        changed += 1;
-        return next;
-      });
+      for (const hostId of ["local", ""]) {
+        queryClient.setQueriesData({
+          predicate: (query) => {
+            const key = query?.queryKey || query?.options?.queryKey;
+            return Array.isArray(key) && key[0] === "models" && key[1] === "list"
+              && (key[2] === "local") === (hostId === "local");
+          },
+        }, (current) => {
+          if (!current || typeof current !== "object" || typeof structuredClone !== "function") return current;
+          const next = structuredClone(current);
+          if (!patchModelContainer(next, hostId)) return current;
+          changed += 1;
+          return next;
+        });
+      }
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
       window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
