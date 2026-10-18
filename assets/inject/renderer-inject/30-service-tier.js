@@ -893,8 +893,13 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
+      const providerSelectionChanged = codexPlusBackendSettings.relayProfilesEnabled !== settings.relayProfilesEnabled
+        || codexPlusBackendSettings.activeRelayId !== settings.activeRelayId;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (providerSelectionChanged && typeof loadCodexModelCatalog === "function") {
+        void loadCodexModelCatalog(true);
+      }
       if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,

@@ -42,7 +42,9 @@ pub async fn read_codex_model_catalog() -> Value {
     let home = codex_home_dir();
     let settings_path = crate::paths::default_settings_path();
     if settings_path.exists() {
-        if let Ok(settings) = SettingsStore::new(settings_path).load() {
+        if let Ok(settings) = SettingsStore::new(settings_path).load()
+            && settings.relay_profiles_enabled
+        {
             let profile = settings.active_relay_profile();
             let catalog = if let Some(aggregate) = crate::aggregate_catalog::active_model_aggregation(&settings) {
                 crate::aggregate_catalog::catalog_summary(&home, &settings, &aggregate)

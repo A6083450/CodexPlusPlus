@@ -6159,8 +6159,13 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
+      const providerSelectionChanged = codexPlusBackendSettings.relayProfilesEnabled !== settings.relayProfilesEnabled
+        || codexPlusBackendSettings.activeRelayId !== settings.activeRelayId;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (providerSelectionChanged && typeof loadCodexModelCatalog === "function") {
+        void loadCodexModelCatalog(true);
+      }
       if (typeof setCodexImageGenerationRuntimeActive === "function") setCodexImageGenerationRuntimeActive(true);
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
@@ -11291,7 +11296,8 @@
         if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
           try {
             const settingsResp = await readCodexAppServerPreparation("/settings/get", {});
-            if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
+            if (settingsResp && settingsResp.relayProfilesEnabled !== false
+                && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
               const activeId = settingsResp.activeRelayId || "";
               const profile = settingsResp.relayProfiles.find(p => p.id === activeId);
               if (profile && profile.modelList) {

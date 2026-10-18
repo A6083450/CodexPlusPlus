@@ -229,7 +229,7 @@ async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider(
         std::env::set_var("CODEX_HOME", &codex_home);
     }
 
-    let (result, live_fallback_result) = async {
+    let (result, live_fallback_result, disabled_result) = async {
         write_config(
             &codex_home,
             "model = \"qwen3-coder\"\nmodel_provider = \"live_vendor\"\n",
@@ -261,7 +261,14 @@ async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider(
         settings.relay_profiles[0].config_contents = "model = \"qwen3-coder\"\n".to_string();
         store.save(&settings).unwrap();
         let live_fallback_result = read_codex_model_catalog().await;
-        (result, live_fallback_result)
+        settings = store.load().unwrap();
+        settings.relay_profiles_enabled = false;
+        store.save(&settings).unwrap();
+        write_config(&codex_home, "model = \"external-a\"\nmodel_provider = \"custom\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n");
+        std::fs::write(codex_home.join("cc-switch-model-catalog.json"),
+            json!({"models":[{"slug":"external-a"},{"slug":"external-b"}]}).to_string()).unwrap();
+        let disabled_result = read_codex_model_catalog().await;
+        (result, live_fallback_result, disabled_result)
     }
     .await;
 
@@ -304,6 +311,9 @@ async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider(
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
     assert_eq!(result["sources"][0]["type"], "relay_profile_model_list");
+    assert_eq!(disabled_result["models"], json!(["external-a", "external-b"]));
+    assert_eq!(disabled_result["model_provider"], "custom");
+    assert_eq!(disabled_result["default_model"], "external-a");
 }
 
 #[tokio::test]
