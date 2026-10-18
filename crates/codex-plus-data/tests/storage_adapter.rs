@@ -233,7 +233,7 @@ fn delete_removes_all_rollout_generations_and_undo_restores_them() {
         &session("t1", "Thread"),
         Some(home),
     );
-    assert_eq!(DeleteStatus::LocalDeleted, result.status);
+    assert_eq!(DeleteStatus::LocalDeleted, result.status, "{}", result.message);
     assert!(paths.iter().all(|path| !path.exists()));
     assert!(fork.exists());
     // 重启扫描会从旧 rollout 重建会话，因此删除后不能剩下同 ID 的文件。

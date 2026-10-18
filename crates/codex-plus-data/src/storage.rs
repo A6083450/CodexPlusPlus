@@ -2115,9 +2115,9 @@ fn rollout_file_sources(
     paths.sort();
     paths.dedup();
     for path in paths {
-        let path = path.to_string_lossy();
-        if !rows.iter().any(|row| row["rollout_path"].as_str() == Some(path.as_ref())) {
-            rows.push(json!({"rollout_path": path}));
+        if !rows.iter().any(|row| row["rollout_path"].as_str()
+            .is_some_and(|existing| Path::new(existing) == path.as_path())) {
+            rows.push(json!({"rollout_path": path.to_string_lossy()}));
         }
     }
     Ok(listed_rollout_file_sources(Some(&rows)))

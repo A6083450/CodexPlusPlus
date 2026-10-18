@@ -245,7 +245,7 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#V}"
           STAGE="dist/macos/stage-${VERSION}-universal"
           test -L "$STAGE/Applications"

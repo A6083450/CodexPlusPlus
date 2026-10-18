@@ -271,6 +271,7 @@ fn github_release_workflow_uploads_static_latest_json() {
     let workflow = std::fs::read_to_string(&workflow).expect("read release assets workflow");
 
     assert!(workflow.contains("latest-json:"));
+    assert!(!workflow.contains("${GITHUB_REF_NAME#v}"), "manual release builds must validate the requested tag, not the workflow branch");
     assert!(workflow.contains("latest.json"));
     assert!(workflow.contains("gh release upload \"$TAG\" latest.json --clobber"));
 }
