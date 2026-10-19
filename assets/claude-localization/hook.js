@@ -197,6 +197,12 @@ function install() {
     return;
   }
 
+  // 原生更新器不能把 Anthropic 签名包安装到 ad-hoc 副本；只替换副本的更新流程。
+  if (process.platform === 'darwin' && globalThis.__claudeCnManagedUpdate) {
+    require('./managed-update.cjs').installUpdater(electron, globalThis.__claudeCnManagedUpdate, log);
+    log('managed Claude updater installed');
+  }
+
   let SHIM = '';
   let DICTATION = '';
   try {

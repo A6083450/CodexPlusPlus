@@ -114,6 +114,14 @@ fn replace_copy_with(
 
 const ASSETS: &[(&str, &[u8])] = &[
     (
+        "managed-update.cjs",
+        include_bytes!("../../../assets/claude-localization/managed-update.cjs"),
+    ),
+    (
+        "managed-update.py",
+        include_bytes!("../../../assets/claude-localization/managed-update.py"),
+    ),
+    (
         "build-copy.py",
         include_bytes!("../../../assets/claude-localization/build-copy.py"),
     ),
@@ -492,6 +500,7 @@ fn inspect_installed_source(
 }
 
 pub fn status() -> Result<ClaudeLocalizationStatus> {
+    recover_interrupted_update()?;
     let deadline = Instant::now() + STATUS_TIMEOUT;
     let source = source_app(deadline)?;
     let copy = copy_app(&source);
@@ -585,6 +594,32 @@ fn install_assets(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn recover_interrupted_update() -> Result<()> {
+    if !cfg!(target_os = "macos") { return Ok(()); }
+    let root = runtime_dir();
+    let updates = root.join("updates");
+    if !updates.is_dir() { return Ok(()); }
+    for entry in fs::read_dir(updates)? {
+        let journal = entry?.path().join("transaction.json");
+        if !journal.is_file() { continue; }
+        let value: Value = serde_json::from_slice(&fs::read(journal)?)?;
+        if value.get("state").and_then(Value::as_str) == Some("pending") {
+            install_assets(&root)?;
+            let python = find_runtime("python3", Instant::now() + STATUS_TIMEOUT)?.context("未找到 Python 3，无法恢复 Claude 更新")?;
+            run_script(&python, "managed-update.py", Path::new(""), Path::new(""), &["--recover"])?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn lock_update(root: &Path) -> Result<fs::File> {
+    fs::create_dir_all(root)?;
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join("update.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock).context("另一项 Claude 更新或副本操作正在进行")?;
+    Ok(lock)
+}
+
 fn run_script(program: &Path, script: &str, source: &Path, copy: &Path, args: &[&str]) -> Result<()> {
     let root = runtime_dir();
     let log = root.join("operation.log");
@@ -598,6 +633,9 @@ fn run_script(program: &Path, script: &str, source: &Path, copy: &Path, args: &[
         .args(args)
         .env("CODEX_PLUS_CLAUDE_SOURCE", source)
         .env("CODEX_PLUS_CLAUDE_COPY", copy)
+        .env("CODEX_PLUS_CLAUDE_PYTHON", if cfg!(target_os = "macos") {
+            find_runtime("python3", Instant::now() + STATUS_TIMEOUT)?.context("未找到 Python 3，无法准备 Claude 更新")?
+        } else { PathBuf::new() })
         // 启动脚本据此决定要不要给页面注入语音入口；构建/校验脚本读到也无害。
         .env(
             "CODEX_PLUS_CLAUDE_VOICE_INPUT",
@@ -689,6 +727,9 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
     let _guard = OPERATION
         .try_lock()
         .map_err(|_| anyhow::anyhow!("另一项 Claude 增强操作正在进行"))?;
+    recover_interrupted_update()?;
+    // 与 Python 安装器使用同一把 flock，防止准备旧副本与更新提交交错。
+    let _update_lock = if cfg!(target_os = "macos") { Some(lock_update(&runtime_dir())?) } else { None };
     let deadline = Instant::now() + STATUS_TIMEOUT;
     let source = source_app(deadline)?;
     ensure!(AppLayout::current().exists(&source), "未检测到 Claude，请先安装官方应用");
@@ -815,6 +856,15 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_lock_excludes_other_copy_operations_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_update(dir.path()).unwrap();
+        assert!(lock_update(dir.path()).is_err());
+        drop(first);
+        assert!(lock_update(dir.path()).is_ok());
+    }
 
     #[test]
     fn claude_msix_namespace_discovery_and_classification_agree() {

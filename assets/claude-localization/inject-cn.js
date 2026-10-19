@@ -170,7 +170,7 @@ async function evaluateRetry(c, expression, tries) {
 }
 
 async function evaluate(c, expression) {
-  const r = await c.send('Runtime.evaluate', { expression, returnByValue: true, includeCommandLineAPI: true, awaitPromise: false });
+  const r = await c.send('Runtime.evaluate', { expression, returnByValue: true, includeCommandLineAPI: true, awaitPromise: true });
   if (r.exceptionDetails) {
     throw new Error('页面/进程异常: ' + (r.exceptionDetails.exception?.description || JSON.stringify(r.exceptionDetails)).slice(0, 300));
   }
@@ -252,7 +252,14 @@ async function evaluate(c, expression) {
     const version = await evaluateRetry(c, "require('electron').app.getVersion()");
     log(`→ 已连上主进程（Claude ${version}, pid ${await evaluateRetry(c, 'process.pid')}）`);
 
-    await evaluate(c, `globalThis.__claudeCnTargetLocale = ${JSON.stringify(LOCALE)}; globalThis.__claudeCnVoiceInput = ${VOICE_INPUT ? 'true' : 'false'}; globalThis.__claudeCnLocalization = ${LOCALIZATION ? 'true' : 'false'}; require(${JSON.stringify(HOOK)})`);
+    // 冷启动时 inspector 可能先于 app ready；此时读 defaultSession 会使整个 hook 装载失败。
+    await evaluate(c, "require('electron').app.whenReady().then(() => true)");
+
+    const updateOptions = process.platform === 'darwin' && process.env.CODEX_PLUS_CLAUDE_SOURCE && process.env.CODEX_PLUS_CLAUDE_PYTHON
+      ? { source: process.env.CODEX_PLUS_CLAUDE_SOURCE, copy: APP, node: process.execPath,
+          python: process.env.CODEX_PLUS_CLAUDE_PYTHON, locale: LOCALE, voiceInput: VOICE_INPUT, localization: LOCALIZATION }
+      : null;
+    await evaluate(c, `globalThis.__claudeCnManagedUpdate = ${JSON.stringify(updateOptions)}; globalThis.__claudeCnTargetLocale = ${JSON.stringify(LOCALE)}; globalThis.__claudeCnVoiceInput = ${VOICE_INPUT ? 'true' : 'false'}; globalThis.__claudeCnLocalization = ${LOCALIZATION ? 'true' : 'false'}; require(${JSON.stringify(HOOK)})`);
     const okFlag = await evaluate(c, 'globalThis.__claudeCnHookInstalled === true');
     if (!okFlag) {
       console.error('✗ hook 没有装载成功，看看 ' + HOOK_LOG);
@@ -262,7 +269,7 @@ async function evaluate(c, expression) {
 
     try {
       // 这一句会把 inspector 和当前连接一起关掉，所以大概率等不到返回值，属正常
-      await evaluate(c, "setImmediate(()=>require('node:inspector').close()); 'closing'");
+      await evaluate(c, "setImmediate(require('node:inspector').close); 'closing'");
     } catch (e) {}
     try { c.close(); } catch (e) {}
     await new Promise((r) => setTimeout(r, 1200));
