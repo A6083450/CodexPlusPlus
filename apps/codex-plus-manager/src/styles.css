@@ -328,6 +328,29 @@ body {
   flex: 0 0 auto;
 }
 
+.app-update-notice {
+  flex: 0 0 auto;
+  margin: 12px 20px 0;
+  padding: 12px 16px;
+  border: 1px solid hsl(var(--primary) / 0.3);
+  border-radius: var(--radius-lg);
+  background: hsl(var(--primary) / 0.06);
+}
+
+.app-update-notice-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.app-update-notice p {
+  margin: 4px 0 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
 .screen {
   position: relative;
   display: grid;

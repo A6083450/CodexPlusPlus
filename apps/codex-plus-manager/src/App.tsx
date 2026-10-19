@@ -1333,6 +1333,8 @@ export function App() {
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
+  const updateCheckPendingRef = useRef(false);
+  const lastUpdateCheckAtRef = useRef(0);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -2643,17 +2645,28 @@ export function App() {
   };
 
   const checkUpdate = async (silent = false) => {
-    const result = await run(() => call<UpdateResult>("check_update"));
-    if (result) {
-      setUpdate(result);
-      if (!silent || result.updateAvailable) {
-        showNotice(t("GitHub Release 检查"), result.message, result.status);
+    if (updateCheckPendingRef.current || updateInstallProgress.active) return;
+    if (silent && lastUpdateCheckAtRef.current > 0
+        && Date.now() - lastUpdateCheckAtRef.current < 30 * 60 * 1000) return;
+    updateCheckPendingRef.current = true;
+    try {
+      const result = await run(() => call<UpdateResult>("check_update"));
+      if (result) {
+        if (result.status !== "failed") setUpdate(result);
+        if (!silent) showNotice(t("检查更新"), result.message, result.status);
       }
+    } finally {
+      updateCheckPendingRef.current = false;
+      lastUpdateCheckAtRef.current = Date.now();
     }
   };
 
   const performUpdate = async () => {
     if (updateInstallProgress.active) return;
+    if (settingsDirty || dreamSkinDraftDirty) {
+      showNotice(t("在线更新"), t("请先保存当前修改后再更新。"), "failed");
+      return;
+    }
     const release =
       update?.latestVersion && update.assetName && update.assetUrl
         ? {
@@ -3395,6 +3408,17 @@ export function App() {
     })();
   }, []);
 
+  useEffect(() => {
+    if (updateInstallProgress.active) return;
+    const check = () => { void checkUpdate(true); };
+    window.addEventListener("focus", check);
+    const timer = window.setInterval(check, 30 * 60 * 1000);
+    return () => {
+      window.removeEventListener("focus", check);
+      window.clearInterval(timer);
+    };
+  }, [updateInstallProgress.active]);
+
   // 主题卡片的「更多操作」是原生 details 弹层：原生不会因为点了别处就收起，
   // 会出现多个菜单同时展开。这里统一做外点收起（details 的开关是 DOM 瞬态，不经 React 状态）。
   useEffect(() => {
@@ -3946,6 +3970,13 @@ export function App() {
             ) : null}
           </div>
         </header>
+        <UpdateNotice
+          update={update}
+          progress={updateInstallProgress}
+          blocked={settingsDirty || dreamSkinDraftDirty}
+          onUpdate={() => void performUpdate()}
+          onDetails={() => void navigate("about")}
+        />
         <section className={`screen ${isManagementScreen ? "management-screen" : ""}`} key={route}>
           {route === "overview" ? (
             <OverviewScreen
@@ -7936,6 +7967,34 @@ function MaintenanceScreen({
   );
 }
 
+function UpdateNotice({ update, progress, blocked, onUpdate, onDetails }: {
+  update: UpdateResult | null;
+  progress: TaskProgress;
+  blocked: boolean;
+  onUpdate: () => void;
+  onDetails: () => void;
+}) {
+  if (!update?.updateAvailable) return null;
+  return (
+    <aside className="app-update-notice" aria-label={t("在线更新")}>
+      <div className="app-update-notice-row">
+        <div role="status" aria-live="polite">
+          <strong>{tf("发现新版本 {0}", [update.latestVersion ?? ""])}</strong>
+          <p>{blocked ? t("请先保存当前修改后再更新。") : t("程序会自动下载安装包，无需手动前往发布页下载。")}</p>
+        </div>
+        <div className="topbar-actions">
+          <Button variant="secondary" onClick={onDetails}>{t("查看更新")}</Button>
+          <Button disabled={blocked || progress.active || !update.assetName || !update.assetUrl} onClick={onUpdate}>
+            {progress.active ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            {progress.active ? t("正在更新…") : t("立即更新")}
+          </Button>
+        </div>
+      </div>
+      {progress.active ? <TaskProgressBox progress={progress} title={t("在线更新")} /> : null}
+    </aside>
+  );
+}
+
 function AboutScreen({
   overview,
   update,
@@ -7982,7 +8041,7 @@ function AboutScreen({
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("GitHub Release 更新")} detail={tf("当前版本 {0}", [overview?.current_version ?? update?.currentVersion ?? "-"])} />
+        <CardHead title={t("在线更新")} detail={tf("当前版本 {0}", [overview?.current_version ?? update?.currentVersion ?? "-"])} />
         <CardContent>
           <div className="metric-list">
             <Metric label={t("状态")} value={update?.status ?? "not_checked"} />
@@ -7990,12 +8049,13 @@ function AboutScreen({
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
             <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
           </div>
-          <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
+          <p className="field-hint">{t("macOS 会自动安装并重启 Codex++，无需拖拽 DMG；Windows 会自动下载并打开安装向导。")}</p>
+          <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("点击检查更新，发现新版本后可直接在线更新。")} />
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
-            <Button disabled={updateInstallProgress.active} variant="secondary" onClick={() => void actions.performUpdate()}>
-              {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
+            <Button disabled={updateInstallProgress.active || !update?.updateAvailable || !update.assetName || !update.assetUrl} variant="secondary" onClick={() => void actions.performUpdate()}>
+              {updateInstallProgress.active ? t("正在下载安装包…") : t("立即更新")}
             </Button>
           </Toolbar>
         </CardContent>

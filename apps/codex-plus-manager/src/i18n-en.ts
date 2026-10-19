@@ -5,6 +5,14 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "在线更新": "Online update",
+  "请先保存当前修改后再更新。": "Save your changes before updating.",
+  "程序会自动下载安装包，无需手动前往发布页下载。": "The app downloads the update for you; no manual download is needed.",
+  "查看更新": "View update",
+  "正在更新…": "Updating…",
+  "立即更新": "Update now",
+  "macOS 会自动安装并重启 Codex++，无需拖拽 DMG；Windows 会自动下载并打开安装向导。": "On macOS, Codex++ installs and restarts automatically. On Windows, the app downloads and opens the setup wizard.",
+  "点击检查更新，发现新版本后可直接在线更新。": "Check for updates, then install the new version directly from the app.",
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
   "删除 Key": "Delete key",
@@ -268,7 +276,6 @@ export const EN_PLAIN: Record<string, string> = {
   "原生 Fast 强制解锁": "Force unlock native Fast",
   "纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。":
     "Restore the native Fast switch in API key mode; save and restart Codex to apply. Actual support and billing depend on the provider.",
-  "GitHub Release 更新": "GitHub Release update",
   "GitHub Release 检查": "GitHub Release check",
   "Helper 端口": "Helper port",
   "MCP 与插件作为全局配置独立管理，切换任意供应商都会合并。":
@@ -526,7 +533,6 @@ export const EN_PLAIN: Record<string, string> = {
   "强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。": "Force the standard OpenAI protocol without vendor-specific reasoning parameters, for third-party gateways that accept only standard OpenAI fields and reject vendor-bundled private parameters.",
   "上一页": "Previous page",
   "下一页": "Next page",
-  "下载并运行安装包": "Download and run installer",
   "不写 API 文件": "Does not write API files",
   "个": "",
   "个会话": " session(s)",
