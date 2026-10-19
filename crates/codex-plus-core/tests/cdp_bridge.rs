@@ -3775,7 +3775,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"26\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"27\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
 
@@ -5435,7 +5435,7 @@ api.patchAppServerClient(catalogClient);
 const catalogTurn = await expectNativeRequestCompletes(catalogClient.sendRequest("turn/start", {{ threadId: "hung-catalog", model: "gpt-5.4" }}));
 const turnCompletedBeforeCatalogRead = catalogTurn.nativeComplete === true && !catalogReadFinished;
 const catalogList = await expectNativeRequestCompletes(catalogClient.sendRequest("list-models-for-host", {{}}));
-const hungCatalogListReturned = Array.isArray(catalogList.data) && catalogReadFinished;
+const hungCatalogListReturned = Array.isArray(catalogList.data) && !catalogReadFinished;
 await catalogRead;
 resolveCatalog({{ status: "ok", model: "late-model", models: ["late-model"] }});
 await new Promise(setImmediate);

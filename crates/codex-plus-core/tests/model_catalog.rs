@@ -14,6 +14,42 @@ use codex_plus_core::settings::{
 use serde_json::json;
 
 #[tokio::test]
+async fn cc_switch_catalog_is_available_without_waiting_for_the_upstream() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::create_dir(temp.path().join("model-catalogs")).unwrap();
+    std::fs::write(temp.path().join("model-catalogs/cc-switch-native.json"), json!({"models":[
+        {"slug":"gpt-6.1-sol","context_window":1000000},
+        {"slug":"gpt-6-sol","context_window":500000}
+    ]}).to_string()).unwrap();
+    std::fs::write(temp.path().join("config.toml"), format!(
+        "model=\"gpt-6.1-sol\"\nmodel_provider=\"custom\"\nmodel_catalog_json=\"model-catalogs/cc-switch-native.json\"\n[model_providers.custom]\nbase_url=\"http://{}\"\n",
+        listener.local_addr().unwrap(),
+    )).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2),
+        read_codex_model_catalog_from_home(temp.path(), &HashMap::new(), reqwest::Client::builder().no_proxy().build().unwrap())
+    ).await.expect("the complete local CC Switch catalog must not wait for /models");
+    assert_eq!(result["models"], json!(["gpt-6.1-sol", "gpt-6-sol"]));
+    assert_eq!(result["modelMetadata"]["gpt-6.1-sol"]["contextWindow"], 1000000);
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+}
+
+#[tokio::test]
+async fn empty_cc_switch_catalog_still_discovers_remote_models() {
+    let temp = tempfile::tempdir().unwrap();
+    let server = spawn_models_server(json!({"data":[{"id":"remote-model"}]}));
+    std::fs::create_dir(temp.path().join("model-catalogs")).unwrap();
+    std::fs::write(temp.path().join("model-catalogs/cc-switch-native.json"), r#"{"models":[]}"#).unwrap();
+    write_config(temp.path(), &format!(
+        "model_provider=\"custom\"\nmodel_catalog_json=\"model-catalogs/cc-switch-native.json\"\n[model_providers.custom]\nbase_url=\"{}\"\n",
+        server.base_url,
+    ));
+    let result = read_codex_model_catalog_from_home(temp.path(), &HashMap::new(), server.client.clone()).await;
+    assert_eq!(result["models"], json!(["remote-model"]));
+}
+
+#[tokio::test]
 async fn external_catalog_context_metadata_precedes_builtin_defaults() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("config.toml"), "model=\"gpt-6.1-sol\"\nmodel_catalog_json=\"custom.json\"\n").unwrap();

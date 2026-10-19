@@ -4,7 +4,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 pub const MANAGED_SERVICE_TIER_CATALOG: &str = "model-catalogs/codexplusplus-service-tiers.json";
-const CC_SWITCH_NATIVE_CATALOG: &str = "model-catalogs/cc-switch-native.json";
+pub(crate) const CC_SWITCH_NATIVE_CATALOG: &str = "model-catalogs/cc-switch-native.json";
 
 pub fn sync_cc_switch_catalog(
     home: &Path,

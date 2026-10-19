@@ -319,13 +319,16 @@ pub async fn read_codex_model_catalog_from_home(
 
     let mut source_statuses = Vec::new();
     let mut models = Vec::new();
-    for source in sources.iter() {
+    let (catalog_models, catalog_status) = models_from_config_model_catalog_json(home, &effective);
+    let cc_switch_catalog = !catalog_models.is_empty()
+        && resolve_config_path(home, &string_value(effective.get("model_catalog_json")))
+            == home.join(crate::service_tier_catalog::CC_SWITCH_NATIVE_CATALOG);
+    for source in sources.iter().filter(|_| !cc_switch_catalog) {
         let (source_models, mut source_status) = fetch_models_from_source(&client, source).await;
         source_status["responses_api"] = responses_api_status("unknown", "", "");
         models.extend(source_models);
         source_statuses.push(source_status);
     }
-    let (catalog_models, catalog_status) = models_from_config_model_catalog_json(home, &effective);
     models.extend(catalog_models);
     if let Some(status) = catalog_status {
         source_statuses.push(status);

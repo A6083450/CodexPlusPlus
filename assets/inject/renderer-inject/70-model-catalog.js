@@ -564,8 +564,8 @@
 
   async function patchModelJsonResponse(payload) {
     if (!codexPlusModelUnlockEnabled()) return payload;
-    if (!codexPlusModelNames().length) await loadCodexModelCatalog();
     if (!modelJsonResponseLooksPatchable(payload)) return payload;
+    if (!codexPlusModelNames().length) void loadCodexModelCatalog();
     try {
       patchModelContainer(payload, modelResponseHostId(payload, payload.result, payload.message));
     } catch (error) {
@@ -576,8 +576,8 @@
   }
 
   function installModelJsonResponsePatch() {
-    if (window.__codexPlusModelJsonResponsePatchInstalled === "3") return;
-    window.__codexPlusModelJsonResponsePatchInstalled = "3";
+    if (window.__codexPlusModelJsonResponsePatchInstalled === "4") return;
+    window.__codexPlusModelJsonResponsePatchInstalled = "4";
     window.__codexPlusModelJsonResponseOriginals = window.__codexPlusModelJsonResponseOriginals || {};
     const originals = window.__codexPlusModelJsonResponseOriginals;
     originals.responseJson = originals.responseJson || Response.prototype.json;
@@ -1000,7 +1000,7 @@
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
       }
       if (!codexPlusModelUnlockEnabled() || !["list-models-for-host", "model/list"].includes(requestMethod)) return result;
-      if (!codexPlusModelNames().length) await loadCodexModelCatalog();
+      if (!codexPlusModelNames().length) void loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
     if (typeof client.prewarmThreadStart === "function") {
@@ -1213,7 +1213,7 @@
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
       }
       if (!codexPlusModelUnlockEnabled() || !["list-models-for-host", "model/list"].includes(requestMethod)) return result;
-      if (!codexPlusModelNames().length) await loadCodexModelCatalog();
+      if (!codexPlusModelNames().length) void loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
     if (typeof proto.prewarmThreadStart === "function") {
