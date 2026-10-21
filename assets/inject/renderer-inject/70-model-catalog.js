@@ -1020,8 +1020,8 @@
   // 改为两段式接管：这里先用纯文本定位算出 sendRequest 的断点坐标（按 UTF-16 计数，
   // 与 V8 断点坐标语义一致），launcher 侧 bridge.rs 再用 CDP Debugger 按坐标下条件断点，
   // 命中时把类构造器挂到 window.__codexPlusAppServerClientClass，随后对原型套用与
-  // 实例版完全一致的请求补丁。断点条件 `!window.__codexPlusAppServerClientClass`
-  // 保证页面重载后自动重新捕获，且每次页面生命周期内只暂停一次。
+  // 实例版完全一致的请求补丁。条件表达式记录构造器后始终返回 false，
+  // 保证页面重载后自动重新捕获，不暂停原生界面。
   function locateCodexAppServerClientBreakpoint(text) {
     if (typeof text !== "string" || !text) return null;
     const markerIdx = text.indexOf(codexAppServerClientCaptureMarker);

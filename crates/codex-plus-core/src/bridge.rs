@@ -695,11 +695,15 @@ where
 /// 渲染层扫描无法触达，直接改写 dispatcher 又会撞上不可写的 RPC stub。
 /// 分两段接管：渲染层用纯文本定位算出 sendRequest 的断点坐标并放到
 /// `window.__codexPlusAppServerClientCapture`；这里用独立 CDP 会话按坐标下
-/// 条件断点（`!window.__codexPlusAppServerClientClass`），命中时把类构造器挂到
-/// `window.__codexPlusAppServerClientClass`，渲染层再对原型套用与旧版实例补丁
-/// 一致的请求逻辑。条件断点保证页面重载后自动重新捕获、正常路径零暂停。
+/// 条件表达式内直接发布类构造器，渲染层再对原型套用与旧版实例补丁一致的请求逻辑。
+/// 始终返回 false，避免首次捕获时暂停整个页面；页面重载后仍可重新捕获。
 pub fn app_server_client_capture_condition() -> &'static str {
-    "!window.__codexPlusAppServerClientClass"
+    static CONDITION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CONDITION
+        .get_or_init(|| format!(
+            "(()=>{{try{{if(!window.__codexPlusAppServerClientClass){{{APP_SERVER_CLIENT_CAPTURE_ON_CALL_FRAME};}}}}catch{{}}return false;}})()"
+        ))
+        .as_str()
 }
 
 pub fn app_server_client_capture_probe_script() -> &'static str {

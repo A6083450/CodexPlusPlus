@@ -7430,11 +7430,60 @@ assert.equal(removed, 2);
 }
 
 #[test]
-fn app_server_client_capture_condition_targets_class_handle() {
-    assert_eq!(
-        bridge::app_server_client_capture_condition(),
-        "!window.__codexPlusAppServerClientClass"
-    );
+fn app_server_client_capture_condition_never_pauses_the_renderer() {
+    let condition = serde_json::to_string(bridge::app_server_client_capture_condition()).unwrap();
+    let script = format!(r#"
+const assert = require('node:assert/strict');
+const inspector = require('node:inspector');
+const vm = require('node:vm');
+const session = new inspector.Session();
+session.connect();
+const send = (method, params = {{}}) => new Promise((resolve, reject) => {{
+  session.post(method, params, (error, result) => error ? reject(error) : resolve(result));
+}});
+let pauses = 0;
+session.on('Debugger.paused', () => {{
+  pauses += 1;
+  session.post('Debugger.resume');
+}});
+(async () => {{
+  try {{
+    await send('Debugger.enable');
+    vm.runInThisContext(`
+globalThis.CaptureClient = class CaptureClient {{
+  sendRequest() {{
+    return 'response';
+  }}
+}};
+`, {{ filename: 'codex-capture-fixture.js' }});
+    const breakpoint = await send('Debugger.setBreakpointByUrl', {{
+      url: 'codex-capture-fixture.js', lineNumber: 3, condition: {condition},
+    }});
+    assert.ok(breakpoint.locations.length, 'the test must exercise a resolved V8 breakpoint');
+    const client = new CaptureClient();
+    for (let document = 0; document < 2; document += 1) {{
+      globalThis.window = {{}};
+      assert.equal(client.sendRequest(), 'response');
+      assert.equal(pauses, 0, 'capturing a client must not pause the renderer');
+      assert.equal(window.__codexPlusAppServerClientClass, CaptureClient);
+    }}
+    const existing = function ExistingClient() {{}};
+    window.__codexPlusAppServerClientClass = existing;
+    client.sendRequest();
+    assert.equal(window.__codexPlusAppServerClientClass, existing);
+    globalThis.window = {{}};
+    CaptureClient.prototype.sendRequest.call({{ sendRequest() {{}} }});
+    assert.equal(window.__codexPlusAppServerClientClass, undefined);
+    globalThis.window = Object.freeze({{}});
+    client.sendRequest();
+    assert.equal(pauses, 0);
+    await send('Debugger.removeBreakpoint', {{ breakpointId: breakpoint.breakpointId }});
+    await send('Debugger.disable');
+  }} finally {{ session.disconnect(); }}
+}})().catch(error => {{ console.error(error); process.exitCode = 1; }});
+"#);
+    let output = std::process::Command::new("node").args(["-e", &script]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]

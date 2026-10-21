@@ -4964,16 +4964,14 @@
     const urls = codexAppAssetCandidateUrls();
     const preferred = urls.filter((url) => {
       const name = (url.split("/").pop() || "").toLowerCase();
-      return /use-host-config|app-server-manager-signals|app-initial|app-main|page-|chatg|signals|server-manager/.test(name);
+      return /use-host-config|app-server-manager-signals|signals|server-manager/.test(name);
     });
-    // Prefer known request-client modules, then the larger application bundles.
+    // 只读服务模块，导入 app-main/app-initial 会抢跑原生启动与模型查询初始化。
     preferred.sort((left, right) => {
       const score = (url) => {
         const name = (url.split("/").pop() || "").toLowerCase();
         if (name.includes("use-host-config")) return 0;
         if (name.includes("app-server-manager-signals")) return 1;
-        if (name.includes("app-initial") && name.includes("app-main")) return 3;
-        if (name.includes("app-main")) return 4;
         return 5;
       };
       return score(left) - score(right) || right.length - left.length;
@@ -4989,15 +4987,16 @@
       seen.add(value);
       candidates.push(value);
     };
-    for (const value of Object.values(module || {})) {
+    for (const { value } of Object.values(Object.getOwnPropertyDescriptors(module || {}))) {
       push(value);
       if (!value || typeof value !== "object") continue;
-      if (typeof value.get === "function") {
-        try { push(value.get()); } catch {}
-        try { push(value.get("local")); } catch {}
-      }
       try {
-        for (const nested of Object.values(value).slice(0, 100)) push(nested);
+        // 任意 get()/getter 可能创建原生查询；仅 Map 查找和已存储的字段可安全探测。
+        if (value instanceof Map) {
+          push(Map.prototype.get.call(value, undefined));
+          push(Map.prototype.get.call(value, "local"));
+        }
+        for (const { value: nested } of Object.values(Object.getOwnPropertyDescriptors(value)).slice(0, 100)) push(nested);
       } catch {}
     }
     return candidates;
@@ -12190,8 +12189,8 @@
   // 改为两段式接管：这里先用纯文本定位算出 sendRequest 的断点坐标（按 UTF-16 计数，
   // 与 V8 断点坐标语义一致），launcher 侧 bridge.rs 再用 CDP Debugger 按坐标下条件断点，
   // 命中时把类构造器挂到 window.__codexPlusAppServerClientClass，随后对原型套用与
-  // 实例版完全一致的请求补丁。断点条件 `!window.__codexPlusAppServerClientClass`
-  // 保证页面重载后自动重新捕获，且每次页面生命周期内只暂停一次。
+  // 实例版完全一致的请求补丁。条件表达式记录构造器后始终返回 false，
+  // 保证页面重载后自动重新捕获，不暂停原生界面。
   function locateCodexAppServerClientBreakpoint(text) {
     if (typeof text !== "string" || !text) return null;
     const markerIdx = text.indexOf(codexAppServerClientCaptureMarker);
