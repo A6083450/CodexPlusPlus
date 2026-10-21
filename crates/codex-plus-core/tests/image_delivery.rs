@@ -66,9 +66,9 @@ fn responses_proxy_stream_retains_image_delivery_after_upstream_refactor() {
     let body = source.split("async fn forward_protocol_proxy_stream(").nth(1).unwrap();
     let responses = body.split("    let mut converter = request").next().unwrap();
     assert!(responses.contains("ImageDeliveryStream::new("));
-    assert!(responses.contains("delivery.push(&bytes)?"));
+    assert!(responses.contains("delivery.push(&out)?"));
     assert!(responses.contains("delivery.finish()"));
-    assert!(responses.contains("NativeResponsesSseObserver::default()"));
-    assert!(responses.contains("observer.push_bytes(&bytes)"));
-    assert!(responses.contains("return Ok(observer.finish())"));
+    assert!(responses.contains("ResponsesSseTransformer::for_request(request)"));
+    assert!(responses.contains("transformer.push_bytes(&bytes)"));
+    assert!(responses.contains("transformer.finish(), usage, detail, first_output_at_ms"));
 }

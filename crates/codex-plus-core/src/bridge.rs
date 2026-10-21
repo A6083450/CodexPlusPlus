@@ -283,14 +283,39 @@ pub fn bridge_health_check_script() -> &'static str {
   const lastSuccessAt = Number(health.lastSuccessAt) || 0;
   const lastInjectionAt = Number(health.lastInjectionAt) || 0;
   const lastAttemptAt = Number(health.lastAttemptAt) || 0;
+  const failures = Number(health.failures) || 0;
   if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
   if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
+  // 连续失败及时恢复，同时保留忙碌页面的一分钟成功响应上限。
+  if (failures >= 3 && (lastSuccessAt === 0 || now - lastSuccessAt > 15000)) return false;
   // 短暂忙碌允许超时；一分钟没有成功响应后不能再靠重试掩盖断连。
   const lastConfirmedAt = Math.max(lastSuccessAt, lastInjectionAt);
   return lastAttemptAt > 0 && now - lastAttemptAt <= 15000
     && lastConfirmedAt > 0 && now - lastConfirmedAt <= 60000;
 })()
 "#
+}
+
+#[cfg(test)]
+mod bridge_health_script_tests {
+    use super::bridge_health_check_script;
+
+    /// 桥接挂死时 `lastAttemptAt` 仍会被心跳刷新；健康判定必须让「连续失败 +
+    /// 长时间没有成功」优先于「最近尝试过」，否则看门狗永远不会重注入。
+    #[test]
+    fn repeated_failures_without_success_are_unhealthy() {
+        let script = bridge_health_check_script();
+        let failures_guard = script
+            .find("failures >= 3")
+            .expect("健康脚本应包含连续失败判定");
+        let attempt_fallback = script
+            .find("lastAttemptAt > 0")
+            .expect("健康脚本应保留最近尝试兜底");
+        assert!(
+            failures_guard < attempt_fallback,
+            "连续失败判定必须在 lastAttemptAt 兜底之前生效"
+        );
+    }
 }
 
 pub async fn evaluate_script(websocket_url: &str, script: &str) -> anyhow::Result<Value> {

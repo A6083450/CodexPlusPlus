@@ -4,6 +4,7 @@ import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
+import { UpdateNotifications } from "./update-notification.ts";
 
 const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
 const tree = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -23,14 +24,16 @@ function load(name: string, dependencies: Record<string, unknown>) {
 test("update checks throttle automatic polling, deduplicate requests and preserve an available update on failure", { timeout: 2000 }, async () => {
   let now = 2000000;
   let calls = 0;
-  let reply: any = { status: "ok", updateAvailable: true, latestVersion: "v1.10.0+63" };
+  const reply = { status: "ok", updateAvailable: true, latestVersion: "v1.10.0+63" };
   let current: any = null;
   let resolve!: (value: any) => void;
-  const progress = { active: false };
+  const installing = { current: false };
+  const checkPending = { current: null as { manual: boolean } | null };
   const dependencies = {
-    Date: { now: () => now }, updateCheckPendingRef: { current: false }, lastUpdateCheckAtRef: { current: 0 },
-    updateInstallProgress: progress,
-    run: async (task: () => Promise<any>) => task(),
+    Date: { now: () => now }, updateCheckPending: checkPending, lastUpdateCheckAtRef: { current: 0 },
+    updateInstallPending: installing,
+    updateNotifications: { current: new UpdateNotifications(() => ({ getItem: () => null, setItem: () => {} })) },
+    setUpdatePrompt: () => {}, stringifyError: String,
     call: async () => { calls++; return new Promise(value => { resolve = value; }); },
     setUpdate: (value: any) => { current = typeof value === "function" ? value(current) : value; },
     showNotice: () => {}, t: (text: string) => text,
@@ -39,18 +42,24 @@ test("update checks throttle automatic polling, deduplicate requests and preserv
   const pending = check(true);
   const duplicate = check(true);
   assert.equal(calls, 1);
+  assert.deepEqual(checkPending.current, { manual: false });
   resolve(reply); await pending; await duplicate;
+  assert.equal(dependencies.updateCheckPending.current, null);
   await check(true);
   assert.equal(calls, 1);
   const manual = check(false);
   assert.equal(calls, 2);
   resolve({ status: "failed", updateAvailable: false }); await manual;
   assert.equal(current.latestVersion, reply.latestVersion);
-  now += 30 * 60 * 1000;
-  progress.active = true;
+  now += 30 * 60 * 1000 - 1;
   await check(true);
+  assert.equal(calls, 2, "automatic checks remain throttled until the full interval has elapsed");
+  now++;
+  installing.current = true;
+  await check(true);
+  await check(false);
   assert.equal(calls, 2);
-  progress.active = false;
+  installing.current = false;
   const next = check(true);
   assert.equal(calls, 3);
   resolve({ status: "not_checked", updateAvailable: false }); await next;
@@ -74,11 +83,38 @@ test("the update notice exposes an in-app install action and protects unsaved se
 });
 
 test("the shared installer action refuses to exit with unsaved configuration", async () => {
-  const notices: string[] = [];
-  const perform = load("performUpdate", {
-    updateInstallProgress: { active: false }, settingsDirty: true, dreamSkinDraftDirty: false,
-    t: (text: string) => text, showNotice: (_title: string, message: string) => notices.push(message),
+  for (const dirty of [
+    { settingsDirty: true, dreamSkinDraftDirty: false },
+    { settingsDirty: false, dreamSkinDraftDirty: true },
+  ]) {
+    const notices: string[] = [];
+    const pending = { current: false };
+    const perform = load("performUpdate", {
+      update: { latestVersion: "v1.10.0+63", assetName: "app.dmg", assetUrl: "https://example.invalid/app.dmg" },
+      updateInstallPending: pending, ...dirty,
+      t: (text: string) => text, showNotice: (_title: string, message: string) => notices.push(message),
+      listen: () => assert.fail("dirty drafts must block the installer before subscribing to progress"),
+      call: () => assert.fail("dirty drafts must not start a download"),
+    });
+    await perform();
+    assert.deepEqual(notices, ["请先保存当前修改后再更新。"]);
+    assert.equal(pending.current, false);
+  }
+});
+
+test("closing the update notification preserves the release used by the persistent notice", () => {
+  const update = { status: "ok", updateAvailable: true, latestVersion: "v1.10.0+63", assetName: "app.dmg", assetUrl: "https://example.invalid/app.dmg" };
+  const notifications = new UpdateNotifications(() => ({ getItem: () => null, setItem: () => {} }));
+  let prompt: typeof update | null = update;
+  const close = load("closeUpdatePrompt", {
+    updatePrompt: update, updateNotifications: { current: notifications },
+    setUpdatePrompt: (value: null) => { prompt = value; },
+    setUpdate: () => assert.fail("closing the notification must not clear the available release"),
   });
-  await perform();
-  assert.match(notices[0], /保存/);
+  close();
+  assert.equal(prompt, null);
+  assert.equal(notifications.shouldPrompt(update), false);
+  assert.equal(notifications.shouldPrompt(update, true), true);
+  assert.equal(update.updateAvailable, true);
+  assert.equal(update.assetUrl, "https://example.invalid/app.dmg");
 });

@@ -18,6 +18,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Var ExistingInstall
 Var HadDesktopEntry
+Var LegacyDeleteTries
 
 !define MUI_ICON "${ROOT}\apps\codex-plus-manager\src-tauri\icons\icon.ico"
 !define MUI_UNICON "${ROOT}\apps\codex-plus-manager\src-tauri\icons\icon.ico"
@@ -81,9 +82,19 @@ Section "Install"
   Push "codex-plus-plus-manager.exe"
   Call WaitForProcessExit
 
-  ; 双程序版本升级时只保留统一应用；清理失败则停止，避免残留旧管理工具。
+  ; 双程序版本升级时只保留统一应用。旧管理工具可能在本安装器被拉起后
+  ; 才真正退出（更新入口本身就跑在 manager 里），WaitForProcessExit 看到
+  ; 进程名消失时文件锁未必立刻释放，Delete 会静默失败；此处再轮询重试，
+  ; 而不是一次失败就把整次安装 Abort 掉（issue #2460）。
+  StrCpy $LegacyDeleteTries 0
+  legacy_binary_delete_loop:
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
   IfFileExists "$INSTDIR\codex-plus-plus-manager.exe" 0 legacy_binary_removed
+    IntOp $LegacyDeleteTries $LegacyDeleteTries + 1
+    IntCmp $LegacyDeleteTries 20 legacy_binary_delete_failed
+    Sleep 500
+    Goto legacy_binary_delete_loop
+  legacy_binary_delete_failed:
     MessageBox MB_OK|MB_ICONSTOP "旧管理工具仍被占用。请退出 Codex++ 后重新安装。"
     Abort
   legacy_binary_removed:
