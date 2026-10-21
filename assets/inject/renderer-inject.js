@@ -30,7 +30,7 @@
     if (!config) return;
     const enabled = config.enabled === true;
     const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
-    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
+    const installationKey = `3:${enabled ? "on" : "off"}:${locale}`;
     if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
     window.__codexPlusForceChineseLocaleInstalled = installationKey;
     const languages = [locale, "zh", "en-US", "en"];
@@ -105,6 +105,7 @@
       const managed = readManagedLocale();
       if (!enabled && !managed) return;
       const response = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+      if (!response || !Object.prototype.hasOwnProperty.call(response, "value")) return;
       const currentValue = response?.value ?? null;
 
       if (enabled) {
@@ -116,6 +117,9 @@
           writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
         }
         await callCodexSettingApi("set-setting", { key: "localeOverride", value: locale });
+        // 写入未生效时刷新只会重复启动，必须先读回确认。
+        const saved = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+        if (saved?.value !== locale) return;
         reloadAfterLocaleChange(locale);
         return;
       }
@@ -130,6 +134,8 @@
         key: "localeOverride",
         value: previousValue,
       });
+      const restored = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+      if (restored?.value !== previousValue) return;
       writeManagedLocale(null);
       reloadAfterLocaleChange(previousValue);
     };
@@ -10411,40 +10417,37 @@
     if (assetPrefix.startsWith("vscode-api-")) {
       return typeof module?.n === "function" ? module.n : null;
     }
-    if (assetPrefix.startsWith("app-initial-")) {
-      return typeof module?.qut === "function" ? module.qut : null;
-    }
-    if (assetPrefix.startsWith("app-shared-")) {
+    if (assetPrefix.startsWith("app-initial-") || assetPrefix.startsWith("app-shared-")) {
       return codexStateCallByCapability(module);
     }
     return null;
   }
 
-  // issue #2399：26.930 起 state API 随 AppServerRequestClient 一起搬进 app-shared-*，
-  // 而这批产物每次构建都会重排压缩导出名（旧版是 qut），按字面量取必然落空。
-  // 改成按能力找：函数源码里带 get-global-state / set-global-state 的就是它。
+  // 压缩导出名会被复用；新版通用 RPC 保留请求选项，但不再列举 state 方法名。
   function codexStateCallByCapability(module) {
     const values = module && typeof module === "object" ? Object.values(module) : [];
     return values.find((candidate) => {
       if (typeof candidate !== "function") return false;
       let source = "";
       try {
-        source = String(candidate);
+        source = Function.prototype.toString.call(candidate);
       } catch {
         return false;
       }
-      return source.includes("get-global-state")
+      const legacyStateCall = source.includes("get-global-state")
         && source.includes("set-global-state")
         && source.includes("params");
+      const nativeRpc = /^async\b/.test(source)
+        && ["params", "select", "signal", "responsePriority"].every((key) => source.includes(key));
+      return legacyStateCall || nativeRpc;
     }) || null;
   }
 
   async function codexStateApi() {
     codexStateApiPromise = codexStateApiPromise || (async () => {
       const errors = [];
-      // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
-      // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
-      for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
+      // 先找已加载的共享模块，避免为读取设置提前执行整个原生启动模块。
+      for (const assetPrefix of ["app-shared-", ...["vscode-api-", "app-initial-"]]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);

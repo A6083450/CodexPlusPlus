@@ -3,7 +3,7 @@
     {
       "name": "00-prelude.js",
       "description": "IIFE 开头、环境守卫、平台探测、常量与图片覆盖层",
-      "lines": 1768
+      "lines": 1774
     },
     {
       "name": "01-registry.js",
@@ -43,7 +43,7 @@
     {
       "name": "60-plugin-marketplace.js",
       "description": "插件市场请求/响应补丁、本地兜底与合并",
-      "lines": 1886
+      "lines": 1883
     },
     {
       "name": "61-plugin-market-ui.js",

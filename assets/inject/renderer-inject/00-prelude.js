@@ -30,7 +30,7 @@
     if (!config) return;
     const enabled = config.enabled === true;
     const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
-    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
+    const installationKey = `3:${enabled ? "on" : "off"}:${locale}`;
     if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
     window.__codexPlusForceChineseLocaleInstalled = installationKey;
     const languages = [locale, "zh", "en-US", "en"];
@@ -105,6 +105,7 @@
       const managed = readManagedLocale();
       if (!enabled && !managed) return;
       const response = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+      if (!response || !Object.prototype.hasOwnProperty.call(response, "value")) return;
       const currentValue = response?.value ?? null;
 
       if (enabled) {
@@ -116,6 +117,9 @@
           writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
         }
         await callCodexSettingApi("set-setting", { key: "localeOverride", value: locale });
+        // 写入未生效时刷新只会重复启动，必须先读回确认。
+        const saved = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+        if (saved?.value !== locale) return;
         reloadAfterLocaleChange(locale);
         return;
       }
@@ -130,6 +134,8 @@
         key: "localeOverride",
         value: previousValue,
       });
+      const restored = await callCodexSettingApi("get-setting", { key: "localeOverride" });
+      if (restored?.value !== previousValue) return;
       writeManagedLocale(null);
       reloadAfterLocaleChange(previousValue);
     };

@@ -4611,7 +4611,10 @@ const capabilitySettingStorageValue = api.settingStorageFromModule({{
 const capabilitySettingStorage = capabilitySettingStorageValue.n === currentGetSetting
   && capabilitySettingStorageValue.s === currentSetSetting;
 const legacyStateCall = async () => "legacy-state";
-const currentStateCall = async () => "current-state";
+const currentStateCall = async (method, {{ params }}) => {{
+  const operations = ["get-global-state", "set-global-state"];
+  return operations.includes(method) ? params : null;
+}};
 const legacyStateApi = api.stateApiFromModule({{
   n: legacyStateCall,
   qut: currentStateCall,
