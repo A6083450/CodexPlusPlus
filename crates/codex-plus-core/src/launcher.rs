@@ -3854,6 +3854,7 @@ const INJECT_ATTEMPT_DELAYS: [Duration; 3] = [
 ];
 
 async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
+    crate::cdp::wait_for_injectable_codex_page(debug_port, Duration::from_secs(12)).await?;
     let mut last_error = None;
     for (attempt, delay) in INJECT_ATTEMPT_DELAYS.iter().enumerate() {
         match try_inject(debug_port, helper_port).await {

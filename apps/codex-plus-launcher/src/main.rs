@@ -1858,6 +1858,7 @@ async fn inject_with_context(
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
 ) -> anyhow::Result<()> {
+    codex_plus_core::cdp::wait_for_injectable_codex_page(debug_port, Duration::from_secs(12)).await?;
     let mut last_error = None;
     for (attempt, delay) in INJECT_WITH_CONTEXT_ATTEMPT_DELAYS.iter().enumerate() {
         match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
@@ -2722,6 +2723,64 @@ mod tests {
         assert!(body.contains("INJECT_WITH_CONTEXT_ATTEMPT_DELAYS"));
         assert!(production_source.contains("Duration::from_secs(30)"));
         assert!(!body.contains("for _ in 0..20"));
+    }
+
+    #[tokio::test]
+    async fn cold_start_injects_promptly_when_the_page_appears_after_two_seconds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let started = std::time::Instant::now();
+        let (attempted, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                if request[..count].starts_with(b"GET /devtools/page/") {
+                    let _ = attempted.send(started.elapsed());
+                    return;
+                }
+                assert!(request[..count].starts_with(b"GET /json "));
+                let body = if started.elapsed() < Duration::from_secs(3) {
+                    json!([])
+                } else {
+                    json!([{
+                        "id": "cold-start", "type": "page", "title": "ChatGPT",
+                        "url": "app://-/index.html",
+                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/cold-start")
+                    }])
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let hooks = LauncherHooks::default();
+        let ctx = hooks
+            .bridge_context(port, Path::new("/fixture/ChatGPT.app"))
+            .await
+            .unwrap()
+            .unwrap();
+        let elapsed = tokio::select! {
+            result = inject_with_context(port, 57321, ctx, hooks.runtime.clone()) => {
+                panic!("injection ended before reaching the page: {result:?}")
+            }
+            result = tokio::time::timeout(Duration::from_secs(6), received) => result,
+        };
+        server.abort();
+        let _ = server.await;
+        let elapsed = elapsed
+            .expect("ready page must not wait for the 10-second injection backoff")
+            .expect("the injection must connect to the page WebSocket");
+        assert!(elapsed >= Duration::from_secs(3));
+        assert!(elapsed < Duration::from_secs(6));
     }
 
 

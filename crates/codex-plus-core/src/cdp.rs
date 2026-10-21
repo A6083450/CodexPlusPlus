@@ -218,6 +218,32 @@ pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
     )
 }
 
+/// 冷启动只轮询轻量目标列表，页面未出现时不消耗完整注入的退避次数。
+pub async fn wait_for_injectable_codex_page(
+    debug_port: u16,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let result = tokio::time::timeout_at(deadline, async {
+            let targets = list_targets(debug_port).await?;
+            pick_injectable_codex_page_target(&targets)
+        })
+        .await
+        .context("timed out waiting for an injectable Codex page")?;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let next_probe = tokio::time::Instant::now() + Duration::from_millis(250);
+                if next_probe >= deadline {
+                    return Err(error.context("timed out waiting for an injectable Codex page"));
+                }
+                tokio::time::sleep_until(next_probe).await;
+            }
+        }
+    }
+}
+
 pub async fn browser_identity(debug_port: u16) -> anyhow::Result<CdpBrowserIdentity> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -613,6 +639,46 @@ mod endpoint_tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (port, handle)
+    }
+
+    #[tokio::test]
+    async fn ready_page_does_not_wait_for_the_readiness_timeout() {
+        let (port, server) = serve_once(|port| {
+            target_body("ChatGPT", "app://-/index.html")
+                .replace(":9229/", &format!(":{port}/"))
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_injectable_codex_page(port, Duration::from_secs(30)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn page_readiness_timeout_also_bounds_an_unresponsive_cdp_server() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_injectable_codex_page(port, Duration::from_millis(100)),
+        )
+        .await
+        .expect("CDP request must respect the readiness deadline");
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn page_readiness_rejects_unsafe_websocket_targets() {
+        let (port, server) = serve_once(|port| {
+            target_body("ChatGPT", "app://-/index.html")
+                .replace("127.0.0.1:9229", &format!("203.0.113.1:{port}"))
+        });
+        let result = wait_for_injectable_codex_page(port, Duration::from_secs(1)).await;
+        assert!(result.is_err(), "an unsafe WebSocket target must never become ready");
+        server.join().unwrap();
     }
 
     #[test]
