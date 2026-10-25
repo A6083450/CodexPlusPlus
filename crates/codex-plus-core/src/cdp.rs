@@ -9,6 +9,38 @@ const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const CDP_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const CDP_PROBE_MAX_BYTES: usize = 256 * 1024;
 
+async fn http_client() -> anyhow::Result<&'static reqwest::Client> {
+    // 看门狗持续轮询，复用客户端以免反复加载系统根证书。
+    static CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
+    CLIENT
+        .get_or_try_init(|| async {
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(CDP_HTTP_TIMEOUT)
+                // 会话 runtime 会销毁，不能保留由旧 runtime 驱动的空闲连接池。
+                .pool_max_idle_per_host(0)
+                .build()
+                .context("failed to build CDP HTTP client")
+        })
+        .await
+}
+
+#[cfg(test)]
+mod client_tests {
+    #[test]
+    fn client_initialization_is_shared_across_session_runtimes() {
+        let load = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(super::http_client())
+                .unwrap()
+        };
+        assert!(std::ptr::eq(load(), load()));
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct CdpTarget {
     pub id: String,
@@ -194,11 +226,7 @@ fn decode_probe_chunked_body(body: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(CDP_HTTP_TIMEOUT)
-        .build()
-        .context("failed to build CDP HTTP client")?;
+    let client = http_client().await?;
 
     let urls = [
         format!("http://127.0.0.1:{debug_port}/json"),
@@ -206,7 +234,7 @@ pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
     ];
     let mut errors = Vec::new();
     for url in urls {
-        match query_targets_url(&client, &url, debug_port).await {
+        match query_targets_url(client, &url, debug_port).await {
             Ok(targets) => return Ok(targets),
             Err(error) => errors.push(format!("{url}: {error:#}")),
         }
@@ -245,11 +273,7 @@ pub async fn wait_for_injectable_codex_page(
 }
 
 pub async fn browser_identity(debug_port: u16) -> anyhow::Result<CdpBrowserIdentity> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(CDP_HTTP_TIMEOUT)
-        .build()
-        .context("failed to build CDP HTTP client")?;
+    let client = http_client().await?;
     let urls = [
         format!("http://127.0.0.1:{debug_port}/json/version"),
         format!("http://[::1]:{debug_port}/json/version"),

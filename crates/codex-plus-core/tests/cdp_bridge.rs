@@ -6191,6 +6191,87 @@ fn pick_injectable_codex_page_target_requires_websocket() {
 }
 
 #[tokio::test]
+async fn cdp_polling_survives_runtime_restarts_without_retaining_idle_connections() {
+    use codex_plus_core::cdp::browser_identity;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let mut connections = 0;
+        let mut responses = 0;
+        while responses < 6 {
+            let (stream, _) = listener.accept().await.unwrap();
+            connections += 1;
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let body = if line.starts_with("GET /json/version ") {
+                    json!({
+                        "Browser": "Chrome/test",
+                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/shared-client"),
+                    })
+                } else {
+                    assert!(line.starts_with("GET /json "));
+                    json!([{
+                        "id": "page-1", "type": "page", "title": "Codex",
+                        "url": "app://-/index.html",
+                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/page-1"),
+                    }])
+                }.to_string();
+                loop {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                responses += 1;
+                if responses == 6 {
+                    return connections;
+                }
+            }
+        }
+        connections
+    });
+
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..3 {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert_eq!(list_targets(port).await.unwrap()[0].id, "page-1");
+                assert_eq!(
+                    browser_identity(port).await.unwrap().browser_id().unwrap(),
+                    "shared-client"
+                );
+            });
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server.await.unwrap(),
+        6,
+        "CDP queries must release connections before their runtime shuts down"
+    );
+}
+
+#[tokio::test]
 async fn list_targets_can_query_ipv6_loopback_cdp_endpoint() {
     let listener = TcpListener::bind("[::1]:0")
         .await
