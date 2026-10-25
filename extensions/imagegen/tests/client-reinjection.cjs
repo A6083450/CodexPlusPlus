@@ -5,7 +5,7 @@ const source = fs.readFileSync(process.argv[2], 'utf8');
 const start = source.indexOf('  function patchAppServerModelRequestClient(');
 const end = source.indexOf('\n  // issue #2177', start);
 const context = {
-  codexAppServerModelRequestPatchVersion: '16',
+  codexAppServerModelRequestPatchVersion: source.match(/const codexAppServerModelRequestPatchVersion = "([^"]+)"/)[1],
   registerNativeHostClient() {},
   codexPlusPluginNativeInterceptClient: () => null,
   appServerModelRequestMethod: method => method,
@@ -33,9 +33,9 @@ vm.runInContext(source.slice(start, end), context);
       return Promise.resolve(params);
     }
     const proto = {
-      __codexPlusModelRequestPatch: '15',
+      __codexPlusModelRequestPatch: '27',
       __codexPlusModelOriginalSendRequest: nativeSendRequest,
-      sendRequest: async function codexPlusModelPatchedSendRequest(method, params) { return nativeSendRequest.call(this, method, params); },
+      sendRequest: async function codexPlusModelPatchedSendRequest(method, params) { oldCalls++; return nativeSendRequest.call(this, method, params); },
     };
     const client = Object.assign(Object.create(proto), { hostId: 'local' });
     if (mode === 'old-own-wrapper') {

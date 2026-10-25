@@ -15,8 +15,12 @@
   function recordCodexImageGenerationThread(client, state, params) {
     if (client.hostId !== "local" || !codexImageGenerationRuntimeActive() || !state.threadId
         || params?.config?.["features.image_generation"] !== false) return;
+    const model = state.model || codexServiceTierCurrentModelName();
+    if (String(model).toLowerCase().startsWith("gpt-image-")) {
+      (client.__codexPlusImageGenerationProxyThreads ||= new Set()).add(state.threadId);
+    }
     window.__codexPlusImageGenerationRuntime.threads.set(state.threadId, {
-      client, model: state.model || codexServiceTierCurrentModelName(),
+      client, model,
     });
   }
 
@@ -119,6 +123,11 @@
     if (!threadId) return;
     const runtime = window.__codexPlusImageGenerationRuntime;
     if (!runtime) return;
+    const imageModel = model.toLowerCase().startsWith("gpt-image-");
+    const hadImageOverride = client.__codexPlusImageGenerationProxyThreads?.has(threadId)
+      || String(runtime.threads.get(threadId)?.model || "").toLowerCase().startsWith("gpt-image-");
+    // 普通文字发送不依赖生图恢复；真正用过生图覆盖的会话仍必须先恢复。
+    if (!imageModel && !hadImageOverride) return;
     if (codexImageGenerationRuntimeActive()) {
       const status = await postJson("/backend/status", {}).catch(() => null);
       if (status?.status !== "ok") setCodexImageGenerationRuntimeActive(false);
@@ -135,8 +144,8 @@
       }
       return;
     }
-    const imageModel = model.toLowerCase().startsWith("gpt-image-");
     const proxyThreads = client.__codexPlusImageGenerationProxyThreads ||= new Set();
+    if (hadImageOverride) proxyThreads.add(threadId);
     await loadBackendSettingsState();
     const profile = codexRemoteSessionActiveProfile();
     const proxied = codexPlusBackendSettings.imageGenerationProxy

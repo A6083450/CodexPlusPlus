@@ -169,7 +169,7 @@ fn image_generation_reinjection_does_not_keep_obsolete_client_wrappers() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new("node")
         .arg(root.join("extensions/imagegen/tests/client-reinjection.cjs"))
-        .arg(root.join("assets/inject/renderer-inject/70-model-catalog.js"))
+        .arg(root.join("assets/inject/renderer-inject.js"))
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
@@ -3670,7 +3670,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"27\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"28\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
 

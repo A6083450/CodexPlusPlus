@@ -26,6 +26,21 @@ const client = { hostId: 'local', async sendRequest(method) {
   assert.equal(method, 'thread/read'); calls++; return { thread: { path } };
 } };
 (async () => {
+  context.codexImageGenerationDisabled = () => true;
+  const textClient = { hostId: 'local', async sendRequest() {
+    assert.fail('ordinary text turns must not read or reload image-generation state');
+  } };
+  const runtime = context.window.__codexPlusImageGenerationRuntime;
+  for (const active of [true, false]) {
+    runtime.active = active;
+    runtime.threads.set('text', { client: textClient, model: 'gpt-6.1-sol' });
+    await context.prepareCodexImageGenerationTurn(textClient, 'turn/start', {
+      threadId: 'text', model: 'gpt-6.1-sol',
+    });
+  }
+  assert.equal(restores, 0, 'unrelated text threads must not depend on image restoration');
+  runtime.active = true;
+  runtime.threads.delete('text');
   const prepare = () => context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old' });
   await prepare(); await prepare();
   assert.equal(restores, 1, 'previously loaded thread must be reloaded exactly once');
@@ -54,5 +69,20 @@ const client = { hostId: 'local', async sendRequest(method) {
   context.codexRemoteSessionActiveProfile = () => null;
   await prepare();
   assert.equal(restores, 5, 'turning off image proxy must unload its old override');
+  assert.equal(client.__codexPlusImageGenerationProxyThreads.has('old'), false);
+  const recordStart = source.indexOf('  function recordCodexImageGenerationThread(');
+  vm.runInContext(source.slice(recordStart, source.indexOf('  window.__codexPlusRestoreNativeImageGeneration', recordStart)), context);
+  context.recordCodexImageGenerationThread(client, { threadId: 'old', model: 'gpt-image-2.5-flare' }, {
+    config: { 'features.image_generation': false },
+  });
+  // 扫描到用户刚选的文字模型，不能丢掉已实际应用的生图代理记录。
+  runtime.threads.set('old', { client, model: 'gpt-6' });
+  expectedModel = 'gpt-6';
+  await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });
+  assert.equal(restores, 6, 'an image start must be restored even before its first image turn');
+  assert.equal(client.__codexPlusImageGenerationProxyThreads.has('old'), false);
+  runtime.threads.set('old', { client, model: 'gpt-image-2.5-flare' });
+  await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });
+  assert.equal(restores, 7, 'legacy image records must restore after the image proxy is disabled');
   assert.equal(client.__codexPlusImageGenerationProxyThreads.has('old'), false);
 })().catch(error => { console.error(error); process.exitCode = 1; });
