@@ -157,6 +157,21 @@ const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
 const PROTOCOL_PROXY_BIND_RETRY_TIMEOUT_MS: u64 = 10_000;
 const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
 
+/// 注入重试的总时长预算（issue #2681）。
+///
+/// 过去这里只有「最多 120 次」这一个上限，而单次失败本身还要等 CDP 连接超时
+/// （实测约 92 秒），于是 Codex 根本没监听调试端口时，启动器会空转三个多小时，
+/// 期间界面上一直停在「启动中」。改成按总时长收敛：预算耗尽即判失败并降级，
+/// 由上层写入 `running_degraded` 让用户知道增强没生效。
+const INJECTION_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// 两次注入尝试之间的间隔；失败很快时用它避免忙等。
+const INJECTION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// 注入失败日志的节流周期：只在第 1 次和之后每隔这么多次各记一条。
+///
+/// 每次失败都记完整错误串会把诊断日志刷到十几 MB（issue #2681），
+/// 而这些记录内容彼此相同，保留首末与次数就够了。
+const INJECTION_LOG_EVERY_ATTEMPTS: u32 = 10;
+
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
 /// Callers that install a custom [`crate::routes::BridgeContext`] should configure this callback
@@ -506,29 +521,44 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        for attempt in 1..=120 {
-            let result = match self.bridge_context(debug_port, app_dir).await {
-                Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
-                Ok(None) => self.inject(debug_port, helper_port).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(()) => return true,
-                Err(error) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.ensure_injection_retry_failed",
-                        serde_json::json!({
-                            "debug_port": debug_port,
-                            "helper_port": helper_port,
-                            "attempt": attempt,
-                            "message": error.to_string()
-                        }),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let outcome = run_injection_attempts(
+            INJECTION_TOTAL_BUDGET,
+            INJECTION_RETRY_INTERVAL,
+            INJECTION_LOG_EVERY_ATTEMPTS,
+            |attempt, message| {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.ensure_injection_retry_failed",
+                    serde_json::json!({
+                        "debug_port": debug_port,
+                        "helper_port": helper_port,
+                        "attempt": attempt,
+                        "message": message,
+                    }),
+                );
+            },
+            |_attempt| async move {
+                match self.bridge_context(debug_port, app_dir).await {
+                    Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
+                    Ok(None) => self.inject(debug_port, helper_port).await,
+                    Err(error) => Err(error),
                 }
-            }
-        }
-        false
+            },
+        )
+        .await;
+        // 只在结束时记一条结论，避免每次失败都刷一整条 JSON（issue #2681）。
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.ensure_injection_done",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "helper_port": helper_port,
+                "ready": outcome.ready,
+                "attempts": outcome.attempts,
+                "elapsed_ms": outcome.elapsed_ms,
+                "reason": outcome.reason.as_str(),
+                "last_error": outcome.last_error,
+            }),
+        );
+        outcome.ready
     }
     /// 初次启动初始化结束时固定身份（包含注入降级）；watchdog 不能重新绑定实例。
     async fn capture_injected_launch_identity(&self, _debug_port: u16) {}
@@ -602,7 +632,7 @@ pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchH
 
 /// 判断错误链里是不是「端口已被占用」。只有这一种失败值得等前任让位重试，
 /// 其余（权限不足、地址非法等）重试多少次都一样，直接冒泡更快也更好排查。
-fn error_is_address_in_use(error: &anyhow::Error) -> bool {
+pub(crate) fn error_is_address_in_use(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -622,6 +652,116 @@ fn error_is_bind_forbidden(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(crate::ports::port_bind_forbidden)
     })
+}
+
+/// 一次注入重试过程为什么停下（issue #2681）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionStopReason {
+    /// 注入成功，可以继续启动流程。
+    Succeeded,
+    /// 总时长预算耗尽，按失败降级处理。
+    BudgetExhausted,
+}
+
+impl InjectionStopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+/// 注入重试的结果，供调用方写一条结论日志。
+#[derive(Debug, Clone)]
+struct InjectionOutcome {
+    ready: bool,
+    attempts: u32,
+    elapsed_ms: u128,
+    reason: InjectionStopReason,
+    last_error: Option<String>,
+}
+
+/// 带总时长预算的注入重试循环（issue #2681）。
+///
+/// 单次注入失败往往要等 CDP 连接超时（实测约 92 秒），只按次数封顶会让启动器
+/// 空转数小时。这里改成到点即停，并把失败日志按 `log_every_attempts` 节流，
+/// 既保证「注入失败」能很快反映到界面，也不会把诊断日志刷爆。
+///
+/// `log_failure` 由调用方注入，是为了让节流行为能在测试里直接数调用次数，
+/// 而不必去动进程级的诊断日志路径（那是全局状态，并发测试会互相干扰）。
+async fn run_injection_attempts<F, Fut, L>(
+    budget: std::time::Duration,
+    retry_interval: std::time::Duration,
+    log_every_attempts: u32,
+    mut log_failure: L,
+    mut attempt: F,
+) -> InjectionOutcome
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+    L: FnMut(u32, &str),
+{
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+    let log_every_attempts = log_every_attempts.max(1);
+    let mut attempts = 0u32;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return InjectionOutcome {
+                ready: false,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis(),
+                reason: InjectionStopReason::BudgetExhausted,
+                last_error,
+            };
+        }
+        attempts += 1;
+        match tokio::time::timeout(remaining, attempt(attempts)).await {
+            Ok(Ok(())) => {
+                return InjectionOutcome {
+                    ready: true,
+                    attempts,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    reason: InjectionStopReason::Succeeded,
+                    last_error: None,
+                };
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            // 单次尝试把剩余预算耗光：算超时，不再往下重试。
+            Err(_) => {
+                last_error = Some(format!(
+                    "injection attempt timed out after {} ms of the total budget",
+                    budget.as_millis()
+                ));
+                return InjectionOutcome {
+                    ready: false,
+                    attempts,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    reason: InjectionStopReason::BudgetExhausted,
+                    last_error,
+                };
+            }
+        }
+        // 首次失败立刻记一条，之后每隔 N 次记一条，避免 100+ 条同内容记录。
+        if attempts == 1 || attempts % log_every_attempts == 0 {
+            log_failure(attempts, last_error.as_deref().unwrap_or_default());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return InjectionOutcome {
+                ready: false,
+                attempts,
+                elapsed_ms: started.elapsed().as_millis(),
+                reason: InjectionStopReason::BudgetExhausted,
+                last_error,
+            };
+        }
+        tokio::time::sleep(remaining.min(retry_interval)).await;
+    }
 }
 
 /// 把 helper 端口 bind 失败翻译成用户能照着处理的提示。
@@ -776,6 +916,9 @@ where
     let mut debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
+    // 请求体上限必须在 helper 绑定端口、开始接收请求前生效；环境变量优先级更高，
+    // 由 configured_http_body_bytes 统一处理。
+    set_http_body_limit_bytes(settings.helper_max_request_body_bytes());
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let status_store = options.status_store.clone();
     let mut helper_started = false;
@@ -1235,6 +1378,15 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+        // 常驻 helper 已经监听同一端口时直接复用：会话不再二次 bind，也不会在
+        // Codex 退出时关掉它（本实例没有持有它的 shutdown 句柄）。
+        if crate::resident_helper::resident_helper_port() == Some(helper_port) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.reuse_resident",
+                serde_json::json!({ "helper_port": helper_port }),
+            );
+            return Ok(());
+        }
         let bind_host = helper_bind_host();
         let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
             .await
@@ -1717,8 +1869,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn shutdown_helper(&self, _helper_port: u16) {
-        remove_dictation_helper_receipt();
+    async fn shutdown_helper(&self, helper_port: u16) {
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -1726,6 +1877,16 @@ impl LaunchHooks for DefaultLaunchHooks {
         if let Some(runtime) = self.helper.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
+            // 只有真正持有 helper 的实例才删除听写凭据：复用了常驻 helper 的
+            // 会话收尾时不能把常驻 helper 的凭据删掉。
+            remove_dictation_helper_receipt_for_port(helper_port);
+        }
+        // 会话 helper 启动时会写凭据并覆盖掉常驻 helper 的；收尾后若常驻实例
+        // 还在监听，把凭据补回常驻端口，避免听写路由因为凭据指向已关闭端口而失效。
+        if let Some(port) = crate::resident_helper::resident_helper_port()
+            && port != helper_port
+        {
+            write_dictation_helper_receipt(port);
         }
     }
 
@@ -1813,12 +1974,24 @@ fn write_dictation_helper_receipt_at(path: &Path, helper_port: u16, token: &str)
     let _ = std::fs::rename(&temporary, path);
 }
 
-fn remove_dictation_helper_receipt() {
-    remove_dictation_helper_receipt_at(&dictation_helper_receipt_path());
+/// 删除属于指定端口的听写 helper 凭据。
+///
+/// 同一进程里可能同时存在常驻 helper 与会话 helper（例如协议转换已关闭但
+/// 常驻实例还没退出）：只删除端口匹配的凭据，避免一方收尾时把另一方的凭据
+/// 误删。凭据整体只在 helper 停止时清理，与旧行为一致。
+fn remove_dictation_helper_receipt_for_port(helper_port: u16) {
+    remove_dictation_helper_receipt_at_for_port(&dictation_helper_receipt_path(), helper_port);
 }
 
-fn remove_dictation_helper_receipt_at(path: &Path) {
-    let _ = std::fs::remove_file(path);
+fn remove_dictation_helper_receipt_at_for_port(path: &Path, helper_port: u16) {
+    let matches = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .and_then(|value| value.get("port").and_then(Value::as_u64))
+        .is_some_and(|port| port == u64::from(helper_port));
+    if matches {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 async fn handle_helper_connection(
@@ -3118,7 +3291,10 @@ mod dictation_receipt_tests {
         assert_eq!(again["port"], 57322);
         assert_eq!(again["token"], "token-def");
         assert!(!path.with_extension("json.tmp").exists(), "临时文件必须被改名走");
-        remove_dictation_helper_receipt_at(&path);
+        // 端口不匹配时不能误删：常驻 helper 与会话 helper 可能同时在跑。
+        remove_dictation_helper_receipt_at_for_port(&path, 57321);
+        assert!(path.exists(), "非本端口的凭据必须保留");
+        remove_dictation_helper_receipt_at_for_port(&path, 57322);
         assert!(!path.exists());
     }
 }
@@ -3720,16 +3896,65 @@ mod computer_use_tests {
 }
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_CONFIGURED_HTTP_BODY_BYTES: usize = 512 * 1024 * 1024;
+/// 默认请求体上限 128 MiB；与设置项默认值共用同一组常量，避免两处漂移。
+const DEFAULT_HTTP_BODY_BYTES: usize =
+    crate::settings::DEFAULT_HELPER_MAX_REQUEST_BODY_MIB as usize * 1024 * 1024;
+/// 允许的最低请求体上限 32 MiB；更低会误伤正常请求。
+const MIN_HTTP_BODY_BYTES: usize =
+    crate::settings::MIN_HELPER_MAX_REQUEST_BODY_MIB as usize * 1024 * 1024;
+/// 允许的最高请求体上限 512 MiB；helper 会整段缓冲，再高内存开销不可控。
+const MAX_HTTP_BODY_BYTES: usize =
+    crate::settings::MAX_HELPER_MAX_REQUEST_BODY_MIB as usize * 1024 * 1024;
+
+/// 运行期生效的请求体上限（字节）。0 表示设置尚未应用，回落到默认值。
+static CONFIGURED_HTTP_BODY_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 把设置里的请求体上限应用给正在运行的 helper。
+///
+/// 启动流程在 helper 绑定端口前调用；管理器保存设置后也会调用，这样调大上限
+/// 不必重启 Codex++/Codex 就能让下一次请求生效。超出 32~512 MiB 的值会被夹取。
+pub fn set_http_body_limit_bytes(bytes: usize) {
+    CONFIGURED_HTTP_BODY_BYTES.store(
+        normalize_http_body_bytes(bytes),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn normalize_http_body_bytes(bytes: usize) -> usize {
+    bytes.clamp(MIN_HTTP_BODY_BYTES, MAX_HTTP_BODY_BYTES)
+}
+
+/// 解析环境变量里的字节数：低于下限视为无效（打错不缩小上限），高于上限则夹取。
+fn parse_env_http_body_bytes(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|bytes| *bytes >= MIN_HTTP_BODY_BYTES)
+        .map(normalize_http_body_bytes)
+}
+
+/// 解析最终生效的请求体上限：环境变量优先，其次设置，最后默认值。
+fn resolve_http_body_bytes(env_value: Option<&str>, setting_bytes: usize) -> usize {
+    env_value
+        .and_then(parse_env_http_body_bytes)
+        .unwrap_or_else(|| normalize_http_body_bytes(setting_bytes))
+}
 
 fn configured_http_body_bytes() -> usize {
-    std::env::var("CODEX_PLUS_MAX_HTTP_BODY_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value >= MAX_HTTP_BODY_BYTES)
-        .map(|value| value.min(MAX_CONFIGURED_HTTP_BODY_BYTES))
-        .unwrap_or(MAX_HTTP_BODY_BYTES)
+    let stored = CONFIGURED_HTTP_BODY_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let setting_bytes = if stored == 0 {
+        DEFAULT_HTTP_BODY_BYTES
+    } else {
+        stored
+    };
+    resolve_http_body_bytes(
+        std::env::var("CODEX_PLUS_MAX_HTTP_BODY_BYTES")
+            .ok()
+            .as_deref(),
+        setting_bytes,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3739,10 +3964,15 @@ struct HttpBodyLimits {
 }
 
 fn http_body_limits() -> HttpBodyLimits {
-    let decoded = configured_http_body_bytes();
+    http_body_limits_from(configured_http_body_bytes())
+}
+
+fn http_body_limits_from(decoded: usize) -> HttpBodyLimits {
+    let decoded = normalize_http_body_bytes(decoded);
     HttpBodyLimits {
         decoded,
-        encoded: decoded.saturating_mul(2).min(MAX_CONFIGURED_HTTP_BODY_BYTES),
+        // 请求体可能带压缩（zstd 等），编码后允许到解码上限的 2 倍，封顶最高上限。
+        encoded: decoded.saturating_mul(2).min(MAX_HTTP_BODY_BYTES),
     }
 }
 
@@ -3766,10 +3996,11 @@ impl HttpRequestReadError {
     }
 
     fn payload_too_large_with_limit(limit: usize) -> Self {
+        let limit_mib = limit / (1024 * 1024);
         Self {
             status: "413 Payload Too Large",
             message: format!(
-                "HTTP 请求体超过 {limit} 字节限制（可通过 CODEX_PLUS_MAX_HTTP_BODY_BYTES 调大）"
+                "HTTP 请求体超过 {limit_mib} MiB（{limit} 字节）上限：请在 Codex++「代理设置」调大「请求体上限」，或设置环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES"
             ),
         }
     }
@@ -3821,7 +4052,7 @@ struct ChunkedScanState {
 
 impl ChunkedScanState {
     fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
-        self.advance_with_limit(encoded, MAX_HTTP_BODY_BYTES)
+        self.advance_with_limit(encoded, DEFAULT_HTTP_BODY_BYTES)
     }
 
     fn advance_with_limit(
@@ -3902,7 +4133,13 @@ impl ChunkedScanState {
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<HttpRequest, HttpRequestReadError> {
-    let limits = http_body_limits();
+    read_http_request_with_limits(stream, http_body_limits()).await
+}
+
+async fn read_http_request_with_limits(
+    stream: &mut tokio::net::TcpStream,
+    limits: HttpBodyLimits,
+) -> Result<HttpRequest, HttpRequestReadError> {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
     let mut header_end = None;
@@ -4027,7 +4264,7 @@ fn content_length_body(
     encoded: &[u8],
     content_length: usize,
 ) -> Result<Vec<u8>, HttpRequestReadError> {
-    content_length_body_with_limit(encoded, content_length, MAX_HTTP_BODY_BYTES)
+    content_length_body_with_limit(encoded, content_length, DEFAULT_HTTP_BODY_BYTES)
 }
 
 fn content_length_body_with_limit(
@@ -4045,7 +4282,7 @@ fn content_length_body_with_limit(
 }
 
 fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
-    decode_chunked_body_with_limit(encoded, MAX_HTTP_BODY_BYTES)
+    decode_chunked_body_with_limit(encoded, DEFAULT_HTTP_BODY_BYTES)
 }
 
 fn decode_chunked_body_with_limit(
@@ -6265,18 +6502,23 @@ mod tests {
         assert_eq!(multiple.status(), "400 Bad Request");
     }
 
+    /// 测试用的小上限，避免为了验证边界在测试里真的分配/扫描 128 MiB。
+    const TEST_HTTP_BODY_BYTES: usize = 4 * 1024;
+
     #[test]
     fn chunked_decoder_accepts_exact_body_limit_and_rejects_one_byte_more() {
-        let mut exact = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES).into_bytes();
-        exact.resize(exact.len() + MAX_HTTP_BODY_BYTES, b'a');
+        let mut exact = format!("{:X}\r\n", TEST_HTTP_BODY_BYTES).into_bytes();
+        exact.resize(exact.len() + TEST_HTTP_BODY_BYTES, b'a');
         exact.extend_from_slice(b"\r\n0\r\n\r\n");
-        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact).unwrap() else {
+        let ChunkedBody::Complete(decoded) =
+            decode_chunked_body_with_limit(&exact, TEST_HTTP_BODY_BYTES).unwrap()
+        else {
             panic!("expected complete chunked body");
         };
-        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+        assert_eq!(decoded.len(), TEST_HTTP_BODY_BYTES);
 
-        let oversized = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES + 1).into_bytes();
-        let error = decode_chunked_body(&oversized).unwrap_err();
+        let oversized = format!("{:X}\r\n", TEST_HTTP_BODY_BYTES + 1).into_bytes();
+        let error = decode_chunked_body_with_limit(&oversized, TEST_HTTP_BODY_BYTES).unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
     }
 
@@ -6314,16 +6556,112 @@ mod tests {
 
     #[test]
     fn content_length_body_accepts_exact_limit_and_rejects_one_byte_more() {
-        let exact = vec![b'a'; MAX_HTTP_BODY_BYTES];
+        let exact = vec![b'a'; TEST_HTTP_BODY_BYTES];
         assert_eq!(
-            content_length_body(&exact, MAX_HTTP_BODY_BYTES)
+            content_length_body_with_limit(&exact, TEST_HTTP_BODY_BYTES, TEST_HTTP_BODY_BYTES)
                 .unwrap()
                 .len(),
-            MAX_HTTP_BODY_BYTES
+            TEST_HTTP_BODY_BYTES
         );
 
-        let error = content_length_body(&[], MAX_HTTP_BODY_BYTES + 1).unwrap_err();
+        let error =
+            content_length_body_with_limit(&[], TEST_HTTP_BODY_BYTES + 1, TEST_HTTP_BODY_BYTES)
+                .unwrap_err();
         assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[test]
+    fn http_body_limit_defaults_to_128_mib_and_resolves_env_over_setting() {
+        let mib = 1024 * 1024;
+        assert_eq!(DEFAULT_HTTP_BODY_BYTES, 128 * mib);
+        assert_eq!(MIN_HTTP_BODY_BYTES, 32 * mib);
+        assert_eq!(MAX_HTTP_BODY_BYTES, 512 * mib);
+        assert_eq!(
+            resolve_http_body_bytes(None, DEFAULT_HTTP_BODY_BYTES),
+            128 * mib
+        );
+
+        // 设置值生效；越界值夹取到 32~512 MiB。
+        assert_eq!(resolve_http_body_bytes(None, 256 * mib), 256 * mib);
+        assert_eq!(resolve_http_body_bytes(None, 8 * mib), 32 * mib);
+        assert_eq!(resolve_http_body_bytes(None, 4096 * mib), 512 * mib);
+
+        // 环境变量优先于设置；低于下限或非法值忽略，高于上限夹取。
+        assert_eq!(resolve_http_body_bytes(Some(" 402653184 "), 64 * mib), 384 * mib);
+        assert_eq!(resolve_http_body_bytes(Some("1048576"), 64 * mib), 64 * mib);
+        assert_eq!(resolve_http_body_bytes(Some("not-a-number"), 64 * mib), 64 * mib);
+        assert_eq!(resolve_http_body_bytes(Some("1073741824"), 64 * mib), 512 * mib);
+    }
+
+    #[test]
+    fn http_body_limits_allow_double_encoded_body_and_cap_at_512_mib() {
+        let mib = 1024 * 1024;
+        let limits = http_body_limits_from(128 * mib);
+        assert_eq!(limits.decoded, 128 * mib);
+        assert_eq!(limits.encoded, 256 * mib);
+
+        let limits = http_body_limits_from(MAX_HTTP_BODY_BYTES);
+        assert_eq!(limits.decoded, MAX_HTTP_BODY_BYTES);
+        assert_eq!(limits.encoded, MAX_HTTP_BODY_BYTES);
+
+        // 低于下限的输入按 32 MiB 处理，避免配置错误把上限缩到不可用。
+        assert_eq!(http_body_limits_from(1).decoded, 32 * mib);
+    }
+
+    #[tokio::test]
+    async fn read_http_request_uses_injected_limit_instead_of_global_default() {
+        let limits = HttpBodyLimits {
+            decoded: TEST_HTTP_BODY_BYTES,
+            encoded: TEST_HTTP_BODY_BYTES * 2,
+        };
+
+        // 超过注入上限：只发请求头，服务端必须在读正文前拒绝。
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /v1/responses HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                        TEST_HTTP_BODY_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let error = read_http_request_with_limits(&mut server, limits)
+            .await
+            .err()
+            .expect("oversized body should be rejected");
+        assert_eq!(error.status(), "413 Payload Too Large");
+        client.await.unwrap();
+
+        // 正好等于注入上限：正常读入正文。
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = "a".repeat(TEST_HTTP_BODY_BYTES);
+        let request_text = format!(
+            "POST /v1/responses HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            TEST_HTTP_BODY_BYTES, payload
+        );
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request_text.as_bytes()).await.unwrap();
+        });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let request = read_http_request_with_limits(&mut server, limits)
+            .await
+            .unwrap();
+        assert_eq!(request.body.len(), TEST_HTTP_BODY_BYTES);
+        client.await.unwrap();
     }
 
     #[tokio::test]
@@ -6340,7 +6678,7 @@ mod tests {
     async fn helper_returns_413_before_reading_oversized_content_length_body() {
         let request = format!(
             "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: {}\r\n\r\n",
-            MAX_HTTP_BODY_BYTES + 1
+            DEFAULT_HTTP_BODY_BYTES + 1
         );
         let response = send_raw_helper_request(request.as_bytes()).await;
 
@@ -7893,5 +8231,102 @@ mod proxy_stream_tests {
         assert!(forwarded_bytes.len() > 5 * 1024 * 1024, "超大事件必须完整转发，收到 {} 字节", forwarded_bytes.len());
         assert!(forwarded_bytes.ends_with(b"data:{\"type\":\"response.completed\"}\n\n"));
         upstream_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod injection_budget_tests {
+    use super::{InjectionStopReason, run_injection_attempts};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn injection_stops_when_total_budget_is_exhausted() {
+        // 每次尝试都卡住：总预算耗尽后必须返回，而不是跑满次数上限（issue #2681）。
+        let outcome = run_injection_attempts(
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            10,
+            |_attempt, _message| {},
+            |_attempt| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                anyhow::bail!("should never finish");
+            },
+        )
+        .await;
+
+        assert!(!outcome.ready);
+        assert_eq!(outcome.reason, InjectionStopReason::BudgetExhausted);
+        assert_eq!(outcome.attempts, 1, "单次尝试吃光预算后不应再重试");
+        assert!(
+            outcome
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "应记录超时原因，实际 {:?}",
+            outcome.last_error
+        );
+        assert!(
+            outcome.elapsed_ms < 3_000,
+            "总耗时必须收敛到预算量级，实际 {} ms",
+            outcome.elapsed_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_succeeds_on_later_attempt() {
+        let mut calls = 0;
+        let outcome = run_injection_attempts(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            10,
+            |_attempt, _message| {},
+            |_attempt| {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt < 3 {
+                        anyhow::bail!("cdp not ready yet");
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(outcome.ready);
+        assert_eq!(outcome.reason, InjectionStopReason::Succeeded);
+        assert_eq!(outcome.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn injection_failure_logging_is_throttled() {
+        let logged_attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let logged = logged_attempts.clone();
+
+        let outcome = run_injection_attempts(
+            Duration::from_millis(400),
+            Duration::from_millis(1),
+            10,
+            |attempt, message| {
+                assert!(message.contains("connect refused"));
+                logged.lock().unwrap().push(attempt);
+            },
+            |_attempt| async { anyhow::bail!("connect refused") },
+        )
+        .await;
+
+        assert!(!outcome.ready);
+        assert!(outcome.attempts >= 20, "失败很快时应尝试足够多次");
+        let logged = logged_attempts.lock().unwrap();
+        // 首次 + 每 10 次一条；关键是不能随尝试次数线性增长。
+        assert_eq!(logged.first().copied(), Some(1));
+        assert_eq!(logged.len(), 1 + (outcome.attempts as usize / 10));
+        assert!(
+            logged.len() * 5 < outcome.attempts as usize,
+            "{} 次尝试只应记少量日志，实际 {} 条",
+            outcome.attempts,
+            logged.len()
+        );
     }
 }

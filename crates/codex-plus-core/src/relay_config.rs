@@ -289,6 +289,45 @@ pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
         )
 }
 
+/// live `config.toml` 是否把 Codex 请求指向本机协议代理。
+///
+/// 覆盖两种形态：
+/// - 普通中转：活动 provider 的 `model_providers.<id>.base_url` 是本机代理地址；
+/// - 官方会话身份（Remote Control / 官方 + API 混合）：根键 `openai_base_url`
+///   指向本机代理。
+///
+/// 只认活动 provider，避免配置里残留的其它 provider 造成误判。管理器据此判断
+/// 「Codex 即使不经过 Codex++ 启动也会把请求发给本地代理」，从而决定是否常驻
+/// 本地 helper。
+pub fn live_config_uses_managed_protocol_proxy_in_home(home: &Path) -> bool {
+    let contents = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+    live_config_contents_use_managed_protocol_proxy(&contents)
+}
+
+fn live_config_contents_use_managed_protocol_proxy(contents: &str) -> bool {
+    if root_key_string(contents, OPENAI_BASE_URL_KEY)
+        .is_some_and(|value| crate::protocol_proxy::is_managed_protocol_proxy_base_url(&value))
+    {
+        return true;
+    }
+    let Ok(doc) = parse_toml_document(contents) else {
+        return false;
+    };
+    let Some(provider_id) = active_provider_id(&doc) else {
+        return false;
+    };
+    doc.get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .is_some_and(|value| crate::protocol_proxy::is_managed_protocol_proxy_base_url(value))
+}
+
 pub fn ensure_active_protocol_proxy_config_in_home(
     home: &Path,
     settings: &BackendSettings,
@@ -1645,6 +1684,22 @@ pub fn live_config_matches_other_profile_in_home(
     }))
 }
 
+/// 回填时发现实时配置的 endpoint 与供应商快照对不上：分不清是外部工具接管还是
+/// 用户手工改的，自动回填只能停下（#2666）。单独成类型，切换流程据此让用户
+/// 显式选择「导入为新供应商」或「放弃实时改动」，而不是只给一句报错。
+#[derive(Debug)]
+pub struct LiveEndpointChanged;
+
+impl std::fmt::Display for LiveEndpointChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。",
+        )
+    }
+}
+
+impl std::error::Error for LiveEndpointChanged {}
+
 fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> anyhow::Result<()> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return Ok(());
@@ -1673,9 +1728,7 @@ fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> 
     {
         return Ok(());
     }
-    anyhow::bail!(
-        "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。"
-    )
+    Err(LiveEndpointChanged.into())
 }
 
 /// 纯官方快照保留非认证设置，去掉第三方路由/认证和托管目录指针。
@@ -3077,7 +3130,15 @@ fn parse_optional_positive_u64(value: &str, label: &str) -> anyhow::Result<Optio
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let parsed = trimmed
+    // 用户常从文档或别处复制带千分位的数字（`1,050,000`）。此前会直接
+    // `InvalidDigit` 判整次保存失败，而语义上它就是个合法的 1050000，
+    // 静默接受比让整份配置保存不了更合理（issue #2590）。
+    let digits: String = trimmed
+        .chars()
+        .filter(|character| !matches!(character, ',' | '_' | '\u{FF0C}' | '\u{3000}'))
+        .collect();
+    let digits = digits.trim();
+    let parsed = digits
         .parse::<u64>()
         .with_context(|| format!("{label}必须是正整数"))?;
     if parsed == 0 {
@@ -3144,7 +3205,7 @@ fn wsl_catalog_paths_enabled(home: &Path, config: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn managed_catalog_pointer(home: &Path, relative: &str, config: &str) -> anyhow::Result<String> {
+pub(crate) fn managed_catalog_pointer(home: &Path, relative: &str, config: &str) -> anyhow::Result<String> {
     if wsl_catalog_paths_enabled(home, config) {
         // WSL 的 app-server 不能读取 C:\\...；相对路径由共享 CODEX_HOME 解析。
         return Ok(relative.replace('\\', "/"));
@@ -5567,6 +5628,19 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
     }
 }
 
+/// 放弃实时改动前把当前 config.toml / auth.json 原样备份，返回备份目录；
+/// 两个文件都不存在时没有可备份的内容，返回 None。
+pub fn backup_live_files(home: &Path) -> anyhow::Result<Option<String>> {
+    let read = |name: &str| match std::fs::read(home.join(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::from(error).context(format!("读取实时 {name} 失败"))),
+    };
+    let config = read("config.toml")?;
+    let auth = read("auth.json")?;
+    create_live_backup(home, config.as_deref(), auth.as_deref())
+}
+
 fn create_live_backup(
     home: &Path,
     config: Option<&[u8]>,
@@ -5707,6 +5781,63 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_config_detects_managed_protocol_proxy_for_active_provider_only() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let managed = managed_openai_base_url();
+        let direct = "https://upstream.example/v1";
+
+        // 没有 config.toml：不需要本地代理。
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 活动 provider 直连上游：不需要。
+        std::fs::write(
+            &config_path,
+            format!("model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{direct}'\n"),
+        )
+        .unwrap();
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 活动 provider 指向本地代理：需要常驻。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{managed}'\n"
+            ),
+        )
+        .unwrap();
+        assert!(live_config_uses_managed_protocol_proxy_in_home(home.path()));
+
+        // 只有非活动 provider 指向本地代理时不能误判，否则会拉起用不到的 helper。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'custom'\n[model_providers.custom]\nbase_url = '{direct}'\n\
+                 [model_providers.other]\nbase_url = '{managed}'\n"
+            ),
+        )
+        .unwrap();
+        assert!(!live_config_uses_managed_protocol_proxy_in_home(
+            home.path()
+        ));
+
+        // 官方会话身份：根键 openai_base_url 指向本地代理。
+        std::fs::write(
+            &config_path,
+            format!(
+                "model_provider = 'openai'\nopenai_base_url = '{managed}'\n\
+                 [model_providers.custom]\nbase_url = 'https://chatgpt.com/backend-api/codex'\n"
+            ),
+        )
+        .unwrap();
+        assert!(live_config_uses_managed_protocol_proxy_in_home(home.path()));
+    }
 
     #[test]
     fn independent_proxy_routes_responses_and_preserves_the_real_upstream() {
@@ -6669,4 +6800,42 @@ fn root_line_key(line: &str) -> Option<&str> {
         return None;
     }
     trimmed.split_once('=').map(|(key, _)| key.trim())
+}
+
+#[cfg(test)]
+mod window_value_parsing_tests {
+    use super::parse_optional_positive_u64;
+
+    #[test]
+    fn accepts_plain_digits() {
+        assert_eq!(parse_optional_positive_u64("1050000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64(" 1050000 ", "上下文大小").unwrap(), Some(1_050_000));
+    }
+
+    #[test]
+    fn accepts_thousand_separators() {
+        // 用户从文档复制 `1,050,000` 时，此前会判整次保存失败（issue #2590）。
+        assert_eq!(parse_optional_positive_u64("1,050,000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64("1_050_000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(
+            parse_optional_positive_u64("1，050，000", "上下文大小").unwrap(),
+            Some(1_050_000),
+            "全角逗号同样应被接受"
+        );
+    }
+
+    #[test]
+    fn still_rejects_non_numeric_and_zero() {
+        assert!(parse_optional_positive_u64("abc", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("0", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("1.05M", "上下文大小").is_err());
+        assert_eq!(parse_optional_positive_u64("   ", "上下文大小").unwrap(), None);
+    }
+
+    #[test]
+    fn separator_position_is_not_validated() {
+        // 逗号位置不规范（例如 1,0,5,0）仍按纯数字处理：这个字段的目标是拿到
+        // 用户想要的窗口值，不是校验排版。真正的非数字才拒绝。
+        assert_eq!(parse_optional_positive_u64("1,0,5,0", "上下文大小").unwrap(), Some(1_050));
+    }
 }

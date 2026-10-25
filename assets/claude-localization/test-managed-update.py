@@ -1,5 +1,11 @@
 import importlib.util
+import hashlib
+import json
+import os
 import pathlib
+import plistlib
+import shutil
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -9,6 +15,140 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("managed_update", pathlib.Path(__file__).with_name("managed-update.py"))
 updater = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(updater)
+
+
+class UpdateComputerUseTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir()
+        runtime = patch.object(updater, "HERE", self.runtime)
+        runtime.start()
+        self.addCleanup(runtime.stop)
+        self.source = self.app(self.root / "Claude.app", "old")
+        self.copy = self.app(self.runtime / "Claude Enhanced.app", "old")
+        self.work = self.runtime / "updates" / "release"
+        self.work.mkdir(parents=True)
+        self.plan = self.work / "plan.json"
+        archive = self.work / "update.zip"
+        with zipfile.ZipFile(archive, "w") as file:
+            file.writestr("Claude.app/Contents/Info.plist", plistlib.dumps({
+                "CFBundleVersion": "new", "CFBundleShortVersionString": "2.0.0",
+            }))
+        self.value = {
+            "source": str(self.source), "copy": str(self.copy), "node": sys.executable,
+            "locale": "zh-Hans", "voiceInput": True, "localization": False, "parentPid": 1234,
+            "release": {"version": "2.0.0", "size": archive.stat().st_size,
+                        "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()},
+        }
+        # 用实际子进程记录传参和制作标记；系统签名、ditto 与进程等待留在边界替身里。
+        (self.runtime / "build-copy.py").write_text('''import json, os, pathlib, shutil, sys
+root = pathlib.Path(__file__).parent
+source = pathlib.Path(os.environ["CODEX_PLUS_CLAUDE_SOURCE"])
+copy = pathlib.Path(os.environ["CODEX_PLUS_CLAUDE_COPY"])
+enabled = os.environ.get("CODEX_PLUS_CLAUDE_COMPUTER_USE")
+marker = copy / "Contents/Resources/.cu-patched"
+with (root / "build-env.jsonl").open("a") as file:
+    file.write(json.dumps({"check": "--check" in sys.argv, "computerUse": enabled}) + "\\n")
+if "--check" in sys.argv:
+    assert marker.is_file() == (enabled == "1"), "Computer Use 校验状态不匹配"
+else:
+    shutil.copytree(source, copy)
+    if enabled == "1":
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}")
+''')
+        (self.runtime / "inject-cn.js").write_text('''import json, os, pathlib
+pathlib.Path(__file__).with_name("relaunch.json").write_text(json.dumps({
+    "computerUse": os.environ.get("CODEX_PLUS_CLAUDE_COMPUTER_USE"),
+    "voiceInput": os.environ.get("CODEX_PLUS_CLAUDE_VOICE_INPUT"),
+    "localization": os.environ.get("CODEX_PLUS_CLAUDE_LOCALIZATION"),
+}))
+''')
+        def native_run(args, timeout=300):
+            if args[0] == "/usr/bin/ditto":
+                if args[1] == "-x":
+                    with zipfile.ZipFile(args[3]) as file:
+                        file.extractall(args[4])
+                else:
+                    shutil.copytree(args[1], args[2])
+            else:
+                self.assertEqual(args[0], "/usr/bin/codesign")
+            return SimpleNamespace(returncode=0)
+        for target, replacement in [("run", native_run), ("wait_for_exit", lambda pid: None),
+                                    ("wait_for_helpers", lambda: None)]:
+            boundary = patch.object(updater, target, replacement)
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def app(self, path, build):
+        (path / "Contents").mkdir(parents=True)
+        (path / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": build}))
+        return path
+
+    def mark_computer_use(self, copy):
+        marker = copy / "Contents/Resources/.cu-patched"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}")
+
+    def assert_installed(self, enabled):
+        updater.install(self.plan, self.value)
+        self.assertEqual((self.copy / "Contents/Resources/.cu-patched").is_file(), enabled)
+        self.assertEqual(json.loads((self.runtime / "prepared.json").read_text()),
+                         {"sourceBuild": "new", "computerUse": enabled})
+        self.assertEqual(json.loads((self.runtime / "relaunch.json").read_text()),
+                         {"computerUse": "1" if enabled else "0", "voiceInput": "1", "localization": "0"})
+
+    def explicit_update(self, enabled):
+        self.value["computerUse"] = enabled
+        with patch.dict(os.environ, {"CODEX_PLUS_CLAUDE_COMPUTER_USE": "0" if enabled else "1"}):
+            updater.prepare(self.plan, self.value)
+            self.assertIs(json.loads(self.plan.read_text())["computerUse"], enabled)
+            self.assertEqual((self.work / "Claude CN.app/Contents/Resources/.cu-patched").is_file(), enabled)
+            self.assert_installed(enabled)
+        for event in (self.runtime / "build-env.jsonl").read_text().splitlines():
+            self.assertEqual(json.loads(event)["computerUse"], "1" if enabled else "0")
+
+    def test_enabled_update_overrides_inherited_disabled_env(self):
+        self.explicit_update(True)
+
+    def test_disabled_update_overrides_inherited_enabled_env(self):
+        self.mark_computer_use(self.copy)
+        self.explicit_update(False)
+
+    def test_legacy_plan_preserves_current_copy_marker(self):
+        self.mark_computer_use(self.copy)
+        (self.runtime / "prepared.json").write_text('{"computerUse": false}')
+        with patch.dict(os.environ, {"CODEX_PLUS_CLAUDE_COMPUTER_USE": "0"}):
+            updater.prepare(self.plan, self.value)
+            self.assert_installed(True)
+
+    def test_legacy_plan_uses_receipt_when_marker_is_missing(self):
+        (self.runtime / "prepared.json").write_text('{"computerUse": true}')
+        updater.prepare(self.plan, self.value)
+        self.assert_installed(True)
+
+    def test_legacy_plan_without_cu_stays_disabled(self):
+        with patch.dict(os.environ, {"CODEX_PLUS_CLAUDE_COMPUTER_USE": "1"}):
+            updater.prepare(self.plan, self.value)
+            self.assert_installed(False)
+
+    def test_legacy_prepared_plan_rebuilds_unpatched_staging_before_replacement(self):
+        self.value["computerUse"] = False
+        with patch.dict(os.environ, {"CODEX_PLUS_CLAUDE_COMPUTER_USE": "0"}):
+            updater.prepare(self.plan, self.value)
+            self.value.pop("computerUse")
+            self.mark_computer_use(self.copy)
+            self.assert_installed(True)
+        self.assertTrue((self.work / "Claude CN.app").is_dir(), "保留原先准备的副本")
+        self.assertFalse((self.work / "Claude CN.app/Contents/Resources/.cu-patched").exists())
+
+    def test_plan_rejects_non_boolean_computer_use(self):
+        self.value["computerUse"] = "false"
+        with self.assertRaisesRegex(RuntimeError, "computerUse"):
+            updater.prepare(self.plan, self.value)
 
 
 class UpdateTransactionTests(unittest.TestCase):

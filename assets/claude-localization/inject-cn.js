@@ -196,7 +196,7 @@ async function evaluate(c, expression) {
       const mineRunning = running.find((r) => r.cmd.includes(APP));
       if (mineRunning) {
         console.error('✗ 本地化副本已经在运行了（pid ' + mineRunning.pid + '），但启动时没有带 --inspect，无法注入。');
-        console.error('  请先 ⌘Q 退出「Claude CN」，再重新运行本启动器。');
+        console.error('  请先 ⌘Q 退出「Claude Enhanced」，再重新运行本启动器。');
         process.exit(2);
       }
       const other = running[0];
@@ -257,7 +257,10 @@ async function evaluate(c, expression) {
 
     const updateOptions = process.platform === 'darwin' && process.env.CODEX_PLUS_CLAUDE_SOURCE && process.env.CODEX_PLUS_CLAUDE_PYTHON
       ? { source: process.env.CODEX_PLUS_CLAUDE_SOURCE, copy: APP, node: process.execPath,
-          python: process.env.CODEX_PLUS_CLAUDE_PYTHON, locale: LOCALE, voiceInput: VOICE_INPUT, localization: LOCALIZATION }
+          python: process.env.CODEX_PLUS_CLAUDE_PYTHON, locale: LOCALE, voiceInput: VOICE_INPUT, localization: LOCALIZATION,
+          computerUse: process.env.CODEX_PLUS_CLAUDE_COMPUTER_USE === undefined
+            ? fs.existsSync(path.join(APP, 'Contents/Resources/.cu-patched'))
+            : process.env.CODEX_PLUS_CLAUDE_COMPUTER_USE === '1' }
       : null;
     await evaluate(c, `globalThis.__claudeCnManagedUpdate = ${JSON.stringify(updateOptions)}; globalThis.__claudeCnTargetLocale = ${JSON.stringify(LOCALE)}; globalThis.__claudeCnVoiceInput = ${VOICE_INPUT ? 'true' : 'false'}; globalThis.__claudeCnLocalization = ${LOCALIZATION ? 'true' : 'false'}; require(${JSON.stringify(HOOK)})`);
     const okFlag = await evaluate(c, 'globalThis.__claudeCnHookInstalled === true');

@@ -63,12 +63,12 @@
     {
       "name": "71-model-picker-groups.js",
       "description": "原生模型选择器按供应商分组折叠（聚合供应商场景）",
-      "lines": 1036
+      "lines": 1095
     },
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 1570
+      "lines": 1588
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -118,7 +118,7 @@
     {
       "name": "95-conversation-view.js",
       "description": "会话视图运行时、官方用量策略重写、扫描主循环",
-      "lines": 931
+      "lines": 954
     },
     {
       "name": "96-whale-compat.js",

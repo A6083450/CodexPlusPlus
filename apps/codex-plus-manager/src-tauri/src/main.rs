@@ -3,6 +3,33 @@
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     // MCP 是独立 stdio 进程，必须在 GUI、单实例锁和启动日志之前处理。
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-cu-mcp") {
+        if let Err(error) = codex_plus_manager_lib::run_computer_use_mcp() {
+            eprintln!("Computer Use MCP 退出：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-browser-mcp") {
+        if let Err(error) = codex_plus_manager_lib::run_browser_use_mcp() {
+            eprintln!("浏览器控制 MCP 退出：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // Claude Code 的 Stop / SubagentStop 钩子调用：只往 spool 里记一行，不启动 GUI。
+    // 第二个参数是安装时固化的 state 目录（钩子不继承 CODEX_PLUS_STATE_DIR）。
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-browser-turn-end") {
+        codex_plus_core::claude_hooks::record_turn_end(args.get(2).map(std::ffi::OsString::as_os_str));
+        return;
+    }
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-cu-cli") {
+        if let Err(error) = codex_plus_manager_lib::run_computer_use_cli(&args[2..]) {
+            eprintln!("Computer Use 诊断失败：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--codex-plus-agent-mcp") {
         if let Err(error) = codex_plus_manager_lib::run_agent_collaboration_mcp(&args[2..]) {
             eprintln!("Agent 协作 MCP 启动失败：{error:#}");

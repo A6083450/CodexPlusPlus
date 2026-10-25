@@ -1,5 +1,83 @@
 # 更新日志
 
+## 1.11.2+65 - 2026-10-25
+
+- 同步上游 v1.11.2 及主分支截至 `0295c9f3` 的功能与修复。
+- 新增 Computer Use 原生接入、Chrome 浏览器工具及 Claude Code、Claude Desktop、DeepSeek Harness、ZCode、WorkBuddy AI 接入。
+- 同步常驻协议代理、按 HTTP 状态码重试、128 MiB 默认请求体上限、Claude 增强与原生 Fast 兼容修复。
+- 同步上下文窗口千分位解析、模板窗口优先级、多开隔离、WSL 路径及 Windows 稳定性修复。
+- 保留 fork 的逐模型上下文、独立生图、启动与桥接恢复、无广告界面及 fork 在线更新。
+- 修复上游遗漏的预览组件引用；Claude 托管更新保留 Computer Use 设置，旧副本在退出并取得更新锁后再迁移。
+
+### 上游主分支功能说明
+
+### 新增
+
+- **Computer Use 接入（原生直通 Codex 桌面版的 CU server）**：新增「Computer Use」页，把 Codex 桌面版的 computer use 以 MCP 接给 Claude Code 与 Claude Desktop。做法不是重写鼠标键盘模拟，也不是转译 cua-repl 的 JS 工具，而是**直通原生 CU server**（`SkyComputerUseClient mcp`）：它对外就是标准 stdio MCP，10 个离散工具（`list_apps` / `get_app_state` / `click` / `perform_secondary_action` / `set_value` / `select_text` / `scroll` / `drag` / `press_key` / `type_text`），带 `annotations`。唯一门槛是它校验「直接父进程的代码签名」——非 OpenAI 签名会被拒为 `-10000 Sender process is not authenticated`；因此由 ChatGPT.app 自带的签名 node 执行一个只负责 `spawn` 的 shim 拉起，中间不插 shell。工具面、AX 树信封、diff 语义（`There has been no change…`）、截图原分辨率、`frontmost` 标记全部原样透传，不再逐项手工对齐。代理只做三件事：字节转发、`initialize` 时替客户端补 `elicitation` 能力、按策略处理审批。「运行自检」走同一条直通链路（`tools/list` 校验工具面 + `tools/call list_apps`），失败按「未安装 / 父进程不受信 / 未授权 / 服务未就绪」分类提示。写入配置仍是「锁 → 读 → 比对 → 备份 → 原子写」，同名条目不是本功能写入的一律不覆盖；接入后需重启对应客户端会话。Codex 自己会把 `[mcp_servers.computer-use]` 写进 `~/.codex/config.toml`，桌面版与 CLI 共用该文件，因此不再重复接入。
+- **Computer Use 审批策略**：页面上可切换两档——「完全放开」自动放行所有应用、只记审计；「交给 Claude 审批」把 Codex 原生的 `Allow ChatGPT to use "X"?` 请求原样转给 MCP 客户端，由 Claude 侧弹卡，拒绝即不放行。批准过的应用记进 `~/.codex-session-delete/cu/approvals.json`，可在页面上逐个撤销或全部清空。客户端未声明 elicitation 能力时会退回放行并在日志里说明，不会干等到超时（实测 Claude Code 2.1.245 不声明、3.x 起以实际握手为准，所以按能力而非版本号判断）。
+- **Chrome 浏览器控制**：新增独立的 `codex-plus-browser` MCP server，暴露 12 个离散工具（`browser_list` / `tabs` / `open` / `close` / `state` / `click` / `type` / `key` / `eval` / `screenshot` / `group` / `group_update`），走 Codex 自己的 Chrome 扩展桥（native messaging），不需要自建扩展。标签页按元素索引点击走 AX 树，标签分组用 browser 级 `management` 能力。与 CU 分成两个 server 的原因：原生 CU server 没有浏览器工具，而浏览器桥要求每次调用带 Codex 的 turn 元数据。
+- **更多接入目标：DeepSeek Harness / ZCode / WorkBuddy AI**：Computer Use 页新增三个客户端，桌面操控与浏览器两个 server 一起登记。DeepSeek Harness 写进桌面版 profile 的补丁层 `~/.dsh/profiles/desktop/cordis.patch.yml`（每个 server 一条 `@deepseek-ai/dsh-mcp-client` 条目，放在带首尾标记的托管块里，用户自己的补丁与注释不动，卸载整段删除）；ZCode 写 `~/.zcode/cli/config.json` 的 `mcp.servers`（ZCode 优先读这里）；WorkBuddy AI 写 `~/.workbuddy/mcp.json`。工具没装（配置目录不存在）时显示为「不支持」，不替它建目录。WorkBuddy 只在 `mcp.json` 不存在时写入示例 MCP 服务，由 Codex++ 先建文件后它就不会再写，页面上会提示。接入状态现在同时检查两个 server，只缺浏览器条目也会提示「需更新」。
+
+## 1.11.2 - 2026-10-23
+
+本次为补丁更新，修复 Windows 上的启动器退出、WSL 配置路径和若干供应商与模型问题。
+
+### 修复
+
+- **托盘里退不掉 Codex++**（#2611）：退出时会先等待清理任务、启动器和本地代理收尾；只要其中一步卡住，进程就停在半退出状态，托盘菜单点了没反应，任务管理器也杀不掉。现在清理超过 10 秒会写一条诊断日志后直接退出。
+- **WSL 下配置加载失败**（#2591）：聚合供应商的模型目录指针仍按 Windows 绝对路径写入，WSL 里的 app-server 读不到。现在按运行环境写成共享目录下的相对路径。
+- **官方登录混入 API Key 后无法发送**（#2646）：Codex 26.1016 起新增按模型单独限额的发送锁，官方额度用完后会静默中止提交。现在混入模式下会一并解锁当前模型的限额。
+- **Windows 上 Claude 增强版永远提示需要更新**（#2673）：Windows 的副本构建不改写 app.asar，回执里没有 Computer Use 记录，判断时却被当成「关闭」，开关一打开就会一直要求重建。现在只在支持该功能的平台上比较，Windows 上该开关置灰并说明原因。
+- **删除会话后停在旧对话、已删会话又出现**（#2671）：侧栏折叠时找不到可见的「新聊天」按钮就不再跳转；已删会话的隐藏规则按原始 id 精确匹配，重建后换了写法就漏掉。现在跳转有兜底，隐藏按会话 id 后缀匹配。
+
+### 新增
+
+- **切换供应商被实时配置拦下时可以继续**（#2666）：实时 config.toml 的地址与已保存供应商不一致时，不再只给一句报错，而是让你选择「导入为新供应商」或「放弃实时改动（先备份）」，然后继续切换。
+- **供应商详情显示 Key 首尾**（#2656）：每个 Key 输入框下方显示首尾各 6 位，多个 Key 时更容易区分；过短的 Key 不显示预览。
+
+## 1.11.1 - 2026-10-23
+
+本次为补丁更新，修复 Windows 上打开 Skills 页闪退的问题。
+
+### 修复
+
+- **Windows 打开 Skills 页闪退**（#2642、#2661）：Skills 页拉取技能仓库前会检测系统代理。没有配置 PAC（自动代理脚本）的 Windows 电脑读到的是空值，以前没有判空就直接读取，导致 Codex++ 整个进程崩溃（异常代码 0xc0000005）。该问题从 1.10.0 起存在，现在没有配置 PAC 时会直接跳过。
+- **供应商切换失败时看不到真正原因**（#2651）：切换失败的提示和诊断日志以前只显示最外层的「保存供应商设置失败」，现在会带上完整的错误原因，便于排查。
+
+## 1.11.0 - 2026-10-22
+
+本次更新带来 Claude 增强版的 Computer Use 开关、请求避震按 HTTP 状态码重试，以及随 Codex++ 常驻的本地协议代理；同时修复了 Claude 语音输入、Codex 26.10 的 Fast 按钮和长会话 413 等问题。
+
+### 新增
+
+- **Claude 增强版：Computer Use 开关**：Claude 增强页新增「Computer Use」开关（默认关闭）。打开后重新制作增强版，即可在副本里使用 Claude 的桌面控制，API Key（3p）模式同样可用。它会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，官方 Claude.app 不受影响；不打开时，副本的 app.asar 与官方完全一致。macOS 上增强版启动时会自检辅助功能和屏幕录制授权，缺少时弹窗引导去系统设置。
+- **Claude 增强版：制作进度**：制作增强版时按阶段显示进度条。
+- **请求避震支持按 HTTP 状态码重试**（#2653）：「请求避震」新增「重试的 HTTP 状态码」，可以自行添加 429、500/502/503/504 等。上游直接返回所选状态码时，本地代理按 Retry-After（优先）或退避间隔重发，与重试次数、总等待预算共用，用尽后把最后一次错误交给 Codex。默认不选任何状态码，升级后行为不变；「填入常用」可一键加入 429/500/502/503/504。
+- **本地协议代理常驻**：用到协议转换、聚合供应商或请求避震时，本地代理会跟着 Codex++ 一直运行，退出 Codex 后也不会关闭，只有退出 Codex++ 时才停止。所以从终端 CLI、IDE 插件等不经过 Codex++ 启动的 Codex 也能直接用本地代理。
+
+### 修复
+
+- **Claude 语音输入提示「语音服务未运行」**：Claude 的语音转写依赖 Codex++ 的本地服务，以前只有在通过 Codex++ 运行 Codex 时它才在线。现在只要 Claude 增强版开着语音输入，Codex++ 运行期间转写服务就一直可用，不需要同时开着 Codex。
+- **Claude 语音按钮消失**：增强版启动较快时，注入会在 Claude 尚未就绪时失败，语音按钮和界面汉化都不生效。现在会等 Claude 就绪后再完成设置。
+- **Claude 语音按钮位置错乱**：新版 Claude 在输入框为空时不显示发送键，语音按钮会掉到输入框左下角。现在始终固定在右下角发送键的左边。
+- **Claude 新版无法制作增强版**：官方 Claude 3.1623 起，Electron 框架里的 fuse 标记从一处变成两处，制作时会误报「格式已变化」。现在两处都会识别和改写。
+- **Codex 26.10 不显示 Fast 按钮**：Codex 26.1016 改了 Fast 的显示逻辑，导致 API 模式下开关已打开，Fast 按钮却不出现（#2645）。现在新旧版本 Codex 都能正常显示。
+- **长会话请求报 413**：本地代理的请求体上限默认从 32 MiB 提高到 128 MiB。1M 上下文的长会话请求体可能超过 32 MiB，之前会直接报 413 中断对话。上限可以在「代理设置 → 本地协议代理」里按 32~512 MiB 调整，保存后立即生效，不用重启。
+- **聚合模型分组错乱**：聚合供应商里的多个成员发布同名模型（如 `deepseek-v4-pro`）时，模型选择器以前会把它们都归到第一个同名成员下，导致同一家被拆成好几段、同名分组重复出现。现在按「模型名 + 供应商后缀」精确归组，空格和连字符写法不同也能正确匹配。
+- **Windows 上供应商同步整体失败**：同步时如果有会话文件正被占用，以前整次同步会失败。现在和原本的设计一致，跳过被占用的文件，其余照常同步。
+- **删除重试状态码时一次删掉两个**：macOS 上点状态码旁的删除按钮会连带删掉第一个，已修复。
+
+### 优化
+
+- Claude 增强页重新排版：状态、版本信息和操作按钮放在第一屏；「启动增强版」移到右上角，和 Codex 页的「启动 Codex」位置一致。
+- Claude 增强页首次进入时自动检测安装状态，Codex++ 运行期间只自动检测一次，之后需要时点「检测 Claude」刷新。
+- 增强版副本改名为 Claude Enhanced.app，旧副本会自动迁移。macOS 上改用本机自签证书签名，重新制作增强版后不会再丢失已授予的辅助功能和屏幕录制权限。
+
+### 注意
+
+- Claude 增强版的改动需要重新制作或重新启动增强版后才生效；Computer Use 开关改动后需要重新制作增强版。
+- 本地代理或 Claude 语音的转写服务常驻后，退出 Codex 时它们的端口仍会被 Codex++ 占用，这是正常的；完全退出 Codex++ 后端口才会释放。
+
 ## 1.10.1+64 - 2026-10-21
 
 - 合并上游 v1.10.1：请求避震、请求日志、会话管理、全局听写及桥接自动恢复。

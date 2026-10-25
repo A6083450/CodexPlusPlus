@@ -53,6 +53,14 @@ export const EN_PLAIN: Record<string, string> = {
   "今日不再提示": "Don't remind me today",
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
+  "Key 首尾预览": "Key preview (first and last characters)",
+  "暂仅支持 macOS：Windows 的副本构建流程不会改写 app.asar，打开这个开关不会有任何效果。": "macOS only for now: the Windows copy-build flow does not rewrite app.asar, so this switch has no effect there.",
+  "实时配置已被修改": "Live config was changed",
+  "当前生效的 config.toml / auth.json 里的供应商地址，和「{0}」保存的不一样。可能是其它工具改过，也可能是你手动改的，Codex++ 无法自动判断该保留哪一份。": "The provider URL in the live config.toml / auth.json differs from what \"{0}\" has saved. Another tool may have changed it, or you edited it by hand; Codex++ cannot tell which one to keep.",
+  "导入为新供应商：把当前生效的地址和 Key 保存成一个新供应商，「{0}」保持原样，然后继续切换。": "Import as new provider: save the live URL and key as a new provider, leave \"{0}\" unchanged, then continue switching.",
+  "放弃实时改动：先把当前生效的文件备份一份，「{0}」保持原样，然后继续切换。": "Discard live changes: back up the live files first, leave \"{0}\" unchanged, then continue switching.",
+  "导入为新供应商": "Import as new provider",
+  "放弃实时改动、继续切换": "Discard live changes and switch",
   "删除 Key": "Delete key",
   "添加 Key": "Add key",
   "本地服务器状态": "Local server status",
@@ -673,25 +681,24 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 图片覆盖层": "Codex image overlay",
   "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
   "请求避震": "Request shock absorption",
-  "代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理与工具调用阶段），尽量不把错误交给 Codex":
-    "Absorb upstream overload at the proxy: retry model capacity/overload errors (including reasoning and tool-call phases) so Codex rarely sees them",
+  "在本地代理内消化上游过载与限流，尽量不把错误交给 Codex": "Absorb upstream overloads and rate limits in the local proxy so Codex rarely sees them",
   "启用请求避震": "Enable request shock absorption",
-  "请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。":
-    "Request shock absorption only handles upstream overload/capacity errors that arrive inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy first buffers invisible phases such as reasoning and tool-call arguments; it waits until the whole tool call completes or the first visible output appears, then applies the first-token commit delay and retries overloads with backoff during that window. After commit, the same overloads are rewritten into capacity errors Codex recognizes so Codex retries them itself; connection failures, 429/5xx, rate limits, and other errors are not retried. The retained Streaming (legacy) mode keeps the old logic and hands the first output event to Codex immediately. In buffered mode the proxy retries overloads at any point, but streaming is lost.",
+  "仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及下方选择的 HTTP 状态码。": "Applies only to requests through the local protocol proxy: retries overload/capacity errors inside 200 streams, plus the HTTP status codes selected below.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
-  "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
-    "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
+  "之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。": "Later waits double, up to 30 seconds each; Retry-After takes precedence when present.",
+  "重试的 HTTP 状态码": "HTTP status codes to retry",
+  "点击移除": "Click to remove",
+  "输入状态码后回车": "Enter a status code and press Enter",
+  "输入状态码后回车，如 429": "Enter a status code and press Enter, e.g. 429",
+  "填入常用": "Add common codes",
+  "命中时退避重发，次数用尽后把错误交给 Codex。默认不选；常用 429（限流）和 5xx（服务端故障）。": "Matching responses are retried with backoff; once attempts run out, the error goes to Codex. None by default; common picks are 429 (rate limit) and 5xx (server errors).",
   "避震模式": "Shock absorption mode",
   "首字提交延迟（毫秒）": "First-token commit delay (ms)",
-  "流式避震：工具调用参数与首字宽限内由代理重试，提交后交给 Codex 原生重试":
-    "Streaming: retry inside the proxy for tool-call arguments and during the first-token grace window, then hand off to Codex after commit",
-  "流式避震（旧行为）：首个输出事件立即提交，之后交给 Codex 原生重试":
-    "Streaming (legacy): commit as soon as the first output event arrives, then let Codex retry natively",
-  "整段缓冲避震：任何时点过载都由代理重试（失去流式）":
-    "Buffered shock absorption: retry overload errors at any point inside the proxy (loses streaming)",
-  "流式避震保留实时输出；「首字提交延迟」把首段可见输出也算进可重试窗口：0 = 一出现正文就提交，1000 = 再缓冲 1 秒，期间过载仍由代理重试；工具调用的参数生成阶段始终整项缓冲，不额外增加首字延迟。选「旧行为」则不做这些缓冲，完全回到旧逻辑。整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。":
-    "Streaming keeps live output; the first-token commit delay also counts the first visible output toward the retry window: 0 commits as soon as text appears, 1000 buffers one more second while the proxy still retries overloads; tool-call argument generation is always buffered as a whole and adds no extra first-token delay. Choosing Streaming (legacy) skips this buffering and restores the old behavior. Buffered mode never hands overload errors to Codex, but the reply only appears after the whole response completes.",
+  "流式（推荐）": "Streaming (recommended)",
+  "流式（旧行为）": "Streaming (legacy)",
+  "整段缓冲": "Buffered",
+  "流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。": "Streaming keeps live output: the proxy retries overloads until text is committed, then hands off to Codex; the first-token commit delay is how long to keep buffering after text appears (0 commits immediately). Buffered: the proxy always retries, but the reply appears only after it completes.",
   "代理设置": "Proxy settings",
   "请求日志": "Request log",
   "进行中": "In progress",
@@ -742,8 +749,8 @@ export const EN_PLAIN: Record<string, string> = {
   "统一管理本地协议代理、供应商代理与重试策略":
     "Manage the local protocol proxy, provider proxies, and retry policy in one place",
   "本地协议代理": "Local protocol proxy",
-  "从 Codex++ 启动 Codex 时承载协议转换、聚合与自动重试":
-    "Handles protocol conversion, aggregation, and automatic retries when Codex is launched from Codex++",
+  "需要协议转换、聚合或请求避震时随 Codex++ 常驻；Codex 退出不影响，退出 Codex++ 才关闭":
+    "Stays resident with Codex++ while protocol conversion, aggregation, or request shock absorption is needed; quitting Codex does not stop it — only quitting Codex++ does",
   "协议转换": "Protocol conversion",
   "未启用": "Not enabled",
   "本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。":
@@ -1993,6 +2000,8 @@ export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^删除环境变量失败：(.+)$/, "Failed to delete environment variables: $1"],
   [/^保存配置文件失败：(.+)$/, "Failed to save config file: $1"],
   [/^供应商切换失败：(.+)$/, "Provider switch failed: $1"],
+  [/^已把实时配置导入为新供应商「(.+)」，并完成切换。$/, "Imported the live config as new provider \"$1\" and switched."],
+  [/^供应商已切换。实时配置的改动已放弃，原文件备份在：(.+)$/, "Provider switched. Live changes were discarded; the original files are backed up at: $1"],
   [/^写入诊断日志失败：(.+)$/, "Failed to write diagnostics log: $1"],
   [/^回填当前供应商配置失败：(.+)$/, "Failed to backfill current provider config: $1"],
   [/^读取MCP&插件列表失败：(.+)$/, "Failed to read MCP & plugins list: $1"],

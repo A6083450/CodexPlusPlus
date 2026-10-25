@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -48,8 +49,31 @@ def validate_archive(archive):
                     raise RuntimeError("Claude 更新归档包含越界符号链接")
 
 
-def check_copy(source, copy):
-    env = {**os.environ, "CODEX_PLUS_CLAUDE_SOURCE": str(source), "CODEX_PLUS_CLAUDE_COPY": str(copy)}
+def computer_use_for_update(value):
+    if "computerUse" in value:
+        enabled = value["computerUse"]
+    elif pathlib.Path(value["copy"]).joinpath("Contents/Resources/.cu-patched").is_file():
+        enabled = True
+    else:
+        receipt = HERE / "prepared.json"
+        enabled = json.loads(receipt.read_text()).get("computerUse", False) if receipt.is_file() else False
+    if not isinstance(enabled, bool):
+        raise RuntimeError("Claude 更新计划的 computerUse 必须是 boolean")
+    return enabled
+
+
+def build_copy(source, copy, computer_use):
+    env = {**os.environ, "CODEX_PLUS_CLAUDE_SOURCE": str(source), "CODEX_PLUS_CLAUDE_COPY": str(copy),
+           "CODEX_PLUS_CLAUDE_COMPUTER_USE": "1" if computer_use else "0"}
+    result = subprocess.run([sys.executable, str(HERE / "build-copy.py")], env=env,
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode:
+        raise RuntimeError(result.stderr[-2000:] or "新版本增强副本构建失败，旧版已保留")
+
+
+def check_copy(source, copy, computer_use):
+    env = {**os.environ, "CODEX_PLUS_CLAUDE_SOURCE": str(source), "CODEX_PLUS_CLAUDE_COPY": str(copy),
+           "CODEX_PLUS_CLAUDE_COMPUTER_USE": "1" if computer_use else "0"}
     result = subprocess.run([sys.executable, str(HERE / "build-copy.py"), "--check"],
                             env=env, capture_output=True, text=True, timeout=300)
     if result.returncode:
@@ -57,6 +81,7 @@ def check_copy(source, copy):
 
 
 def prepare(plan, value):
+    value["computerUse"] = computer_use_for_update(value)
     root = plan.parent
     archive = root / "update.zip"
     release = value["release"]
@@ -79,11 +104,7 @@ def prepare(plan, value):
     if not os.access(current_source.parent, os.W_OK):
         raise RuntimeError("没有官方 Claude 安装目录的写权限，请先通过官方版更新")
     staged = root / "Claude CN.app"
-    env = {**os.environ, "CODEX_PLUS_CLAUDE_SOURCE": str(source), "CODEX_PLUS_CLAUDE_COPY": str(staged)}
-    result = subprocess.run([sys.executable, str(HERE / "build-copy.py")], env=env,
-                            capture_output=True, text=True, timeout=300)
-    if result.returncode:
-        raise RuntimeError(result.stderr[-2000:] or "新版本增强副本构建失败，旧版已保留")
+    build_copy(source, staged, value["computerUse"])
     # 官方暂存目录位于目标旁边，保证最终替换只需原子 rename，即使 state 在另一个卷上。
     official_staged = current_source.with_name(".Claude-update-" + root.name + ".app")
     if official_staged.exists():
@@ -171,6 +192,7 @@ def wait_for_helpers():
 def install(plan, value):
     if not value.get("prepared") or not pathlib.Path(value["officialStaged"]).is_dir():
         raise RuntimeError("Claude 更新尚未通过完整校验")
+    value["computerUse"] = computer_use_for_update(value)
     print("ready", flush=True)
     wait_for_exit(value["parentPid"])
     wait_for_helpers()
@@ -180,17 +202,24 @@ def install(plan, value):
         raise RuntimeError("准备更新后 Claude 版本发生变化，请重新检查更新")
     official_staged = pathlib.Path(value["officialStaged"])
     validate_official(official_staged, value["release"]["version"])
-    check_copy(official_staged, root / "Claude CN.app")
+    staged = root / "Claude CN.app"
+    if staged.joinpath("Contents/Resources/.cu-patched").is_file() != value["computerUse"]:
+        # 旧计划可能已准备了不带 CU 的副本；另建暂存，保留原产物供恢复。
+        staged = root / ("Claude-rebuilt-" + uuid.uuid4().hex + ".app")
+        build_copy(official_staged, staged, value["computerUse"])
+    check_copy(official_staged, staged, value["computerUse"])
     replace_apps([(official_staged, source, source.with_name(".Claude-backup-" + root.name + ".app")),
-                  (root / "Claude CN.app", copy, root / "previous-copy.app")], root / "transaction.json")
+                  (staged, copy, root / "previous-copy.app")], root / "transaction.json")
     receipt = HERE / "prepared.json"
     receipt_temp = root / "prepared.json"
-    receipt_temp.write_text(json.dumps({"sourceBuild": info(source)["CFBundleVersion"]}))
+    receipt_temp.write_text(json.dumps({"sourceBuild": info(source)["CFBundleVersion"],
+                                       "computerUse": value["computerUse"]}))
     receipt_temp.replace(receipt)
     value["installed"] = True
     plan.write_text(json.dumps(value))
     env = {**os.environ, "CODEX_PLUS_CLAUDE_SOURCE": str(source), "CODEX_PLUS_CLAUDE_COPY": str(copy),
            "CODEX_PLUS_CLAUDE_PYTHON": sys.executable,
+           "CODEX_PLUS_CLAUDE_COMPUTER_USE": "1" if value["computerUse"] else "0",
            "CODEX_PLUS_CLAUDE_VOICE_INPUT": "1" if value["voiceInput"] else "0",
            "CODEX_PLUS_CLAUDE_LOCALIZATION": "1" if value["localization"] else "0"}
     result = subprocess.run([value["node"], str(HERE / "inject-cn.js"), "--locale", value["locale"]],
