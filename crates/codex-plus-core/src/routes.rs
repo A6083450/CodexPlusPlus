@@ -23,6 +23,8 @@ pub struct BridgeContext {
     settings: Arc<dyn BridgeSettingsService>,
     runtime: Arc<dyn BridgeRuntimeService>,
     data: Arc<dyn BridgeDataService>,
+    // 每次轮询都会克隆上下文，共享客户端以免反复读取系统证书。
+    proxy_status_client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
 }
 
 impl BridgeContext {
@@ -35,6 +37,7 @@ impl BridgeContext {
             settings,
             runtime,
             data,
+            proxy_status_client: Arc::new(tokio::sync::OnceCell::const_new()),
         }
     }
 
@@ -505,14 +508,25 @@ pub async fn handle_bridge_request(
         "/proxy-status" => {
             // 代理进程的实时请求状态只存在管理器内存里；桥接进程通过本地 helper
             // 的只读路由取一份快照，供 Codex 页面里的状态条轮询。
-            let client = reqwest::Client::new();
-            match client
-                .post("http://127.0.0.1:57321/proxy-status")
-                .json(&serde_json::json!({}))
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
+            let response = async {
+                let client = ctx
+                    .proxy_status_client
+                    .get_or_try_init(|| async {
+                        reqwest::Client::builder()
+                            .no_proxy()
+                            .pool_max_idle_per_host(0)
+                            .build()
+                    })
+                    .await?;
+                client
+                    .post("http://127.0.0.1:57321/proxy-status")
+                    .json(&serde_json::json!({}))
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+            }
+            .await;
+            match response {
                 Ok(response) => response
                     .json::<Value>()
                     .await
@@ -1449,6 +1463,39 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod proxy_status_route_tests {
+    use super::*;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn cloned_bridge_contexts_reuse_the_proxy_status_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy-status"))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"cachedClient": true})))
+            .mount(&server)
+            .await;
+        let ctx = BridgeContext::core(Arc::new(CoreRuntimeService::new(
+            0,
+            StatusStore::new(PathBuf::from("unused-test-status.json")),
+        )));
+        ctx.proxy_status_client
+            .set(reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(server.uri()).unwrap())
+                .build()
+                .unwrap())
+            .unwrap();
+        for _ in 0..2 {
+            let result = handle_bridge_request(ctx.clone(), "/proxy-status", json!({})).await;
+            assert_eq!(result["cachedClient"], true);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 }
 
 #[cfg(test)]
