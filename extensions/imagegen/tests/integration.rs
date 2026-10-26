@@ -41,3 +41,14 @@ fn imagegen_converts_native_image_ingress_before_caching() {
         .arg(root.join("ui/renderer-runtime.js")).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn imagegen_restores_followups_through_native_manager_rpc() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let extension = root.join("extensions/imagegen");
+    let output = std::process::Command::new("node")
+        .arg(extension.join("tests/native-manager-restore.cjs"))
+        .arg(extension.join("ui/renderer-runtime.js"))
+        .arg(&root).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}

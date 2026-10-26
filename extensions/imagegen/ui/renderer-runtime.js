@@ -58,26 +58,50 @@
     const jobs = window.__codexPlusImagePersistenceJobs;
     if (!id) return Promise.resolve(false);
     if (jobs.has(id)) return jobs.get(id);
-    const manager = collectCodexReactRuntimeCandidates().conversationManagers.find(m => m.requestClient?.hostId === "local");
-    if (!manager || typeof manager.streamState?.stopFollowingConversationState !== "function") return Promise.resolve(false);
-    // 内部保存不能触发原生 archive 通知的缓存驱逐，否则当前页面会跳到新会话。
-    for (const candidate of collectCodexReactRuntimeCandidates().conversationManagers) {
-      if (candidate.requestClient?.hostId !== "local") continue;
-      const context = candidate.notificationContext;
-      if (!context) return Promise.resolve(false);
-      for (const name of ["handleThreadArchived", "handleThreadUnarchived"]) {
-        const original = context[name];
-        if (typeof original !== "function") return Promise.resolve(false);
-        if (original.__codexPlusImagePersistenceGuard) continue;
-        const guarded = function(threadId, ...args) {
-          if (jobs.has(threadId)) return;
-          return original.call(this, threadId, ...args);
-        };
-        guarded.__codexPlusImagePersistenceGuard = true;
-        context[name] = guarded;
-      }
-    }
+    const candidates = collectCodexReactRuntimeCandidates();
+    const manager = candidates.conversationManagers.find(m => m.requestClient?.hostId === "local"
+      && typeof m.streamState?.stopFollowingConversationState === "function");
+    if (!manager && !refreshOnly) return Promise.resolve(false);
     const job = (async () => {
+      if (!manager) {
+        const module = await loadOptionalCodexAppModule("app-initial-");
+        const getter = Object.values(module || {}).find(value => typeof value === "function"
+          && value.toString().includes("AppServerManager RPC is unavailable for hostId:")
+          && /\.forHost\(/.test(value.toString()));
+        if (!getter || !candidates.appScope) return false;
+        const rpc = getter(candidates.appScope, "local");
+        if (await rpc.getHostId() !== "local") return false;
+        const { thread } = await rpc.sendRequest("thread/read", { threadId: id, includeTurns: false });
+        if (!["idle", "notLoaded"].includes(thread.status?.type)) return "busy";
+        const conversation = await rpc.getConversation(id);
+        if (!conversation) return false;
+        // 图片编辑器等页面只暴露 RPC；原生卸载接口会保留会话设置并清理流归属。
+        await rpc.unsubscribeInactiveConversation(id);
+        if ((await rpc.getConversation(id))?.resumeState !== "needs_resume") return false;
+        const resumed = await rpc.resumeConversation({ conversationId: id,
+          workspaceRoots: [conversation.cwd || thread.cwd], model: session.model || conversation.latestModel,
+          reasoningEffort: conversation.latestReasoningEffort ?? null });
+        if (resumed?.status !== "ready") return false;
+        const restored = await rpc.sendRequest("thread/read", { threadId: id, includeTurns: false });
+        return restored.thread.status?.type !== "notLoaded";
+      }
+      // 内部保存不能触发原生 archive 通知的缓存驱逐，否则当前页面会跳到新会话。
+      for (const candidate of candidates.conversationManagers) {
+        if (candidate.requestClient?.hostId !== "local") continue;
+        const context = candidate.notificationContext;
+        if (!context) return false;
+        for (const name of ["handleThreadArchived", "handleThreadUnarchived"]) {
+          const original = context[name];
+          if (typeof original !== "function") return false;
+          if (original.__codexPlusImagePersistenceGuard) continue;
+          const guarded = function(threadId, ...args) {
+            if (jobs.has(threadId)) return;
+            return original.call(this, threadId, ...args);
+          };
+          guarded.__codexPlusImagePersistenceGuard = true;
+          context[name] = guarded;
+        }
+      }
       const client = manager.requestClient;
       const { thread } = await client.sendRequest("thread/read", { threadId: id, includeTurns: false });
       if (!["idle", "notLoaded"].includes(thread.status?.type)) return "busy";

@@ -316,6 +316,7 @@
     const queryClients = [];
     const requestClients = [];
     const conversationManagers = [];
+    let appScope = null;
     const seenFibers = new Set();
     const pushQueryClient = (value) => {
       if (!value || typeof value.setQueriesData !== "function" || queryClients.includes(value)) return;
@@ -333,6 +334,8 @@
     };
     const inspect = (value) => {
       if (!value || typeof value !== "object") return;
+      if (!appScope) appScope = [value, value.current].find(scope => scope?.scope
+        && typeof scope.get === "function" && typeof scope.set === "function") || null;
       pushQueryClient(value);
       pushQueryClient(value.queryClient);
       pushRequestClient(value);
@@ -362,7 +365,7 @@
       if (fiber.child) queue.push(fiber.child);
       if (fiber.sibling) queue.push(fiber.sibling);
     }
-    return { queryClients, requestClients, conversationManagers, fiberCount: seenFibers.size };
+    return { queryClients, requestClients, conversationManagers, appScope, fiberCount: seenFibers.size };
   }
 
   async function loadAppServerRequestCandidates() {

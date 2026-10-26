@@ -469,7 +469,7 @@
   const codexThreadScrollKey = "codexThreadScroll";
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "35";
+  const codexAppServerModelRequestPatchVersion = "36";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -5130,6 +5130,7 @@
     const queryClients = [];
     const requestClients = [];
     const conversationManagers = [];
+    let appScope = null;
     const seenFibers = new Set();
     const pushQueryClient = (value) => {
       if (!value || typeof value.setQueriesData !== "function" || queryClients.includes(value)) return;
@@ -5147,6 +5148,8 @@
     };
     const inspect = (value) => {
       if (!value || typeof value !== "object") return;
+      if (!appScope) appScope = [value, value.current].find(scope => scope?.scope
+        && typeof scope.get === "function" && typeof scope.set === "function") || null;
       pushQueryClient(value);
       pushQueryClient(value.queryClient);
       pushRequestClient(value);
@@ -5176,7 +5179,7 @@
       if (fiber.child) queue.push(fiber.child);
       if (fiber.sibling) queue.push(fiber.sibling);
     }
-    return { queryClients, requestClients, conversationManagers, fiberCount: seenFibers.size };
+    return { queryClients, requestClients, conversationManagers, appScope, fiberCount: seenFibers.size };
   }
 
   async function loadAppServerRequestCandidates() {
