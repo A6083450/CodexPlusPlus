@@ -827,11 +827,12 @@ impl SQLiteStorageAdapter {
                 rollout_path,
                 rollout,
             }) => match read_rollout_usage_tail(&rollout, USAGE_TAIL_EVENT_LIMIT) {
-                Ok(events) => json!({
+                Ok((events, last_model)) => json!({
                     "status": "ok",
                     "session_id": thread_id,
                     "rollout_path": rollout_path,
                     "events": events,
+                    "last_model": last_model,
                 }),
                 Err(err) => with_events(json!({
                     "status": "failed",
@@ -1405,15 +1406,16 @@ const USAGE_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// 返回给渲染侧的 token_count 事件条数上限，够算速度与最近一轮用量即可。
 const USAGE_TAIL_EVENT_LIMIT: usize = 24;
 
-/// 只读 rollout 尾部，取出最近的 `token_count` 事件。
-fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<Value>> {
+/// 只读 rollout 尾部，取出最近的 `token_count` 事件及真实轮次模型。
+fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<(Vec<Value>, Option<String>)> {
     let file = File::open(rollout)?;
     let len = file.metadata()?.len();
     let mut window = USAGE_TAIL_INITIAL_BYTES;
     loop {
         let start = len.saturating_sub(window);
         let mut events = Vec::new();
-        read_rollout_usage_window(&file, start, limit, &mut events)?;
+        let mut last_model = None;
+        read_rollout_usage_window(&file, start, limit, &mut events, &mut last_model)?;
         // 至少两条事件渲染侧才算得出生成速度。还要找到真实轮边界：
         // total_token_usage 是会话累计，不能靠输出计数回落判断换轮。
         let latest_turn_known = events
@@ -1422,8 +1424,9 @@ fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<V
             .and_then(Value::as_str)
             .is_some();
         // 到顶或已经从头开始读时不再尝试，避免退化成整文件解析。
-        if events.len() >= 2 && latest_turn_known || start == 0 || window >= USAGE_TAIL_MAX_BYTES {
-            return Ok(events);
+        if events.len() >= 2 && latest_turn_known && last_model.is_some()
+            || start == 0 || window >= USAGE_TAIL_MAX_BYTES {
+            return Ok((events, last_model));
         }
         window = (window * 4).min(USAGE_TAIL_MAX_BYTES);
     }
@@ -1434,6 +1437,7 @@ fn read_rollout_usage_window(
     start: u64,
     limit: usize,
     out: &mut Vec<Value>,
+    last_model: &mut Option<String>,
 ) -> anyhow::Result<()> {
     let mut handle = file.try_clone()?;
     handle.seek(SeekFrom::Start(start))?;
@@ -1468,6 +1472,9 @@ fn read_rollout_usage_window(
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
         if kind == Some("turn_context") {
+            // 会话当前配置可被尚未发送的选择覆盖，恢复选择器只能用真实轮次记录。
+            *last_model = payload.get("model").and_then(Value::as_str)
+                .map(str::trim).filter(|model| !model.is_empty()).map(str::to_owned);
             // 老版本上下文没有 id 时，保留本轮 task_started 已经确认的归属。
             if let Some(id) = turn_id {
                 if current_turn_id.as_deref() != Some(id) {

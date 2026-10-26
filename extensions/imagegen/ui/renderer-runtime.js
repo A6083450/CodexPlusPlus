@@ -186,11 +186,6 @@
     if (manager.requestClient?.hostId !== "local") return;
     patchCodexNativeImagePreview(manager);
     const settings = manager.settings;
-    const id = typeof currentSessionRef === "function" && currentSessionRef()?.session_id;
-    const conversation = id && manager.getConversation?.(id);
-    if (conversation && codexImageGenerationRuntimeActive()) window.__codexPlusImageGenerationRuntime.threads.set(id, {
-      client: manager.requestClient, model: conversation.latestModel,
-    });
     if (typeof settings?.readDefaultFeatureOverrides !== "function"
         || settings.__codexPlusImageGenerationDefaults === "lifecycle-v1") return;
     const legacy = settings.__codexPlusImageGenerationDefaults === true;

@@ -82,7 +82,7 @@
     // persisted UUID without replacing the DOM node. Re-scan those rows so the
     // action button and its delete reference are rebuilt from the canonical ID.
     attributes: true,
-    attributeFilter: ["data-app-action-sidebar-thread-id", "href"],
+    attributeFilter: ["data-app-action-sidebar-thread-id", "href", "data-above-composer-conversation-id", "data-composer-placement"],
   });
   document.removeEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);
   window.__codexSessionActionTriggerHandler = rememberSessionActionTrigger;

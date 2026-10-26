@@ -41,6 +41,8 @@ vm.runInContext(source, context);
     'backend has not confirmed startup: native request must remain untouched');
   context.setCodexImageGenerationRuntimeActive(true);
   context.patchCodexImageGenerationManager(manager);
+  assert.equal(context.window.__codexPlusImageGenerationRuntime.threads.size, 0,
+    'a displayed image model is not evidence that the thread applied an image proxy');
   assert.equal(manager.settings.readDefaultFeatureOverrides().image_generation, false);
   const image = context.applyCodexImageGenerationRequestOverride('thread/start', params);
   assert.equal(image.config['features.image_generation'], false);

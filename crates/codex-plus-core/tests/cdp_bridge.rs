@@ -3348,7 +3348,7 @@ fn injection_script_guards_temporary_new_thread_ids_before_delete() {
     ));
     assert!(script.contains("const openDeleteConfirm = (event) => openDeleteConfirmForRow(row, deleteButton, sessionRefFromRow(row), event)"));
     assert!(script.contains("会话仍在同步，请稍后重试"));
-    assert!(script.contains("attributeFilter: [\"data-app-action-sidebar-thread-id\", \"href\"]"));
+    assert!(script.contains("attributeFilter: [\"data-app-action-sidebar-thread-id\", \"href\", \"data-above-composer-conversation-id\", \"data-composer-placement\"]"));
 
     let cases = run_session_ref_contract_harness();
     assert_eq!(
@@ -3670,7 +3670,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"32\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"33\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
 

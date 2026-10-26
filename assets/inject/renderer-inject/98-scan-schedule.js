@@ -32,6 +32,8 @@
       '[data-message-author-role]',
       '[data-testid="conversation-turn"]',
       '[data-model-picker-model-row]',
+      '[data-above-composer-conversation-id]',
+      '[data-codex-composer-root]',
       '[data-codex-intelligence-trigger="true"]',
       '[data-tab-id^="sidechat:"]',
       '[class*="user-message"]',

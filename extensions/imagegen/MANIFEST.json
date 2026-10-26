@@ -32,11 +32,11 @@
   "tests/generated_images.rs": "5c0bbb206195bda1731f64a26fd949ead8736cb40fb0cce7d8202e6d3ad26c3b",
   "tests/imagegen_skill.rs": "c7af2df50af5d12603daf948eca1daf167edbc44cfa18e17118af5af0dd67205",
   "tests/integration.rs": "915eafedc9c94397878d30bc03e442e830d57ff9041cbc40aba60e782178cfc1",
-  "tests/lifecycle.cjs": "31d8135ce3d3fa6ab584139c18ea140f14fe3c90012ccecfb98d4f7c16bdd0f2",
+  "tests/lifecycle.cjs": "d53ffc7cb50010c08d06359ec5d2cfb25864e68da203a600d4e3726c5fcd9e6b",
   "tests/native-preview.cjs": "bdd7a087fcb82e6a79805e45e023d24b865ce2df0c812d38524caf7caf8fb57b",
   "tests/protocol_tools.rs": "7ee13566fead4d8aa020f3d434ca0d598c11c67bd3863f1f35a1994b23f15a53",
   "tests/test_sync.py": "5a1a75d3fe3e21e0a8742a6c6cf745db6c84e5283c53611123e4dd33d73538bd",
   "tests/turn-preparation.cjs": "0c93409de516ce29cac76c28fca895e2a688a1a89b05ce9bd2e108477e7de451",
   "ui/generated-images-inject.js": "be021efda4f5882e680faed763e0e6ab5016d29cb327dfb25d966c6ad677daf9",
-  "ui/renderer-runtime.js": "72b1ab2b6835deaa2a44d4aa2dc0c45c1639841266981878222a313f73f2c960"
+  "ui/renderer-runtime.js": "048602a715618f1f54f0365af8565c5fc8f0a0cd1372ae8d2b013f6edb6e0938"
 }

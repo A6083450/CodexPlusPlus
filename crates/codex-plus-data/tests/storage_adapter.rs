@@ -1768,6 +1768,31 @@ fn live_usage_from_records(records: &[serde_json::Value]) -> serde_json::Value {
 }
 
 #[test]
+fn thread_usage_live_returns_the_last_executed_model_without_token_events() {
+    let value = live_usage_from_records(&[
+        json!({"type":"turn_context","payload":{"turn_id":"first","model":"gpt-image-2.5-flare"}}),
+        json!({"type":"turn_context","payload":{"turn_id":"last","model":"gpt-6.1-sol"}}),
+        json!({"type":"response_item","payload":{"model":"unrelated-tool-model"}}),
+    ]);
+    assert_eq!(value["last_model"], "gpt-6.1-sol");
+    assert_eq!(value["events"], json!([]));
+    let empty = live_usage_from_records(&[json!({"type":"session_meta","payload":{}})]);
+    assert!(empty["last_model"].is_null());
+}
+
+#[test]
+fn thread_usage_live_expands_tail_until_the_last_model_context_is_found() {
+    let value = live_usage_from_records(&[
+        json!({"type":"turn_context","payload":{"turn_id":"last","model":"gpt-6.1-sol"}}),
+        json!({"type":"response_item","payload":{"text":"x".repeat(600_000)}}),
+        live_usage_token_event(100, 1000, 100),
+        live_usage_token_event(200, 2000, 200),
+        json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"last"}}),
+    ]);
+    assert_eq!(value["last_model"], "gpt-6.1-sol");
+}
+
+#[test]
 fn thread_usage_live_marks_real_turns_with_monotonic_session_totals() {
     let value = live_usage_from_records(&[
         json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),
