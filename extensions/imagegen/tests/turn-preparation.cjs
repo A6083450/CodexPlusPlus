@@ -50,12 +50,32 @@ const client = { hostId: 'local', async sendRequest(method) {
   path = null; await prepare(); assert.equal(restores, 2, 'new thread has no rollout to unload');
   client.hostId = 'remote'; await prepare(); assert.equal(calls, 3);
   vm.runInContext(source.slice(source.indexOf('  function codexImageGenerationDisabled(')), context);
-  const params = { model: 'gpt-image-2.5-flare', config: { retained: true } };
-  const overridden = context.applyCodexImageGenerationRequestOverride('thread/start', params);
-  assert.equal(overridden.config['model_providers."custom".base_url'], 'http://127.0.0.1:57321/v1');
-  assert.equal(overridden.modelProvider, 'custom');
-  assert.equal(overridden.config.retained, true);
-  assert.equal(params.config['model_providers."custom".base_url'], undefined);
+  for (const provider of ['custom', 'relay.with."quotes"']) {
+    context.codexPlusBackendSettings.imageGenerationProxy.provider = provider;
+    const params = { model: 'gpt-image-2.5-flare', config: {
+      retained: true, features: { image_generation: true, retained: true },
+      model_providers: { [provider]: { name: 'Existing', base_url: 'https://original.invalid/v1',
+        wire_api: 'responses', http_headers: { 'X-Tenant': 'fixture' } }, other: { name: 'Other' } },
+    } };
+    const before = JSON.stringify(params);
+    for (const method of ['thread/start', 'thread/resume', 'thread/fork']) {
+      const overridden = context.applyCodexImageGenerationRequestOverride(method, params);
+      const actual = JSON.parse(JSON.stringify(overridden.config));
+      assert.equal(overridden.modelProvider, provider);
+      assert.deepEqual(actual.model_providers, { ...params.config.model_providers,
+        [provider]: { ...params.config.model_providers[provider],
+          base_url: 'http://127.0.0.1:57321/v1', supports_websockets: false },
+      });
+      assert.equal(Object.keys(actual).some(key => key.startsWith('model_providers.')), false,
+        'app-server dotted config keys do not parse TOML quotes');
+      assert.equal(actual.retained, true);
+      assert.deepEqual(actual.features, { image_generation: false, retained: true });
+      assert.equal(JSON.stringify(params), before, 'do not mutate caller config');
+    }
+  }
+  context.codexPlusBackendSettings.imageGenerationProxy.provider = 'custom';
+  const minimal = context.applyCodexImageGenerationRequestOverride('thread/start', { model: 'gpt-image-2.5-flare' });
+  assert.equal(minimal.config.model_providers.custom.base_url, 'http://127.0.0.1:57321/v1');
   assert.equal(context.applyCodexImageGenerationRequestOverride('thread/start', { model: 'gpt-6' }).config['features.image_generation'], false);
   client.hostId = 'local'; path = '/rollout.jsonl'; succeed = true;
   expectedModel = 'gpt-6';

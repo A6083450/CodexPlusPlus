@@ -213,8 +213,11 @@
     if (!proxy && !codexImageGenerationDisabled()) return params;
     const config = { ...params?.config, "features.image_generation": false };
     if (proxy) {
-      config[`model_providers.${JSON.stringify(proxy.provider)}.base_url`] = proxy.baseUrl;
-      config[`model_providers.${JSON.stringify(proxy.provider)}.supports_websockets`] = false;
+      // app-server 的点分键不解析 TOML 引号，嵌套对象才能保留供应商名称原文。
+      config.model_providers = { ...config.model_providers, [proxy.provider]: {
+        ...config.model_providers?.[proxy.provider],
+        base_url: proxy.baseUrl, supports_websockets: false,
+      } };
     }
     if (config.features && typeof config.features === "object" && !Array.isArray(config.features)) {
       config.features = { ...config.features, image_generation: false };
