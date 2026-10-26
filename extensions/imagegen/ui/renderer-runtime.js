@@ -184,6 +184,7 @@
 
   function patchCodexImageGenerationManager(manager) {
     if (manager.requestClient?.hostId !== "local") return;
+    patchCodexNativeImagePreview(manager);
     const settings = manager.settings;
     const id = typeof currentSessionRef === "function" && currentSessionRef()?.session_id;
     const conversation = id && manager.getConversation?.(id);
@@ -206,6 +207,51 @@
         ? { ...defaults, image_generation: codexPlusBackendSettings.nativeImageGenerationEnabled } : defaults;
     };
     settings.__codexPlusImageGenerationDefaults = "lifecycle-v1";
+  }
+
+  function codexNativeImagePreviewItems(items) {
+    let changed = false;
+    const next = (items || []).flatMap(item => {
+      if (item?.type !== "agentMessage" || !/^msg_cpp_images_(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(item.id || "")) return [item];
+      const paths = String(item.text || "").split("\n\n").map(line =>
+        /^!\[已生成图像\]\(<((?:\/|[A-Za-z]:[\\/])[^<>\r\n]*[\\/]generated_images[\\/]response-assets[\\/][A-Za-z0-9_-]+\.(?:png|jpg|webp))>\)$/.exec(line)?.[1]);
+      if (paths.some(path => !path || path.split(/[\\/]/).includes(".."))) return [item];
+      changed = true;
+      return paths.flatMap((path, index) => {
+        const id = index === 0 ? item.id : `${item.id}_${index}`;
+        // 分页恢复可能保留派生图片，同时把首项恢复成磁盘中的 Markdown 消息。
+        if (index > 0 && items.some(existing => existing?.type === "imageGeneration"
+            && existing.id === id && existing.savedPath === path)) return [];
+        return { type: "imageGeneration", id, status: "completed",
+          result: path, savedPath: path, src: path, revisedPrompt: null, inputImages: [] };
+      });
+    });
+    return changed ? next : null;
+  }
+
+  function patchCodexNativeImagePreview(manager) {
+    if (typeof manager.addAnyConversationCallback !== "function") return;
+    if (manager.__codexPlusNativeImagePreviewPatch !== codexAppServerModelRequestPatchVersion) {
+      manager.__codexPlusNativeImagePreviewObserver?.();
+      const turns = state => [...(state?.turns || []), ...Object.values(state?.turnHistory?.history?.entitiesByKey || {})];
+      const refresh = value => {
+        const id = typeof value === "string" ? value : currentSessionRef()?.session_id;
+        if (!codexImageGenerationRuntimeActive() || typeof id !== "string") return;
+        if (!turns(manager.getConversation(id)).some(turn => turn.status === "completed" && codexNativeImagePreviewItems(turn.items))) return;
+        // 仅投影已完成轮次，保留流式消息目标及磁盘历史，由原生图库处理预览和编辑。
+        manager.updateConversationState(id, state => {
+          for (const turn of turns(state)) {
+            const items = turn.status === "completed" && codexNativeImagePreviewItems(turn.items);
+            if (items) turn.items = items;
+          }
+        }, false);
+      };
+      manager.__codexPlusNativeImagePreviewObserver = manager.addAnyConversationCallback(refresh);
+      manager.__codexPlusNativeImagePreviewRefresh = refresh;
+      manager.__codexPlusNativeImagePreviewPatch = codexAppServerModelRequestPatchVersion;
+    }
+    const id = typeof currentSessionRef === "function" && currentSessionRef()?.session_id;
+    if (id) manager.__codexPlusNativeImagePreviewRefresh(id);
   }
 
   function codexImageGenerationDisabled() {
