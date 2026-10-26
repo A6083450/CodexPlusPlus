@@ -130,8 +130,10 @@
     const runtime = window.__codexPlusImageGenerationRuntime;
     if (!runtime) return;
     const imageModel = model.toLowerCase().startsWith("gpt-image-");
+    const previousClient = runtime.threads.get(threadId)?.client;
+    // 旧注入的模型名可能来自界面；只有请求实际应用过代理才需要恢复。
     const hadImageOverride = client.__codexPlusImageGenerationProxyThreads?.has(threadId)
-      || String(runtime.threads.get(threadId)?.model || "").toLowerCase().startsWith("gpt-image-");
+      || previousClient?.__codexPlusImageGenerationProxyThreads?.has(threadId);
     // 普通文字发送不依赖生图恢复；真正用过生图覆盖的会话仍必须先恢复。
     if (!imageModel && !hadImageOverride) return;
     if (codexImageGenerationRuntimeActive()) {
@@ -145,6 +147,7 @@
         const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId, model }, true);
         if (restored !== true) throw new Error("原生生图配置尚未恢复，请等待当前会话空闲后重试");
         runtime.threads.delete(threadId);
+        previousClient?.__codexPlusImageGenerationProxyThreads?.delete(threadId);
         client.__codexPlusImageGenerationProxyThreads?.delete(threadId);
         client.__codexPlusImageGenerationReady?.clear();
       }
@@ -172,6 +175,7 @@
     await window.__codexPlusImagePersistenceJobs.get(threadId);
     const restored = await window.__codexPlusPersistGeneratedImages({ session_id: threadId, model }, true);
     if (restored !== true) throw new Error("生图会话配置未恢复，请稍后重试");
+    previousClient?.__codexPlusImageGenerationProxyThreads?.delete(threadId);
     ready.add(readyKey);
     runtime.threads.set(threadId, { client, model });
     if (wantsProxy) proxyThreads.add(threadId);

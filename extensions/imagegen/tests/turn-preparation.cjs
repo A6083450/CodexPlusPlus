@@ -33,7 +33,8 @@ const client = { hostId: 'local', async sendRequest(method) {
   const runtime = context.window.__codexPlusImageGenerationRuntime;
   for (const active of [true, false]) {
     runtime.active = active;
-    runtime.threads.set('text', { client: textClient, model: 'gpt-6.1-sol' });
+    // 旧注入会把界面临时显示的图片模型留在 runtime，不能当作已应用代理的证据。
+    runtime.threads.set('text', { client: textClient, model: 'gpt-image-2.5-flare' });
     await context.prepareCodexImageGenerationTurn(textClient, 'turn/start', {
       threadId: 'text', model: 'gpt-6.1-sol',
     });
@@ -101,8 +102,22 @@ const client = { hostId: 'local', async sendRequest(method) {
   await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });
   assert.equal(restores, 6, 'an image start must be restored even before its first image turn');
   assert.equal(client.__codexPlusImageGenerationProxyThreads.has('old'), false);
-  runtime.threads.set('old', { client, model: 'gpt-image-2.5-flare' });
+  const previousClient = { hostId: 'local', __codexPlusImageGenerationProxyThreads: new Set(['old']) };
+  runtime.threads.set('old', { client: previousClient, model: 'gpt-image-2.5-flare' });
   await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });
-  assert.equal(restores, 7, 'legacy image records must restore after the image proxy is disabled');
+  assert.equal(restores, 7, 'a proxy applied by an older client must still restore after the image proxy is disabled');
   assert.equal(client.__codexPlusImageGenerationProxyThreads.has('old'), false);
+  assert.equal(previousClient.__codexPlusImageGenerationProxyThreads.has('old'), false,
+    'restoration must clear the older client marker before it can be reused');
+  runtime.active = false;
+  previousClient.__codexPlusImageGenerationProxyThreads.add('old');
+  runtime.threads.set('old', { client: previousClient, model: 'gpt-image-2.5-flare' });
+  succeed = false;
+  await assert.rejects(context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel }));
+  assert.equal(previousClient.__codexPlusImageGenerationProxyThreads.has('old'), true,
+    'failed restoration must retain the real proxy marker');
+  succeed = true;
+  await context.prepareCodexImageGenerationTurn(client, 'turn/start', { threadId: 'old', model: expectedModel });
+  assert.equal(previousClient.__codexPlusImageGenerationProxyThreads.has('old'), false);
+  assert.equal(runtime.threads.has('old'), false, 'a stopped backend must also clear restored proxy ownership');
 })().catch(error => { console.error(error); process.exitCode = 1; });

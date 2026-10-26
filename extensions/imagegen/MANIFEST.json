@@ -36,7 +36,7 @@
   "tests/native-preview.cjs": "bdd7a087fcb82e6a79805e45e023d24b865ce2df0c812d38524caf7caf8fb57b",
   "tests/protocol_tools.rs": "7ee13566fead4d8aa020f3d434ca0d598c11c67bd3863f1f35a1994b23f15a53",
   "tests/test_sync.py": "5a1a75d3fe3e21e0a8742a6c6cf745db6c84e5283c53611123e4dd33d73538bd",
-  "tests/turn-preparation.cjs": "0c93409de516ce29cac76c28fca895e2a688a1a89b05ce9bd2e108477e7de451",
+  "tests/turn-preparation.cjs": "61a931693d95c29d78648dc6a9a1abf2bd16af4f6eb3d89c0fc8cc8ac8f331f4",
   "ui/generated-images-inject.js": "be021efda4f5882e680faed763e0e6ab5016d29cb327dfb25d966c6ad677daf9",
-  "ui/renderer-runtime.js": "048602a715618f1f54f0365af8565c5fc8f0a0cd1372ae8d2b013f6edb6e0938"
+  "ui/renderer-runtime.js": "72852d55d0d1b12327d2d91f8ce31c194d8ed23e4b1f8dbde40953a1c36a833b"
 }
