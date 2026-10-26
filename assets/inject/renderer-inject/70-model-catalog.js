@@ -991,7 +991,8 @@
       const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest,
         String(method || ""), nextParams, options, modelContextRefresh);
       if (managedTurn) return managedTurn.result;
-      const result = await originalSendRequest(method, nextParams, options);
+      const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
+        () => originalSendRequest(method, nextParams, options));
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
@@ -1013,6 +1014,11 @@
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
+  }
+
+  function sendAppServerRequestWithSideChat(client, method, params, send) {
+    return typeof sendCodexSideChatNativeRequest === "function"
+      ? sendCodexSideChatNativeRequest(client, method, params, send) : send();
   }
 
   // issue #2177：Codex 26.908 把 AppServerRequestClient 类藏进模块闭包且不再导出，
@@ -1137,7 +1143,7 @@
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
       || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
-      || codexPlusSettings().sessionDelete;
+      || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
@@ -1204,7 +1210,8 @@
       const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest.bind(client),
         String(method || ""), nextParams, options, modelContextRefresh);
       if (managedTurn) return managedTurn.result;
-      const result = await originalSendRequest.call(client, method, nextParams, options);
+      const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
+        () => originalSendRequest.call(client, method, nextParams, options));
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
@@ -1352,7 +1359,7 @@
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
         || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
-          || codexPlusSettings().sessionDelete) {
+          || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
       collectCodexReactRuntimeCandidates().conversationManagers.forEach((manager) => {

@@ -21,7 +21,8 @@
 //!
 //! 其它平台没有这个概念，退回普通 `Command`。
 
-use std::ffi::OsStr;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -94,9 +95,37 @@ pub fn spawn(
     args: &[&OsStr],
     envs: &[(String, String)],
 ) -> anyhow::Result<DisclaimedChild> {
+    let mut merged: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    for (key, value) in envs {
+        merged.insert(key.into(), value.into());
+    }
+    spawn_with_env(program, args, merged)
+}
+
+/// 拉起 `program args…`，环境**只有** `envs`，不继承当前进程的任何变量。
+///
+/// 给第三方程序用：调用方（例如 Claude Code）的环境里可能有 API Key 之类的东西，
+/// 对方用不到就不该拿到。
+pub fn spawn_clean(
+    program: &Path,
+    args: &[&OsStr],
+    envs: &[(String, String)],
+) -> anyhow::Result<DisclaimedChild> {
+    let env = envs
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect();
+    spawn_with_env(program, args, env)
+}
+
+fn spawn_with_env(
+    program: &Path,
+    args: &[&OsStr],
+    env: BTreeMap<OsString, OsString>,
+) -> anyhow::Result<DisclaimedChild> {
     #[cfg(target_os = "macos")]
     {
-        macos::spawn(program, args, envs)
+        macos::spawn(program, args, &env)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -105,7 +134,8 @@ pub fn spawn(
         let mut command = Command::new(program);
         command
             .args(args)
-            .envs(envs.iter().map(|(key, value)| (key, value)))
+            .env_clear()
+            .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -130,7 +160,7 @@ pub fn spawn(
 #[cfg(target_os = "macos")]
 mod macos {
     use std::collections::BTreeMap;
-    use std::ffi::{CString, OsStr, c_char, c_int, c_short, c_void};
+    use std::ffi::{CString, OsStr, OsString, c_char, c_int, c_short, c_void};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
@@ -181,10 +211,11 @@ mod macos {
         CString::new(value.as_bytes()).context("参数里含有 NUL 字节")
     }
 
+    /// `env` 是子进程的完整环境，这里不再合并当前进程的变量。
     pub(super) fn spawn(
         program: &Path,
         args: &[&OsStr],
-        envs: &[(String, String)],
+        env: &BTreeMap<OsString, OsString>,
     ) -> anyhow::Result<DisclaimedChild> {
         let (stdin_read, stdin_write) = std::io::pipe().context("无法创建标准输入管道")?;
         let (stdout_read, stdout_write) = std::io::pipe().context("无法创建标准输出管道")?;
@@ -197,14 +228,8 @@ mod macos {
         let mut argv: Vec<*const c_char> = argv_owned.iter().map(|value| value.as_ptr()).collect();
         argv.push(std::ptr::null());
 
-        // 继承当前环境，再按 `envs` 覆盖。
-        let mut merged: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
-            std::env::vars_os().collect();
-        for (key, value) in envs {
-            merged.insert(key.into(), value.into());
-        }
-        let mut env_owned = Vec::with_capacity(merged.len());
-        for (key, value) in &merged {
+        let mut env_owned = Vec::with_capacity(env.len());
+        for (key, value) in env {
             let mut pair = key.as_bytes().to_vec();
             pair.push(b'=');
             pair.extend_from_slice(value.as_bytes());
@@ -290,6 +315,25 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line.trim(), "hello:ok");
+        child.wait();
+    }
+
+    #[test]
+    fn clean_spawn_passes_only_the_given_env() {
+        // 当前进程一定有 HOME；clean 模式下子进程不该看到它。
+        assert!(std::env::var_os("HOME").is_some());
+        let mut child = spawn_clean(
+            Path::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new("echo \"${HOME:-none}:$CODEX_PLUS_PROBE\"")],
+            &[("CODEX_PLUS_PROBE".to_string(), "ok".to_string())],
+        )
+        .unwrap();
+        drop(child.stdin.take());
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "none:ok");
         child.wait();
     }
 

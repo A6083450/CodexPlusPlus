@@ -33,33 +33,172 @@ use serde_json::{Value, json};
 
 use crate::computer_use::{RuntimeLocation, locate_runtime};
 use crate::computer_use_approval::{ApprovalMode, ApprovalStore, Outcome, subject_of};
+use crate::computer_use_js::{ChildFrame, ClientFrame, JsBridge};
 
 /// 审批转给客户端后等多久。超过就回 `cancel`，不让会话永久挂住。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 单帧上限，与原生 CU 的 8 MiB 对齐。
+/// 单帧上限，与原生 CU 的 8 MiB 对齐。超过的帧不转发，改回一个错误（见 [`Oversized`]）。
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// 超长 JSON-RPC 错误码：服务端内部错误。
+const OVERSIZED_ERROR_CODE: i64 = -32603;
 
 enum Event {
     /// 客户端发来的原始帧（含结尾换行）。
     Client(Vec<u8>),
     /// 子进程发来的原始帧（含结尾换行）。
     Child(Vec<u8>),
+    /// 客户端发来的帧超过上限，已丢弃。
+    ClientOversized(Oversized),
+    /// 子进程发来的帧超过上限，已丢弃。
+    ChildOversized(Oversized),
+    ClientClosed,
     ChildClosed,
+    /// Claude Code 的 Stop 钩子：一个回合结束了（只在 JS 档使用）。
+    TurnEnd,
+}
+
+/// 给客户端的操作方式，见 `settings.computer_use_mode`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuMode {
+    /// 原生 CU 的 10 个离散工具（直通 `SkyComputerUseClient mcp`）。
+    Tools,
+    /// `cua_repl` 的 `js` 工具，和 Codex 当前主要的 CU 路径一致。
+    Js,
+}
+
+impl CuMode {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "tools" => Self::Tools,
+            // 未知取值按默认（JS）处理：settings.json 里可能有旧版本或手写的值。
+            _ => Self::Js,
+        }
+    }
+
+    /// 从设置文件现读。读失败按默认处理。
+    pub fn current() -> Self {
+        let value = crate::settings::SettingsStore::default()
+            .load()
+            .map(|settings| settings.computer_use_mode)
+            .unwrap_or_default();
+        Self::parse(&value)
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Js => "js",
+        }
+    }
+}
+
+/// 一条被丢弃的超长帧：只留下回错误所需的信息。
+#[derive(Debug, Clone, PartialEq)]
+struct Oversized {
+    len: usize,
+    id: Option<Value>,
+    method: Option<String>,
+}
+
+impl Oversized {
+    /// 从完整帧里只取 `id` 和 `method`。其余字段用 `IgnoredAny` 跳过，不会为截图分配内存；
+    /// 帧不是合法 JSON 时两者都为空。
+    fn of(frame: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            #[serde(default)]
+            id: Option<Value>,
+            #[serde(default)]
+            method: Option<String>,
+        }
+        let envelope = serde_json::from_slice::<Envelope>(frame).ok();
+        Self {
+            len: frame.len(),
+            id: envelope.as_ref().and_then(|envelope| envelope.id.clone()).filter(|id| !id.is_null()),
+            method: envelope.and_then(|envelope| envelope.method),
+        }
+    }
+
+    /// 回给发送方的错误：只有带 id 的**请求**才需要答复（响应和通知不能回）。
+    fn error_reply(&self, origin: &str) -> Option<Vec<u8>> {
+        let id = self.id.as_ref()?;
+        self.method.as_ref()?;
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": OVERSIZED_ERROR_CODE,
+                "message": format!(
+                    "{origin}超过 {} MiB 上限（{:.1} MiB），已丢弃，会话不受影响。",
+                    MAX_FRAME / 1024 / 1024,
+                    self.len as f64 / 1024.0 / 1024.0
+                ),
+            }
+        });
+        let mut line = serde_json::to_vec(&reply).ok()?;
+        line.push(b'\n');
+        Some(line)
+    }
+
+    /// 子进程超长帧回给客户端的错误：它是对客户端某个请求的**响应**，按那个 id 回。
+    fn error_for_client(&self) -> Option<Vec<u8>> {
+        let id = self.id.as_ref()?;
+        if self.method.is_some() {
+            return None;
+        }
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": OVERSIZED_ERROR_CODE,
+                "message": format!(
+                    "Computer Use 返回内容超过 {} MiB 上限（{:.1} MiB），已丢弃，会话不受影响。\
+                     可以缩小窗口或换个方式重试。",
+                    MAX_FRAME / 1024 / 1024,
+                    self.len as f64 / 1024.0 / 1024.0
+                ),
+            }
+        });
+        let mut line = serde_json::to_vec(&reply).ok()?;
+        line.push(b'\n');
+        Some(line)
+    }
+}
+
+/// 读一帧的结果。
+#[derive(Debug, PartialEq)]
+enum Frame {
+    /// 完整的一帧（含结尾换行）。
+    Line(Vec<u8>),
+    /// 超过上限的一帧，已丢弃。和 EOF 分开：早先两者共用返回值 0，
+    /// 一条超长消息就被当成断开，整个 CU 会话随之结束。
+    Oversized(Oversized),
+    Eof,
 }
 
 /// 以 stdio MCP server 的身份运行，直到客户端断开。
 pub fn serve() -> anyhow::Result<()> {
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），Computer Use 不可用")?;
-    let shim = crate::computer_use::ensure_shim()?;
-    let mut child = spawn_child(&runtime, &shim)?;
+    let cu_mode = CuMode::current();
+    let mut child = match cu_mode {
+        CuMode::Tools => spawn_child(&runtime, &crate::computer_use::ensure_shim()?)?,
+        CuMode::Js => spawn_js_child(&runtime)?,
+    };
     let child_stdin = child.stdin.take().context("CU 子进程的标准输入不可用")?;
     let child_stdout = child.stdout.take().context("CU 子进程的标准输出不可用")?;
 
     let (sender, receiver) = mpsc::channel::<Event>();
     spawn_client_reader(sender.clone());
     spawn_child_reader(child_stdout, sender.clone());
+    if cu_mode == CuMode::Js {
+        let turn_sender = sender.clone();
+        crate::claude_hooks::spawn_turn_watcher(move || {
+            let _ = turn_sender.send(Event::TurnEnd);
+        });
+    }
     drop(sender);
 
     let mut forwarder = Forwarder {
@@ -70,8 +209,19 @@ pub fn serve() -> anyhow::Result<()> {
         pending: HashMap::new(),
         session_allowed: BTreeSet::new(),
         next_token: 0,
+        js: (cu_mode == CuMode::Js)
+            .then(|| JsBridge::new(uuid::Uuid::new_v4().to_string())),
+        last_activity: None,
+        tools_init_id: None,
+        // JS 档由 cua_repl 自己下发说明与确认规则；离散工具档由这里补。
+        policy: (cu_mode == CuMode::Tools)
+            .then(|| crate::computer_use_tools::read_confirmations(&runtime.node_module_dirs))
+            .flatten(),
+        policy_call_ids: BTreeSet::new(),
     };
     let outcome = forwarder.run(receiver);
+    // 会话结束：让管理器收起这个会话的悬浮预览。
+    crate::cu_activity::record("end", 0, "", "");
     child.kill();
     child.wait();
     outcome
@@ -79,7 +229,8 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// 拉起 OpenAI 签名的 node 执行 shim，由 shim 直接 spawn 原生 CU server。
 ///
-/// 两条约束：
+/// 三条约束：
+/// - 环境只给原生 server 需要的那几项，不继承调用方的（Claude 的环境里有用户的 Key）。
 /// - 中间不经过 shell：服务端校验**直接父进程**的签名，多插一层就会失效。
 /// - 必须放弃责任归属（disclaim），让 node 成为自己的 responsible process。否则
 ///   Codex++ 被 Claude 的 `disclaimer` 或管理器 GUI 拉起时，责任进程是 ad-hoc 签名的
@@ -88,11 +239,30 @@ fn spawn_child(
     runtime: &RuntimeLocation,
     shim: &std::path::Path,
 ) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    // 不继承调用方环境：见 `native_client_env` 的说明。
     let mut envs: Vec<(String, String)> = runtime.native_client_env().into_iter().collect();
     envs.push(("CODEX_PLUS_CU_CLIENT".into(), runtime.client.clone()));
-    crate::disclaimed_spawn::spawn(
+    crate::disclaimed_spawn::spawn_clean(
         std::path::Path::new(&runtime.node),
         &[OsStr::new(shim)],
+        &envs,
+    )
+}
+
+/// JS 档：拉起 `cua_repl`（OpenAI 签名的 node 直接执行，和 Codex 的插件配置一致）。
+///
+/// 和直通档一样放弃责任归属、不继承调用方环境；环境见 `RuntimeLocation::js_env`。
+fn spawn_js_child(
+    runtime: &RuntimeLocation,
+) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    anyhow::ensure!(
+        std::path::Path::new(&runtime.cua_repl).is_file(),
+        "当前 ChatGPT.app 没有 cua-repl，JS 操作方式不可用；请在 Computer Use 页改回「离散工具」"
+    );
+    let envs: Vec<(String, String)> = runtime.js_env().into_iter().collect();
+    crate::disclaimed_spawn::spawn_clean(
+        std::path::Path::new(&runtime.node),
+        &[OsStr::new(&runtime.cua_repl)],
         &envs,
     )
 }
@@ -101,51 +271,53 @@ fn spawn_client_reader(sender: Sender<Event>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = BufReader::new(stdin.lock());
-        loop {
-            let mut frame = Vec::new();
-            match read_frame(&mut reader, &mut frame) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if sender.send(Event::Client(frame)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        pump(&mut reader, &sender, Event::Client, Event::ClientOversized);
+        // 客户端断开要通知主循环：只靠 channel 断开不够，子进程那一侧的 sender 还活着。
+        let _ = sender.send(Event::ClientClosed);
     });
 }
 
 fn spawn_child_reader(stdout: Box<dyn Read + Send>, sender: Sender<Event>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        loop {
-            let mut frame = Vec::new();
-            match read_frame(&mut reader, &mut frame) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if sender.send(Event::Child(frame)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        pump(&mut reader, &sender, Event::Child, Event::ChildOversized);
         let _ = sender.send(Event::ChildClosed);
     });
 }
 
-/// 读一整帧（含结尾换行）。返回读到的字节数，0 表示 EOF。
+/// 逐帧读到 EOF 或出错为止；超长帧照常上报，不中断读取。
+fn pump(
+    reader: &mut impl BufRead,
+    sender: &Sender<Event>,
+    line: fn(Vec<u8>) -> Event,
+    oversized: fn(Oversized) -> Event,
+) {
+    loop {
+        let event = match read_frame(reader) {
+            Ok(Frame::Line(frame)) => line(frame),
+            Ok(Frame::Oversized(info)) => oversized(info),
+            Ok(Frame::Eof) | Err(_) => break,
+        };
+        if sender.send(event).is_err() {
+            break;
+        }
+    }
+}
+
+/// 读一整帧（含结尾换行）。
 ///
 /// 用 `read_until` 而不是 `lines()`：后者做 UTF-8 校验并吃掉换行，
 /// 而直通层的目标是**字节不变**。
-fn read_frame(reader: &mut impl BufRead, frame: &mut Vec<u8>) -> std::io::Result<usize> {
-    let read = reader.read_until(b'\n', frame)?;
-    if read > MAX_FRAME {
-        frame.clear();
-        return Ok(0);
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Frame> {
+    let mut frame = Vec::new();
+    let read = reader.read_until(b'\n', &mut frame)?;
+    if read == 0 {
+        return Ok(Frame::Eof);
     }
-    Ok(read)
+    if read > MAX_FRAME {
+        return Ok(Frame::Oversized(Oversized::of(&frame)));
+    }
+    Ok(Frame::Line(frame))
 }
 
 /// 已转给客户端、正在等答复的审批。
@@ -165,8 +337,8 @@ struct Forwarder {
     /// 客户端自己是否声明了 elicitation。
     ///
     /// `None` = 还没握手。这个值决定 `claude` 模式能不能真的转发：
-    /// Claude Code 2.x 不声明（转发出去没人渲染，只会等到超时），
-    /// 3.x 之后声明与否要以实际握手为准，不能按版本号猜。
+    /// 没声明表单式 elicitation 的客户端，转发出去没人渲染，只会等到超时。
+    /// 一律以实际握手为准，不能按客户端名或版本号猜。
     client_supports_elicitation: Option<bool>,
     mode: ApprovalMode,
     /// 我们发给客户端的审批请求 id（字符串，避免与两端数字 id 撞号）→ 待办。
@@ -174,6 +346,16 @@ struct Forwarder {
     /// 本进程内已放行的 app（`session` 语义，不落盘）。
     session_allowed: BTreeSet<String>,
     next_token: u64,
+    /// JS 档的回合与工具面状态；直通档为 `None`，帧原样转发。
+    js: Option<JsBridge>,
+    /// 最近一次记下的被操作应用（bundle id 或应用名）与时间：同一个应用 1 秒内不重复写。
+    last_activity: Option<(String, Instant)>,
+    /// 离散工具档：客户端 `initialize` 的 id，响应里要补使用说明。
+    tools_init_id: Option<String>,
+    /// 离散工具档：还没附上的确认规则（附在本会话第一次成功的工具结果后面）。
+    policy: Option<String>,
+    /// 等着附确认规则的 `tools/call` 请求 id。
+    policy_call_ids: BTreeSet<String>,
 }
 
 impl Forwarder {
@@ -188,9 +370,22 @@ impl Forwarder {
                     }
                 }
                 Ok(Event::Child(frame)) => self.on_child(frame)?,
+                Ok(Event::ChildOversized(info)) => self.on_child_oversized(&info)?,
+                Ok(Event::ClientOversized(info)) => self.on_client_oversized(&info)?,
+                Ok(Event::ClientClosed) => {
+                    self.cancel_all("客户端已断开");
+                    return Ok(());
+                }
                 Ok(Event::ChildClosed) => {
                     self.cancel_all("CU 子进程已退出");
                     return Ok(());
+                }
+                Ok(Event::TurnEnd) => {
+                    if let Some(call) = self.js.as_mut().and_then(JsBridge::end_turn) {
+                        let mut line = serde_json::to_vec(&call)?;
+                        line.push(b'\n');
+                        self.write_child(&line)?;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -215,7 +410,7 @@ impl Forwarder {
         {
             // 先记下客户端**自己**有没有声明，再补。补只是为了不让服务端拒绝，
             // 不代表客户端真的会渲染这个表单——`claude` 模式要看这个值决定能否转发。
-            let supports = declares_capability(&message, "elicitation");
+            let supports = supports_form_elicitation(&message);
             self.client_supports_elicitation = Some(supports);
             crate::computer_use_approval::record_client(
                 message.get("params").and_then(|params| params.get("clientInfo")),
@@ -223,47 +418,102 @@ impl Forwarder {
             );
             declare_elicitation(&mut message);
             self.declare_elicitation = false;
+            if self.js.is_none() {
+                self.tools_init_id = message.get("id").map(Value::to_string);
+            }
             let mut line = serde_json::to_vec(&message)?;
             line.push(b'\n');
             return self.write_child(&line);
         }
-        // 审批答复：没有 method、id 是我们发的字符串。
+        // 审批答复：没有 method、id 是我们发的字符串。客户端回错误（渲染不了）时按取消处理，
+        // 不能干等到超时。
         if !mentions(&frame, b"\"method\"")
-            && mentions(&frame, b"\"result\"")
+            && (mentions(&frame, b"\"result\"") || mentions(&frame, b"\"error\""))
             && let Ok(message) = serde_json::from_slice::<Value>(&frame)
             && let Some(token) = message.get("id").and_then(Value::as_str)
             && let Some(pending) = self.pending.remove(token)
         {
             return self.relay_approval(&pending, &message);
         }
+        // 离散工具档：`type_text` 含键盘打不出的字符时直接回错误（否则系统会静默丢字）；
+        // 确认规则还没附上时，记下这次调用的 id。
+        if self.js.is_none()
+            && mentions(&frame, b"\"tools/call\"")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+        {
+            if let Some(reply) = crate::computer_use_tools::reject_untypeable(&message) {
+                let mut line = serde_json::to_vec(&reply)?;
+                line.push(b'\n');
+                return write_client(&line);
+            }
+            if self.policy.is_some()
+                && let Some(id) = message.get("id")
+            {
+                self.policy_call_ids.insert(id.to_string());
+            }
+        }
+        // JS 档：`tools/call` 要带回合信息，`tools/list` 的响应要过滤。
+        if let Some(js) = self.js.as_mut()
+            && mentions(&frame, b"\"tools/")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && let ClientFrame::Rewritten(message) = js.on_client(message)
+        {
+            let mut line = serde_json::to_vec(&message)?;
+            line.push(b'\n');
+            return self.write_child(&line);
+        }
         self.write_child(&frame)
     }
 
+    /// 子进程发来的超长帧：是对客户端请求的响应就按原 id 回错误；是子进程发的请求
+    /// （例如超长的审批请求）就回子进程错误，免得它一直等；通知直接丢掉。
+    fn on_child_oversized(&mut self, info: &Oversized) -> anyhow::Result<()> {
+        eprintln!(
+            "[codex-plus-cu] 丢弃 CU 发来的超长消息：{} 字节，method={:?}",
+            info.len, info.method
+        );
+        if let Some(line) = info.error_for_client() {
+            return write_client(&line);
+        }
+        if let Some(line) = info.error_reply("发给 CU 客户端的请求") {
+            return self.write_child(&line);
+        }
+        Ok(())
+    }
+
+    /// 客户端发来的超长帧：是请求就回客户端错误，响应和通知直接丢掉。
+    fn on_client_oversized(&mut self, info: &Oversized) -> anyhow::Result<()> {
+        eprintln!(
+            "[codex-plus-cu] 丢弃客户端发来的超长消息：{} 字节，method={:?}",
+            info.len, info.method
+        );
+        match info.error_reply("请求") {
+            Some(line) => write_client(&line),
+            None => Ok(()),
+        }
+    }
+
     /// 逐条答复客户端对审批请求的决定。
+    ///
+    /// 勾了「始终允许」就回 `_meta.persist: "always"`，由 Computer Use 自己记住（和 Codex 一样）。
     fn relay_approval(&mut self, pending: &PendingApproval, message: &Value) -> anyhow::Result<()> {
-        let action = message
-            .get("result")
-            .and_then(|result| result.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("cancel");
-        let content = message
-            .get("result")
-            .and_then(|result| result.get("content"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let outcome = match action {
-            "accept" => Outcome::ClientAccepted,
-            "decline" => Outcome::ClientDeclined,
+        let (result, always) =
+            crate::computer_use_approval::native_reply(message.get("result"));
+        let outcome = match result.get("action").and_then(Value::as_str) {
+            Some("accept") if always => Outcome::ClientAcceptedAlways,
+            Some("accept") => Outcome::ClientAccepted,
+            Some("decline") => Outcome::ClientDeclined,
             _ => Outcome::ClientCanceled,
         };
         if outcome.accepted() {
-            // `session` 语义在本进程内生效；跨会话的持久化交给 `remember`。
+            // 本进程内不再问；跨会话的「始终允许」由 Computer Use 自己记。
             self.session_allowed.insert(pending.key.clone());
         }
         let reply = json!({
             "jsonrpc": "2.0",
             "id": pending.child_id,
-            "result": { "action": action, "content": content }
+            "result": result
         });
         let mut line = serde_json::to_vec(&reply)?;
         line.push(b'\n');
@@ -274,6 +524,15 @@ impl Forwarder {
 
     /// 子进程 → 客户端。审批请求按策略处理，其余帧原样透传。
     fn on_child(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
+        self.note_activity(&frame);
+        // JS 档操作浏览器：同 Codex，用结果里附带的截图更新悬浮预览。
+        if self.js.is_some()
+            && mentions(&frame, b"codex/toolSurface")
+            && mentions(&frame, b"browserUse")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            crate::cu_activity::note_browser_surface(&message);
+        }
         if mentions(&frame, b"\"method\"") && mentions(&frame, b"elicitation/create") {
             if let Ok(message) = serde_json::from_slice::<Value>(&frame) {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
@@ -281,7 +540,70 @@ impl Forwarder {
                 }
             }
         }
+        if self.js.is_none()
+            && (self.tools_init_id.is_some() || !self.policy_call_ids.is_empty())
+            && !mentions(&frame, b"\"method\"")
+            && let Ok(mut message) = serde_json::from_slice::<Value>(&frame)
+            && let Some(id) = message.get("id").map(Value::to_string)
+        {
+            let mut rewritten = false;
+            if self.tools_init_id.as_deref() == Some(id.as_str()) {
+                self.tools_init_id = None;
+                crate::computer_use_tools::add_instructions(&mut message);
+                rewritten = true;
+            } else if self.policy_call_ids.remove(&id)
+                && let Some(policy) = self.policy.as_deref()
+                && crate::computer_use_tools::append_text(&mut message, policy)
+            {
+                self.policy = None;
+                self.policy_call_ids.clear();
+                rewritten = true;
+            }
+            if rewritten {
+                let mut line = serde_json::to_vec(&message)?;
+                line.push(b'\n');
+                return write_client(&line);
+            }
+        }
+        if let Some(js) = self.js.as_mut()
+            && js.wants_child_frames()
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            match js.on_child(message) {
+                ChildFrame::Drop => return Ok(()),
+                ChildFrame::Rewritten(message) => {
+                    let mut line = serde_json::to_vec(&message)?;
+                    line.push(b'\n');
+                    return write_client(&line);
+                }
+                ChildFrame::Forward => {}
+            }
+        }
         write_client(&frame)
+    }
+
+    /// 返回结果里能看出被操作的应用时，告诉管理器（悬浮预览用）：
+    /// 离散工具档有 `App=… (bundleID …, pid …)`，JS 档只有 `App: 名字.`。
+    fn note_activity(&mut self, frame: &[u8]) {
+        let (pid, bundle_id, app_name) = if mentions(frame, b"(bundleID ")
+            && let Some((bundle_id, pid)) = crate::cu_activity::parse_app_line(frame)
+        {
+            (pid, bundle_id, String::new())
+        } else if mentions(frame, b"\", App: ")
+            && let Some(name) = crate::cu_activity::parse_app_name(frame)
+        {
+            (0, String::new(), name)
+        } else {
+            return;
+        };
+        let key = if bundle_id.is_empty() { app_name.clone() } else { bundle_id.clone() };
+        let fresh = self.last_activity.as_ref().is_none_or(|(last, at)| {
+            *last != key || at.elapsed() >= Duration::from_secs(1)
+        });
+        if fresh {
+            crate::cu_activity::record("act", pid, &bundle_id, &app_name);
+            self.last_activity = Some((key, Instant::now()));
+        }
     }
 
     fn on_elicitation(&mut self, message: Value) -> anyhow::Result<()> {
@@ -324,7 +646,7 @@ impl Forwarder {
         //
         // 客户端没声明时转发出去没人渲染，只能干等到超时——那比直接放行更糟：
         // 用户会看到「读应用列表正常、一点击就卡两分钟」。
-        // 版本号不能作为依据（2.x 不声明、3.x 之后可能变），一律以握手时的实际能力为准。
+        // 不按客户端名或版本号猜，一律以握手时声明的能力为准（要支持表单式，只有 url 式不算）。
         if self.client_supports_elicitation == Some(false) {
             let pending = PendingApproval {
                 child_id,
@@ -338,6 +660,8 @@ impl Forwarder {
             );
             return self.accept_now(&pending, Outcome::AutoAccepted);
         }
+        let mut params = params;
+        crate::computer_use_approval::offer_always(&mut params);
         self.next_token += 1;
         let token = format!("codexplus-cu-elicit-{}", self.next_token);
         let forwarded = json!({
@@ -449,14 +773,18 @@ fn write_client(frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 客户端自己有没有声明某个能力（`params.capabilities.<name>` 存在且非 null）。
-pub(crate) fn declares_capability(message: &Value, name: &str) -> bool {
-    message
-        .get("params")
-        .and_then(|params| params.get("capabilities"))
-        .and_then(|capabilities| capabilities.get(name))
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
+/// 客户端能不能渲染表单式的审批卡。
+///
+/// MCP 2025-11-25 起 elicitation 分 `form` 与 `url` 两种：空对象 `{}` 按旧规范视为支持 form；
+/// 只声明 `{url:{}}` 的客户端渲染不了 Computer Use 的审批卡。
+/// 实测 Claude Code 2.1.310 声明的是 `{form:{}, url:{}}`。
+pub(crate) fn supports_form_elicitation(message: &Value) -> bool {
+    match message.pointer("/params/capabilities/elicitation") {
+        Some(Value::Object(modes)) => {
+            modes.is_empty() || modes.get("form").is_some_and(|form| !form.is_null())
+        }
+        _ => false,
+    }
 }
 
 /// 在客户端声明的能力里补上 `elicitation`，其余字段原样保留。
@@ -483,6 +811,18 @@ pub(crate) fn declare_elicitation(message: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_elicitation_support_follows_declared_modes() {
+        let init = |elicitation: Value| {
+            json!({ "method": "initialize", "params": { "capabilities": { "elicitation": elicitation } } })
+        };
+        assert!(supports_form_elicitation(&init(json!({}))));
+        assert!(supports_form_elicitation(&init(json!({ "form": {}, "url": {} }))));
+        assert!(!supports_form_elicitation(&init(json!({ "url": {} }))));
+        assert!(!supports_form_elicitation(&init(Value::Null)));
+        assert!(!supports_form_elicitation(&json!({ "method": "initialize", "params": { "capabilities": {} } })));
+    }
 
     #[test]
     fn declare_elicitation_keeps_existing_capabilities() {
@@ -522,15 +862,66 @@ mod tests {
     #[test]
     fn read_frame_preserves_bytes_and_newline() {
         let mut reader = BufReader::new(&b"{\"a\":1}\n{\"b\":2}\n"[..]);
-        let mut frame = Vec::new();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 8);
-        assert_eq!(frame, b"{\"a\":1}\n");
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Line(b"{\"a\":1}\n".to_vec()));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Line(b"{\"b\":2}\n".to_vec()));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Eof);
+    }
 
-        frame.clear();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 8);
-        assert_eq!(frame, b"{\"b\":2}\n");
+    /// 一个超过上限的 tools/call 响应：截图塞在 result 里，id 在前。
+    fn huge_response(id: Value) -> Vec<u8> {
+        let image = "A".repeat(MAX_FRAME + 16);
+        let mut frame = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "content": [{ "type": "image", "data": image }] }
+        }))
+        .unwrap();
+        frame.push(b'\n');
+        frame
+    }
 
-        frame.clear();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 0);
+    #[test]
+    fn oversized_frame_is_skipped_and_reading_continues() {
+        let mut bytes = huge_response(json!(7));
+        bytes.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n");
+        let mut reader = BufReader::new(&bytes[..]);
+
+        let Frame::Oversized(info) = read_frame(&mut reader).unwrap() else {
+            panic!("expected oversized frame");
+        };
+        assert_eq!(info.id, Some(json!(7)));
+        assert_eq!(info.method, None);
+        assert!(info.len > MAX_FRAME);
+        // 超长帧之后的消息照常读到，不再被当成 EOF。
+        assert!(matches!(read_frame(&mut reader).unwrap(), Frame::Line(_)));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Eof);
+    }
+
+    #[test]
+    fn oversized_child_response_becomes_error_with_same_id() {
+        let info = Oversized::of(&huge_response(json!("req-1")));
+        let reply: Value = serde_json::from_slice(&info.error_for_client().unwrap()).unwrap();
+        assert_eq!(reply["id"], "req-1");
+        assert_eq!(reply["error"]["code"], OVERSIZED_ERROR_CODE);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("已丢弃"));
+        // 响应不是请求，不能再回给子进程。
+        assert!(info.error_reply("x").is_none());
+    }
+
+    #[test]
+    fn oversized_request_is_answered_and_notifications_are_dropped() {
+        let request = Oversized { len: MAX_FRAME + 1, id: Some(json!(3)), method: Some("tools/call".into()) };
+        let reply: Value = serde_json::from_slice(&request.error_reply("请求").unwrap()).unwrap();
+        assert_eq!(reply["id"], 3);
+        assert!(request.error_for_client().is_none());
+
+        let notification = Oversized { len: MAX_FRAME + 1, id: None, method: Some("notifications/x".into()) };
+        assert!(notification.error_reply("请求").is_none());
+        assert!(notification.error_for_client().is_none());
+
+        // 截断或非法 JSON：拿不到 id，只能丢弃。
+        let garbage = Oversized::of(b"{\"id\":1, oops");
+        assert_eq!(garbage.id, None);
+        assert!(garbage.error_for_client().is_none());
     }
 }

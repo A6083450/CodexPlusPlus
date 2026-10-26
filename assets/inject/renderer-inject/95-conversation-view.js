@@ -178,6 +178,7 @@
   }
 
   function scanLightweight() {
+    if (typeof syncCodexPlusTurnRewind === "function") runScanStep(syncCodexPlusTurnRewind);
     installStyle();
     installCodexServiceTierDispatcherPatch();
     installCodexAppServerClientPrototypePatch();
@@ -929,6 +930,7 @@
     scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
+    refreshSideChatSaveButtons();
     removeLegacyCodexServiceTierBadges();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
@@ -944,6 +946,7 @@
   }
 
   function scan() {
+    pruneSessionMoreMenus();
     if (document.hidden) {
       window.__codexSessionDeleteScanPending = true;
       return;

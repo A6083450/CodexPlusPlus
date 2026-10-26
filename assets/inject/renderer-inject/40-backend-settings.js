@@ -62,6 +62,7 @@
         globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
           enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
         });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
@@ -1159,6 +1160,10 @@
               <h2 class="codex-plus-settings-section-title">对话与输入</h2>
               <div class="codex-plus-settings-card">
                 <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">轮次回退（实验性）</div><div class="codex-plus-row-description">在回答的“分支到新聊天”下增加回退入口。先保存恢复记录，再由 AI 撤销可恢复操作，全部完成后截断本轮及后续历史。仅支持本地聊天；无法撤销的操作会保留记录。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="turnRewind"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">悬浮球 · 下一步建议</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
                 </div>
@@ -1185,6 +1190,10 @@
                 <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">分享会话按钮</div><div class="codex-plus-row-description">在当前会话工具栏显示分享按钮，关闭后立即隐藏。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionShare"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">旁支保存</div><div class="codex-plus-row-description">在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sideChatSave"><span></span></button>
                 </div>
                 <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
@@ -1426,9 +1435,11 @@
       // Discord / Telegram / Issues 按钮也一律走 window.open）。
       const adCard = target?.closest("[data-codex-plus-ad-url]");
       if (adCard) {
+        // 无论 URL 合不合法都先掐掉 <a> 的默认行为：留下它，非 http(s) 的
+        // scheme 就会走原生跳转，而不是被下面这层挡掉。
+        event.preventDefault();
         const adUrl = adCard.getAttribute("data-codex-plus-ad-url") || "";
-        if (/^https?:\/\//i.test(adUrl)) {
-          event.preventDefault();
+        if (isCodexPlusAdWebUrl(adUrl)) {
           window.open(adUrl, "_blank", "noopener,noreferrer");
         }
         return;

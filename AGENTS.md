@@ -95,6 +95,8 @@
 - 默认直接提交并合入 fork 的 `main`；仅在用户明确要求时创建 PR。
 - `origin` 是上游 BigPizzaV3/CodexPlusPlus，`myfork` 是用户 A6083450/CodexPlusPlus。
 
+- 提交信息、PR 描述里不加 `Co-Authored-By: Claude …` 等 AI 署名。
+
 ## 独立生图扩展
 
 - 生图修复与本地 imagegen 增强的维护源为同级独立仓库 `../CodexPlusPlus-imagegen`，不在上游仓库中开发这部分实现。

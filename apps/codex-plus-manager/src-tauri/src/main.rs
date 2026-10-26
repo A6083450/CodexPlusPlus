@@ -30,6 +30,28 @@ fn main() {
         }
         return;
     }
+    // 卸载器在删除主程序前调用：config.toml 仍指向本机代理时恢复官方配置（issue #406）。
+    // 结果只写诊断日志，失败也以 0 退出，不能让卸载器卡住。
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-uninstall-cleanup") {
+        let home = codex_plus_core::codex_home::default_codex_home_dir();
+        let detail = match codex_plus_core::relay_config::clear_managed_proxy_config_for_uninstall(
+            &home,
+        ) {
+            Ok(changed) => serde_json::json!({
+                "home": home.to_string_lossy(),
+                "changed": changed,
+            }),
+            Err(error) => serde_json::json!({
+                "home": home.to_string_lossy(),
+                "error": format!("{error:#}"),
+            }),
+        };
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "uninstall.proxy_config_cleanup",
+            detail,
+        );
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--codex-plus-agent-mcp") {
         if let Err(error) = codex_plus_manager_lib::run_agent_collaboration_mcp(&args[2..]) {
             eprintln!("Agent 协作 MCP 启动失败：{error:#}");

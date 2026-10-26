@@ -3,7 +3,7 @@
 - 日期：2026-10-23
 - 取代：[2026-10-23-codexpp-computer-use-bridge-design.md](./2026-10-23-codexpp-computer-use-bridge-design.md) 的 §2.5 路线（`cua_repl` + 薄适配层）
 - 依据：[codexapp CU 与 Chrome 移植可行性分析](../reports/2026-10-23-codexapp-cu-and-chrome-porting-analysis.md)
-- 状态：**设计稿（未实现）**
+- 状态：**M1 已实现**（`acbc1ef5`）。M2 审批以策略开关形式实现；M3 turn 边界经实测不做，§2.2 的 diff 行为现版本已不再出现，见 [2026-10-25 一致性核对](../reports/2026-10-25-cu-codex-parity-audit.md)
 
 ---
 

@@ -958,6 +958,125 @@ pub fn save_grok_config(
     }
 }
 
+/// Claude Code 供应商命令的统一出口：失败时附上磁盘上的最新状态，前端据此回滚界面。
+fn claude_provider_result(
+    success: impl FnOnce(&codex_plus_core::tools::claude::ClaudeProvidersPayload) -> String,
+    failure: &str,
+    result: anyhow::Result<codex_plus_core::tools::claude::ClaudeProvidersPayload>,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    match result {
+        Ok(payload) => ok(&success(&payload), Some(payload)),
+        Err(error) => failed(
+            &format!("{failure}：{error:#}"),
+            claude::load(&claude::ClaudeContext::default_paths()).ok(),
+        ),
+    }
+}
+
+/// 读取 Claude Code 的供应商列表与 `settings.json` 现状。
+#[tauri::command]
+pub fn load_claude_providers()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "Claude 供应商已加载。".to_string(),
+        "读取 Claude 供应商失败",
+        claude::load(&claude::ClaudeContext::default_paths()),
+    )
+}
+
+/// 新增或保存一个 Claude 供应商；保存的是当前供应商时同步写入 `settings.json`。
+#[tauri::command]
+pub fn save_claude_provider(
+    provider: codex_plus_core::tools::claude::ClaudeProvider,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    let name = provider.name.trim().to_string();
+    claude_provider_result(
+        |payload| {
+            if payload.backup_path.is_some() {
+                format!("供应商「{name}」已保存，并已同步到 Claude Code。")
+            } else {
+                format!("供应商「{name}」已保存。")
+            }
+        },
+        "保存 Claude 供应商失败",
+        claude::save_provider(&claude::ClaudeContext::default_paths(), provider),
+    )
+}
+
+#[tauri::command]
+pub fn delete_claude_provider(
+    id: String,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "供应商已删除。".to_string(),
+        "删除 Claude 供应商失败",
+        claude::delete_provider(&claude::ClaudeContext::default_paths(), &id),
+    )
+}
+
+/// 切换 Claude Code 的当前供应商：改写 `~/.claude/settings.json` 的关键字段，写前备份。
+#[tauri::command]
+pub fn switch_claude_provider(
+    id: String,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |payload| {
+            let name = payload
+                .providers
+                .iter()
+                .find(|provider| provider.id == payload.current_id)
+                .map(|provider| provider.name.as_str())
+                .unwrap_or_default();
+            let mut message = format!("已切换到「{name}」，新开的 Claude Code 会话生效。");
+            if payload.imported > 0 {
+                message.push_str("切换前 settings.json 里的配置已保存为「切换前的配置」。");
+            }
+            message
+        },
+        "切换 Claude 供应商失败",
+        claude::switch_provider(&claude::ClaudeContext::default_paths(), &id),
+    )
+}
+
+/// 把 `settings.json` 现有的地址、Key、模型存成一个供应商。
+#[tauri::command]
+pub fn import_claude_live_provider()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "已把 Claude Code 当前配置保存为供应商。".to_string(),
+        "导入 Claude 当前配置失败",
+        claude::import_live(&claude::ClaudeContext::default_paths()),
+    )
+}
+
+/// 从 CC Switch 的数据库导入 Claude 供应商（只读打开，不改 CC Switch）。
+#[tauri::command]
+pub fn import_claude_providers_from_cc_switch()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let configured = settings.ccs_db_path.trim();
+    let db_path = if configured.is_empty() {
+        codex_plus_core::ccs_import::default_ccs_db_path()
+    } else {
+        std::path::PathBuf::from(configured)
+    };
+    claude_provider_result(
+        |payload| match payload.imported {
+            0 => "CC Switch 里没有新的 Claude 供应商。".to_string(),
+            count => format!("已从 CC Switch 导入 {count} 个 Claude 供应商。"),
+        },
+        "从 CC Switch 导入失败",
+        claude::import_from_cc_switch(&claude::ClaudeContext::default_paths(), &db_path),
+    )
+}
+
 fn empty_grok_config_payload() -> codex_plus_core::grok_config::GrokConfigPayload {
     let home = codex_plus_core::grok_config::default_grok_home_dir();
     codex_plus_core::grok_config::GrokConfigPayload {
@@ -1007,12 +1126,7 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
     let tools = codex_plus_core::tools::tool_specs()
         .into_iter()
         .map(|spec| {
-            let config = settings.tool_config(&spec.id);
-            let active_relay_name = config
-                .relay_profiles
-                .iter()
-                .find(|profile| profile.id == config.active_relay_id)
-                .map(|profile| profile.name.clone());
+            let (active_relay_name, relay_count) = tool_provider_summary(&settings, &spec.id);
             ToolEntry {
                 id: spec.id.as_str().to_string(),
                 name: spec.name,
@@ -1020,7 +1134,7 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
                 switchable: spec.switchable,
                 active: settings.active_tool == spec.id,
                 active_relay_name,
-                relay_count: config.relay_profiles.len(),
+                relay_count,
             }
         })
         .collect();
@@ -1030,6 +1144,33 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
         active_tool: settings.active_tool.as_str().to_string(),
     };
     ok("工具列表已加载。", payload)
+}
+
+/// 工具栏提示里的「当前供应商 / 供应商数」。Claude 的供应商存在独立文件里。
+fn tool_provider_summary(
+    settings: &BackendSettings,
+    id: &codex_plus_core::tools::ToolId,
+) -> (Option<String>, usize) {
+    use codex_plus_core::tools::{ToolId, claude};
+    if *id == ToolId::Claude {
+        return claude::load(&claude::ClaudeContext::default_paths())
+            .map(|payload| {
+                let name = payload
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == payload.current_id)
+                    .map(|provider| provider.name.clone());
+                (name, payload.providers.len())
+            })
+            .unwrap_or((None, 0));
+    }
+    let config = settings.tool_config(id);
+    let active_relay_name = config
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == config.active_relay_id)
+        .map(|profile| profile.name.clone());
+    (active_relay_name, config.relay_profiles.len())
 }
 
 #[tauri::command]
@@ -4658,7 +4799,7 @@ fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPay
     static PROJECT_PAGER: std::sync::OnceLock<std::sync::Mutex<codex_plus_data::LocalSessionPager>> =
         std::sync::OnceLock::new();
     let page = match PROJECT_PAGER.get_or_init(Default::default).lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, 0, usize::MAX),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, 0, usize::MAX),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["项目会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -4710,7 +4851,7 @@ fn list_local_sessions_blocking(
         std::sync::OnceLock::new();
     let pager = PAGER.get_or_init(Default::default);
     let page = match pager.lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, offset, limit),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, offset, limit),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -5660,8 +5801,8 @@ pub async fn refresh_script_market() -> CommandResult<ScriptMarketPayload> {
             script_market_payload_from_manifest(&manifest, "ok", "脚本市场已刷新。"),
         ),
         Err(error) => failed(
-            &format!("脚本市场加载失败：{error}"),
-            failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
+            &format!("脚本市场加载失败：{error:#}"),
+            failed_script_market_payload(&format!("脚本市场加载失败：{error:#}")),
         ),
     }
 }
@@ -5805,8 +5946,8 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
             Ok(manifest) => manifest,
             Err(error) => {
                 return failed(
-                    &format!("脚本市场加载失败：{error}"),
-                    failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
+                    &format!("脚本市场加载失败：{error:#}"),
+                    failed_script_market_payload(&format!("脚本市场加载失败：{error:#}")),
                 );
             }
         };
@@ -5823,11 +5964,11 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
             script_market_payload_from_manifest(&manifest, "ok", "脚本已安装。"),
         ),
         Err(error) => failed(
-            &format!("安装脚本失败：{error}"),
+            &format!("安装脚本失败：{error:#}"),
             script_market_payload_from_manifest(
                 &manifest,
                 "failed",
-                &format!("安装脚本失败：{error}"),
+                &format!("安装脚本失败：{error:#}"),
             ),
         ),
     }
@@ -7716,20 +7857,7 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
     } else {
         profile.name.trim()
     };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let test_model: String = if !profile.test_model.trim().is_empty() {
-        // 1. 使用者在該供應商明確填的測試模型
-        profile.test_model.trim().to_string()
-    } else {
-        // 2. 該供應商自己 config.toml 裡的 model（避免串味）
-        let from_profile = codex_plus_core::relay_config::relay_profile_model(&profile);
-        if from_profile.trim().is_empty() {
-            // 3. 最後才用全域預設
-            settings.relay_test_model.trim().to_string()
-        } else {
-            from_profile
-        }
-    };
+    let test_model = codex_plus_core::relay_config::relay_profile_test_model(&profile);
     match codex_plus_core::relay_config::test_relay_profile(&profile, &test_model).await {
         Ok(result) => {
             let status = if !result.protocol_valid { "failed" }
@@ -7917,17 +8045,7 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
     } else {
         profile.name.trim().to_string()
     };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let test_model = if !profile.test_model.trim().is_empty() {
-        profile.test_model.trim().to_string()
-    } else {
-        let from_profile = codex_plus_core::relay_config::relay_profile_model(&profile);
-        if from_profile.trim().is_empty() {
-            settings.relay_test_model.trim().to_string()
-        } else {
-            from_profile
-        }
-    };
+    let test_model = codex_plus_core::relay_config::relay_profile_test_model(&profile);
     let mut checks = Vec::new();
 
     if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
@@ -8116,8 +8234,15 @@ fn provider_doctor_recommendation(checks: &[ProviderDoctorCheck]) -> String {
     {
         return "优先检查测试模型名称、上游协议选择和 Key 权限；如果 Chat Completions 可用，请切到对应协议。".to_string();
     }
-    if checks.iter().any(|check| check.status == "warning") {
+    // 只有模型列表告警才是「测试模型不在列表里」，其他告警不能套用这句（#2638）
+    if checks
+        .iter()
+        .any(|check| check.id == "models" && check.status == "warning")
+    {
         return "连接可用，但测试模型没有出现在模型列表里；建议改用上游返回的模型名。".to_string();
+    }
+    if checks.iter().any(|check| check.status == "warning") {
+        return "连接可用，但上游返回了未完成的响应；请查看「真实请求」一项的详情，并在真实对话里确认是否正常。".to_string();
     }
     "可以作为 Codex 供应商使用；如果真实对话仍失败，请查看协议代理日志里的上游响应。".to_string()
 }
@@ -9976,6 +10101,27 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    fn provider_doctor_recommendation_does_not_blame_model_list_for_request_warning() {
+        let recommendation = provider_doctor_recommendation(&[
+            ProviderDoctorCheck {
+                id: "models".to_string(),
+                title: "模型列表".to_string(),
+                status: "ok".to_string(),
+                detail: "已看到测试模型".to_string(),
+            },
+            ProviderDoctorCheck {
+                id: "request".to_string(),
+                title: "真实请求".to_string(),
+                status: "warning".to_string(),
+                detail: "incomplete".to_string(),
+            },
+        ]);
+
+        assert!(!recommendation.contains("模型列表"));
+        assert!(recommendation.contains("未完成"));
+    }
+
+    #[test]
     fn provider_doctor_recommendation_reports_model_warning() {
         let recommendation = provider_doctor_recommendation(&[
             ProviderDoctorCheck {
@@ -10727,6 +10873,42 @@ base_url = "https://example.invalid/v1"
         assert_eq!(result.payload.sessions.len(), 1);
         assert_eq!(result.payload.sessions[0].id, "t1");
         assert_eq!(result.payload.sessions[0].title, "Current Thread");
+    }
+
+    #[test]
+    fn list_local_sessions_prefers_codex_sidebar_thread_names() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        create_minimal_thread_db(&sqlite_dir.join("state_5.sqlite"), "t1", "你好", 100);
+        // Codex 重命名追加写到 CODEX_HOME/session_index.jsonl，侧栏显示最后一条（#1976）。
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            concat!(
+                r#"{"id":"t1","thread_name":"旧名","updated_at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"id":"t1","thread_name":"新名","updated_at":"2026-01-02T00:00:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = list_local_sessions_blocking(None);
+        // 夹具没有 cwd 列，所有会话都归到空路径项目下。
+        let project = list_project_sessions_blocking(String::new());
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.sessions[0].id, "t1");
+        assert_eq!(result.payload.sessions[0].title, "新名");
+        assert_eq!(project.payload.sessions.len(), 1);
+        assert_eq!(project.payload.sessions[0].title, "新名");
     }
 
     #[test]
@@ -11718,6 +11900,7 @@ model_reasoning_effort = "high"
         );
         assert!(with_detail.contains("该进程没有程序包标识符"));
         assert!(!with_detail.contains("Microsoft Store"));
+        assert!(with_detail.contains("codex-plus.log"));
     }
 
     // 旧版 manifest 里没有 launchResult 字段，升级后必须仍能读出来（默认 None）。

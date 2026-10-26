@@ -41,8 +41,8 @@ pub fn spool_dir() -> PathBuf {
     crate::paths::default_app_state_dir().join("browser")
 }
 
-/// 钩子命令里要写的 spool 绝对路径。
-fn spool_path() -> PathBuf {
+/// 钩子命令里要写的 spool 绝对路径。管理器的悬浮预览也据此判断回合结束。
+pub fn spool_path() -> PathBuf {
     spool_dir().join(SPOOL_FILE)
 }
 
@@ -100,7 +100,12 @@ pub struct HookReceipt {
 
 /// 把回合结束钩子装进 Claude Code 的 settings.json。
 pub fn install() -> anyhow::Result<HookReceipt> {
-    let path = claude_settings_path();
+    install_at(&claude_settings_path())
+}
+
+/// 装进指定的 settings.json：自定义配置目录（`CLAUDE_CONFIG_DIR` 布局）用。
+pub fn install_at(path: &Path) -> anyhow::Result<HookReceipt> {
+    let path = path.to_path_buf();
     let command = hook_command()?;
     let mut document = read_settings(&path)?;
     let backup = backup_settings(&path)?;
@@ -125,7 +130,12 @@ pub fn install() -> anyhow::Result<HookReceipt> {
 
 /// 移除我们装的钩子；别人的钩子不动。
 pub fn uninstall() -> anyhow::Result<HookReceipt> {
-    let path = claude_settings_path();
+    uninstall_at(&claude_settings_path())
+}
+
+/// 从指定的 settings.json 移除我们的钩子。
+pub fn uninstall_at(path: &Path) -> anyhow::Result<HookReceipt> {
+    let path = path.to_path_buf();
     if !path.is_file() {
         return Ok(HookReceipt {
             changed: false,
@@ -348,7 +358,7 @@ pub fn spawn_turn_watcher(on_turn_end: impl Fn() + Send + 'static) {
 }
 
 /// 用「行数 + 修改时间」判断有没有新事件。
-fn spool_len(path: &Path) -> u64 {
+pub fn spool_len(path: &Path) -> u64 {
     let Ok(metadata) = std::fs::metadata(path) else {
         return 0;
     };
