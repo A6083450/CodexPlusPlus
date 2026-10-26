@@ -5,25 +5,34 @@ const source = fs.readFileSync(process.argv[2], 'utf8');
 const start = source.indexOf('  function renderImages(');
 const end = source.indexOf('\n  async function refresh()', start);
 const findStart = source.indexOf('  function findResponseTarget(');
-const findEnd = source.indexOf('\n  function openPreview(', findStart);
+const findEnd = source.indexOf('\n  async function openPreview(', findStart);
 
-{
-  let clicks = 0, notices = 0;
+(async () => {
+  let clicks = 0, notices = 0, opens = 0, failed = false;
   const trigger = { querySelector: () => null, appendChild: () => { notices++; } };
   const image = { src: 'data:image/png;base64,fixture', getAttribute: () => 'ig-matching', parentElement: trigger };
   const native = { disabled: false, getAttribute: () => null, querySelectorAll: () => [], click() { clicks++; },
     __reactFiber$fixture: { memoizedProps: { image: { src: '/generated_images/response-assets/ig-matching.png' } } },
   };
   let candidates = [native];
-  const context = { document: { querySelectorAll: () => candidates,
+  const context = { state: { images: [{ id: 'ig-matching', base64_data: 'fixture' }] }, window: {
+    __codexPlusCurrentSessionRef: () => ({ session_id: 'thread' }),
+    async __codexPlusOpenGeneratedImagePreview(image, session) {
+      assert.equal(image.id, 'ig-matching'); assert.equal(session.session_id, 'thread');
+      opens++; if (failed) throw new Error('原生图片打开失败'); return true;
+    },
+  }, document: { querySelectorAll: () => candidates,
     createElement(tag) { assert.notEqual(tag, 'dialog', 'fallback image clicks must never open a replacement lightbox'); return { setAttribute() {} }; },
   } };
   vm.createContext(context);
   vm.runInContext(source.slice(findEnd, start), context);
-  context.openPreview(image); assert.equal(clicks, 1); assert.equal(notices, 0);
-  candidates = []; context.openPreview(image);
-  assert.equal(clicks, 1); assert.equal(notices, 1, 'when native UI is not ready, keep the thumbnail and show its status');
-}
+  await context.openPreview(image); assert.equal(clicks, 1); assert.equal(notices, 0);
+  candidates = []; await context.openPreview(image);
+  assert.equal(clicks, 1); assert.equal(opens, 1); assert.equal(notices, 0, 'missing native gallery must open the native editor directly');
+  failed = true; await context.openPreview(image);
+  assert.equal(notices, 1); assert.equal(trigger.disabled, false, 'a failed open must remain retryable');
+  failed = false; await context.openPreview(image); assert.equal(opens, 3);
+})().catch(error => { console.error(error); process.exitCode = 1; });
 
 {
   let oldDialogs = 0, nativeClicks = 0;

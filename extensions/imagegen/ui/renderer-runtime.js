@@ -2,6 +2,27 @@
   window.__codexPlusImageGenerationRuntime.stopping = false;
   installCodexNativeImageIngress();
 
+  window.__codexPlusOpenGeneratedImagePreview = async (image, session) => {
+    const id = session?.session_id;
+    if (!id || !image?.base64_data) return false;
+    if (session.host_id && session.host_id !== "local") throw new Error("此图片需要在原会话的主机中预览");
+    const module = await loadOptionalCodexAppModule("app-initial-");
+    const open = Object.values(module || {}).find(value => typeof value === "function"
+      && ["availableImageCount", "initialZoomPercent", "openInEditor"].every(key => value.toString().includes(key)));
+    if (currentSessionRef()?.session_id !== id) return false;
+    const scope = collectCodexReactRuntimeCandidates().appScopes.find(scope =>
+      scope.value?.routeKind === "local-thread"
+        && [scope.value.conversationId, scope.value.routeConversationId].includes(id));
+    if (!scope || !open) throw new Error("当前版本的原生图片编辑器未能接入，请重新打开会话后重试");
+    const src = `data:${image.media_type || "image/png"};base64,${image.base64_data}`;
+    // 原始 image_generation_call 不在原生图库缓存中；单图入口保留原生批注和编辑提交。
+    const opened = open(scope, { alt: "生成的图片", title: "生成的图片", src, downloadSrc: src, attachmentSrc: src,
+      imageSource: "generated", sourceConversationId: id, imageSourceContext: { hostId: "local", conversationId: id },
+      openInEditor: true });
+    if (!opened) throw new Error("原生图片编辑器打开失败，请重试");
+    return true;
+  };
+
   function codexImageGenerationRuntimeActive() {
     const runtime = window.__codexPlusImageGenerationRuntime;
     return runtime?.active === true && !runtime.stopping;

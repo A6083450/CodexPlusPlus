@@ -37,7 +37,7 @@
     return messageId ? null : targets.at(-1) || null;
   }
 
-  function openPreview(sourceImage) {
+  async function openPreview(sourceImage) {
     const imageId = sourceImage.getAttribute("data-codex-generated-image-id");
     const matches = src => typeof src === "string" && imageId && src.includes(imageId);
     const button = Array.from(document.querySelectorAll('[data-testid="generated-image-preview"]')).find(candidate => {
@@ -53,13 +53,24 @@
     });
     if (button) { button.click(); return; }
     const trigger = sourceImage.parentElement;
-    if (!trigger || trigger.querySelector("[data-codex-native-preview-status]")) return;
-    const status = document.createElement("span");
-    status.setAttribute("data-codex-plus-ext", "imagegen");
-    status.setAttribute("data-codex-native-preview-status", "true");
-    status.setAttribute("role", "status");
-    status.textContent = "原生图片预览尚未准备好，请稍后重试";
-    trigger.appendChild(status);
+    if (!trigger || trigger.disabled) return;
+    trigger.querySelector("[data-codex-native-preview-status]")?.remove();
+    const image = state.images.find(image => image.id === imageId);
+    const session = window.__codexPlusCurrentSessionRef?.();
+    trigger.disabled = true;
+    try {
+      if (!image || typeof window.__codexPlusOpenGeneratedImagePreview !== "function") throw new Error("图片预览组件未加载，请重新打开会话");
+      await window.__codexPlusOpenGeneratedImagePreview(image, session);
+    } catch (error) {
+      const status = document.createElement("span");
+      status.setAttribute("data-codex-plus-ext", "imagegen");
+      status.setAttribute("data-codex-native-preview-status", "true");
+      status.setAttribute("role", "status");
+      status.textContent = String(error?.message || "原生图片预览打开失败，请重试");
+      trigger.appendChild(status);
+    } finally {
+      trigger.disabled = false;
+    }
   }
 
   function renderImages(images, targets) {

@@ -1,7 +1,7 @@
 {
   ".gitignore": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793",
   "LICENSE": "8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef",
-  "README.md": "a5ad47a5f3e370387e34e778c0a858aa9b3a9fbdbed74dfd6e0b8c83a3ce5ccd",
+  "README.md": "e3cb295139225674460866c0c9956d1eaa2f84f029f3fb488b0a2898e4e6dd94",
   "VERSION": "59854984853104df5c353e2f681a15fc7924742f9a2e468c29af248dce45ce03",
   "integration/build_check.rs": "c0e1428efd244fa3a307225fa86f4c1a83b4eced95db1568407312a49b5df5c0",
   "integration/hooks.tsv": "c5a2349f7005ec39051879c0b83474c1546e04a512fb56e79d871131bf22218e",
@@ -28,17 +28,18 @@
   "skill/scripts/responses_transport.py": "312c2d174c0d09f6d52f1c434fab294892115bba58c06bf5e6d4571a622b6ea5",
   "sync.py": "053885b2a79df7d7ea698f1fcfd22f3b935a6a7eaa294132229355ac3eb57160",
   "tests/client-reinjection.cjs": "5f8d41ff0fe5e35729365650e85bca8e533a469a6fd671936c3e068b65a296cd",
-  "tests/generated-images-rendering.cjs": "6ab4de01cb7a063405079ca60f906821fcee7103c7b62459f324ead74ad8e007",
+  "tests/generated-images-rendering.cjs": "8d922f8e0a7721372ba64983275295cfa757ba0feb3f1e6e5531b814c0d739bb",
   "tests/generated_images.rs": "5c0bbb206195bda1731f64a26fd949ead8736cb40fb0cce7d8202e6d3ad26c3b",
   "tests/imagegen_skill.rs": "c7af2df50af5d12603daf948eca1daf167edbc44cfa18e17118af5af0dd67205",
-  "tests/integration.rs": "d7e63c4fe401ae450dd346e64113546684f3b7e56284d72c34b43dfd596ff1e4",
+  "tests/integration.rs": "5cfd35db9deeccd513f50c6d67bc0d506199a0a97307d3a3f6feb348423f3006",
   "tests/lifecycle.cjs": "d53ffc7cb50010c08d06359ec5d2cfb25864e68da203a600d4e3726c5fcd9e6b",
   "tests/native-image-ingress.cjs": "8179bb205a3fac7c1641251c656553126beaca7a8f232df453517c3160c93c2a",
   "tests/native-manager-restore.cjs": "19e1cae24403db40d9acd14786e6dd15bf308c957432f1bd95039825a63a88cb",
+  "tests/native-preview-open.cjs": "e673e1a91e928970681b73a40ce005e857a6e5c7b462350226f7abc1841e1936",
   "tests/native-preview.cjs": "bdd7a087fcb82e6a79805e45e023d24b865ce2df0c812d38524caf7caf8fb57b",
   "tests/protocol_tools.rs": "7ee13566fead4d8aa020f3d434ca0d598c11c67bd3863f1f35a1994b23f15a53",
   "tests/test_sync.py": "5a1a75d3fe3e21e0a8742a6c6cf745db6c84e5283c53611123e4dd33d73538bd",
   "tests/turn-preparation.cjs": "61a931693d95c29d78648dc6a9a1abf2bd16af4f6eb3d89c0fc8cc8ac8f331f4",
-  "ui/generated-images-inject.js": "7be7d6e7f3f519b65cdb2d19f283c0c35d0bb4ad282982e84d41f416b45f9896",
-  "ui/renderer-runtime.js": "37fd4284fd0fbfafd654e235a06721cbbfdcaef988310355ad0b2557b1af3f88"
+  "ui/generated-images-inject.js": "e28e0c3d011041c7db037c94e4250c78d47e537d46abde4c81f99f4c1e081608",
+  "ui/renderer-runtime.js": "2f86fd1150499ae2d346987005eda588d3ec90ea8997e238f5ec4461bed3f043"
 }

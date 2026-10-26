@@ -18,7 +18,7 @@
     {
       "name": "20-menu.js",
       "description": "Codex++ 菜单、后端设置加载、插件解锁策略与版本判定",
-      "lines": 536
+      "lines": 542
     },
     {
       "name": "30-service-tier.js",

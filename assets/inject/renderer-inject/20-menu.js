@@ -316,6 +316,7 @@
     const queryClients = [];
     const requestClients = [];
     const conversationManagers = [];
+    const appScopes = [];
     let appScope = null;
     const seenFibers = new Set();
     const pushQueryClient = (value) => {
@@ -334,8 +335,11 @@
     };
     const inspect = (value) => {
       if (!value || typeof value !== "object") return;
-      if (!appScope) appScope = [value, value.current].find(scope => scope?.scope
-        && typeof scope.get === "function" && typeof scope.set === "function") || null;
+      for (const scope of [value, value.current, value.value]) {
+        if (scope?.scope && typeof scope.get === "function" && typeof scope.set === "function"
+            && !appScopes.includes(scope)) appScopes.push(scope);
+      }
+      appScope ||= appScopes[0] || null;
       pushQueryClient(value);
       pushQueryClient(value.queryClient);
       pushRequestClient(value);
@@ -356,6 +360,8 @@
       seenFibers.add(fiber);
       inspect(fiber.memoizedProps);
       inspect(fiber.pendingProps);
+      let context = fiber.dependencies?.firstContext;
+      for (let index = 0; context && index < 40; index++, context = context.next) inspectMemo(context.memoizedValue);
       let hook = fiber.memoizedState;
       for (let index = 0; hook && typeof hook === "object" && index < 40; index += 1) {
         inspectMemo(hook.memoizedState);
@@ -365,7 +371,7 @@
       if (fiber.child) queue.push(fiber.child);
       if (fiber.sibling) queue.push(fiber.sibling);
     }
-    return { queryClients, requestClients, conversationManagers, appScope, fiberCount: seenFibers.size };
+    return { queryClients, requestClients, conversationManagers, appScope, fiberCount: seenFibers.size, appScopes };
   }
 
   async function loadAppServerRequestCandidates() {

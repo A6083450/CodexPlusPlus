@@ -52,3 +52,14 @@ fn imagegen_restores_followups_through_native_manager_rpc() {
         .arg(&root).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn imagegen_opens_raw_tool_images_without_a_native_gallery() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let extension = root.join("extensions/imagegen");
+    let output = std::process::Command::new("node")
+        .arg(extension.join("tests/native-preview-open.cjs"))
+        .arg(extension.join("ui/renderer-runtime.js"))
+        .arg(&root).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
