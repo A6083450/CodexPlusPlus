@@ -7,6 +7,56 @@ const end = source.indexOf('\n  async function refresh()', start);
 const findStart = source.indexOf('  function findResponseTarget(');
 const findEnd = source.indexOf('\n  function openPreview(', findStart);
 
+{
+  let clicks = 0, notices = 0;
+  const trigger = { querySelector: () => null, appendChild: () => { notices++; } };
+  const image = { src: 'data:image/png;base64,fixture', getAttribute: () => 'ig-matching', parentElement: trigger };
+  const native = { disabled: false, getAttribute: () => null, querySelectorAll: () => [], click() { clicks++; },
+    __reactFiber$fixture: { memoizedProps: { image: { src: '/generated_images/response-assets/ig-matching.png' } } },
+  };
+  let candidates = [native];
+  const context = { document: { querySelectorAll: () => candidates,
+    createElement(tag) { assert.notEqual(tag, 'dialog', 'fallback image clicks must never open a replacement lightbox'); return { setAttribute() {} }; },
+  } };
+  vm.createContext(context);
+  vm.runInContext(source.slice(findEnd, start), context);
+  context.openPreview(image); assert.equal(clicks, 1); assert.equal(notices, 0);
+  candidates = []; context.openPreview(image);
+  assert.equal(clicks, 1); assert.equal(notices, 1, 'when native UI is not ready, keep the thumbnail and show its status');
+}
+
+{
+  let oldDialogs = 0, nativeClicks = 0;
+  const handlers = [];
+  const container = {};
+  const trigger = { parentElement: container,
+    getAttribute: name => name === 'data-codex-generated-image-preview-trigger' ? 'true' : null,
+    addEventListener(_type, handler, capture = false) { handlers.push({ handler, capture }); },
+    removeEventListener(_type, handler, capture) { const i = handlers.findIndex(entry => entry.handler === handler && entry.capture === capture); if (i >= 0) handlers.splice(i, 1); },
+    click() {
+      const event = { preventDefault() {}, stopImmediatePropagation() { this.stopped = true; } };
+      for (const entry of [...handlers].sort((a, b) => Number(b.capture) - Number(a.capture))) {
+        entry.handler(event); if (event.stopped) break;
+      }
+    },
+  };
+  trigger.addEventListener('click', () => { oldDialogs++; });
+  const image = { parentElement: trigger, getAttribute: () => 'ig-existing' };
+  const target = { children: [], querySelector: () => container };
+  const context = { document: { querySelectorAll: selector => selector === '[data-codex-generated-image-id]' ? [image] : [] },
+    state: {}, scheduleRefresh() {}, openPreview: () => { nativeClicks++; },
+  };
+  vm.createContext(context);
+  const helpers = source.slice(findStart, findEnd) + source.slice(start, end);
+  for (let i = 0; i < 2; i++) {
+    vm.runInContext(helpers, context);
+    context.renderImages([{ id: 'ig-existing', base64_data: 'aW1hZ2U=' }], [target]);
+    trigger.click();
+  }
+  assert.equal(oldDialogs, 0, 'reinjection must suppress the anonymous listener left by the old lightbox');
+  assert.equal(nativeClicks, 2, 'each click must delegate exactly once after reinjection');
+}
+
 for (const width of [0, 128]) {
   for (const src of ['/generated_images/ig-broken.png', 'data:image/png;base64,aW1hZ2U=']) {
     for (const preview of [false, true]) {

@@ -32,3 +32,12 @@ fn imagegen_proxy_images_use_native_preview_items() {
         .arg(root.join("ui/renderer-runtime.js")).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn imagegen_converts_native_image_ingress_before_caching() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/imagegen");
+    let output = std::process::Command::new("node")
+        .arg(root.join("tests/native-image-ingress.cjs"))
+        .arg(root.join("ui/renderer-runtime.js")).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}

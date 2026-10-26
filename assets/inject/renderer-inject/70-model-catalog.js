@@ -1057,6 +1057,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
         () => originalSendRequest(method, nextParams, options));
+      if (typeof patchCodexNativeImageResult === "function") patchCodexNativeImageResult(requestMethod, client, result, nextParams);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
@@ -1276,6 +1277,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
         () => originalSendRequest.call(client, method, nextParams, options));
+      if (typeof patchCodexNativeImageResult === "function") patchCodexNativeImageResult(requestMethod, client, result, nextParams);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);

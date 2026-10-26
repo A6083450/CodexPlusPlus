@@ -1,5 +1,6 @@
   window.__codexPlusImageGenerationRuntime ||= { active: false, threads: new Map() };
   window.__codexPlusImageGenerationRuntime.stopping = false;
+  installCodexNativeImageIngress();
 
   function codexImageGenerationRuntimeActive() {
     const runtime = window.__codexPlusImageGenerationRuntime;
@@ -208,15 +209,15 @@
     settings.__codexPlusImageGenerationDefaults = "lifecycle-v1";
   }
 
-  function codexNativeImagePreviewItems(items) {
+  function codexNativeImagePreviewItems(items, descending = false) {
     let changed = false;
     const next = (items || []).flatMap(item => {
-      if (item?.type !== "agentMessage" || !/^msg_cpp_images_(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(item.id || "")) return [item];
+      if (item?.type !== "agentMessage" || !codexNativeImageMessageId(item.id)) return [item];
       const paths = String(item.text || "").split("\n\n").map(line =>
         /^!\[已生成图像\]\(<((?:\/|[A-Za-z]:[\\/])[^<>\r\n]*[\\/]generated_images[\\/]response-assets[\\/][A-Za-z0-9_-]+\.(?:png|jpg|webp))>\)$/.exec(line)?.[1]);
       if (paths.some(path => !path || path.split(/[\\/]/).includes(".."))) return [item];
       changed = true;
-      return paths.flatMap((path, index) => {
+      const generated = paths.flatMap((path, index) => {
         const id = index === 0 ? item.id : `${item.id}_${index}`;
         // 分页恢复可能保留派生图片，同时把首项恢复成磁盘中的 Markdown 消息。
         if (index > 0 && items.some(existing => existing?.type === "imageGeneration"
@@ -224,8 +225,83 @@
         return { type: "imageGeneration", id, status: "completed",
           result: path, savedPath: path, src: path, revisedPrompt: null, inputImages: [] };
       });
+      return descending ? generated.reverse() : generated;
     });
     return changed ? next : null;
+  }
+
+  function codexNativeImageMessageId(id) {
+    return /^msg_cpp_images_(?:[a-f0-9]{32}|[a-f0-9]{64})$/.test(id || "");
+  }
+
+  function patchCodexNativeImageResult(method, client, result, params = {}) {
+    if (client.hostId !== "local" || !codexImageGenerationRuntimeActive() || !result) return;
+    const patchTurn = turn => {
+      const items = codexNativeImagePreviewItems(turn?.items);
+      if (items) turn.items = items;
+    };
+    if (["thread/start", "thread/resume", "thread/read", "thread/fork", "thread/rollback"].includes(method)) {
+      result.thread?.turns?.forEach(patchTurn);
+    } else if (method === "thread/turns/list") result.data?.forEach(patchTurn);
+    else if (["thread/items/list", "thread/items/read"].includes(method)) {
+      const descending = method === "thread/items/list" && (params.sortDirection || params.params?.sortDirection) === "desc";
+      if (Array.isArray(result.data) && result.data.every(entry => entry?.item)) {
+        const entries = new Map(result.data.map(entry => [entry.item.id, entry]));
+        const items = codexNativeImagePreviewItems(result.data.map(entry => entry.item), descending);
+        if (items) result.data = items.map(item => ({
+          ...(entries.get(item.id) || entries.get(item.id.replace(/_\d+$/, ""))), item,
+        }));
+      } else {
+        const items = codexNativeImagePreviewItems(result.data, descending);
+        if (items) result.data = items;
+      }
+    }
+  }
+
+  function installCodexNativeImageIngress() {
+    if (typeof window.addEventListener !== "function") return;
+    if (window.__codexPlusNativeImageMessageHandler) window.removeEventListener("message", window.__codexPlusNativeImageMessageHandler, true);
+    const pending = window.__codexPlusImageGenerationRuntime.nativeImageIds ||= new Set();
+    const handler = event => {
+      const data = event.data;
+      if (data?.type !== "mcp-notification" || data.hostId !== "local") return;
+      const origin = String(event.origin || "");
+      if (!(event.source == null && !origin)
+          && (event.source !== window || (origin && origin !== "null" && origin !== window.location.origin))) return;
+      const params = data.params;
+      const itemId = params?.item?.id || params?.itemId;
+      if (!codexImageGenerationRuntimeActive() && !pending.has(itemId)) return;
+      if (data.method === "item/agentMessage/delta" && codexNativeImageMessageId(itemId)) {
+        event.stopImmediatePropagation();
+      } else if (data.method === "item/started" && params?.item?.type === "agentMessage" && codexNativeImageMessageId(itemId)) {
+        pending.add(itemId);
+        if (pending.size > 128) pending.delete(pending.values().next().value);
+        params.item = { type: "imageGeneration", id: itemId, status: "in_progress", result: "", revisedPrompt: null, inputImages: [] };
+      } else if (data.method === "item/completed") {
+        pending.delete(itemId);
+        const items = codexNativeImagePreviewItems([params?.item]);
+        if (!items) return;
+        params.item = items[0];
+        // 多图分别进入原生项目表，不能把第二张塞到文字或自制弹窗中。
+        if (items.length > 1) queueMicrotask(() => {
+          for (const item of items.slice(1)) for (const method of ["item/started", "item/completed"]) {
+            const nativeItem = method === "item/started" ? { ...item, status: "in_progress", result: "", savedPath: null } : item;
+            const nativeParams = { ...params, item: nativeItem };
+            if (method === "item/started") {
+              nativeParams.startedAtMs = params.completedAtMs ?? Date.now();
+              delete nativeParams.completedAtMs;
+            }
+            window.dispatchEvent(new MessageEvent("message", { data: { ...data, method, params: nativeParams } }));
+          }
+        });
+      } else if (data.method === "turn/completed") {
+        for (const item of params?.turn?.items || []) pending.delete(item.id);
+        const items = codexNativeImagePreviewItems(params?.turn?.items);
+        if (items) params.turn.items = items;
+      }
+    };
+    window.__codexPlusNativeImageMessageHandler = handler;
+    window.addEventListener("message", handler, true);
   }
 
   function patchCodexNativeImagePreview(manager) {

@@ -22,6 +22,7 @@ crates/codex-plus-core/tests/protocol_proxy.rs	extensions/imagegen/tests/protoco
 crates/codex-plus-core/src/protocol_proxy.rs	let settings = image_generation_settings_for_request(
 crates/codex-plus-core/src/routes.rs	configured_image_generation_proxy(&crate::relay_config::default_codex_home_dir(), &settings)
 assets/inject/renderer-inject.js	recordCodexImageGenerationThread(client, threadState, nextParams)
+assets/inject/renderer-inject.js	patchCodexNativeImageResult(requestMethod, client, result, nextParams)
 assets/inject/renderer-inject.js	setCodexImageGenerationRuntimeActive(true)
 crates/codex-plus-core/src/imagegen_runtime.rs	extensions/imagegen/rust/runtime.rs
 crates/codex-plus-core/src/lib.rs	pub mod imagegen_runtime;

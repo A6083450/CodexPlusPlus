@@ -91,4 +91,14 @@ vm.runInContext(source.slice(start, end), context);
   context.codexPlusBackendSettings.imageGenerationProxy.baseUrl = 'http://127.0.0.1:57322/v1';
   await assert.rejects(fresh.sendRequest('turn/start', { threadId: 'fresh', model: 'gpt-image-2.5-flare' }), /生图会话配置未恢复/,
     'a changed proxy must invalidate the successfully started session');
+  const history = { hostId: 'local', async sendRequest() {
+    return { thread: { turns: [{ status: 'completed', items: [{ type: 'agentMessage',
+      id: 'msg_cpp_images_' + 'd'.repeat(32),
+      text: '![已生成图像](</tmp/generated_images/response-assets/ig_history.png>)',
+    }] }] } };
+  } };
+  context.patchAppServerModelRequestClient(history);
+  const response = await history.sendRequest('thread/read', { threadId: 'history' });
+  assert.equal(response.thread.turns[0].items[0].type, 'imageGeneration',
+    'the actual client wrapper must deliver native image items before history normalization');
 })().catch(error => { console.error(error); process.exitCode = 1; });

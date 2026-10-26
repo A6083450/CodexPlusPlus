@@ -280,6 +280,11 @@ function imageCount(root) {{
   return descendants(root).filter((child) => child.getAttribute?.("data-codex-generated-image-id") !== null).length;
 }}
 
+let nativePreviewClicks = 0;
+const nativeImageButton = element("button");
+nativeImageButton.querySelectorAll = () => [];
+nativeImageButton.__reactFiber$preview = {{ memoizedProps: {{ image: {{ src: "/generated_images/image-1.png" }} }} }};
+nativeImageButton.addEventListener("click", () => {{ nativePreviewClicks++; }});
 const targets = [responseTarget("msg-last")];
 globalThis.window = globalThis;
 window.innerWidth = 1800;
@@ -288,6 +293,7 @@ globalThis.document = {{
   body: element("body"), documentElement: element("html"),
   createElement: (tagName) => element(tagName),
   querySelectorAll(selector) {{
+    if (selector === '[data-testid="generated-image-preview"]') return [nativeImageButton];
     if (selector === "[data-response-annotation-target]") return targets;
     if (selector === "[data-codex-generated-image-id]") {{
       return targets.flatMap((target) => descendants(target)).filter(
@@ -340,56 +346,16 @@ async function flushTimers() {{
   const renderedContainer = descendants(exactTarget).find(
     (child) => child.getAttribute?.("data-codex-generated-images") !== null,
   );
-  renderedImage.naturalWidth = 1536;
-  renderedImage.naturalHeight = 1024;
   renderedImage?.parentElement?.click();
-  const previewDialog = descendants(document.body).find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview") !== null,
-  );
-  const previewDescendants = previewDialog ? descendants(previewDialog) : [];
-  const zoomLevel = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-zoom-level") !== null,
-  );
-  const zoomIn = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "放大图片");
-  const zoomOut = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "缩小图片");
-  const download = previewDescendants.find((child) => child.getAttribute?.("aria-label") === "下载图片");
-  const close = previewDescendants.find(
-    (child) => child.getAttribute?.("aria-label") === "关闭图片预览",
-  );
-  const previewTitle = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview-title") !== null,
-  );
-  const imageViewport = previewDescendants.find(
-    (child) => child.getAttribute?.("data-codex-generated-image-preview-viewport") !== null,
-  );
-  const initialZoom = zoomLevel?.textContent || "";
-  zoomIn?.click();
-  const zoomedIn = zoomLevel?.textContent || "";
-  zoomOut?.click();
-  const zoomedBackOut = zoomLevel?.textContent || "";
   const nativePreview = {{
     containerInMarkdown: renderedContainer?.parentElement === exactTarget.markdown,
     targetChildren: exactTarget.children.length,
     imageParentTag: renderedImage?.parentElement?.tagName || "",
     imageClass: renderedImage?.className || "",
     imageStyle: renderedImage?.style?.cssText || "",
-    previewDialogTag: previewDialog?.tagName || "",
-    previewDialogClass: previewDialog?.className || "",
-    previewDialogOpen: previewDialog?.getAttribute?.("open") !== null,
-    previewTitle: previewTitle?.textContent || "",
-    imageViewportClass: imageViewport?.className || "",
-    downloadTag: download?.tagName || "",
-    downloadHref: download?.getAttribute?.("href") || "",
-    downloadName: download?.getAttribute?.("download") || "",
-    hasZoomOut: Boolean(zoomOut),
-    hasZoomIn: Boolean(zoomIn),
-    initialZoom,
-    zoomedIn,
-    zoomedBackOut,
-    hasClose: Boolean(close),
+    nativeClicks: nativePreviewClicks,
+    customDialogs: descendants(document.body).filter(child => child.tagName === "dialog").length,
   }};
-  close?.click();
-  nativePreview.previewRemovedAfterClose = !descendants(document.body).includes(previewDialog);
 
   delete require.cache[require.resolve(scriptPath)];
   require(scriptPath);
@@ -454,42 +420,8 @@ async function flushTimers() {{
     assert_eq!(result["nativePreview"]["containerInMarkdown"], true);
     assert_eq!(result["nativePreview"]["targetChildren"], 2);
     assert_eq!(result["nativePreview"]["imageParentTag"], "button");
-    assert_eq!(result["nativePreview"]["previewDialogTag"], "dialog");
-    assert_eq!(result["nativePreview"]["previewDialogOpen"], true);
-    assert!(
-        result["nativePreview"]["previewDialogClass"]
-            .as_str()
-            .is_some_and(|classes| classes.contains("codex-dialog")
-                && classes.contains("h-[100dvh]")
-                && classes.contains("w-screen"))
-    );
-    assert_eq!(result["nativePreview"]["previewTitle"], "生成的图片");
-    assert!(
-        result["nativePreview"]["imageViewportClass"]
-            .as_str()
-            .is_some_and(|classes| classes.contains("flex-1")
-                && classes.contains("touch-none")
-                && classes.contains("overflow-auto"))
-    );
-    assert_eq!(result["nativePreview"]["downloadTag"], "a");
-    assert!(
-        result["nativePreview"]["downloadHref"]
-            .as_str()
-            .is_some_and(|href| href.starts_with("data:image/png;base64,"))
-    );
-    assert_eq!(result["nativePreview"]["downloadName"], "生成的图片");
-    assert_eq!(result["nativePreview"]["hasZoomOut"], true);
-    assert_eq!(result["nativePreview"]["hasZoomIn"], true);
-    assert_ne!(
-        result["nativePreview"]["initialZoom"],
-        result["nativePreview"]["zoomedIn"]
-    );
-    assert_eq!(
-        result["nativePreview"]["initialZoom"],
-        result["nativePreview"]["zoomedBackOut"]
-    );
-    assert_eq!(result["nativePreview"]["hasClose"], true);
-    assert_eq!(result["nativePreview"]["previewRemovedAfterClose"], true);
+    assert_eq!(result["nativePreview"]["nativeClicks"], 1);
+    assert_eq!(result["nativePreview"]["customDialogs"], 0);
     assert!(
         result["nativePreview"]["imageClass"]
             .as_str()
@@ -3670,7 +3602,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"34\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"35\""));
     assert!(script.contains("collectCodexReactRuntimeCandidates"));
     assert!(script.contains("patchCodexModelQueryClient"));
 

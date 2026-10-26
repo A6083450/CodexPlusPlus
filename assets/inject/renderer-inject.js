@@ -469,7 +469,7 @@
   const codexThreadScrollKey = "codexThreadScroll";
   const headerIconTextButtonClass = "border-token-border no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap select-none focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg text-token-text-tertiary enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border-transparent h-token-button-composer px-2 py-0 text-base leading-[18px]";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "34";
+  const codexAppServerModelRequestPatchVersion = "35";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -12382,6 +12382,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
         () => originalSendRequest(method, nextParams, options));
+      if (typeof patchCodexNativeImageResult === "function") patchCodexNativeImageResult(requestMethod, client, result, nextParams);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
@@ -12601,6 +12602,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
         () => originalSendRequest.call(client, method, nextParams, options));
+      if (typeof patchCodexNativeImageResult === "function") patchCodexNativeImageResult(requestMethod, client, result, nextParams);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (typeof recordCodexImageGenerationThread === "function") recordCodexImageGenerationThread(client, threadState, nextParams);
