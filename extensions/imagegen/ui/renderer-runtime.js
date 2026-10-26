@@ -18,6 +18,12 @@
     const model = state.model || codexServiceTierCurrentModelName();
     if (String(model).toLowerCase().startsWith("gpt-image-")) {
       (client.__codexPlusImageGenerationProxyThreads ||= new Set()).add(state.threadId);
+      const proxy = codexPlusBackendSettings.imageGenerationProxy;
+      if (state.requestMethod === "thread/start" && proxy && params.modelProvider === proxy.provider
+          && params.config.model_providers?.[proxy.provider]?.base_url === proxy.baseUrl) {
+        // 新会话也立即有 rollout；成功 start 已应用代理，无需首条消息前再恢复。
+        (client.__codexPlusImageGenerationReady ||= new Set()).add(codexImageGenerationReadyKey(state.threadId, model));
+      }
     }
     window.__codexPlusImageGenerationRuntime.threads.set(state.threadId, {
       client, model,
@@ -154,7 +160,7 @@
     const wantsProxy = imageModel && Boolean(proxied);
     if (!wantsProxy && !proxyThreads.has(threadId) && !codexImageGenerationDisabled()) return;
     const ready = client.__codexPlusImageGenerationReady ||= new Set();
-    const readyKey = `hosted-v3:${model}:${profile?.id || ""}:${JSON.stringify(codexPlusBackendSettings.imageGenerationProxy)}:${threadId}`;
+    const readyKey = codexImageGenerationReadyKey(threadId, model);
     if (ready.has(readyKey) && wantsProxy === proxyThreads.has(threadId)) return;
     // 已加载会话会忽略 resume 的 config；首次发送前必须真正卸载再恢复。
     const { thread } = await client.sendRequest("thread/read", { threadId, includeTurns: false });
@@ -170,6 +176,10 @@
     runtime.threads.set(threadId, { client, model });
     if (wantsProxy) proxyThreads.add(threadId);
     else proxyThreads.delete(threadId);
+  }
+
+  function codexImageGenerationReadyKey(threadId, model) {
+    return `hosted-v3:${model}:${codexRemoteSessionActiveProfile()?.id || ""}:${JSON.stringify(codexPlusBackendSettings.imageGenerationProxy)}:${threadId}`;
   }
 
   function patchCodexImageGenerationManager(manager) {
