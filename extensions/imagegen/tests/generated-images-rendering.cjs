@@ -17,8 +17,9 @@ const findEnd = source.indexOf('\n  async function openPreview(', findStart);
   let candidates = [native];
   const context = { state: { images: [{ id: 'ig-matching', base64_data: 'fixture' }] }, window: {
     __codexPlusCurrentSessionRef: () => ({ session_id: 'thread' }),
-    async __codexPlusOpenGeneratedImagePreview(image, session) {
+    async __codexPlusOpenGeneratedImagePreview(image, session, sourceImage) {
       assert.equal(image.id, 'ig-matching'); assert.equal(session.session_id, 'thread');
+      assert.equal(sourceImage.getAttribute('data-codex-generated-image-id'), 'ig-matching');
       opens++; if (failed) throw new Error('原生图片打开失败'); return true;
     },
   }, document: { querySelectorAll: () => candidates,
@@ -26,12 +27,27 @@ const findEnd = source.indexOf('\n  async function openPreview(', findStart);
   } };
   vm.createContext(context);
   vm.runInContext(source.slice(findEnd, start), context);
-  await context.openPreview(image); assert.equal(clicks, 1); assert.equal(notices, 0);
+  await context.openPreview(image); assert.equal(clicks, 0); assert.equal(opens, 1); assert.equal(notices, 0);
   candidates = []; await context.openPreview(image);
-  assert.equal(clicks, 1); assert.equal(opens, 1); assert.equal(notices, 0, 'missing native gallery must open the native editor directly');
+  assert.equal(clicks, 0); assert.equal(opens, 2); assert.equal(notices, 0, 'thumbnail clicks must open the overlay instead of a native side-panel button');
   failed = true; await context.openPreview(image);
   assert.equal(notices, 1); assert.equal(trigger.disabled, false, 'a failed open must remain retryable');
-  failed = false; await context.openPreview(image); assert.equal(opens, 3);
+  failed = false; await context.openPreview(image); assert.equal(opens, 4);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+
+(async () => {
+  let reads = 0, synchronizations = 0;
+  const context = { state: { pending: false }, window: {
+    __codexPlusGeneratedImageOverlay: { sync() { synchronizations++; } },
+    __codexPlusCurrentSessionRef() { reads++; },
+  } };
+  vm.createContext(context);
+  const refreshStart = source.indexOf('  async function refresh()');
+  const refreshEnd = source.indexOf('\n  function scheduleRefresh()', refreshStart);
+  vm.runInContext(source.slice(refreshStart, refreshEnd), context);
+  await context.refresh();
+  assert.equal(synchronizations, 1);
+  assert.equal(reads, 0, 'an open overlay must sync native context without persisting and replacing its chat thumbnail');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 {

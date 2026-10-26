@@ -2,25 +2,117 @@
   window.__codexPlusImageGenerationRuntime.stopping = false;
   installCodexNativeImageIngress();
 
-  window.__codexPlusOpenGeneratedImagePreview = async (image, session) => {
+  window.__codexPlusOpenGeneratedImagePreview = async (image, session, sourceImage) => {
     const id = session?.session_id;
     if (!id || !image?.base64_data) return false;
     if (session.host_id && session.host_id !== "local") throw new Error("此图片需要在原会话的主机中预览");
-    const module = await loadOptionalCodexAppModule("app-initial-");
-    const open = Object.values(module || {}).find(value => typeof value === "function"
-      && ["availableImageCount", "initialZoomPercent", "openInEditor"].every(key => value.toString().includes(key)));
+    const shared = await loadOptionalCodexAppModule("app-shared-");
     if (currentSessionRef()?.session_id !== id) return false;
+    // shortcut: 原生 React 工厂导出随客户端构建变化，升级后需核对适配。
+    const React = shared?.XVt?.(), client = shared?.KNt?.();
     const scope = collectCodexReactRuntimeCandidates().appScopes.find(scope =>
       scope.value?.routeKind === "local-thread"
         && [scope.value.conversationId, scope.value.routeConversationId].includes(id));
-    if (!scope || !open) throw new Error("当前版本的原生图片编辑器未能接入，请重新打开会话后重试");
+    if (!scope || !React?.createElement || !client?.createRoot || !shared?.vIt) {
+      throw new Error("当前版本的原生图片浮层未能接入，请重新打开会话后重试");
+    }
+    window.__codexPlusNativeImageOverlayModule ||= (async () => {
+      const read = async url => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("原生图片浮层样式加载失败，请重新打开会话");
+        return response.text();
+      };
+      let url = codexAppAssetUrl("local-conversation-turn-") || await codexAppAssetUrlFromScriptText("local-conversation-turn-");
+      for (const pattern of [/['"`](\.\/schema-[a-f0-9]+\.js)['"`]/, /['"`](\.\/generated-image-gallery-[a-f0-9]+\.js)['"`]/]) {
+        const match = (await read(url)).match(pattern);
+        if (!match) throw new Error("原生图片浮层样式入口未找到，请重新打开会话");
+        url = new URL(match[1], url).href;
+      }
+      const gallery = await read(url);
+      const css = Array.from(gallery.matchAll(/['"`](\.\/[^'"`]+\.css)['"`]/g), match => match[1]);
+      const entry = gallery.match(/['"`](\.\/overlay-[a-f0-9]+\.js)['"`]/);
+      if (!css.length || !entry) throw new Error("原生图片浮层依赖未找到");
+      // 复用原生 preload 的去重、CSP nonce 和加载等待，首开也有批注及编辑器样式。
+      return shared.vIt(() => import(new URL(entry[1], url).href), css, url);
+    })().catch(error => { window.__codexPlusNativeImageOverlayModule = null; throw error; });
+    const overlay = await window.__codexPlusNativeImageOverlayModule;
+    if (currentSessionRef()?.session_id !== id) return false;
+    if (!overlay?.ImagePreviewOverlay) throw new Error("原生图片浮层组件未找到");
+    const currentFiber = fiber => {
+      let root = fiber;
+      while (root?.return) root = root.return;
+      return root?.stateNode?.current && root.stateNode.current !== root && fiber.alternate ? fiber.alternate : fiber;
+    };
+    const providers = () => {
+      let node = sourceImage, fiber;
+      while (node && !fiber) {
+        const key = Object.getOwnPropertyNames(node).find(key => key.startsWith("__reactFiber$"));
+        fiber = key && node[key];
+        node = node.parentElement;
+      }
+      fiber = currentFiber(fiber);
+      const values = [];
+      for (; fiber; fiber = fiber.return) {
+        if (fiber.tag !== 10) continue;
+        const context = fiber.type?._context || fiber.type;
+        if (context?.$$typeof === Symbol.for("react.context")) values.push({ context, value: fiber.memoizedProps?.value, fiber });
+      }
+      return values;
+    };
+    if (!sourceImage?.isConnected || !providers().length) throw new Error("原生图片预览上下文未找到，请重新打开会话");
+    window.__codexPlusGeneratedImageOverlay?.close();
+    const container = document.createElement("div");
+    container.setAttribute("data-codex-plus-ext", "imagegen");
+    document.body.appendChild(container);
     const src = `data:${image.media_type || "image/png"};base64,${image.base64_data}`;
-    // 原始 image_generation_call 不在原生图库缓存中；单图入口保留原生批注和编辑提交。
-    const opened = open(scope, { alt: "生成的图片", title: "生成的图片", src, downloadSrc: src, attachmentSrc: src,
-      imageSource: "generated", sourceConversationId: id, imageSourceContext: { hostId: "local", conversationId: id },
-      openInEditor: true });
-    if (!opened) throw new Error("原生图片编辑器打开失败，请重试");
-    return true;
+    return new Promise((resolve, reject) => {
+      let root, preview, closed = false, previous = [];
+      const liveComposers = new WeakMap();
+      const providerValue = entry => {
+        if (!entry.value?.composerHost || typeof entry.value.setTarget !== "function") return entry.value;
+        if (!liveComposers.has(entry.context)) liveComposers.set(entry.context, new Proxy({}, {
+          // 原生 cleanup 会同步检查 target；不能等待 MutationObserver 的延迟刷新。
+          get: (_, key) => Reflect.get(currentFiber(entry.fiber)?.memoizedProps?.value || entry.value, key),
+        }));
+        return liveComposers.get(entry.context);
+      };
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        if (window.__codexPlusGeneratedImageOverlay === preview) window.__codexPlusGeneratedImageOverlay = null;
+        root?.unmount();
+        container.remove();
+        resolve(false);
+      };
+      const Ready = () => {
+        React.useEffect(() => { resolve(true); }, []);
+        return React.createElement(overlay.ImagePreviewOverlay, { image: {
+          alt: "生成的图片", title: "生成的图片", src, downloadSrc: src, attachmentSrc: src,
+          imageSource: "generated", sourceConversationId: id, editInOverlay: true,
+          imageRef: node => node?.setAttribute("data-codex-generated-image-preview-content", "true"),
+        }, onClose: close, getThumbnail: () => sourceImage });
+      };
+      try {
+        root = client.createRoot(container, { onUncaughtError: error => {
+          sendCodexPlusDiagnostic("generated_image_overlay_failed", { message: String(error?.message || error) });
+          queueMicrotask(close);
+          reject(new Error(`原生图片浮层打开失败：${error?.message || error}`));
+        } });
+        preview = { close, sync() {
+          if (currentSessionRef()?.session_id !== id || !sourceImage.isConnected) { close(); return; }
+          const next = providers();
+          if (next.length === previous.length && next.every((entry, index) =>
+            entry.context === previous[index].context && entry.value === previous[index].value)) return;
+          previous = next;
+          // 复用原消息的原生上下文；评论和浮层输入框必须继续跟随原生 composer 的迁移。
+          let tree = React.createElement(Ready);
+          for (const entry of next) tree = React.createElement(entry.context.Provider || entry.context, { value: providerValue(entry) }, tree);
+          root.render(tree);
+        } };
+        window.__codexPlusGeneratedImageOverlay = preview;
+        preview.sync();
+      } catch (error) { reject(error); close(); }
+    });
   };
 
   function codexImageGenerationRuntimeActive() {

@@ -39,19 +39,6 @@
 
   async function openPreview(sourceImage) {
     const imageId = sourceImage.getAttribute("data-codex-generated-image-id");
-    const matches = src => typeof src === "string" && imageId && src.includes(imageId);
-    const button = Array.from(document.querySelectorAll('[data-testid="generated-image-preview"]')).find(candidate => {
-      if (candidate.disabled || candidate.closest?.('[inert], [data-app-shell-active-page="false"]')) return false;
-      if (Array.from(candidate.querySelectorAll("img")).some(image => matches(image.getAttribute("src")) || image.src === sourceImage.src)) return true;
-      const key = Object.getOwnPropertyNames(candidate).find(name => name.startsWith("__reactFiber$"));
-      let fiber = key && candidate[key];
-      for (let depth = 0; fiber && depth < 16; depth++, fiber = fiber.return) {
-        const props = fiber.memoizedProps;
-        if ([props?.src, props?.image?.src, props?.image?.savedPath, props?.sourceImage?.src].some(matches)) return true;
-      }
-      return false;
-    });
-    if (button) { button.click(); return; }
     const trigger = sourceImage.parentElement;
     if (!trigger || trigger.disabled) return;
     trigger.querySelector("[data-codex-native-preview-status]")?.remove();
@@ -60,7 +47,7 @@
     trigger.disabled = true;
     try {
       if (!image || typeof window.__codexPlusOpenGeneratedImagePreview !== "function") throw new Error("图片预览组件未加载，请重新打开会话");
-      await window.__codexPlusOpenGeneratedImagePreview(image, session);
+      await window.__codexPlusOpenGeneratedImagePreview(image, session, sourceImage);
     } catch (error) {
       const status = document.createElement("span");
       status.setAttribute("data-codex-plus-ext", "imagegen");
@@ -158,7 +145,8 @@
   }
 
   async function refresh() {
-    if (state.pending) return;
+    window.__codexPlusGeneratedImageOverlay?.sync();
+    if (window.__codexPlusGeneratedImageOverlay || state.pending) return;
     const sessionRef = window.__codexPlusCurrentSessionRef?.();
     const sessionId = String(sessionRef?.session_id || "").trim();
     const targets = responseTargets();

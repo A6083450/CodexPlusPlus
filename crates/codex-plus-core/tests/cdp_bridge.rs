@@ -281,6 +281,7 @@ function imageCount(root) {{
 }}
 
 let nativePreviewClicks = 0;
+let nativeOverlayOpens = 0;
 const nativeImageButton = element("button");
 nativeImageButton.querySelectorAll = () => [];
 nativeImageButton.__reactFiber$preview = {{ memoizedProps: {{ image: {{ src: "/generated_images/image-1.png" }} }} }};
@@ -311,6 +312,12 @@ globalThis.MutationObserver = class MutationObserver {{
 globalThis.setTimeout = (callback) => {{ timers.push(callback); return timers.length; }};
 globalThis.clearTimeout = () => {{}};
 window.__codexPlusCurrentSessionRef = () => ({{ session_id: "thread-1" }});
+window.__codexPlusOpenGeneratedImagePreview = async (image, session, sourceImage) => {{
+  if (image.id !== "image-1" || session.session_id !== "thread-1"
+      || sourceImage.getAttribute("data-codex-generated-image-id") !== image.id) throw new Error("preview binding mismatch");
+  nativeOverlayOpens++;
+  return true;
+}};
 window.__codexPlusPostJson = async () => ({{
   status: "found",
   images: [{{
@@ -354,6 +361,7 @@ async function flushTimers() {{
     imageClass: renderedImage?.className || "",
     imageStyle: renderedImage?.style?.cssText || "",
     nativeClicks: nativePreviewClicks,
+    overlayOpens: nativeOverlayOpens,
     customDialogs: descendants(document.body).filter(child => child.tagName === "dialog").length,
   }};
 
@@ -420,7 +428,8 @@ async function flushTimers() {{
     assert_eq!(result["nativePreview"]["containerInMarkdown"], true);
     assert_eq!(result["nativePreview"]["targetChildren"], 2);
     assert_eq!(result["nativePreview"]["imageParentTag"], "button");
-    assert_eq!(result["nativePreview"]["nativeClicks"], 1);
+    assert_eq!(result["nativePreview"]["nativeClicks"], 0);
+    assert_eq!(result["nativePreview"]["overlayOpens"], 1);
     assert_eq!(result["nativePreview"]["customDialogs"], 0);
     assert!(
         result["nativePreview"]["imageClass"]

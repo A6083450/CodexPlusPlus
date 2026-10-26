@@ -3,6 +3,7 @@ assets/inject/renderer-inject.js	await window.__codexPlusImagePersistenceJobs?.g
 assets/inject/renderer-inject.js	nextParams = applyCodexImageGenerationRequestOverride(requestMethod, nextParams)
 assets/inject/renderer-inject.js	conversationManagers.forEach(patchCodexImageGenerationManager)
 assets/inject/renderer-inject.js	conversationManagers, appScope, fiberCount
+assets/inject/renderer-inject.js	fiberCount: seenFibers.size, appScopes
 crates/codex-plus-core/src/assets.rs	RENDERER_SCRIPT.replace(SLOT, IMAGEGEN_RENDERER_EXTENSION)
 crates/codex-plus-core/src/assets.rs	extensions/imagegen/ui/generated-images-inject.js
 crates/codex-plus-core/src/imagegen_skill.rs	extensions/imagegen/rust/imagegen_skill.rs
