@@ -17,9 +17,13 @@ const requestBedrock = async function S$s(e,t){let n=await v$s(e,t);if(n!==`chat
 const queueDefaultBedrock = function Vin(e,{runtime:t,storage:n},r,i){let a=null;return{async readServiceTier(i){for(;a!=null;)await a.catch(()=>void 0);return r(),zin(e.requestClient,e.logger,i,async()=>{if(e.getHostId()===`local`&&await n.readGlobalState(`use-copilot-auth-if-available`)===!0&&await t.isCopilotApiAvailable())return!1;let r=await e.getAccount({priority:`critical`});return r.account?.type===`chatgpt`||r.account?.type===`amazonBedrock`})},async writeServiceTier(t,n){let o=a,s=(async()=>(await o?.catch(()=>void 0),r(),e.sendRequest(`config/batchWrite`,{edits:[{keyPath:n==null?`service_tier`:`profiles.${n}.service_tier`,value:t??`default`,mergeStrategy:`upsert`}],filePath:null,expectedVersion:null,reloadUserConfig:!0})))();a=s;try{return await s}finally{a===s&&(a=null,i())}},writeModel(t,n,r){return e.sendRequest(`config/batchWrite`,a1t(t,n,r))},readShellEnvironmentPolicy(e,t){return Promise.resolve(null)}}}.toString();
 const queueExplicitBedrock = queueExplicit.replace("return t?.type===`chatgpt`?", "return t?.type===`chatgpt`||t?.type===`amazonBedrock`?");
 
+// 26.1021.31345 把默认队列的 Copilot 判断收敛到 runtime，移除了 storage 参数。
+const queueDefaultCopilotInference = function Vin(e,{runtime:t},n,r){let i=null;return{async readServiceTier(r){for(;i!=null;)await i.catch(()=>void 0);return n(),zin(e.requestClient,e.logger,r,async()=>{if(e.getHostId()===`local`&&await t.isUsingCopilotInference())return!1;let n=await e.getAccount({priority:`critical`});return n.account?.type===`chatgpt`||n.account?.type===`amazonBedrock`})},async writeServiceTier(t,a){let o=i,s=(async()=>(await o?.catch(()=>void 0),n(),e.sendRequest(`config/batchWrite`,{edits:[{keyPath:a==null?`service_tier`:`profiles.${a}.service_tier`,value:t??`default`,mergeStrategy:`upsert`}],filePath:null,expectedVersion:null,reloadUserConfig:!0})))();i=s;try{return await s}finally{i===s&&(i=null,r())}},writeModel(t,n,r){return e.sendRequest(`config/batchWrite`,a1t(t,n,r))},readShellEnvironmentPolicy(e,t){return Promise.resolve(null)}}}.toString();
+
 const shapes = [
   { name: "legacy", fixtures: [ui, request, queueDefault, queueExplicit], bedrockNative: false },
   { name: "bedrock", fixtures: [uiBedrock, requestBedrock, queueDefaultBedrock, queueExplicitBedrock], bedrockNative: true },
+  { name: "copilot-inference", fixtures: [uiBedrock, requestBedrock, queueDefaultCopilotInference, queueExplicitBedrock], bedrockNative: true, copilotInferenceNative: true },
 ];
 
 // 原生 requirements 和 tier 解析函数也直接保留，验证补丁没有绕开它们。
@@ -44,6 +48,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
     config: { model: "model", service_tier: "priority" }, override: { type: "fromConfig" },
     model: { model: "model", isDefault: true, defaultServiceTier: "fast", serviceTiers: [{ id: "priority", name: "Fast" }] },
     copilotPreferred: false, copilotAvailable: false, accountMissing: false, accountReads: 0, requirementsReads: 0, publications: 0,
+    copilotInference: null,
   };
   const sendRequest = async method => {
     if (method === "configRequirements/read") { state.requirementsReads++; return state.requirements; }
@@ -82,6 +87,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
   const fns = context.fixtures;
   const queueRuntime = {
     isCopilotApiAvailable: async () => state.copilotAvailable,
+    isUsingCopilotInference: async () => state.copilotInference ?? (state.copilotPreferred && state.copilotAvailable),
     accountId: () => "fixture", threadMode: () => "default",
   };
   const queue = () => fns.Vin(manager, { runtime: queueRuntime, storage: { readGlobalState: async () => state.copilotPreferred } }, () => {}, () => {});
@@ -98,7 +104,7 @@ function environment(patch = true, source = sourceOf(shapes[0].fixtures)) {
   return { api, state, fns, manager, scope, queue, explicit, result, context };
 }
 
-async function runShape({ name, fixtures, bedrockNative }) {
+async function runShape({ name, fixtures, bedrockNative, copilotInferenceNative }) {
   const source = sourceOf(fixtures);
   const env = environment(true, source);
   const { api, state, fns, result } = env;
@@ -202,6 +208,15 @@ async function runShape({ name, fixtures, bedrockNative }) {
   state.accountReads = 0;
   assert.equal(await env.queue().readServiceTier("model"), "priority");
   assert.equal(state.accountReads, 1, "默认队列只读取一次账号类型");
+  if (copilotInferenceNative) {
+    state.copilotInference = true;
+    state.accountReads = 0;
+    state.requirementsReads = 0;
+    assert.equal(await env.queue().readServiceTier("model"), null, "直接遵循 runtime 的 Copilot 判断");
+    assert.equal(state.accountReads, 0, "所选 Copilot 不读取底层 API 账号");
+    assert.equal(state.requirementsReads, 0, "所选 Copilot 在 requirements 请求前短路");
+    state.copilotInference = null;
+  }
   state.copilotPreferred = true;
   state.copilotAvailable = true;
   state.accountReads = 0;
@@ -319,7 +334,13 @@ async function runNativeFastTests() {
     queueExplicitBedrock]);
   assert.notEqual(shadowedDefault, sourceOf(shapes[1].fixtures));
   assert.equal(api.plan(shadowedDefault, url).diagnostics.reason, "shadowed-bindings");
-  return "Native Fast structure matching (legacy and Bedrock shapes), four auth paths, requirements, local scope, opt-in, queue and module transport behavior passed";
+  const shadowedInference = sourceOf([uiBedrock, requestBedrock,
+    queueDefaultCopilotInference.replace("let n=await e.getAccount", "let e=await e.getAccount").replace("return n.account?.type===`chatgpt`||n.account?.type===`amazonBedrock`", "return e.account?.type===`chatgpt`||e.account?.type===`amazonBedrock`"),
+    queueExplicitBedrock]);
+  assert.notEqual(shadowedInference, sourceOf(shapes[2].fixtures));
+  assert.equal(api.plan(shadowedInference, url).diagnostics.reason, "shadowed-bindings");
+  assert.equal(api.plan(`${sourceOf(shapes[2].fixtures)}\n${queueDefaultBedrock}`, url).diagnostics.reason, "ambiguous-gates", "不同历史结构同时出现时拒绝部分应用");
+  return "Native Fast structure matching (legacy, Bedrock and Copilot inference shapes), four auth paths, requirements, local scope, opt-in, queue and module transport behavior passed";
 }
 
 module.exports = runNativeFastTests;

@@ -18,7 +18,7 @@
     {
       "name": "20-menu.js",
       "description": "Codex++ 菜单、后端设置加载、插件解锁策略与版本判定",
-      "lines": 542
+      "lines": 554
     },
     {
       "name": "30-service-tier.js",
@@ -58,7 +58,7 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 1506
+      "lines": 1539
     },
     {
       "name": "71-model-picker-groups.js",
@@ -158,7 +158,7 @@
     {
       "name": "99-startup.js",
       "description": "启动序列：resize 处理、MutationObserver 与事件绑定",
-      "lines": 96
+      "lines": 101
     },
     {
       "name": "99-tail.js",

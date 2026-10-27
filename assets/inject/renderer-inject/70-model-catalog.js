@@ -797,39 +797,61 @@
   /* @codex-imagegen:runtime */
 
   async function syncCodexThreadModelSelection(managers) {
+    if (window.__codexPlusGeneratedImageOverlay) return;
     const threadId = codexPlusUsageThreadId(codexPlusUsageComposerCard());
     let visit = window.__codexPlusThreadModelVisit;
     // 图片预览、输入框重建期间暂时没有 composer，不算离开当前会话。
     if (!threadId && visit?.threadId && locationThreadId() === visit.threadId) return;
-    if (visit?.threadId !== threadId) {
+    if (visit?.threadId !== threadId || visit?.version !== codexAppServerModelRequestPatchVersion) {
       if (visit?.timer) clearTimeout(visit.timer);
-      visit = window.__codexPlusThreadModelVisit = { threadId, done: false, pending: false, failures: 0 };
+      visit = window.__codexPlusThreadModelVisit = { threadId, version: codexAppServerModelRequestPatchVersion,
+        done: false, pending: false, failures: 0 };
     }
     if (!threadId || visit.done || visit.pending || visit.timer || !window.__codexSessionDeleteBridge
         || codexPlusBackendSettings.enhancementsEnabled === false) return;
-    const manager = managers.find(candidate => candidate.requestClient?.hostId === "local"
-      && typeof candidate.updateThreadSettingsForNextTurn === "function" && candidate.getConversation?.(threadId));
-    const conversation = manager?.getConversation(threadId);
-    if (!conversation || conversation.resumeState !== "resumed") return;
-    if (manager.hasPendingThreadSettingsUpdate?.(threadId)) { visit.done = true; return; }
-    visit.before ||= { model: conversation.latestModel, effort: conversation.latestReasoningEffort };
-    const { model: modelBefore, effort: effortBefore } = visit.before;
-    if (conversation.latestModel !== modelBefore || conversation.latestReasoningEffort !== effortBefore) { visit.done = true; return; }
-    if (codexContextUsageTurnActive(manager, threadId)) return;
+    const host = typeof currentSessionRef === "function" && currentSessionRef()?.host_id;
+    if ((host && host !== "local") || managers.some(candidate => candidate.requestClient?.hostId !== "local"
+        && candidate.getConversation?.(threadId))) return;
+    const retry = delay => {
+      if (window.__codexPlusThreadModelVisit !== visit || visit.done || visit.timer) return;
+      visit.timer = setTimeout(() => {
+        visit.timer = null;
+        if (window.__codexPlusThreadModelVisit === visit) void syncCodexThreadModelSelection(managers);
+      }, delay);
+    };
+    const currentVisit = () => window.__codexPlusThreadModelVisit === visit && !visit.done
+      && codexPlusUsageThreadId(codexPlusUsageComposerCard()) === threadId;
+    const active = state => codexContextUsageTurnActive({ getConversation: () => state }, threadId);
     visit.pending = true;
     try {
-      const result = await postJson("/thread-usage-live", { session_id: threadId });
-      if (window.__codexPlusThreadModelVisit !== visit
-          || codexPlusUsageThreadId(codexPlusUsageComposerCard()) !== threadId) return;
-      const current = manager.getConversation(threadId);
+      let manager = managers.find(candidate => candidate.requestClient?.hostId === "local"
+        && typeof candidate.updateThreadSettingsForNextTurn === "function" && candidate.getConversation?.(threadId));
+      const viaRpc = !manager;
+      manager ||= await codexLocalAppServerManagerRpc();
+      if (!manager) throw new Error("原生会话模型接口尚未连接");
+      if (!currentVisit()) return;
+      const conversation = await manager.getConversation(threadId);
+      if (!currentVisit()) return;
+      if (!conversation || conversation.resumeState !== "resumed") { if (viaRpc) retry(1000); return; }
+      // RPC 不公开 pending 查询；原生条件更新仍会在队列执行时再次检查。
+      const pending = () => !viaRpc && manager.hasPendingThreadSettingsUpdate?.(threadId);
+      if (pending()) { visit.done = true; return; }
+      visit.before ||= { model: conversation.latestModel, effort: conversation.latestReasoningEffort };
+      const { model: modelBefore, effort: effortBefore } = visit.before;
+      if (conversation.latestModel !== modelBefore || conversation.latestReasoningEffort !== effortBefore) { visit.done = true; return; }
+      if (active(conversation)) { if (viaRpc) retry(1000); return; }
+      const result = await postJson("/thread-last-model", { session_id: threadId });
+      if (!currentVisit()) return;
+      const current = await manager.getConversation(threadId);
+      if (!currentVisit()) return;
       if (!current
           || current.latestModel !== modelBefore || current.latestReasoningEffort !== effortBefore
-          || manager.hasPendingThreadSettingsUpdate?.(threadId)) { visit.done = true; return; }
-      if (codexContextUsageTurnActive(manager, threadId)) return;
+          || pending()) { visit.done = true; return; }
+      if (active(current)) { if (viaRpc) retry(1000); return; }
       if (result?.status !== "ok") throw new Error(result?.message || "会话模型读取失败");
       visit.done = true;
       if (result.session_id !== threadId) return;
-      // 尾窗中没有真实模型时保持未知，历史 turn.params 可能由 resume 默认值推断。
+      // 恢复真实轮次记录，不使用由 resume 默认值推断的历史 turn.params。
       const model = typeof result.last_model === "string" ? result.last_model.trim() : "";
       if (!model || (model === current.latestModel && model === current.latestCollaborationMode?.settings?.model)) return;
       // 原生条件更新会在队列执行时再次检查，不能覆盖等待期间用户新选的模型。
@@ -838,16 +860,27 @@
       });
     } catch (error) {
       sendCodexPlusDiagnostic("thread_model_restore_failed", { message: String(error?.message || error) });
-      if (window.__codexPlusThreadModelVisit === visit) {
+      if (window.__codexPlusThreadModelVisit === visit && !visit.manualSelection) {
         visit.done = ++visit.failures >= 3;
-        if (!visit.done) visit.timer = setTimeout(() => {
-          visit.timer = null;
-          if (window.__codexPlusThreadModelVisit === visit) void syncCodexThreadModelSelection(managers);
-        }, visit.failures * 1000);
+        if (!visit.done) retry(visit.failures * 1000);
       }
     } finally {
       visit.pending = false;
     }
+  }
+
+  function noteCodexThreadModelManualSelection(event) {
+    if (event.type === "keydown") {
+      if (!["Enter", " ", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
+          || !event.target?.closest?.("[data-model-picker-view]")) return;
+    } else if (!event.target?.closest?.('[data-model-picker-view] [role="menuitemradio"][aria-checked], '
+        + '[data-model-picker-power-slider], [data-model-picker-view] [class*="_ResetToDefault_"], [data-model-picker-model-row]')) return;
+    const visit = window.__codexPlusThreadModelVisit;
+    if (!visit) return;
+    visit.manualSelection = true;
+    visit.done = true;
+    if (visit.timer) clearTimeout(visit.timer);
+    visit.timer = null;
   }
 
   function installCodexThreadModelSelectionObserver(manager) {

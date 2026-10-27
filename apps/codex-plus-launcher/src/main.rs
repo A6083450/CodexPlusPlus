@@ -1551,6 +1551,13 @@ impl BridgeDataService for LauncherDataService {
             .map_err(|error| anyhow::anyhow!("thread usage live task failed: {error}"))
     }
 
+    async fn thread_last_model(&self, session: SessionRef) -> anyhow::Result<Value> {
+        let adapter = self.storage_adapter();
+        tokio::task::spawn_blocking(move || adapter.codex_thread_last_model(&session))
+            .await
+            .map_err(|error| anyhow::anyhow!("thread last model task failed: {error}"))
+    }
+
     async fn whale_session(&self, session: SessionRef) -> anyhow::Result<Value> {
         let adapter = self.storage_adapter();
         tokio::task::spawn_blocking(move || {

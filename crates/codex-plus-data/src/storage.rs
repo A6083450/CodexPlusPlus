@@ -843,6 +843,39 @@ impl SQLiteStorageAdapter {
         }
     }
 
+    /// 仅在切换会话时调用；大块生图结果可能把模型记录挤出状态栏的尾窗。
+    pub fn codex_thread_last_model(&self, session: &SessionRef) -> Value {
+        let mut result = self.codex_thread_usage_live(session);
+        if let Some(object) = result.as_object_mut() {
+            object.remove("events");
+        }
+        if result["status"] != "ok" || result["last_model"].is_string() {
+            return result;
+        }
+        let model = (|| -> anyhow::Result<Option<String>> {
+            let file = File::open(result["rollout_path"].as_str().unwrap_or_default())?;
+            let mut model = None;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if !line.contains("\"turn_context\"") { continue; }
+                let Ok(record) = serde_json::from_str::<Value>(&line) else { continue; };
+                if record["type"] == "turn_context" {
+                    model = record["payload"]["model"].as_str().map(str::trim)
+                        .filter(|model| !model.is_empty()).map(str::to_owned);
+                }
+            }
+            Ok(model)
+        })();
+        match model {
+            Ok(model) => result["last_model"] = json!(model),
+            Err(error) => {
+                result["status"] = json!("failed");
+                result["message"] = json!(format!("会话模型读取失败：{error}"));
+            }
+        }
+        result
+    }
+
     fn delete_catalog_thread(
         &self,
         db: &mut Connection,

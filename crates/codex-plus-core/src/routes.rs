@@ -197,6 +197,10 @@ pub trait BridgeDataService: Send + Sync {
     async fn thread_usage_live(&self, _session: SessionRef) -> anyhow::Result<Value> {
         Ok(json!({"status": "unavailable", "message": "本机用量快照暂不可用", "events": []}))
     }
+    /// 会话切换时读取真实轮次模型；不用于状态栏轮询，也不开放给第三方拓展。
+    async fn thread_last_model(&self, session: SessionRef) -> anyhow::Result<Value> {
+        self.thread_usage_live(session).await
+    }
     async fn whale_session(&self, _session: SessionRef) -> anyhow::Result<Value> {
         Ok(json!({"status": "unavailable", "message": "当前后端暂不支持会话用量摘要"}))
     }
@@ -417,6 +421,7 @@ pub async fn handle_bridge_request(
                 .thread_usage_live(session_from_payload(&payload))
                 .await
         }
+        "/thread-last-model" => ctx.data.thread_last_model(session_from_payload(&payload)).await,
         // 仅内置挂件使用，不加入第三方拓展路由白名单。
         "/whale/history" => match ctx.settings.get_settings().await {
             Ok(settings)

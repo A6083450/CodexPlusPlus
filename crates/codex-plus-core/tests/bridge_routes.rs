@@ -93,6 +93,7 @@ async fn bridge_routes_cover_all_current_paths() {
             "/thread-usage-live",
             json!({"session_id": "s1", "title": "First"}),
         ),
+        ("/thread-last-model", json!({"session_id":"s1","title":"First"})),
         ("/archived-thread", json!({"title": "Archived"})),
         (
             "/move-thread-workspace",

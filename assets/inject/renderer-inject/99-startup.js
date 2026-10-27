@@ -84,6 +84,11 @@
     attributes: true,
     attributeFilter: ["data-app-action-sidebar-thread-id", "href", "data-above-composer-conversation-id", "data-composer-placement"],
   });
+  ["click", "pointerdown", "keydown"].forEach(type => {
+    document.removeEventListener(type, window.__codexPlusThreadModelSelectionHandler, true);
+    document.addEventListener(type, noteCodexThreadModelManualSelection, true);
+  });
+  window.__codexPlusThreadModelSelectionHandler = noteCodexThreadModelManualSelection;
   document.removeEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);
   window.__codexSessionActionTriggerHandler = rememberSessionActionTrigger;
   document.addEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);

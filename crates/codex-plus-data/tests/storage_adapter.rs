@@ -1793,6 +1793,28 @@ fn thread_usage_live_expands_tail_until_the_last_model_context_is_found() {
 }
 
 #[test]
+fn thread_last_model_recovers_context_before_large_image_results_without_changing_usage_tail() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let rollout_path = tmp.path().join("rollout.jsonl");
+    let content = [
+        json!({"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}),
+        json!({"type":"turn_context","payload":{"model":"gpt-image-2.5-flare"}}),
+        json!({"type":"response_item","payload":{"type":"image_generation_call","result":"x".repeat(9 * 1024 * 1024)}}),
+    ].iter().map(|record| format!("{record}\n")).collect::<String>();
+    fs::write(&rollout_path, &content).unwrap();
+    create_codex_thread_db(&db_path, &rollout_path);
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+    let reference = session("local:t1", "Codex Thread");
+    assert!(adapter.codex_thread_usage_live(&reference)["last_model"].is_null());
+    let result = adapter.codex_thread_last_model(&reference);
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["last_model"], "gpt-image-2.5-flare");
+    assert!(result.get("events").is_none());
+    assert_eq!(fs::read_to_string(&rollout_path).unwrap(), content);
+}
+
+#[test]
 fn thread_usage_live_marks_real_turns_with_monotonic_session_totals() {
     let value = live_usage_from_records(&[
         json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}),

@@ -44,7 +44,7 @@ function fixture() {
     sendCodexPlusDiagnostic() {},
     codexContextUsageTurnActive: (manager: any, id: string) => manager.getConversation(id)?.threadRuntimeStatus?.type === "active",
     postJson: async (route: string, params: any) => {
-      assert.equal(route, "/thread-usage-live"); calls.push(params.session_id);
+      assert.equal(route, "/thread-last-model"); calls.push(params.session_id);
       return { status: "ok", session_id: params.session_id, last_model: params.session_id === "thread-a" ? "gpt-6.1-sol" : "gpt-image-2.5-flare" };
     },
   };
@@ -73,15 +73,101 @@ test("switching A/B/A restores each last-used model once and preserves manual se
   assert.deepEqual(f.calls, ["thread-a", "thread-b", "thread-a"]);
 });
 
+test("native RPC conversations restore A/B/A when React exposes no synchronous manager", async () => {
+  const f = fixture(); let hostReads = 0;
+  const rpc = new Proxy({
+    async getHostId() { hostReads++; return "local"; },
+    async getConversation(id: string) { return structuredClone(f.conversations[id]); },
+    async updateThreadSettingsForNextTurn(...args: any[]) { return f.manager.updateThreadSettingsForNextTurn(...args); },
+  }, { get(target: any, key: string) {
+    if (key === "then") return undefined;
+    if (key in target) return target[key];
+    throw new Error(`RPC method is not public: ${key}`);
+  } });
+  f.context.codexLocalAppServerManagerRpc = async () => { assert.equal(await rpc.getHostId(), "local"); return rpc; };
+  const sync = () => f.context.syncCodexThreadModelSelection([]);
+  await sync();
+  assert.equal(f.conversations["thread-a"].latestModel, "gpt-6.1-sol");
+  f.select("thread-b"); await sync();
+  f.select("thread-a"); f.conversations["thread-a"].latestModel = "global-model"; await sync();
+  assert.equal(f.conversations["thread-a"].latestModel, "gpt-6.1-sol");
+  assert.equal(hostReads, 3);
+});
+
+test("a manual choice while native RPC discovery is pending cancels restoration", async () => {
+  const f = fixture(); let resolveManager: any;
+  f.context.codexLocalAppServerManagerRpc = () => new Promise(done => { resolveManager = done; });
+  const pending = f.context.syncCodexThreadModelSelection([]);
+  f.context.window.__codexPlusThreadModelVisit.done = true;
+  f.conversations["thread-a"].latestModel = "manual-model";
+  resolveManager({ getConversation: async (id: string) => f.conversations[id] });
+  await pending;
+  assert.equal(f.calls.length, 0); assert.equal(f.updates.length, 0);
+});
+
+test("current native picker rows and slider cancel a restoration before RPC returns", async () => {
+  for (const control of ['[data-model-picker-view] [role="menuitemradio"][aria-checked]', '[data-model-picker-power-slider]']) {
+    const f = fixture(); let resolveManager: any;
+    f.context.codexLocalAppServerManagerRpc = () => new Promise(done => { resolveManager = done; });
+    const handler = source.match(/^  function noteCodexThreadModelManualSelection\([^]*?^  \}/m)?.[0];
+    assert.ok(handler); vm.runInContext(handler, f.context);
+    const pending = f.context.syncCodexThreadModelSelection([]);
+    // 当前原生未选中行没有 data-model-selected，也没有旧版 model-row 属性。
+    const target: any = { closest: (selector: string) => selector.includes(control) ? target : null };
+    f.context.noteCodexThreadModelManualSelection({ type: "pointerdown", target });
+    f.conversations["thread-a"].latestModel = "manual-model";
+    resolveManager({ getConversation: async (id: string) => f.conversations[id],
+      updateThreadSettingsForNextTurn: f.manager.updateThreadSettingsForNextTurn });
+    await pending;
+    assert.equal(f.conversations["thread-a"].latestModel, "manual-model");
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test("the native image overlay does not reset a visit when the URL contains no thread id", async () => {
+  const f = fixture(); await f.sync();
+  f.conversations["thread-a"].latestModel = "manual-model";
+  f.context.window.__codexPlusGeneratedImageOverlay = {};
+  f.context.locationThreadId = () => "";
+  f.hideComposer(); await f.sync();
+  delete f.context.window.__codexPlusGeneratedImageOverlay;
+  f.showComposer(); await f.sync();
+  assert.equal(f.conversations["thread-a"].latestModel, "manual-model");
+});
+
+test("native model picker clicks cancel pending restoration and its retry", () => {
+  const f = fixture();
+  f.context.window.__codexPlusThreadModelVisit = { done: false, timer: 4 };
+  const handler = source.match(/^  function noteCodexThreadModelManualSelection\([^]*?^  \}/m)?.[0];
+  assert.ok(handler); vm.runInContext(handler, f.context);
+  f.context.noteCodexThreadModelManualSelection({ target: { closest: () => ({}) } });
+  assert.equal(f.context.window.__codexPlusThreadModelVisit.done, true);
+  assert.equal(f.context.window.__codexPlusThreadModelVisit.timer, null);
+});
+
+test("a failed history read cannot restart restoration after a manual picker click", async () => {
+  const f = fixture(); let rejectHistory: any;
+  f.context.postJson = () => new Promise((_resolve, reject) => { rejectHistory = reject; });
+  const pending = f.sync(); await new Promise(setImmediate);
+  const handler = source.match(/^  function noteCodexThreadModelManualSelection\([^]*?^  \}/m)?.[0];
+  assert.ok(handler); vm.runInContext(handler, f.context);
+  f.context.noteCodexThreadModelManualSelection({ target: { closest: () => ({}) } });
+  rejectHistory(new Error("bridge disconnected")); await pending;
+  assert.equal(f.context.window.__codexPlusThreadModelVisit.done, true);
+  assert.equal(f.context.window.__codexPlusThreadModelVisit.timer, null);
+});
+
 test("late history responses cannot change another visit or overwrite a new manual choice", async () => {
   const f = fixture(); const resolvers: any[] = [];
   f.context.postJson = () => new Promise(done => { resolvers.push(done); });
-  const stale = f.sync(); f.select("thread-b");
+  const stale = f.sync(); await new Promise(setImmediate); f.select("thread-b");
   const current = f.sync();
+  await new Promise(setImmediate);
   resolvers[1]({ status: "ok", session_id: "thread-b", last_model: "gpt-image-2.5-flare" }); await current;
   resolvers[0]({ status: "ok", session_id: "thread-a", last_model: "gpt-6.1-sol" }); await stale;
   assert.equal(f.updates.length, 0);
   f.select("thread-a"); const manual = f.sync();
+  await new Promise(setImmediate);
   f.conversations["thread-a"].latestModel = "manual-model";
   resolvers[2]({ status: "ok", session_id: "thread-a", last_model: "gpt-6.1-sol" }); await manual;
   assert.equal(f.updates.length, 0);
@@ -131,7 +217,8 @@ test("composer identity attribute changes reach the shared scan scheduler", () =
   const scan = readFileSync(new URL("../../../assets/inject/renderer-inject/98-scan-schedule.js", import.meta.url), "utf8");
   const startup = readFileSync(new URL("../../../assets/inject/renderer-inject/99-startup.js", import.meta.url), "utf8");
   let observer: any, options: any, scheduled = false;
-  const context: any = { window: {}, document: { body: {} }, selectors: {},
+  const context: any = { window: {}, document: { body: {}, removeEventListener() {}, addEventListener() {} }, selectors: {},
+    noteCodexThreadModelManualSelection() {},
     codexPluginMarketplacePatchEnabled: () => false, isExtensionUiNode: () => false,
     nodeOrAncestorLooksLikeCodexUserBubble: () => false, nodeLooksLikeCodexUserBubble: () => false,
     MutationObserver: class {

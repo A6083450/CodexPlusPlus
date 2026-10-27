@@ -177,13 +177,8 @@
     if (!manager && !refreshOnly) return Promise.resolve(false);
     const job = (async () => {
       if (!manager) {
-        const module = await loadOptionalCodexAppModule("app-initial-");
-        const getter = Object.values(module || {}).find(value => typeof value === "function"
-          && value.toString().includes("AppServerManager RPC is unavailable for hostId:")
-          && /\.forHost\(/.test(value.toString()));
-        if (!getter || !candidates.appScope) return false;
-        const rpc = getter(candidates.appScope, "local");
-        if (await rpc.getHostId() !== "local") return false;
+        const rpc = await codexLocalAppServerManagerRpc();
+        if (!rpc) return false;
         const { thread } = await rpc.sendRequest("thread/read", { threadId: id, includeTurns: false });
         if (!["idle", "notLoaded"].includes(thread.status?.type)) return "busy";
         const conversation = await rpc.getConversation(id);

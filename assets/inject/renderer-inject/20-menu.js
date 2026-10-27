@@ -452,6 +452,18 @@
     return String(model || "").trim().toLowerCase();
   }
 
+  async function codexLocalAppServerManagerRpc() {
+    const { appScope } = collectCodexReactRuntimeCandidates();
+    if (!appScope) return null;
+    const module = await loadOptionalCodexAppModule("app-initial-");
+    const getter = Object.values(module || {}).find(value => typeof value === "function"
+      && value.toString().includes("AppServerManager RPC is unavailable for hostId:")
+      && /\.forHost\(/.test(value.toString()));
+    if (!getter) return null;
+    const manager = getter(appScope, "local");
+    return await manager.getHostId() === "local" ? manager : null;
+  }
+
   function codexServiceTierModelFromValue(value, visited = new WeakSet(), depth = 0) {
     if (typeof value === "string") return value.trim();
     if (!value || typeof value !== "object" || visited.has(value) || depth > 3) return "";

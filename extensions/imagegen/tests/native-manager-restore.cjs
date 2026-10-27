@@ -52,6 +52,7 @@ context = {
 };
 vm.createContext(context);
 vm.runInContext(host.match(/^  function collectCodexReactRuntimeCandidates\([^]*?^  \}/m)[0], context);
+vm.runInContext(host.match(/^  async function codexLocalAppServerManagerRpc\([^]*?^  \}/m)[0], context);
 vm.runInContext(source, context);
 const client = { hostId: 'local', async sendRequest(method) {
   assert.equal(method, 'thread/read'); return { thread: { path: '/rollout.jsonl', status: { type: 'idle' } } };
