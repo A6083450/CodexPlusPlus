@@ -758,6 +758,7 @@ mod tests {
             for (const ready of [false,true]) {{
                 let listener;
                 const window={{order:[]}}, document={{body:ready?{{}}:null,documentElement:null,
+                    querySelectorAll:()=>[],
                     addEventListener:(_name,callback)=>{{listener=callback;}}}};
                 class MutationObserver {{ observe(node) {{ assert.ok(node);window.order.push('images'); }} }}
                 vm.runInNewContext({},{{window,document,MutationObserver,setTimeout:()=>0,clearTimeout(){{}}}});
