@@ -10,6 +10,66 @@ spec.loader.exec_module(sync)
 
 
 class SynchronizationTests(unittest.TestCase):
+    def test_owned_facade_rejects_code_added_after_the_integration_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, host = root / 'source', root / 'host'
+            (source / 'integration').mkdir(parents=True)
+            host.mkdir()
+            (source / 'integration/hooks.tsv').write_text('adapter.rs\timagegen_hook\n')
+            (source / 'integration/facades.tsv').write_text('adapter.rs\timagegen_hook\n')
+            (host / 'adapter.rs').write_text('imagegen_hook\n')
+            sync.run(source, host, False)
+            (host / 'adapter.rs').write_text('imagegen_hook\nfn imagegen_was_reimplemented() {}\n')
+            with self.assertRaisesRegex(ValueError, 'Host facade changed'):
+                sync.run(source, host, True)
+
+    def test_hook_counts_detect_a_lost_call_even_when_other_calls_survive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, host = root / 'source', root / 'host'
+            (source / 'integration').mkdir(parents=True)
+            host.mkdir()
+            (source / 'integration/hooks.tsv').write_text('adapter.rs\timagegen_hook\t2\n')
+            (host / 'adapter.rs').write_text('imagegen_hook\nimagegen_hook\n')
+            sync.run(source, host, False)
+            (host / 'adapter.rs').write_text('imagegen_hook\n')
+            with self.assertRaisesRegex(ValueError, 'Host hook count changed'):
+                sync.run(source, host, True)
+
+    def test_sync_preserves_an_untracked_host_file_colliding_with_a_new_source_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, host = root / 'source', root / 'host'
+            (source / 'integration').mkdir(parents=True)
+            host.mkdir()
+            (source / 'integration/hooks.tsv').write_text('adapter.rs\timagegen_hook\n')
+            (host / 'adapter.rs').write_text('imagegen_hook\n')
+            sync.run(source, host, False)
+            (source / 'new.js').write_text('source change')
+            local = host / 'extensions/imagegen/new.js'
+            local.write_text('host change')
+            with self.assertRaisesRegex(ValueError, 'Preserving untracked host file'):
+                sync.run(source, host, False)
+            self.assertEqual(local.read_text(), 'host change')
+
+    def test_unknown_snapshot_files_are_rejected_before_any_file_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, host = root / 'source', root / 'host'
+            (source / 'integration').mkdir(parents=True)
+            host.mkdir()
+            (source / 'integration/hooks.tsv').write_text('adapter.rs\timagegen_hook\n')
+            (source / 'feature.js').write_text('original')
+            (host / 'adapter.rs').write_text('imagegen_hook\n')
+            sync.run(source, host, False)
+            (host / 'extensions/imagegen/foreign.js').write_text('upstream interference')
+            (source / 'feature.js').write_text('new version')
+            for check in [True, False]:
+                with self.assertRaisesRegex(ValueError, 'Unexpected snapshot file'):
+                    sync.run(source, host, check)
+            self.assertEqual((host / 'extensions/imagegen/feature.js').read_text(), 'original')
+
     def test_sync_reads_utf8_hooks_with_a_windows_default_encoding(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

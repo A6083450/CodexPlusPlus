@@ -1,3 +1,11 @@
+  function codexImageGenerationBlocksModelRestore() {
+    return !!window.__codexPlusGeneratedImageOverlay;
+  }
+
+  function codexImageGenerationRequestPatchWanted() {
+    return codexPlusBackendSettings.nativeImageGenerationEnabled === false || !!codexPlusBackendSettings.imageGenerationProxy;
+  }
+
   window.__codexPlusImageGenerationRuntime ||= { active: false, threads: new Map() };
   window.__codexPlusImageGenerationRuntime.stopping = false;
   installCodexNativeImageIngress();

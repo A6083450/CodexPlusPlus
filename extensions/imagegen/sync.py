@@ -20,10 +20,22 @@ def check_hooks(source, host):
     for line in (source / 'integration/hooks.tsv').read_text(encoding='utf-8').splitlines():
         if not line or line.startswith('#'):
             continue
-        name, marker = line.split('\t', 1)
+        name, marker, *count = line.split('\t')
         path = host / name
-        if not path.is_file() or marker not in path.read_text(encoding='utf-8'):
+        content = path.read_text(encoding='utf-8') if path.is_file() else ''
+        if marker not in content:
             raise ValueError(f'Missing host integration: {name}: {marker}')
+        if count and content.count(marker) != int(count[0]):
+            raise ValueError(f'Host hook count changed: {name}: {marker}')
+    facades = source / 'integration/facades.tsv'
+    if facades.is_file():
+        for line in facades.read_text(encoding='utf-8').splitlines():
+            if not line or line.startswith('#'):
+                continue
+            name, expected = line.split('\t', 1)
+            path = host / name
+            if not path.is_file() or path.read_text(encoding='utf-8').rstrip() != expected.replace('\\n', '\n'):
+                raise ValueError(f'Host facade changed: {name}; keep implementation in extensions/imagegen')
 
 
 def run(source, host, check):
@@ -32,6 +44,9 @@ def run(source, host, check):
     manifest_path = target / 'MANIFEST.json'
     old = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
     check_hooks(source, host)
+    unexpected = source_files(target).keys() - files.keys()
+    if unexpected:
+        raise ValueError(f'Unexpected snapshot file: {sorted(unexpected)[0]}; reconcile it before synchronizing')
     if check:
         expected = {name: digest(data) for name, data in files.items()}
         if old != expected:
@@ -48,6 +63,10 @@ def run(source, host, check):
                 raise ValueError(f'Source removed {name}; reconcile it explicitly before synchronizing')
             if not path.exists() or digest(path.read_bytes()) != checksum:
                 raise ValueError(f'Preserving modified host file: {name}; reconcile it before synchronizing')
+        for name, data in files.items():
+            path = target / name
+            if name not in old and path.exists() and path.read_bytes() != data:
+                raise ValueError(f'Preserving untracked host file: {name}; reconcile it before synchronizing')
         for name, data in files.items():
             path = target / name
             path.parent.mkdir(parents=True, exist_ok=True)

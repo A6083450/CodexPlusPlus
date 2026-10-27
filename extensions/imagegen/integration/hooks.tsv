@@ -5,7 +5,7 @@ assets/inject/renderer-inject.js	conversationManagers.forEach(patchCodexImageGen
 assets/inject/renderer-inject.js	conversationManagers, appScope, fiberCount
 assets/inject/renderer-inject.js	fiberCount: seenFibers.size, appScopes
 assets/inject/renderer-inject.js	async function codexLocalAppServerManagerRpc()
-crates/codex-plus-core/src/assets.rs	RENDERER_SCRIPT.replace(SLOT, IMAGEGEN_RENDERER_EXTENSION)
+crates/codex-plus-core/src/assets.rs	extensions/imagegen/rust/assets.rs
 crates/codex-plus-core/src/assets.rs	extensions/imagegen/ui/generated-images-inject.js
 crates/codex-plus-core/src/imagegen_skill.rs	extensions/imagegen/rust/imagegen_skill.rs
 crates/codex-plus-data/src/generated_images.rs	extensions/imagegen/rust/generated_images.rs
@@ -30,3 +30,14 @@ assets/inject/renderer-inject.js	setCodexImageGenerationRuntimeActive(true)
 crates/codex-plus-core/src/imagegen_runtime.rs	extensions/imagegen/rust/runtime.rs
 crates/codex-plus-core/src/lib.rs	pub mod imagegen_runtime;
 apps/codex-plus-launcher/src/main.rs	codex_plus_core::imagegen_runtime::restore_native_image_generation(&websocket_url).await
+crates/codex-plus-core/src/models.rs	extensions/imagegen/rust/models.rs	1
+crates/codex-plus-core/src/settings.rs	extensions/imagegen/rust/profile.rs	1
+crates/codex-plus-core/src/lib.rs	pub mod image_delivery;	1
+crates/codex-plus-core/src/launcher.rs	crate::image_delivery::ImageDeliveryStream::new(	3
+crates/codex-plus-core/src/launcher.rs	crate::image_delivery::attach_images(	1
+crates/codex-plus-core/src/launcher.rs	extensions/imagegen/tests/launcher.rs	1
+crates/codex-plus-core/src/assets.rs	extensions/imagegen/tests/assets.rs	1
+crates/codex-plus-core/tests/cdp_bridge.rs	extensions/imagegen/tests/renderer_contract.rs	1
+apps/codex-plus-manager/src/model-routes.ts	extensions/imagegen/ui/model-routes.ts	1
+assets/inject/renderer-inject.js	codexImageGenerationRequestPatchWanted()	2
+assets/inject/renderer-inject.js	codexImageGenerationBlocksModelRestore()	1

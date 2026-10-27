@@ -17,6 +17,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify independent imagegen package
+        run: python3 extensions/imagegen/sync.py --check --target .
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -133,6 +136,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify independent imagegen package
+        run: python3 extensions/imagegen/sync.py --check --target .
 
       - name: Setup Node
         uses: actions/setup-node@v4

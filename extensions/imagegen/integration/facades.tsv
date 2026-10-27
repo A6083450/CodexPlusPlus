@@ -1,0 +1,11 @@
+# Host-owned facades must only delegate to the package. New implementation belongs in imagegen.
+crates/codex-plus-core/build.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/integration/build_check.rs"));
+crates/codex-plus-core/src/image_delivery.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/image_delivery.rs"));
+crates/codex-plus-core/src/imagegen_runtime.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/runtime.rs"));
+crates/codex-plus-core/src/imagegen_skill.rs	// Implementation is maintained in the independent imagegen extension.\ninclude!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/imagegen_skill.rs"));
+crates/codex-plus-data/src/generated_images.rs	// Implementation is maintained in the independent imagegen extension.\ninclude!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/generated_images.rs"));
+crates/codex-plus-core/tests/image_delivery.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/tests/image_delivery.rs"));
+crates/codex-plus-core/tests/imagegen_extension.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/tests/integration.rs"));
+crates/codex-plus-core/tests/imagegen_skill.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/tests/imagegen_skill.rs"));
+crates/codex-plus-data/tests/generated_images.rs	include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/tests/generated_images.rs"));
+apps/codex-plus-manager/src/image-model-menu.test.ts	import "../../../extensions/imagegen/tests/image-model-menu.test.ts";\nimport "../../../extensions/imagegen/tests/model-routes.test.ts";

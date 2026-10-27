@@ -1,3 +1,6 @@
+import { imageGenerationUsesProxy } from "../../../extensions/imagegen/ui/model-routes.ts";
+export { imageGenerationUsesProxy };
+
 export type RelayModelRoute = {
   model: string;
   targetRelayId: string;
@@ -90,13 +93,6 @@ export function findRelayModelRouteIssue(
     }
   }
   return null;
-}
-
-export function imageGenerationUsesProxy(profile: RelayModelRouteProfile): boolean {
-  return profile.imageGenerationProxy !== false && profile.protocol === "responses"
-    && (profile.relayMode !== "official" || profile.officialMixApiKey)
-    && `${profile.model ?? ""}\n${profile.modelList ?? ""}`.split("\n")
-      .some(model => model.trim().toLowerCase().startsWith("gpt-image-"));
 }
 
 export function webSearchHistoryCompatEnabled(

@@ -797,7 +797,7 @@
   /* @codex-imagegen:runtime */
 
   async function syncCodexThreadModelSelection(managers) {
-    if (window.__codexPlusGeneratedImageOverlay) return;
+    if (codexImageGenerationBlocksModelRestore()) return;
     const threadId = codexPlusUsageThreadId(codexPlusUsageComposerCard());
     let visit = window.__codexPlusThreadModelVisit;
     // 图片预览、输入框重建期间暂时没有 composer，不算离开当前会话。
@@ -1239,8 +1239,7 @@
     const wanted = codexPlusModelUnlockEnabled()
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-      || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
-      || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
+      || (codexPlusBackendSettingsLoaded && codexImageGenerationRequestPatchWanted())
       || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
@@ -1459,8 +1458,7 @@
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-        || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.nativeImageGenerationEnabled === false)
-        || (codexPlusBackendSettingsLoaded && codexPlusBackendSettings.imageGenerationProxy)
+        || (codexPlusBackendSettingsLoaded && codexImageGenerationRequestPatchWanted())
           || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});

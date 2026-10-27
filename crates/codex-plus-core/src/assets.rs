@@ -148,15 +148,7 @@ const STEPWISE_SCRIPT: &str = concat!(
 pub const DIAGNOSTIC_BUILD_ID: &str = "fixed6-20260814";
 const DREAM_SKIN_RENDERER_REVISION: &str = "27-dream-skin-1.5.20-wallpaper-shell";
 
-pub fn renderer_script() -> &'static str {
-    static COMPOSED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        const IMAGEGEN_RENDERER_EXTENSION: &str = include_str!("../../../extensions/imagegen/ui/renderer-runtime.js");
-        const SLOT: &str = "  /* @codex-imagegen:runtime */\n\n";
-        assert_eq!(RENDERER_SCRIPT.matches(SLOT).count(), 1, "imagegen integration slot missing or duplicated");
-        RENDERER_SCRIPT.replace(SLOT, IMAGEGEN_RENDERER_EXTENSION)
-    });
-    &COMPOSED
-}
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/rust/assets.rs"));
 
 pub fn generated_images_script() -> &'static str {
     GENERATED_IMAGES_SCRIPT
@@ -740,40 +732,6 @@ mod tests {
     }
 
     #[test]
-    fn native_fast_defers_generated_images_and_following_dom_extensions() {
-        let settings = BackendSettings {
-            enhancements_enabled: true,
-            codex_app_native_fast_unlock: true,
-            codex_app_stepwise_enabled: true,
-            ..Default::default()
-        };
-        let script = injection_script_with_settings(57321, &settings)
-            .replace(&whale_runtime_script(), "")
-            .replace(include_str!("../../../assets/inject/composer-readiness.js"), "")
-            .replace(native_fast_unlock_script(), "window.__codexPlusNativeFastUnlock={runtime:{update(){}}};")
-            .replace(renderer_script(), "window.order.push('renderer');")
-            .replace(stepwise_script(), "window.order.push('stepwise');");
-        let harness = format!(r#"
-            const vm=require('node:vm'),assert=require('node:assert/strict');
-            for (const ready of [false,true]) {{
-                let listener;
-                const window={{order:[]}}, document={{body:ready?{{}}:null,documentElement:null,
-                    querySelectorAll:()=>[],
-                    addEventListener:(_name,callback)=>{{listener=callback;}}}};
-                class MutationObserver {{ observe(node) {{ assert.ok(node);window.order.push('images'); }} }}
-                vm.runInNewContext({},{{window,document,MutationObserver,setTimeout:()=>0,clearTimeout(){{}}}});
-                if(!ready){{assert.deepEqual(window.order,[]);document.body={{}};listener();}}
-                assert.deepEqual(window.order,['renderer','images','stepwise']);
-            }}
-        "#, serde_json::to_string(&script).unwrap());
-        let temp = tempfile::tempdir().unwrap();
-        let harness_path = temp.path().join("native-fast-dom.cjs");
-        std::fs::write(&harness_path, harness).unwrap();
-        let output = std::process::Command::new("node").arg(&harness_path).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    #[test]
     fn native_shell_compatibility_is_present_without_managed_safe_css() {
         let temp = tempfile::tempdir().unwrap();
         for image in [String::new(), temp.path().join("selected.png").to_string_lossy().into_owned()] {
@@ -901,4 +859,6 @@ mod tests {
         assert_eq!(config["dataUrl"], "");
         assert_eq!(config["imageUrl"], "");
     }
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extensions/imagegen/tests/assets.rs"));
+
 }

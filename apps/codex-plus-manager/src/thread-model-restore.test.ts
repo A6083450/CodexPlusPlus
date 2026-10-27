@@ -49,6 +49,9 @@ function fixture() {
     },
   };
   vm.createContext(context);
+  const imagegen = readFileSync(new URL("../../../extensions/imagegen/ui/renderer-runtime.js", import.meta.url), "utf8");
+  const guard = imagegen.match(/^  function codexImageGenerationBlocksModelRestore\([^]*?^  \}/m)?.[0];
+  assert.ok(guard); vm.runInContext(guard, context);
   const helper = source.match(/^  async function syncCodexThreadModelSelection\([^]*?^  \}/m)?.[0];
   assert.ok(helper, "restore the model for the active conversation"); vm.runInContext(helper, context);
   const observer = source.match(/^  function installCodexThreadModelSelectionObserver\([^]*?^  \}/m)?.[0];

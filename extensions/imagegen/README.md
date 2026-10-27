@@ -6,13 +6,32 @@ CodexPlusPlus 的 `extensions/imagegen` 仅是构建快照；**后续修改请�
 
 ## 内容与边界
 
+功能包版本见 `VERSION`，当前为 `1.1.0`。本次生图增强的实现和专属回归测试均在本包维护：
+
 - `ui/renderer-runtime.js`：生图工具冲突修正、保存/恢复、原生消息缓存更新。
 - `ui/generated-images-inject.js`：消息匹配、图片预览、自动持久化触发。
+- `ui/model-routes.ts`：管理器对图片模型、供应商协议和生图代理开关的判断。
 - `rust/generated_images.rs`：图片落盘、原生消息修复、历史索引重建。
+- `rust/image_delivery.rs`：Responses JSON/SSE 图片交付、真实文件引用、历史消息 ID 兼容。
+- `rust/models.rs`、`rust/profile.rs`：图片数据结构和供应商生图能力判断。
+- `rust/assets.rs`、`rust/runtime.rs`：renderer 装配和退出时的原生生图恢复。
 - `rust/imagegen_skill.rs`、`skill/`：本地 imagegen 增强版本、覆盖安装和覆盖状态检查。
 - `rust/relay_compatibility.rs`、`rust/config_read.rs`：图片模型配置兼容与有效开关读取。
 - `rust/protocol_tools.rs`：图片模型使用托管生图，清理顶层及 Code Mode `additional_tools` 中冲突的同名函数。
 - `tests/`：图片数据和 skill 安装回归测试，由宿主 cargo test 执行。
+
+宿主仅保留协议转发调用、桥接路由、配置字段、设置界面和 `include!` / TypeScript import 门面。
+会话最后使用模型的通用恢复、原生 Fast 解锁及共享 AppScope/RPC 查找仍由宿主管理；图片浮层对模型恢复的保护和图片请求接管条件属于本包。
+原有 `codex_plus_core::image_delivery`、`models::GeneratedImage` 等调用路径保持兼容。
+
+| 宿主接入位置 | 本包维护源 |
+| --- | --- |
+| core `image_delivery.rs` 及对应测试 | `rust/image_delivery.rs`、`tests/image_delivery.rs` |
+| core `models.rs`、`settings.rs` | `rust/models.rs`、`rust/profile.rs` |
+| core `assets.rs` | `rust/assets.rs`、`tests/assets.rs` |
+| core `launcher.rs` 的图片交付调用与测试 | `rust/image_delivery.rs`、`tests/launcher.rs` |
+| core `cdp_bridge.rs` 的生图专属测试 | `tests/renderer_contract.rs` |
+| manager `model-routes.ts` 及图片测试入口 | `ui/model-routes.ts`、`tests/*.test.ts` |
 
 图片模型会话优先使用 Responses 托管生图。关闭供应商配置管理时，仅在会话配置中临时接入代理，上游地址、有效 API 凭据与自定义头来自当前 Codex 配置，不改写全局配置或登录文件；切回文字模型时恢复会话配置。官方原生登录、命令认证和带额外查询参数的配置保留原生路径。
 
@@ -35,11 +54,15 @@ CodexPlusPlus 的 `extensions/imagegen` 仅是构建快照；**后续修改请�
 python3 ../CodexPlusPlus-imagegen/sync.py --sync --target .
 python3 ../CodexPlusPlus-imagegen/sync.py --check --target .
 NO_PROXY=127.0.0.1,localhost cargo test -p codex-plus-core --test cdp_bridge --test imagegen_skill --test relay_config
+cargo test -p codex-plus-core --test imagegen_extension --test image_delivery
 cargo test -p codex-plus-data --test generated_images
 ```
 
 以上命令从 CodexPlusPlus 根目录运行。同步只写扩展快照；宿主中已有未同步改动会被拒绝覆盖，不自动删除文件，也不覆盖整份上游源文件。
+新文件与宿主同名文件冲突、快照中出现清单外文件时，也会在写入前拒绝同步。
 
 合并上游前后执行独立源的 `--check`。`integration/hooks.tsv` 列出必须保留的宿主接入点：renderer 插槽/请求钩子、Rust 门面、路由、配置兼容、本地 skill 安装入口、构建/打包检查。缺失时检查明确失败，应恢复对应的薄接入点并运行回归测试，不能直接用旧文件覆盖新版上游。
 
-普通 cargo 构建通过 core/build.rs 自动检查接入点；macOS 打包额外检查快照摘要。独立源保存 SHA-256 清单，能发现扩展文件被静默修改。上游若重写原生会话 API，仍需适配并测试；模块隔离不能保证第三方 API 永远兼容。宿主构建不依赖同级目录或网络，干净 checkout 只需随仓库提交扩展快照即可。
+`integration/facades.tsv` 记录专用宿主门面的完整内容，防止在门面里重新混入实现；`hooks.tsv` 对关键调用还校验出现次数，避免保留一处调用就掩盖其他路径被删的问题。
+普通 cargo 构建通过 core/build.rs 检查门面与接入点；macOS / Windows 的 PR 和发布工作流均检查完整快照及 SHA-256，macOS 打包还会再次检查。
+独立源和随宿主提交的快照都能执行 `sync.py --check`。上游若重写原生会话 API，仍需适配并测试；模块隔离不能保证第三方 API 永远兼容。宿主构建不依赖同级目录或网络，干净 checkout 只需随仓库提交扩展快照即可。
