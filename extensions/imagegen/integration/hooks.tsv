@@ -18,7 +18,7 @@ apps/codex-plus-manager/src-tauri/src/commands.rs	codex_plus_core::imagegen_skil
 crates/codex-plus-core/build.rs	extensions/imagegen/integration/build_check.rs
 crates/codex-plus-core/tests/imagegen_skill.rs	extensions/imagegen/tests/imagegen_skill.rs
 crates/codex-plus-data/tests/generated_images.rs	extensions/imagegen/tests/generated_images.rs
-scripts/installer/macos/package-dmg.sh	extensions/imagegen/sync.py
+scripts/installer/macos/package-dmg.sh	extensions/imagegen/check.py
 assets/inject/renderer-inject.js	await prepareCodexImageGenerationTurn(client, requestMethod, params)
 crates/codex-plus-core/src/protocol_proxy.rs	extensions/imagegen/rust/protocol_tools.rs
 crates/codex-plus-core/tests/protocol_proxy.rs	extensions/imagegen/tests/protocol_tools.rs

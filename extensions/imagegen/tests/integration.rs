@@ -1,8 +1,8 @@
 #[test]
-fn imagegen_snapshot_and_host_contract_are_intact() {
+fn imagegen_package_and_host_contract_are_intact() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::process::Command::new("python3")
-        .arg(root.join("extensions/imagegen/sync.py"))
+        .arg(root.join("extensions/imagegen/check.py"))
         .arg("--check").arg("--target").arg(&root).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
@@ -31,10 +31,10 @@ fn imagegen_build_guard_rejects_changed_facades_and_lost_hook_calls() {
 }
 
 #[test]
-fn imagegen_sync_refuses_to_overwrite_local_work_or_accept_missing_hooks() {
+fn imagegen_package_checker_rejects_integrity_or_hook_drift() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = std::process::Command::new("python3")
-        .arg(root.join("extensions/imagegen/tests/test_sync.py")).output().unwrap();
+        .arg(root.join("extensions/imagegen/tests/test_package.py")).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 

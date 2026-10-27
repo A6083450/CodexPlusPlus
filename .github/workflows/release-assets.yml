@@ -42,8 +42,8 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Verify independent imagegen package
-        run: python3 extensions/imagegen/sync.py --check --target .
+      - name: Verify imagegen package
+        run: python3 extensions/imagegen/check.py --check --target .
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -209,8 +209,8 @@ jobs:
 
           rm -f "$KEY_PATH"
 
-      - name: Verify independent imagegen package
-        run: python3 extensions/imagegen/sync.py --check --target .
+      - name: Verify imagegen package
+        run: python3 extensions/imagegen/check.py --check --target .
 
       - name: Setup Node
         uses: actions/setup-node@v4

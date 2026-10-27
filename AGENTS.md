@@ -97,9 +97,10 @@
 
 - 提交信息、PR 描述里不加 `Co-Authored-By: Claude …` 等 AI 署名。
 
-## 独立生图扩展
+## 生图功能包（同仓库）
 
-- 生图修复与本地 imagegen 增强的维护源为同级独立仓库 `../CodexPlusPlus-imagegen`，不在上游仓库中开发这部分实现。
-- 本仓库 `extensions/imagegen/` 是可独立构建的同步快照；修改维护源后用其 `sync.py --sync --target .` 同步，禁止覆盖宿主未同步改动。
-- 合并上游前后运行 `python3 ../CodexPlusPlus-imagegen/sync.py --check --target .`；缺失接入点必须逐项适配，不能用旧版整文件覆盖上游。
+- 生图实现和专属测试统一在本仓库的 `extensions/imagegen/` 直接维护，与宿主使用同一个 Git 仓库；不要另建仓库、子模块或从外部目录同步源码。
+- 宿主只保留薄接入点，生图业务实现不得重新散落回上游文件。
+- 修改功能包后审查差异，再运行 `python3 extensions/imagegen/check.py --update-manifest --target .` 更新本地完整性清单；此命令只写清单，不复制或覆盖代码。
+- 合并上游前后运行 `python3 extensions/imagegen/check.py --check --target .`；缺失接入点必须逐项适配，不能用旧版整文件覆盖上游。
 - 接入约定和测试见 `extensions/imagegen/README.md`；不要移除 core/build.rs 和打包脚本中的接入检查。

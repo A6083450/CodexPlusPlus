@@ -1,7 +1,7 @@
-# Independent imagegen extension
+# Imagegen 功能包
 
-独立维护源：`../CodexPlusPlus-imagegen`，独立 Git 仓库，不是上游 fork，不配置远程仓库。
-CodexPlusPlus 的 `extensions/imagegen` 仅是构建快照；**后续修改请在独立维护源进行**。
+本仓库的 `extensions/imagegen/` 是生图增强的唯一维护目录，源码和专属测试直接在这里修改，与宿主一起提交到同一个 Git 仓库。
+这里只隔离模块边界，不使用独立仓库、子模块或外部源码同步。
 初始行为基线为用户验证可用的 CodexPlusPlus 1.3.0+46。保留原项目 LICENSE 以及 skill 自带许可。
 
 ## 内容与边界
@@ -44,25 +44,25 @@ CodexPlusPlus 的 `extensions/imagegen` 仅是构建快照；**后续修改请�
 
 原始 `image_generation_call` 未进入原生图库时，兜底缩略图复用原生 `ImagePreviewOverlay` 浮层和消息的 React 上下文，默认覆盖聊天区域；“在侧面板中打开”由用户显式选择。原生标注、评论和编辑提交保持在当前会话，切换会话时关闭浮层；浮层打开期间暂停图片持久化，避免原缩略图被浮层中的图片替换。
 
-这里是独立版本管理的扩展源码包，不是独立运行的 Codex 插件。Rust 通过宿主薄门面编译，复用宿主的数据类型、数据库定位和原子文件写入；renderer 通过一个固定插槽装配，复用宿主桥接和原生会话管理器。宿主的通用 HTTP/模型选择/协议代理仍由宿主管理，不复制整套应用。
+这是同仓库内的功能模块。Rust 通过宿主薄门面编译，复用宿主的数据类型、数据库定位和原子文件写入；renderer 通过一个固定插槽装配，复用宿主桥接和原生会话管理器。宿主的通用 HTTP/模型选择/协议代理仍由宿主管理，不复制整套应用。
 
-## 同步与合并上游
+## 维护与合并上游
 
-在独立源中修改后：
+直接修改 `extensions/imagegen/` 中的代码，审查差异后更新完整性清单，再运行检查和测试。以下命令均从 CodexPlusPlus 根目录运行：
 
 ```sh
-python3 ../CodexPlusPlus-imagegen/sync.py --sync --target .
-python3 ../CodexPlusPlus-imagegen/sync.py --check --target .
+python3 extensions/imagegen/check.py --update-manifest --target .
+python3 extensions/imagegen/check.py --check --target .
 NO_PROXY=127.0.0.1,localhost cargo test -p codex-plus-core --test cdp_bridge --test imagegen_skill --test relay_config
 cargo test -p codex-plus-core --test imagegen_extension --test image_delivery
 cargo test -p codex-plus-data --test generated_images
 ```
 
-以上命令从 CodexPlusPlus 根目录运行。同步只写扩展快照；宿主中已有未同步改动会被拒绝覆盖，不自动删除文件，也不覆盖整份上游源文件。
-新文件与宿主同名文件冲突、快照中出现清单外文件时，也会在写入前拒绝同步。
+`--update-manifest` 只更新本目录的 `MANIFEST.json`，不复制、替换或删除任何源码，也不访问其他仓库。
+`--check` 检查文件清单、SHA-256、宿主门面和接入点；新增、删除或修改包内文件均需审查后显式更新清单。缺失或被改写的宿主接入点不能通过刷新清单来放行。
 
-合并上游前后执行独立源的 `--check`。`integration/hooks.tsv` 列出必须保留的宿主接入点：renderer 插槽/请求钩子、Rust 门面、路由、配置兼容、本地 skill 安装入口、构建/打包检查。缺失时检查明确失败，应恢复对应的薄接入点并运行回归测试，不能直接用旧文件覆盖新版上游。
+合并上游前后执行 `--check`，合并后先检查功能包差异，不要直接刷新清单掩盖上游改动。`integration/hooks.tsv` 列出必须保留的宿主接入点：renderer 插槽/请求钩子、Rust 门面、路由、配置兼容、本地 skill 安装入口、构建/打包检查。缺失时检查明确失败，应恢复对应的薄接入点并运行回归测试，不能直接用旧文件覆盖新版上游。
 
 `integration/facades.tsv` 记录专用宿主门面的完整内容，防止在门面里重新混入实现；`hooks.tsv` 对关键调用还校验出现次数，避免保留一处调用就掩盖其他路径被删的问题。
-普通 cargo 构建通过 core/build.rs 检查门面与接入点；macOS / Windows 的 PR 和发布工作流均检查完整快照及 SHA-256，macOS 打包还会再次检查。
-独立源和随宿主提交的快照都能执行 `sync.py --check`。上游若重写原生会话 API，仍需适配并测试；模块隔离不能保证第三方 API 永远兼容。宿主构建不依赖同级目录或网络，干净 checkout 只需随仓库提交扩展快照即可。
+普通 cargo 构建通过 core/build.rs 检查门面与接入点；macOS / Windows 的 PR 和发布工作流均检查功能包的完整性清单及 SHA-256，macOS 打包还会再次检查。
+上游若重写原生会话 API，仍需适配并测试；模块隔离不能保证第三方 API 永远兼容。干净 checkout 直接构建本仓库即可，不依赖同级目录或网络获取生图源码。
