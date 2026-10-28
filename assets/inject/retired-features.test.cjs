@@ -69,6 +69,7 @@ test("renderer startup forces zh-CN through the native locale setting", async ()
   assert.deepEqual(calls.map(call => [call.method, call.params.key, call.params.value]), [
     ["get-setting", "localeOverride", undefined],
     ["set-setting", "localeOverride", "zh-CN"],
+    ["get-setting", "localeOverride", undefined],
   ]);
   // 菜单汉化仍未恢复，这两个入口都不该回来。
   assert.doesNotMatch(source, /codexMenuLocalizationMap|function localizeCodexMenus\(/);
@@ -81,7 +82,7 @@ test("force Chinese locale installs once per configuration", async () => {
   fixture.context.install();
   await fixture.settled();
   assert.equal(fixture.calls.length, afterFirst, "re-running with the same config does not resync");
-  assert.equal(fixture.context.window.__codexPlusForceChineseLocaleInstalled, "2:on:zh-CN");
+  assert.deepEqual(fixture.reloads, ["reload"], "re-running with the same config does not reload again");
 });
 
 test("force Chinese locale leaves everything alone while it is switched off", async () => {
@@ -101,8 +102,8 @@ test("force Chinese locale retries while the Codex state API is still unavailabl
   await fixture.settled();
   await fixture.settled();
   const methods = fixture.calls.map(call => call.method);
-  assert.deepEqual(methods, ["get-setting", "get-setting", "get-setting", "get-setting", "set-setting"],
-    "three failed reads are retried before the write lands");
+  assert.deepEqual(methods, ["get-setting", "get-setting", "get-setting", "get-setting", "set-setting", "get-setting"],
+    "three failed reads are retried before the write lands and is read back");
   assert.equal(fixture.current(), "zh-CN");
   assert.deepEqual(fixture.reloads, ["reload"]);
 });
